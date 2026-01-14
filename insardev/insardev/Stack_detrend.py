@@ -43,6 +43,10 @@ class Stack_detrend(Stack_unwrap2d):
 
         wrap = True if isinstance(datas, BatchWrap) else False
         data = utils_xarray.apply_pol(datas, weights, transform, func=_regression2d, add_key=True, compute=compute, wrap=wrap, **kwarg)
+        # Preserve pair coordinate type from input (xr.merge in apply_pol can lose MultiIndex)
+        for key in data:
+            if 'pair' in datas[key].coords and 'pair' in data[key].coords:
+                data[key] = data[key].assign_coords(pair=datas[key].coords['pair'])
         return BatchWrap(data) if wrap else Batch(data)
 
     def trend2d_dataset(self, phase, weight=None, transform=None, **kwargs):
