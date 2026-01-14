@@ -26,17 +26,36 @@ class Stack_plot(Stack_export):
         df = self.to_dataframe().reset_index()
         df['date'] = df['startTime'].dt.date
 
-        df['label'] = df.apply(lambda rec: f"{rec['flightDirection'].replace('E','')[:3]} {rec['date']} [{rec['pathNumber']}]", axis=1)
-        unique_labels = sorted(df['label'].unique())
-        unique_paths = sorted(df['pathNumber'].astype(str).unique())
-        #colors = {label[-4:-1]: 'orange' if label[0] == 'A' else 'cyan' for i, label in enumerate(unique_labels)}
-        n = len(unique_labels)
+        # Create group key for orbit direction + path number
+        df['orbit_path'] = df.apply(
+            lambda rec: f"{rec['flightDirection'].replace('E','')[:3]} [{rec['pathNumber']}]", axis=1
+        )
+
+        # Get unique orbit/path combinations and assign colors
+        unique_orbit_paths = sorted(df['orbit_path'].unique())
+        n = len(unique_orbit_paths)
         colormap = matplotlib.cm.get_cmap(cmap, n)
-        color_map = {label[-4:-1]: colormap(i) for i, label in enumerate(unique_labels)}
+        color_map = {op: colormap(i) for i, op in enumerate(unique_orbit_paths)}
+
         fig, ax = plt.subplots()
-        for label, group in df.groupby('label'):
-            group.plot(ax=ax, edgecolor=color_map[label[-4:-1]], facecolor='none', lw=0.25, label=label)
-        handles = [matplotlib.lines.Line2D([0], [0], color=color_map[label[-4:-1]], lw=1, label=label) for label in unique_labels]
+
+        # Plot each burst with color based on orbit/path
+        for orbit_path, group in df.groupby('orbit_path'):
+            group.plot(ax=ax, edgecolor=color_map[orbit_path], facecolor='none', lw=0.25, label=orbit_path)
+
+        # Create consolidated legend labels with date ranges
+        legend_labels = []
+        for orbit_path in unique_orbit_paths:
+            group = df[df['orbit_path'] == orbit_path]
+            dates = sorted(group['date'].unique())
+            if len(dates) == 1:
+                label = f"{orbit_path.split()[0]} {dates[0]} {orbit_path.split()[1]}"
+            else:
+                label = f"{orbit_path.split()[0]} {dates[0]} - {dates[-1]} {orbit_path.split()[1]}"
+            legend_labels.append((orbit_path, label))
+
+        handles = [matplotlib.lines.Line2D([0], [0], color=color_map[op], lw=1, label=label)
+                   for op, label in legend_labels]
         ax.legend(handles=handles, loc='upper right')
 
         col = df.columns[0]
@@ -49,7 +68,7 @@ class Stack_plot(Stack_export):
                 xytext=(0, 0),
                 textcoords='offset points',
                 ha='center', va='bottom',
-                color=color_map[row['label'][-4:-1]],
+                color=color_map[row['orbit_path']],
                 path_effects=[patheffects.withStroke(linewidth=0.25, foreground='black')],
                 alpha=1
             )
