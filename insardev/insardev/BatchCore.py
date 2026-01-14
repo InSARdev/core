@@ -612,7 +612,7 @@ class BatchCore(dict):
         # DataArray case seems not usefull because Batch datasets differ in shape
         return self.map_da(lambda da: da.where(cond, other, **kwargs), **kwargs)
 
-    def mask(self, mask: xr.DataArray | xr.Dataset, other=np.nan):
+    def mask(self, mask, other=np.nan):
         """
         Apply a mask to each burst.
 
@@ -622,12 +622,11 @@ class BatchCore(dict):
 
         Parameters
         ----------
-        mask_data : xr.DataArray, xr.Dataset
+        mask : xr.DataArray, xr.Dataset, or GeoDataFrame
             The mask to apply. Can be:
-            - xr.DataArray: reindexed to each burst's coordinates
+            - xr.DataArray: boolean mask reindexed to each burst's coordinates
             - xr.Dataset: first data variable used as mask, reindexed per burst
-            For integer/boolean masks, values == 1 or True are kept.
-            For float masks (e.g., landmask with 1.0/NaN, correlation), finite values are kept.
+            - GeoDataFrame: polygon(s) to mask by - pixels inside polygons are kept
         other : scalar, optional
             Value to use for masked elements. Default is np.nan.
 
@@ -641,14 +640,45 @@ class BatchCore(dict):
         # Apply binary landmask
         land = np.isfinite(xr.open_dataarray('land.nc').rio.reproject(intf.crs))
         masked_intf = intf.mask(land)
+
+        # Mask by AOI polygon
+        AOI = gpd.read_file('aoi.geojson')
+        masked_velocity = velocity.mask(AOI)
         """
-    
-        # extract DataArray from Dataset
+        import geopandas as gpd
+        from shapely import Geometry
+        import rioxarray
+
+        # Handle GeoDataFrame/GeoSeries/Geometry masking
+        if isinstance(mask, (gpd.GeoDataFrame, gpd.GeoSeries, Geometry)):
+            # Extract geometry for rio.clip
+            if isinstance(mask, gpd.GeoDataFrame):
+                geom = mask.geometry
+                mask_crs = mask.crs
+            elif isinstance(mask, gpd.GeoSeries):
+                geom = mask
+                mask_crs = mask.crs
+            else:
+                # Shapely Geometry - no CRS info
+                geom = [mask]
+                mask_crs = None
+
+            # Reproject to batch CRS if needed
+            crs = self.crs
+            if crs is not None and mask_crs is not None and mask_crs != crs:
+                geom = gpd.GeoSeries(geom, crs=mask_crs).to_crs(crs)
+
+            out = {}
+            for key, ds in self.items():
+                out[key] = ds.rio.clip(geom, all_touched=False)
+            return type(self)(out)
+
+        # Handle xarray mask
         if isinstance(mask, xr.Dataset):
             mask = next(iter(mask.data_vars.values()))
 
         if not np.issubdtype(mask.dtype, np.bool_):
-            raise ValueError('Batch.mask: mask must be a Dataset or DataArray of boolean type')
+            raise ValueError('Batch.mask: mask must be a Dataset or DataArray of boolean type, or a GeoDataFrame')
 
         # auto-chunk if not already chunked to avoid high memory usage
         if not mask.chunks:
@@ -1164,7 +1194,6 @@ class BatchCore(dict):
         If the target object's .<name>() accepts a `dim=` arg, we pass dim, otherwise we just call it without.
         """
         import inspect
-        import pandas as pd
         out = {}
         for key, obj in self.items():
             fn = getattr(obj, name)
@@ -1174,12 +1203,10 @@ class BatchCore(dict):
             else:
                 out[key] = fn(**kwargs)
 
-        #print ('_agg self.chunks', self.chunks)
         # filter out collapsed dimensions
         sample = next(iter(out.values()), None)
         dims = (sample.dims or []) if hasattr(sample, 'dims') else []
         chunks = {d: size for d, size in self.chunks.items() if d in dims}
-        #print ('chunks', chunks)
         result = type(self)(out)
         if chunks:
             return result.chunk(chunks)
@@ -2029,7 +2056,12 @@ class BatchCore(dict):
 
             # calculate min, max when needed
             if quantile is not None:
-                _vmin, _vmax = np.nanquantile(da, quantile)
+                q = np.nanquantile(da.values, quantile)
+                # Handle edge cases: all NaN data returns scalar, empty data, etc.
+                if np.ndim(q) == 0:
+                    _vmin = _vmax = float(q)
+                else:
+                    _vmin, _vmax = q[0], q[-1]
             else:
                 _vmin, _vmax = vmin, vmax
             # define symmetrical boundaries
