@@ -126,11 +126,13 @@ class Stack_phasediff(Stack_base):
         def as_xarray(batch):
             # Add ref/rep/BPR as coordinates along pair dimension
             # BPR is passed as a Batch for per-burst assignment
+            # Note: we keep pair as simple tuple index (not MultiIndex) for consistency
+            # across all processing functions that use .values extraction
             return batch.assign_coords(
                 ref=('pair', data1.coords['pair'].values),
                 rep=('pair', data2.coords['pair'].values),
                 BPR=('pair', bpr)
-            ).set_index(pair=['ref', 'rep'])
+            )
         
         if corr_look is None:
             return as_xarray(phasediff_look)
