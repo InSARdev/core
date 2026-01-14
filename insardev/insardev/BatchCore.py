@@ -1173,11 +1173,6 @@ class BatchCore(dict):
                 out[key] = fn(dim=dim, **kwargs)
             else:
                 out[key] = fn(**kwargs)
-            
-            # xarray coarsen + aggregate do not preserve multiindex pair
-            if all(coord in out[key].coords for coord in ('pair', 'ref','rep')) \
-                   and not isinstance(out[key].coords['pair'], pd.MultiIndex):
-                out[key] = out[key].set_index(pair=['ref', 'rep'])
 
         #print ('_agg self.chunks', self.chunks)
         # filter out collapsed dimensions
@@ -1984,6 +1979,7 @@ class BatchCore(dict):
             nbins: int = 5,
             aspect: float = 1.02,
             y: float = 1.05,
+            flip: bool = False,
             _size: tuple[int, int] | None = None,
             ):
         import xarray as xr
@@ -2057,7 +2053,20 @@ class BatchCore(dict):
             fg.fig.suptitle(f'{polarization} {caption or ''}'.strip(), y=y)
 
             # fg is the FacetGrid returned by xarray.plot.imshow
+            # Get original limits from first axis before any modifications
+            if flip:
+                first_ax = fg.axes.flatten()[0]
+                orig_xlim = first_ax.get_xlim()
+                orig_ylim = first_ax.get_ylim()
+                # Ensure we flip to reversed order (max, min)
+                flipped_xlim = (max(orig_xlim), min(orig_xlim))
+                flipped_ylim = (max(orig_ylim), min(orig_ylim))
+
             for idx, ax in enumerate(fg.axes.flatten()):
+                # flip axes if requested (force consistent flipped limits)
+                if flip:
+                    ax.set_xlim(flipped_xlim)
+                    ax.set_ylim(flipped_ylim)
                 # format tick labels in km
                 km_formatter = FuncFormatter(lambda v, _: f'{v/1000:.0f}')
                 ax.xaxis.set_major_formatter(km_formatter)
