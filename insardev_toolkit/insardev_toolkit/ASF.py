@@ -188,31 +188,22 @@ class ASF(progressbar_joblib):
                     page = tif.pages[0]
                     offset = page.dataoffsets[0]
                 #print ('offset', offset)
-                # get the file name
+                # get the file name - download to burst-specific temp directory to avoid race condition
                 basename = os.path.basename(properties['additionalUrls'][0])
                 #print ('basename', '=>', basename)
-                manifest_file = os.path.join(burst_dir, basename)
-                # remove potentially incomplete manifest file if needed
-                if os.path.exists(manifest_file):
-                    os.remove(manifest_file)
-                asf_search.download_urls(urls=properties['additionalUrls'], path=burst_dir, session=session)
-                if not os.path.exists(manifest_file):
-                    raise Exception(f'ERROR: manifest file is not downloaded: {manifest_file}')
-                if os.path.getsize(manifest_file) == 0:
-                    raise Exception(f'ERROR: manifest file is empty: {manifest_file}')
-                # check XML file validity parsing it
-                with open(manifest_file, 'r') as file:
-                    xml_content = file.read()
-                    _ = ElementTree.fromstring(xml_content)
-                # xml file is well parsed
-                if not os.path.exists(manifest_file):
-                    raise Exception(f'ERROR: manifest file is missed: {manifest_file}')
-                # parse xml
-                with open(manifest_file, 'r') as file:
-                    xml_content = file.read()
-                # remove manifest file
-                if os.path.exists(manifest_file):
-                    os.remove(manifest_file)
+                # use burst-specific temp directory to avoid race condition in parallel downloads
+                import tempfile
+                with tempfile.TemporaryDirectory(prefix=f'{burst}_', dir=burst_dir) as tmp_dir:
+                    asf_search.download_urls(urls=properties['additionalUrls'], path=tmp_dir, session=session)
+                    manifest_file = os.path.join(tmp_dir, basename)
+                    if not os.path.exists(manifest_file):
+                        raise Exception(f'ERROR: manifest file is not downloaded: {manifest_file}')
+                    if os.path.getsize(manifest_file) == 0:
+                        raise Exception(f'ERROR: manifest file is empty: {manifest_file}')
+                    # check XML file validity parsing it
+                    with open(manifest_file, 'r') as file:
+                        xml_content = file.read()
+                        _ = ElementTree.fromstring(xml_content)
 
                 subswathidx = int(subswath[-1:]) - 1
                 content = xmltodict.parse(xml_content)['burst']['metadata']['product'][subswathidx]
@@ -223,6 +214,14 @@ class ASF(progressbar_joblib):
                 start_utc = annotation_burst['azimuthTime']
                 start_utc_dt = datetime.strptime(start_utc, '%Y-%m-%dT%H:%M:%S.%f')
                 #print ('start_utc', start_utc, start_utc_dt)
+
+                # validate startTime matches burst name date (detect manifest mix-up from race condition)
+                burst_date_str = burst.split('_')[3]  # e.g., '20210211T135237'
+                expected_date = datetime.strptime(burst_date_str, '%Y%m%dT%H%M%S').date()
+                if start_utc_dt.date() != expected_date:
+                    raise Exception(f'ERROR: Manifest data mismatch for burst {burst}: '
+                                  f'parsed startTime {start_utc_dt.date()} does not match expected date {expected_date}. '
+                                  f'This indicates corrupted manifest data.')
 
                 length = int(annotation['swathTiming']['linesPerBurst'])
                 #print (f'length={length}, burstIndex={burstIndex}')
