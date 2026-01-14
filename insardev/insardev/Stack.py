@@ -614,7 +614,7 @@ class Stack(Stack_plot, BatchCore):
         
         return df.to_crs(crs) if crs is not None else df
 
-    def load(self, urls:str | list | dict[str, str], storage_options:dict[str, str]|None=None, attr_start:str='BPR', debug:bool=False):
+    def load(self, urls:str | list | dict[str, str], storage_options:dict[str, str]|None=None, debug:bool=False):
         import numpy as np
         import xarray as xr
         import pandas as pd
@@ -645,33 +645,25 @@ class Stack(Stack_plot, BatchCore):
         client = get_client()
         client.register_plugin(IgnoreDaskDivide(), name='ignore_divide')
 
-        def burst_preprocess(ds, attr_start:str='BPR', debug:bool=False):
+        def burst_preprocess(ds, debug:bool=False):
             #print ('ds_preprocess', ds)
-            # TOPS parameters that must be per-date data variables for differential phase computation
-            tops_attrs = ['azimuthSteeringRate', 'azimuthFmRatePolynomial', 'azimuthFmRateT0',
-                         'azimuthFmRateAzimuthTime', 'dcPolynomial', 'dcT0', 'dcAzimuthTime']
-            process_attr = True if debug else False
+            # Convert all attrs to vars (except xarray/CRS metadata)
             for key in list(ds.attrs.keys()):
-                if key==attr_start:
-                    process_attr = True
-                # Include TOPS parameters AND attributes from attr_start onwards
-                if not process_attr and key not in ['SLC_scale'] + tops_attrs:
+                if key in ['Conventions', 'spatial_ref']:
                     continue
-                #print ('key', key)
-                if key not in ['Conventions', 'spatial_ref']:
-                    # Create a new DataArray with the original value
-                    val = ds.attrs[key]
-                    # Handle array values (e.g., polynomial coefficients)
-                    if isinstance(val, (list, tuple)):
-                        val = np.array(val)
-                    val_arr = np.asarray(val)
-                    if val_arr.ndim == 0:
-                        ds[key] = xr.DataArray(val_arr, dims=[])
-                    else:
-                        # For 1D arrays (like polynomial coefficients), create with 'coef' dim
-                        ds[key] = xr.DataArray(val_arr, dims=['coef'])
-                    # remove the attribute
-                    del ds.attrs[key]
+                # Create a new DataArray with the original value
+                val = ds.attrs[key]
+                # Handle array values (e.g., polynomial coefficients)
+                if isinstance(val, (list, tuple)):
+                    val = np.array(val)
+                val_arr = np.asarray(val)
+                if val_arr.ndim == 0:
+                    ds[key] = xr.DataArray(val_arr, dims=[])
+                else:
+                    # For 1D arrays (like polynomial coefficients), create with 'coef' dim
+                    ds[key] = xr.DataArray(val_arr, dims=['coef'])
+                # remove the attribute
+                del ds.attrs[key]
             
             # remove attributes for repeat bursts to unify the attributes
             BPR = ds['BPR'].values.item(0)
@@ -847,7 +839,7 @@ class Stack(Stack_plot, BatchCore):
                     parallel=True,
                     concat_dim='date',
                     combine='nested',
-                    preprocess=lambda ds: burst_preprocess(ds, attr_start=attr_start, debug=False),
+                    preprocess=burst_preprocess,
                     storage_options=storage_options,
                 )
                 # some variables are stored as int32 with scale factor, convert to float32 instead of default float64
@@ -1028,6 +1020,13 @@ class Stack(Stack_plot, BatchCore):
                 var = ds[name]
                 if var.ndim == 0:
                     return var.item()
+                # Handle 1D+ arrays - verify all values are identical
+                elif var.ndim >= 1:
+                    values = var.values.flatten()
+                    unique = np.unique(values)
+                    if len(unique) != 1:
+                        raise ValueError(f'{name} has multiple distinct values: {unique}')
+                    return unique[0]
             return ds.attrs.get(name)
 
         wavelength = _scalar_from_ds(transform_first, 'radar_wavelength')
