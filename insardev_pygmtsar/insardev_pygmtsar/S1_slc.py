@@ -80,6 +80,15 @@ class S1_slc(S1_base):
                 annotation = self.read_xml(os.path.join(meta_dir, meta))
                 start_time = annotation['product']['adsHeader']['startTime']
                 start_time = datetime.strptime(start_time, '%Y-%m-%dT%H:%M:%S.%f')
+                # validate startTime matches burst name date (detect corrupted XML from parallel download race condition)
+                burst_name = os.path.splitext(meta)[0]
+                burst_date_str = burst_name.split('_')[3]  # e.g., '20210211T135237'
+                expected_date = datetime.strptime(burst_date_str, '%Y%m%dT%H%M%S').date()
+                if start_time.date() != expected_date:
+                    raise ValueError(f'ERROR: Corrupted XML annotation for burst {burst_name}: '
+                                   f'startTime {start_time.date()} does not match expected date {expected_date}. '
+                                   f'This is likely caused by a race condition during parallel download. '
+                                   f'Delete the corrupted files and re-download with n_jobs=1 or re-run the download.')
                 # match orbit file
                 date = start_time.date()
                 orbit= (orbits_dict.get((date-oneday, date+oneday)) or
