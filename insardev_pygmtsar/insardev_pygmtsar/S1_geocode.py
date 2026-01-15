@@ -239,7 +239,7 @@ class S1_geocode(S1_align):
                         rae_coarsen[...,i],
                         src_x_coords,
                         src_y_coords,
-                        interpolation=cv2.INTER_CUBIC,
+                        interpolation=cv2.INTER_LANCZOS4,
                         borderMode=cv2.BORDER_REFLECT
                     )
                     for i in range(6)
@@ -271,6 +271,19 @@ class S1_geocode(S1_align):
         dem_x_max = np.max(resolution[1] * ((xx/resolution[1]).round() - 0.5))
         ys = np.arange(dem_y_min, dem_y_max + resolution[0], resolution[0])
         xs = np.arange(dem_x_min, dem_x_max + resolution[1], resolution[1])
+
+        # OpenCV remap requires dimensions strictly < SHRT_MAX (32767)
+        # Crop symmetrically from center if exceeded (border pixels are typically NaN)
+        SHRT_MAX = 32767
+        max_dim = SHRT_MAX - 1  # OpenCV requires strictly less than SHRT_MAX
+        if ys.size > max_dim:
+            excess = ys.size - max_dim
+            ys = ys[excess//2 : ys.size - (excess - excess//2)]
+            print(f'NOTE: y dimension cropped by {excess} pixels to fit OpenCV limit ({SHRT_MAX})')
+        if xs.size > max_dim:
+            excess = xs.size - max_dim
+            xs = xs[excess//2 : xs.size - (excess - excess//2)]
+            print(f'NOTE: x dimension cropped by {excess} pixels to fit OpenCV limit ({SHRT_MAX})')
 
         dem_spacing = ((dem_y_max - dem_y_min)/dem.lat.size, (dem_x_max - dem_x_min)/dem.lon.size)
 
