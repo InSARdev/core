@@ -149,12 +149,12 @@ class Baseline(pd.DataFrame):
                 import adjustText
                 texts = []
                 for date, baseline in df_points.values:
-                    texts.append(ax.text(date, baseline, str(date.date()), ha='center', va='bottom', c='black'))
+                    texts.append(ax.text(date, baseline, str(date.date()), ha='center', va='bottom'))
                 adjustText.adjust_text(texts, ax=ax)
             except ImportError:
                 # Fall back to simple labels without adjustment
                 for date, baseline in df_points.values:
-                    ax.text(date, baseline, str(date.date()), ha='center', va='bottom', c='black', fontsize=8)
+                    ax.text(date, baseline, str(date.date()), ha='center', va='bottom', fontsize=8)
 
         ax.set_xlabel('Timeline')
         ax.set_ylabel('Perpendicular Baseline [m]')
