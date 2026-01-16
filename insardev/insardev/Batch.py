@@ -141,26 +141,29 @@ class Batch(BatchCore):
         # Compute slope (velocity)
         velocity = numer / denom
 
+        # Compute intercept: intercept = (Σ(w·y) - slope * Σ(w·t)) / Σw
+        intercept = (sum_wy - velocity * sum_wt) / sum_w
+
         # Mask pixels with insufficient valid points or zero denominator
-        velocity = torch.where(
-            (valid_count >= min_valid) & (denom.abs() > 1e-10),
-            velocity,
-            torch.tensor(float('nan'), device=dev)
-        )
+        valid_mask = (valid_count >= min_valid) & (denom.abs() > 1e-10)
+        velocity = torch.where(valid_mask, velocity, torch.tensor(float('nan'), device=dev))
+        intercept = torch.where(valid_mask, intercept, torch.tensor(float('nan'), device=dev))
 
         # Reshape back
         vel_np = velocity.cpu().numpy()
+        int_np = intercept.cpu().numpy()
         if len(original_shape) == 3:
             vel_np = vel_np.reshape(original_shape[1], original_shape[2])
+            int_np = int_np.reshape(original_shape[1], original_shape[2])
 
-        return vel_np
+        return vel_np, int_np
 
-    def velocity(self, min_valid=3, device=None, debug=False) -> "Batch":
+    def velocity(self, min_valid=3, device=None, debug=False) -> tuple["Batch", "Batch"]:
         """
-        Compute velocity (linear trend) from time series.
+        Compute velocity (linear trend) and intercept from time series.
 
-        Calculates the slope per year for each pixel using linear regression
-        on the 'date' dimension. Uses PyTorch for GPU acceleration.
+        Calculates the slope per year and intercept for each pixel using linear
+        regression on the 'date' dimension. Uses PyTorch for GPU acceleration.
 
         Parameters
         ----------
@@ -176,13 +179,14 @@ class Batch(BatchCore):
 
         Returns
         -------
-        Batch
-            Batch with velocity (slope per year) for each pixel (lazy).
+        tuple[Batch, Batch]
+            (velocity, intercept) - velocity is slope per year, intercept is
+            the y-value at t=0 (first date). Both are lazy Batch objects.
 
         Examples
         --------
         >>> displacement = stack.lstsq(detrend, corr)
-        >>> velocity = displacement.velocity()
+        >>> velocity, intercept = displacement.velocity()
         """
         import dask
         import numpy as np
@@ -201,10 +205,14 @@ class Batch(BatchCore):
         # Get CRS from input batch
         crs = self.crs
 
-        results = {}
+        vel_results = {}
+        int_results = {}
         for key, ds in self.items():
-            result_vars = {}
-            for var in [v for v in ds.data_vars if v != 'spatial_ref']:
+            vel_vars = {}
+            int_vars = {}
+            # Filter for spatial variables (with y, x dims) - excludes converted attributes
+            for var in [v for v in ds.data_vars
+                       if 'y' in ds[v].dims and 'x' in ds[v].dims]:
                 da = ds[var]
 
                 # Convert dates to years from first date
@@ -221,28 +229,34 @@ class Batch(BatchCore):
 
                 # Use apply_ufunc with dask='parallelized' for lazy evaluation
                 with dask.annotate(resources={'gpu': 1} if device.type != 'cpu' else {}):
-                    vel_da = xr.apply_ufunc(
+                    vel_da, int_da = xr.apply_ufunc(
                         compute_velocity,
                         da,
                         input_core_dims=[['date', 'y', 'x']],
-                        output_core_dims=[['y', 'x']],
+                        output_core_dims=[['y', 'x'], ['y', 'x']],
                         dask='parallelized',
-                        output_dtypes=[np.float32],
+                        output_dtypes=[np.float32, np.float32],
                         dask_gufunc_kwargs={'allow_rechunk': True},
                     )
 
                 # Assign coordinates
                 vel_da = vel_da.assign_coords({'y': da.y, 'x': da.x})
-                result_vars[var] = vel_da
+                int_da = int_da.assign_coords({'y': da.y, 'x': da.x})
+                vel_vars[var] = vel_da
+                int_vars[var] = int_da
 
-            result_ds = xr.Dataset(result_vars)
-            result_ds.attrs = ds.attrs
+            vel_ds = xr.Dataset(vel_vars)
+            vel_ds.attrs = ds.attrs
+            int_ds = xr.Dataset(int_vars)
+            int_ds.attrs = ds.attrs
             # Preserve CRS
             if crs is not None:
-                result_ds = result_ds.rio.write_crs(crs)
-            results[key] = result_ds
+                vel_ds = vel_ds.rio.write_crs(crs)
+                int_ds = int_ds.rio.write_crs(crs)
+            vel_results[key] = vel_ds
+            int_results[key] = int_ds
 
-        return Batch(results)
+        return Batch(vel_results), Batch(int_results)
 
     def incidence(self) -> "Batch":
         """Compute incidence angle from look vector components."""
@@ -317,7 +331,9 @@ class BatchWrap(BatchCore):
                 ds = self[k]
                 # Handle per-pair coefficients from burst_polyfit
                 if isinstance(val, (list, tuple)) and len(val) > 0:
-                    sample_var = list(ds.data_vars)[0]
+                    # Get a spatial variable (with y, x dims) to check for pair dimension
+                    spatial_vars = [v for v in ds.data_vars if 'y' in ds[v].dims and 'x' in ds[v].dims]
+                    sample_var = spatial_vars[0] if spatial_vars else list(ds.data_vars)[0]
                     sample_da = ds[sample_var]
                     has_pair_dim = 'pair' in sample_da.dims
                     n_pairs = sample_da.sizes.get('pair', 1)

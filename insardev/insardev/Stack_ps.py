@@ -188,6 +188,8 @@ class Stack_ps(Stack_stl):
             # Core dim is 'date' (reduction), chunked dims are y, x
             # Note: input_core_dims moves 'date' to last axis, wrapper transposes back
             # Use GPU annotation to prevent MPS command buffer conflicts
+            # Provide explicit meta to avoid ComplexWarning when dask infers
+            # output type from complex input (we intentionally convert to real)
             with dask.annotate(resources={'gpu': 1} if device.type != 'cpu' else {}):
                 psf_da = xr.apply_ufunc(
                     wrapper,
@@ -195,7 +197,7 @@ class Stack_ps(Stack_stl):
                     input_core_dims=[['date']],
                     output_core_dims=[[]],
                     dask='parallelized',
-                    output_dtypes=[np.float32],
+                    dask_gufunc_kwargs={'meta': np.array((), dtype=np.float32)},
                 )
 
             # Assign name to match SLC variable

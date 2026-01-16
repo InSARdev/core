@@ -425,7 +425,9 @@ class BatchCore(dict):
                 ds = self[k]
                 # Handle per-pair coefficients from burst_polyfit
                 if isinstance(val, (list, tuple)):
-                    sample_var = list(ds.data_vars)[0]
+                    # Get a spatial variable (with y, x dims) to check for pair dimension
+                    spatial_vars = [v for v in ds.data_vars if 'y' in ds[v].dims and 'x' in ds[v].dims]
+                    sample_var = spatial_vars[0] if spatial_vars else list(ds.data_vars)[0]
                     sample_da = ds[sample_var]
                     has_pair_dim = 'pair' in sample_da.dims
                     n_pairs = sample_da.sizes.get('pair', 1)
@@ -668,9 +670,10 @@ class BatchCore(dict):
                     mask_da = mask_obj
                 
                 # Align mask to data coordinates (handles different x/y grids)
-                # Get reference DataArray from ds for alignment
+                # Get reference DataArray from ds for alignment (use spatial variable)
                 if isinstance(ds, xr.Dataset):
-                    ref_var = list(ds.data_vars)[0]
+                    spatial_vars = [v for v in ds.data_vars if 'y' in ds[v].dims and 'x' in ds[v].dims]
+                    ref_var = spatial_vars[0] if spatial_vars else list(ds.data_vars)[0]
                     ref_da = ds[ref_var]
                 else:
                     ref_da = ds
@@ -1347,15 +1350,17 @@ class BatchCore(dict):
         """
         result = {}
         for bid, ds in self.items():
+            # Get a spatial variable (with y, x dims)
+            spatial_vars = [v for v in ds.data_vars if 'y' in ds[v].dims and 'x' in ds[v].dims]
+            sample_var = spatial_vars[0] if spatial_vars else list(ds.data_vars)[0]
+
             if bid not in coeffs:
                 # No coefficients for this burst - zero correction
-                sample_var = list(ds.data_vars)[0]
                 result[bid] = xr.zeros_like(ds[sample_var]).to_dataset(name=sample_var)
                 continue
 
             # Get coordinate for evaluation
             coord = ds.coords[dim]
-            sample_var = list(ds.data_vars)[0]
             sample_da = ds[sample_var]
 
             coeff = coeffs[bid]
@@ -1732,7 +1737,9 @@ class BatchCore(dict):
 
         # Determine which polarizations to process
         if polarization is None:
-            polarizations = [v for v in sample.data_vars if v != 'spatial_ref']
+            # Filter for spatial variables (with y, x dims) - excludes converted attributes
+            polarizations = [v for v in sample.data_vars
+                            if 'y' in sample[v].dims and 'x' in sample[v].dims]
         else:
             polarizations = [polarization]
 
@@ -1950,8 +1957,9 @@ class BatchCore(dict):
         # Merge to single dataset
         ds = self.to_dataset()
 
-        # Get data variables (excluding spatial_ref)
-        data_vars = [v for v in ds.data_vars if v != 'spatial_ref']
+        # Get spatial data variables (with y, x dims) - excludes converted attributes
+        data_vars = [v for v in ds.data_vars
+                    if 'y' in ds[v].dims and 'x' in ds[v].dims]
 
         # Convert to dataframe and drop NaN rows
         df = ds.to_dataframe().dropna().reset_index()
@@ -2386,7 +2394,9 @@ class BatchCore(dict):
 
         # Auto-detect polarization if not specified
         sample_ds = self[ids[0]]
-        available_pols = [v for v in sample_ds.data_vars if v != 'spatial_ref']
+        # Filter for spatial variables (with y, x dims) - excludes converted attributes like 'num_valid_az'
+        available_pols = [v for v in sample_ds.data_vars
+                         if 'y' in sample_ds[v].dims and 'x' in sample_ds[v].dims]
         if polarization is None:
             polarization = available_pols[0]
         if polarization not in available_pols:
@@ -2656,7 +2666,9 @@ class BatchCore(dict):
 
         # Auto-detect polarization if not specified
         sample_ds = self[ids[0]]
-        available_pols = [v for v in sample_ds.data_vars if v != 'spatial_ref']
+        # Filter for spatial variables (with y, x dims) - excludes converted attributes like 'num_valid_az'
+        available_pols = [v for v in sample_ds.data_vars
+                         if 'y' in sample_ds[v].dims and 'x' in sample_ds[v].dims]
         if polarization is None:
             polarization = available_pols[0]
         if polarization not in available_pols:
@@ -3150,7 +3162,9 @@ class BatchCore(dict):
         if polarization is None:
             ids = list(self.keys())
             sample_ds = self[ids[0]]
-            available_pols = [v for v in sample_ds.data_vars if v != 'spatial_ref']
+            # Filter for spatial variables (with y, x dims) - excludes converted attributes like 'num_valid_az'
+            available_pols = [v for v in sample_ds.data_vars
+                             if 'y' in sample_ds[v].dims and 'x' in sample_ds[v].dims]
             polarization = available_pols[0]
 
         if degree == 0:
@@ -3294,7 +3308,9 @@ class BatchCore(dict):
         wrap = isinstance(self, BatchWrap)
         burst_ids = list(self.keys())
         sample = self[burst_ids[0]]
-        polarizations = [v for v in sample.data_vars if v != 'spatial_ref']
+        # Filter for spatial variables (with y, x dims) - excludes converted attributes
+        polarizations = [v for v in sample.data_vars
+                        if 'y' in sample[v].dims and 'x' in sample[v].dims]
 
         if debug:
             import time

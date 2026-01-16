@@ -57,8 +57,9 @@ class Stack_stl(Stack_sbas):
         if 'date' not in sample_ds.dims:
             raise ValueError("Input Batch must have 'date' dimension for STL decomposition")
 
-        # Get polarizations from the first dataset
-        polarizations = [v for v in sample_ds.data_vars if v != 'spatial_ref']
+        # Get polarizations from the first dataset (spatial, with y/x dims) - excludes converted attributes
+        polarizations = [v for v in sample_ds.data_vars
+                        if 'y' in sample_ds[v].dims and 'x' in sample_ds[v].dims]
 
         results = {}
         for key, ds in data.items():

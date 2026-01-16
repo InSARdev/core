@@ -1400,8 +1400,9 @@ class Stack_unwrap2d(Stack_unwrap1d):
                 print(f'\nProcessing burst {burst_idx}: {key}')
             burst_idx += 1
 
-            # Get data variables (typically polarization like 'VV'), excluding spatial_ref
-            data_vars = [v for v in phase_ds.data_vars if v != 'spatial_ref']
+            # Get data variables (typically polarization like 'VV'), with y/x dims - excludes converted attributes
+            data_vars = [v for v in phase_ds.data_vars
+                        if 'y' in phase_ds[v].dims and 'x' in phase_ds[v].dims]
 
             unwrap_vars = {}
             comp_vars = {}

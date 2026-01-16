@@ -561,7 +561,9 @@ class Stack_unwrap1d(Stack_phasediff):
             w_ds = weight[key] if weight is not None else None
 
             result_vars = {}
-            for pol in [v for v in ds.data_vars if v != 'spatial_ref']:
+            # Filter for spatial variables (with y, x dims) - excludes converted attributes
+            for pol in [v for v in ds.data_vars
+                       if 'y' in ds[v].dims and 'x' in ds[v].dims]:
                 da = ds[pol]
                 w_da = w_ds[pol] if w_ds is not None else None
 
@@ -785,7 +787,9 @@ class Stack_unwrap1d(Stack_phasediff):
             w_ds = weight[key] if weight is not None else None
 
             result_vars = {}
-            for pol in [v for v in ds.data_vars if v != 'spatial_ref']:
+            # Filter for spatial variables (with y, x dims) - excludes converted attributes
+            for pol in [v for v in ds.data_vars
+                       if 'y' in ds[v].dims and 'x' in ds[v].dims]:
                 da = ds[pol]
                 w_da = w_ds[pol] if w_ds is not None else None
 

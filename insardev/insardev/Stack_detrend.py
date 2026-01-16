@@ -238,13 +238,16 @@ class Stack_detrend(Stack_unwrap2d):
         for key in phase.keys():
             ds = phase[key]
 
-            # Get polarization variables
-            pols = [v for v in ds.data_vars if v != 'spatial_ref']
+            # Get polarization variables (spatial, with y/x dims) - excludes converted attributes
+            pols = [v for v in ds.data_vars
+                   if 'y' in ds[v].dims and 'x' in ds[v].dims]
 
             # Get variables from transform or use y/x coordinates
             if transform is not None:
                 trans_ds = transform[key]
-                var_names = [v for v in trans_ds.data_vars if v != 'spatial_ref']
+                # Filter for spatial variables (with y, x dims) - excludes converted attributes
+                var_names = [v for v in trans_ds.data_vars
+                            if 'y' in trans_ds[v].dims and 'x' in trans_ds[v].dims]
                 # Get transform variables (compute if lazy)
                 var_arrays = [trans_ds[v] for v in var_names]
                 if any(hasattr(arr.data, 'compute') for arr in var_arrays):
@@ -377,8 +380,9 @@ class Stack_detrend(Stack_unwrap2d):
         if weight is not None:
             weight = safe_chunk(weight, chunk_spec)
 
-        # Get polarization variables
-        polarizations = [v for v in phase.data_vars if v != 'spatial_ref']
+        # Get polarization variables (spatial, with y/x dims) - excludes converted attributes
+        polarizations = [v for v in phase.data_vars
+                        if 'y' in phase[v].dims and 'x' in phase[v].dims]
 
         # Detect stack dimension
         sample_da = phase[polarizations[0]]

@@ -27,8 +27,7 @@ class Stack_phasediff(Stack_base):
                        gaussian_threshold:float=0.5,
                        multilook:bool=True,
                        goldstein:int|list[int,int]|None=None,
-                       complex:bool=False,
-                       center:bool=True
+                       complex:bool=False
                        ) -> tuple[xr.DataArray,xr.DataArray]:
         """
         Compute phase difference (interferogram) between pairs of dates.
@@ -52,9 +51,6 @@ class Stack_phasediff(Stack_base):
             Goldstein filter patch size.
         complex : bool
             Return complex values instead of phase angles (default False).
-        center : bool
-            Remove circular mean from each interferogram (default True).
-            This ensures zero-centered phase for consistent detrending and visualization.
 
         Returns
         -------
@@ -130,9 +126,6 @@ class Stack_phasediff(Stack_base):
         
         if not complex:
             phasediff_look = phasediff_look.angle()
-            # Remove circular mean (BatchWrap.mean uses circular mean via complex domain)
-            if center:
-                phasediff_look = phasediff_look - phasediff_look.mean(['y', 'x'])
 
         # BPR differences aligned with pair dimension: BPR(rep) - BPR(ref)
         bpr = data2[['BPR']] - data1[['BPR']]
