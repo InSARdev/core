@@ -8,6 +8,7 @@
 # See the LICENSE file in the insardev directory for license terms.
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
+from contextlib import nullcontext
 from .Stack_unwrap2d import Stack_unwrap2d
 from .utils_regression2d import regression2d
 from . import utils_xarray
@@ -19,20 +20,23 @@ class Stack_detrend(Stack_unwrap2d):
     # def trend2d_interferogram(self, datas, weights=None, variables=['azi', 'rng'], compute=False, **kwarg):
     #     return self.trend2d(datas, weights, variables, compute, wrap=True, **kwarg)
 
-    def trend2d(self, datas, weights, transform, compute=False, **kwarg):
+    def trend2d_sklearn(self, datas, weights, transform, debug=False, **kwarg):
+        """
+        Compute 2D polynomial trend using sklearn (legacy implementation).
+
+        For most use cases, use trend2d() instead which uses PyTorch and is faster.
+        """
+        if debug:
+            print(f"DEBUG trend2d_sklearn: degree={kwarg.get('degree', 1)}")
+
         def _regression2d(data, weight, transform, **kwarg):
-            #print ('kwarg', kwarg)
             key = kwarg.pop('key')
-            #print ('shapes', data.shape, weight.shape, [transform[v].shape for v in variables])
-            #if transform is None:
-            #    # find nearest transform matrix values on the original grid for potentially multilooked data
-            #    transform = self.dss[key][variables].reindex_like(data, method='nearest')
             trend = regression2d(data,
                                  variables=[transform[v] for v in transform.data_vars],
                                  weight=weight,
                                  **kwarg)
-            #print ('trend', trend)
             return trend
+
         if transform is not None:
             # unify keys to datas
             transform = transform.sel(datas)
@@ -42,12 +46,277 @@ class Stack_detrend(Stack_unwrap2d):
         assert weights is None or weights.chunks['pair']==1, 'ERROR: weights must be chunked as (1, ...)'
 
         wrap = True if isinstance(datas, BatchWrap) else False
-        data = utils_xarray.apply_pol(datas, weights, transform, func=_regression2d, add_key=True, compute=compute, wrap=wrap, **kwarg)
-        # Preserve pair coordinate type from input (xr.merge in apply_pol can lose MultiIndex)
-        for key in data:
-            if 'pair' in datas[key].coords and 'pair' in data[key].coords:
-                data[key] = data[key].assign_coords(pair=datas[key].coords['pair'])
+        data = utils_xarray.apply_pol(datas, weights, transform, func=_regression2d, add_key=True, wrap=wrap, **kwarg)
         return BatchWrap(data) if wrap else Batch(data)
+
+    @staticmethod
+    def _trend2d_array(phase, weight, variables, device, degree=1):
+        """
+        Fit 2D polynomial trend using PyTorch least squares (pure GPU implementation).
+
+        Parameters
+        ----------
+        phase : np.ndarray
+            2D or 3D phase array (pair, y, x) or (y, x)
+        weight : np.ndarray or None
+            Weight array, same shape as phase
+        variables : list of np.ndarray
+            List of 2D variable arrays (y, x) to use as regressors
+        device : torch.device
+            PyTorch device
+        degree : int
+            Polynomial degree for each variable (1=linear, 2=quadratic, etc.)
+
+        Returns
+        -------
+        np.ndarray
+            Trend surface, same shape as phase
+        """
+        import torch
+        import numpy as np
+        from itertools import combinations_with_replacement
+
+        # Handle 2D vs 3D input
+        squeeze = phase.ndim == 2
+        if squeeze:
+            phase = phase[np.newaxis, ...]
+            if weight is not None:
+                weight = weight[np.newaxis, ...]
+
+        n_pairs, ny, nx = phase.shape
+        n_pixels = ny * nx
+
+        # Use float64 on CPU, float32 on GPU (MPS doesn't support float64)
+        if device.type == 'cpu':
+            dtype = torch.float64
+        else:
+            dtype = torch.float32
+
+        # Flatten variables and track valid coordinates (on CPU first)
+        valid_coords = np.ones(n_pixels, dtype=bool)
+        vars_np = []
+        for var in variables:
+            v_flat = var.ravel()
+            valid_coords &= np.isfinite(v_flat)
+            vars_np.append(np.nan_to_num(v_flat, nan=0.0))
+
+        # Move variables to GPU and build polynomial features there
+        vars_t = [torch.tensor(v, dtype=dtype, device=device) for v in vars_np]
+        n_vars = len(vars_t)
+
+        # Build polynomial features on GPU (matching sklearn PolynomialFeatures order)
+        # Order: degree 1 first, then degree 2, etc. (same as sklearn include_bias=False)
+        features = []
+        for d in range(1, degree + 1):
+            for combo in combinations_with_replacement(range(n_vars), d):
+                term = torch.ones(n_pixels, dtype=dtype, device=device)
+                for idx in combo:
+                    term = term * vars_t[idx]
+                features.append(term)
+
+        # Stack features: (n_pixels, n_features)
+        X_poly = torch.stack(features, dim=1)
+
+        # Add bias column
+        ones = torch.ones(n_pixels, 1, dtype=dtype, device=device)
+        A_all = torch.cat([X_poly, ones], dim=1)
+
+        # Valid coordinates mask on GPU
+        valid_coords_t = torch.tensor(valid_coords, dtype=torch.bool, device=device)
+
+        trends = np.empty_like(phase)
+
+        for i in range(n_pairs):
+            phase_flat = phase[i].ravel()
+
+            # Get valid (non-NaN) mask
+            valid_np = np.isfinite(phase_flat) & valid_coords
+            if weight is not None:
+                weight_flat = weight[i].ravel()
+                valid_np &= np.isfinite(weight_flat)
+
+            n_valid = valid_np.sum()
+            if n_valid < 10:
+                trends[i] = np.nan
+                continue
+
+            valid_t = torch.tensor(valid_np, dtype=torch.bool, device=device)
+
+            # Extract valid rows
+            A_valid = A_all[valid_t]  # (n_valid, n_features+1)
+            b_valid = torch.tensor(phase_flat[valid_np], dtype=dtype, device=device)
+
+            # Standardize features on GPU (excluding bias column)
+            # Compute mean and std on valid data only
+            feature_mean = A_valid[:, :-1].mean(dim=0, keepdim=True)
+            feature_std = A_valid[:, :-1].std(dim=0, keepdim=True) + 1e-10
+            A_valid_scaled = torch.cat([
+                (A_valid[:, :-1] - feature_mean) / feature_std,
+                A_valid[:, -1:]  # Keep bias column as-is
+            ], dim=1)
+
+            # Apply weights if provided
+            if weight is not None:
+                w = torch.tensor(np.sqrt(weight_flat[valid_np]), dtype=dtype, device=device)
+                A_valid_scaled = A_valid_scaled * w[:, None]
+                b_valid = b_valid * w
+
+            # Solve normal equations: (A^T A) coeffs = A^T b
+            AtA = A_valid_scaled.T @ A_valid_scaled
+            Atb = A_valid_scaled.T @ b_valid
+            coeffs = torch.linalg.solve(AtA, Atb)
+
+            # Compute trend for all pixels using the same scaling
+            A_all_scaled = torch.cat([
+                (A_all[:, :-1] - feature_mean) / feature_std,
+                A_all[:, -1:]
+            ], dim=1)
+            trend = (A_all_scaled @ coeffs).cpu().numpy()
+            trends[i] = trend.reshape(ny, nx)
+
+        if squeeze:
+            trends = trends[0]
+
+        return trends.astype(np.float32)
+
+    def trend2d(self, phase, weight=None, transform=None, degree=1, device=None, debug=False):
+        """
+        Compute 2D polynomial trend using PyTorch (GPU-accelerated).
+
+        Parameters
+        ----------
+        phase : Batch or BatchWrap
+            Phase data to detrend.
+        weight : Batch or None
+            Optional weights (e.g., correlation).
+        transform : Batch or None
+            Transform with variables to use as regressors (e.g., 'azi', 'rng', 'ele').
+            All data_vars in transform will be used. If None, uses y/x coordinates.
+        degree : int
+            Polynomial degree for each variable (default 1):
+            - degree=1: linear (a₁*v₁ + a₂*v₂ + ... + c)
+            - degree=2: includes v₁², v₂², ... terms
+            - degree=3: includes v₁³, v₂³, ... terms
+        device : str or None
+            PyTorch device ('cuda', 'mps', 'cpu'). Auto-detected if None.
+        debug : bool
+            Print debug information.
+
+        Returns
+        -------
+        Batch or BatchWrap
+            Trend surface (same type as input phase, lazy).
+
+        Examples
+        --------
+        >>> trend = stack.trend2d(phase, weight=corr, transform=transform[['azi','rng','ele']], degree=1)
+        >>> detrended = phase - trend
+        """
+        import dask
+        import dask.array as da
+        import torch
+        import xarray as xr
+        import numpy as np
+
+        # Auto-detect device based on Dask cluster resources and hardware
+        device = Stack_detrend._get_torch_device(device if device is not None else 'auto', debug=debug)
+
+        if debug:
+            print(f"DEBUG: using device={device}")
+
+        # Warn about MPS precision issues with high-degree polynomials
+        if device == 'mps' and degree >= 3:
+            print(f"NOTE: MPS has float32 precision issues for degree>={degree}. Use device='cpu' for better accuracy.")
+
+        wrap = isinstance(phase, BatchWrap)
+
+        # Unify transform keys to phase
+        if transform is not None:
+            transform = transform.sel(phase)
+
+        result = {}
+        for key in phase.keys():
+            ds = phase[key]
+
+            # Get polarization variables
+            pols = [v for v in ds.data_vars if v != 'spatial_ref']
+
+            # Get variables from transform or use y/x coordinates
+            if transform is not None:
+                trans_ds = transform[key]
+                var_names = [v for v in trans_ds.data_vars if v != 'spatial_ref']
+                # Get transform variables (compute if lazy)
+                var_arrays = [trans_ds[v] for v in var_names]
+                if any(hasattr(arr.data, 'compute') for arr in var_arrays):
+                    computed = dask.compute(*var_arrays)
+                    variables = [arr.values if hasattr(arr, 'values') else arr for arr in computed]
+                else:
+                    variables = [arr.values for arr in var_arrays]
+            else:
+                # Use y/x coordinates as default variables
+                y = ds[pols[0]].y.values
+                x = ds[pols[0]].x.values
+                Y, X = np.meshgrid(y, x, indexing='ij')
+                variables = [Y.astype(np.float32), X.astype(np.float32)]
+                var_names = ['y', 'x']
+
+            if debug:
+                print(f"DEBUG {key}: variables={var_names}, shapes={[v.shape for v in variables]}")
+
+            result_ds = {}
+            for pol in pols:
+                phase_da = ds[pol]
+                weight_da = weight[key][pol] if weight is not None else None
+
+                # Save coordinates for output
+                coords = dict(phase_da.coords)
+                dims = phase_da.dims
+
+                # Create wrapper function for apply_ufunc
+                def process_chunk(phase_chunk, weight_chunk=None, variables=variables, device=device, degree=degree):
+                    import torch
+                    # Ensure 3D input (pair, y, x)
+                    if phase_chunk.ndim == 2:
+                        phase_chunk = phase_chunk[np.newaxis, ...]
+                        if weight_chunk is not None:
+                            weight_chunk = weight_chunk[np.newaxis, ...]
+                    # Use MPS lock to serialize GPU access on Apple Silicon
+                    with Stack_detrend._mps_lock() if device.type == 'mps' else nullcontext():
+                        result = Stack_detrend._trend2d_array(
+                            phase_chunk, weight_chunk, variables, torch.device(device), degree
+                        )
+                    return result
+
+                # Use apply_ufunc with dask='parallelized' for efficient processing
+                # This avoids serializing variables for each chunk
+                with dask.annotate(resources={'gpu': 1} if device.type != 'cpu' else {}):
+                    if weight_da is not None:
+                        trend_da = xr.apply_ufunc(
+                            process_chunk,
+                            phase_da,
+                            weight_da,
+                            input_core_dims=[['y', 'x'], ['y', 'x']],
+                            output_core_dims=[['y', 'x']],
+                            dask='parallelized',
+                            output_dtypes=[np.float32],
+                            dask_gufunc_kwargs={'allow_rechunk': True},
+                        )
+                    else:
+                        trend_da = xr.apply_ufunc(
+                            process_chunk,
+                            phase_da,
+                            input_core_dims=[['y', 'x']],
+                            output_core_dims=[['y', 'x']],
+                            dask='parallelized',
+                            output_dtypes=[np.float32],
+                            dask_gufunc_kwargs={'allow_rechunk': True},
+                        )
+
+                result_ds[pol] = trend_da
+
+            result[key] = xr.Dataset(result_ds, attrs=ds.attrs)
+
+        return BatchWrap(result) if wrap else Batch(result)
 
     def trend2d_dataset(self, phase, weight=None, transform=None, **kwargs):
         """
@@ -353,7 +622,7 @@ class Stack_detrend(Stack_unwrap2d):
             vmax =  minmax
     
         plt.figure()
-        data.plot.imshow(vmin=vmin, vmax=vmax, alpha=alpha, cmap='turbo')
+        data.plot.imshow(vmin=vmin, vmax=vmax, alpha=alpha, cmap='turbo', interpolation='none')
         #self.plot_AOI(**kwargs)
         #self.plot_POI(**kwargs)
         if aspect is not None:

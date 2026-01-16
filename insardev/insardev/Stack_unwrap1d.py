@@ -8,19 +8,26 @@
 # See the LICENSE file in the insardev directory for license terms.
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
+"""
+1D phase unwrapping along the temporal dimension using L1-norm IRLS.
+
+Optimized implementation with:
+- CPU batched linear solve (faster than GPU for small matrices)
+- Efficient einsum-based AtWA computation
+- Memory-efficient chunked processing
+- Direct time series output option
+"""
 from .Stack_phasediff import Stack_phasediff
-# required for function decorators
-from numba import jit
-# import directive is not compatible to numba
 import numpy as np
 
+
 class Stack_unwrap1d(Stack_phasediff):
-    """1D phase unwrapping along the temporal dimension."""
+    """1D phase unwrapping along the temporal dimension using L1-norm IRLS."""
 
     @staticmethod
     def wrap(data_pairs):
+        """Wrap phase to [-pi, pi] range."""
         import xarray as xr
-        import numpy as np
         import dask
 
         if isinstance(data_pairs, xr.DataArray):
@@ -29,196 +36,914 @@ class Stack_unwrap1d(Stack_phasediff):
         return np.mod(data_pairs + np.pi, 2 * np.pi) - np.pi
 
     @staticmethod
-    @jit(nopython=True, nogil=True)
-    def _unwrap1d_pairs(data      : np.ndarray,
-                        weight    : np.ndarray = np.empty((0),   dtype=np.float32),
-                        matrix    : np.ndarray = np.empty((0,0), dtype=np.float32),
-                        tolerance : np.float32 = np.pi/2) -> np.ndarray:
-        # import directive is not compatible to numba
-        #import numpy as np
-
-        assert data.ndim   == 1
-        assert weight.ndim <= 1
-        assert matrix.ndim == 2
-        assert data.shape[0] == matrix.shape[0]
-
-        if np.all(np.isnan(data)) or (weight.size != 0 and np.all(np.isnan(weight))):
-            return np.full(data.size, np.nan, dtype=np.float32)
-
-        nanmask = np.isnan(data)
-        if weight.size != 0:
-            nanmask = nanmask | np.isnan(weight)
-        if np.all(nanmask):
-            # no valid input data
-            return np.full(data.size, np.nan, dtype=np.float32)
-
-        # the buffer variable will be modified
-        # buffer datatype is the same as input data datatype
-        buffer = data[~nanmask].copy()
-        if weight.size != 0:
-            weight = weight[~nanmask]
-
-        # exclude matrix records for not valid data
-        matrix = matrix[~nanmask,:]
-        pair_sum = matrix.sum(axis=1)
-
-        # processed pairs, allow numba to recognize list type
-        pairs_ok = [0][1:]
-
-        # check all compound pairs vs single pairs: only detect all not wrapped
-        # fill initial pairs_ok
-        for ndate in np.unique(pair_sum)[1:]:
-            pair_idxs = np.where(pair_sum==ndate)[0]
-            if weight.size != 0:
-                # get the sorted order for the specific weights corresponding to pair_idxs
-                pair_idxs_order = np.argsort(weight[pair_idxs])[::-1]
-                # Apply the sorted order to pair_idxs
-                pair_idxs = pair_idxs[pair_idxs_order]
-            for pair_idx in pair_idxs:
-                matching_columns = matrix[pair_idx] == 1
-                matching_rows = ((matrix[:, matching_columns] >= 1).sum(axis=1) == 1)&((matrix[:, ~matching_columns] == 1).sum(axis=1) == 0)
-                matching_matrix = matrix[:,matching_columns] * matching_rows[:,None]
-                value = buffer[pair_idx]
-                values = (matching_matrix * buffer[:,None])
-                jump = int(np.round((values.sum() - value) / (2*np.pi)))
-                is_tolerance = abs(value - values.sum()) < tolerance
-                if jump == 0 and is_tolerance:
-                    pairs_ok.append(pair_idx)
-                    pairs_ok.extend(np.where(matching_rows)[0])
-
-        # check all compound pairs vs single pairs: fix wrapped compound using not wrapped singles only
-        # use pairs_ok to compare and add to pairs_ok
-        for ndate in np.unique(pair_sum)[1:]:
-            pair_idxs = np.where(pair_sum==ndate)[0]
-            if weight.size != 0:
-                pair_idxs_order = np.argsort(weight[pair_idxs])[::-1]
-                pair_idxs = pair_idxs[pair_idxs_order]
-            for pair_idx in pair_idxs:
-                if pair_idx in pairs_ok:
-                    continue
-                matching_columns = matrix[pair_idx] == 1
-                matching_rows = ((matrix[:, matching_columns] >= 1).sum(axis=1) == 1)&((matrix[:, ~matching_columns] == 1).sum(axis=1) == 0)
-                matching_matrix = matrix[:,matching_columns] * matching_rows[:,None]
-
-                pairs_single_not_valid = [pair for pair in np.where(matching_rows)[0] if not pair in pairs_ok]
-                if len(pairs_single_not_valid) > 0:
-                    continue
-
-                value = buffer[pair_idx]
-                values = (matching_matrix * buffer[:,None])
-                jump = int(np.round((values.sum() - value) / (2*np.pi)))
-                buffer[pair_idx] += 2*np.pi*jump
-                is_tolerance = abs(buffer[pair_idx] - values.sum()) < tolerance
-                if is_tolerance:
-                    pairs_ok.append(pair_idx)
-                continue
-
-        # check all compound pairs vs single pairs
-        # complete pairs_ok always when possible
-        for ndate in np.unique(pair_sum)[1:]:
-            pair_idxs = np.where(pair_sum==ndate)[0]
-            if weight.size != 0:
-                pair_idxs_order = np.argsort(weight[pair_idxs])[::-1]
-                pair_idxs = pair_idxs[pair_idxs_order]
-            for pair_idx in pair_idxs:
-                if pair_idx in pairs_ok:
-                    continue
-                matching_columns = matrix[pair_idx] == 1
-                matching_rows = ((matrix[:, matching_columns] >= 1).sum(axis=1) == 1)&((matrix[:, ~matching_columns] == 1).sum(axis=1) == 0)
-                matching_matrix = matrix[:,matching_columns] * matching_rows[:,None]
-                value = buffer[pair_idx]
-                values = (matching_matrix * buffer[:,None])
-                # unwrap if needed (jump=0 means no unwrapping)
-                buffer[pair_idx] += 2*np.pi*jump
-                is_tolerance = abs(buffer[pair_idx] - values.sum()) < tolerance
-                if is_tolerance:
-                    pairs_ok.append(pair_idx)
-                    pairs_ok.extend(np.where(matching_rows)[0])
-
-        # return original values when unwrapping is not possible at all
-        if len(pairs_ok) == 0:
-            return buffer.astype(np.float32)
-        # return unwrapped values
-        # validity mask
-        mask = [idx in pairs_ok for idx in range(buffer.size)]
-        out = np.full(data.size, np.nan, dtype=np.float32)
-        out[~nanmask] = np.where(mask, buffer, np.nan)
-        return out
-
-    def unwrap1d_matrix(self, pairs):
+    def _build_incidence_matrix(pair_dates):
         """
-        Create a matrix for use in the least squares computation based on interferogram date pairs.
+        Build incidence matrix for temporal network.
 
         Parameters
         ----------
-        pairs : pandas.DataFrame or xarray.DataArray or xarray.Dataset
-            DataFrame or DataArray containing interferogram date pairs.
+        pair_dates : list of tuple
+            List of (ref_date, rep_date) pairs.
 
         Returns
         -------
-        numpy.ndarray
-            A matrix with one row for every interferogram and one column for every date.
-            Each element in the matrix is a float, with 1 indicating the start date,
-            -1 indicating the end date, 0 if the date is covered by the corresponding
-            interferogram timeline, and NaN otherwise.
+        A : np.ndarray
+            Incidence matrix (n_pairs, n_intervals) where A[i,j] = 1 if
+            date interval j is covered by pair i.
+        dates : list
+            Sorted unique dates.
         """
-        return (self._get_pairs_matrix(pairs)>=0).astype(int)
+        all_dates = sorted(set(d for pair in pair_dates for d in pair))
+        date_to_idx = {d: i for i, d in enumerate(all_dates)}
 
-    def unwrap1d(self, data, weight=None, tolerance=np.pi/2):
+        n_pairs = len(pair_dates)
+        n_intervals = len(all_dates) - 1
+
+        A = np.zeros((n_pairs, n_intervals), dtype=np.float32)
+        for i, (d1, d2) in enumerate(pair_dates):
+            i1 = date_to_idx[d1]
+            i2 = date_to_idx[d2]
+            for j in range(i1, i2):
+                A[i, j] = 1
+
+        return A, all_dates
+
+    @staticmethod
+    def _irls_solve_1d(phi, W_corr, A_t, dev, max_iter=5, epsilon=0.1,
+                       convergence_threshold=1e-3, return_increments=False):
         """
-        Perform 1D phase unwrapping along the temporal dimension.
+        Optimized IRLS solver using CPU batched operations.
+
+        Uses CPU for batched linear solve (much faster than MPS/CUDA for small matrices)
+        while keeping other operations on the specified device.
 
         Parameters
         ----------
-        data : xarray.DataArray
-            Phase data with 'pair' dimension.
-        weight : xarray.DataArray, optional
-            Weights for each pair.
-        tolerance : float, optional
-            Tolerance for phase consistency check. Default is π/2.
+        phi : torch.Tensor
+            Wrapped or unwrapped phases (n_pairs, n_pixels).
+        W_corr : torch.Tensor
+            Correlation weights (n_pairs, n_pixels).
+        A_t : torch.Tensor
+            Incidence matrix (n_pairs, n_intervals).
+        dev : torch.device
+            PyTorch device (used for element-wise ops, solve always on CPU).
+        max_iter : int
+            Maximum IRLS iterations.
+        epsilon : float
+            IRLS regularization (larger = faster convergence, less L1-like).
+        convergence_threshold : float
+            Stop when weight change is below this.
+        return_increments : bool
+            If True, return phase increments instead of corrected pairs.
 
         Returns
         -------
-        xarray.DataArray
-            Unwrapped phase data.
+        result : torch.Tensor
+            Corrected phases (n_pairs, n_pixels) or increments (n_intervals, n_pixels).
+        """
+        import torch
+
+        n_pairs, n_pixels = phi.shape
+        n_intervals = A_t.shape[1]
+
+        # Handle NaN
+        nan_mask = torch.isnan(phi) | torch.isnan(W_corr)
+        phi_clean = torch.where(nan_mask, torch.zeros_like(phi), phi)
+        W_corr_clean = torch.where(nan_mask, torch.zeros_like(W_corr), W_corr)
+
+        # Detect if input is wrapped (values mostly in [-π, π]) or 2D-unwrapped
+        phi_max = torch.abs(phi_clean).max()
+        wrapped_input = phi_max < 4 * np.pi  # Heuristic: if max < 4π, likely wrapped
+
+        # Initialize IRLS weights
+        W_irls = torch.ones_like(phi_clean)
+
+        # Move A to CPU for batched solve (CPU is much faster for small batched linalg)
+        A_cpu = A_t.cpu()
+        reg_cpu = 1e-4 * torch.eye(n_intervals)
+
+        for iteration in range(max_iter):
+            # Combined weight
+            W = W_irls * W_corr_clean  # (n_pairs, n_pixels)
+            W_T = W.T  # (n_pixels, n_pairs)
+
+            # Move to CPU for solve
+            W_T_cpu = W_T.cpu()
+            phi_cpu = phi_clean.cpu()
+            W_cpu = W.cpu()
+
+            # Build per-pixel AtWA using einsum (efficient on CPU)
+            # AtWA[p,i,j] = sum_k W[p,k] * A[k,i] * A[k,j]
+            AtWA = torch.einsum('pk,ki,kj->pij', W_T_cpu, A_cpu, A_cpu)
+            AtWA = AtWA + reg_cpu
+
+            # RHS: A^T W phi
+            Wphi = W_cpu * phi_cpu  # (n_pairs, n_pixels)
+            AtWphi = (A_cpu.T @ Wphi).T  # (n_pixels, n_intervals)
+
+            # CPU batched solve (much faster than MPS/CUDA for small matrices)
+            x = torch.linalg.solve(AtWA, AtWphi.unsqueeze(2)).squeeze(2)  # (n_pixels, n_intervals)
+            x = x.T  # (n_intervals, n_pixels)
+
+            # Move back to device for residual computation
+            x = x.to(dev)
+
+            # Reconstruct pair phases: φ_recon = A @ x
+            phi_recon = A_t @ x  # (n_pairs, n_pixels)
+
+            # Residuals
+            residuals = phi_clean - phi_recon  # (n_pairs, n_pixels)
+            # Wrap residuals for wrapped input to handle 2π ambiguity
+            if wrapped_input:
+                residuals = torch.atan2(torch.sin(residuals), torch.cos(residuals))
+
+            # Update IRLS weights
+            W_irls_new = 1.0 / (torch.abs(residuals) + epsilon)
+
+            # Check convergence
+            weight_change = torch.abs(W_irls_new - W_irls).mean()
+            if weight_change < convergence_threshold:
+                break
+
+            W_irls = W_irls_new
+
+        if return_increments:
+            # Return phase increments per date interval
+            result = x  # (n_intervals, n_pixels)
+            # Mark pixels with all NaN as NaN
+            all_nan = nan_mask.all(dim=0)
+            result[:, all_nan] = float('nan')
+            return result
+        else:
+            # Return corrected pair phases
+            # Integer correction: k = round((φ_recon - φ) / 2π)
+            corrections = torch.round((phi_recon - phi_clean) / (2 * np.pi))
+            unwrapped = phi_clean + corrections * 2 * np.pi
+
+            # Restore NaN
+            unwrapped = torch.where(nan_mask, torch.full_like(unwrapped, float('nan')), unwrapped)
+            return unwrapped
+
+    @staticmethod
+    def _unwrap1d_pairs_numpy(phase_stack, weight_stack, pair_dates, device='auto',
+                               max_iter=5, epsilon=0.1, batch_size=50000, debug=False):
+        """
+        L1-norm IRLS temporal phase unwrapping on numpy arrays.
+
+        Parameters
+        ----------
+        phase_stack : np.ndarray
+            Wrapped or 2D-unwrapped phases, shape (n_pairs, height, width).
+        weight_stack : np.ndarray or None
+            Correlation weights, shape (n_pairs, height, width) or None.
+        pair_dates : list of tuple
+            List of (ref_date, rep_date) for each pair.
+        device : str
+            PyTorch device ('auto', 'cuda', 'mps', 'cpu').
+        max_iter : int
+            Maximum IRLS iterations.
+        epsilon : float
+            IRLS regularization parameter.
+        batch_size : int
+            Pixels per batch for memory efficiency.
+        debug : bool
+            Print debug information.
+
+        Returns
+        -------
+        unwrapped : np.ndarray
+            Temporally unwrapped phases, shape (n_pairs, height, width).
+        """
+        import torch
+
+        n_pairs, height, width = phase_stack.shape
+        n_pixels = height * width
+
+        # Build incidence matrix
+        A, dates = Stack_unwrap1d._build_incidence_matrix(pair_dates)
+        dev = Stack_unwrap1d._get_torch_device(device)
+
+        if debug:
+            print(f'IRLS 1D unwrap: {n_pairs} pairs, {len(dates)} dates, {n_pixels} pixels')
+            print(f'  Device: {dev}, batch_size: {batch_size}')
+
+        # Move matrix to device
+        A_t = torch.from_numpy(A).to(dev)
+
+        # Reshape to (n_pairs, n_pixels)
+        phases_flat = phase_stack.reshape(n_pairs, n_pixels)
+        if weight_stack is not None:
+            weights_flat = weight_stack.reshape(n_pairs, n_pixels)
+        else:
+            weights_flat = np.ones_like(phases_flat)
+
+        # Process in batches
+        unwrapped_flat = np.zeros_like(phases_flat)
+        n_batches = (n_pixels + batch_size - 1) // batch_size
+
+        for b in range(n_batches):
+            start = b * batch_size
+            end = min((b + 1) * batch_size, n_pixels)
+
+            if debug and (b == 0 or (b + 1) % 10 == 0 or b == n_batches - 1):
+                print(f'  Batch {b+1}/{n_batches}')
+
+            # Move batch to device
+            phi = torch.from_numpy(phases_flat[:, start:end].astype(np.float32)).to(dev)
+            W = torch.from_numpy(weights_flat[:, start:end].astype(np.float32)).to(dev)
+
+            # Solve
+            result = Stack_unwrap1d._irls_solve_1d(
+                phi, W, A_t, dev, max_iter=max_iter, epsilon=epsilon,
+                return_increments=False
+            )
+
+            unwrapped_flat[:, start:end] = result.cpu().numpy()
+
+            del phi, W, result
+            if dev.type == 'cuda':
+                torch.cuda.empty_cache()
+
+        # Reshape back
+        return unwrapped_flat.reshape(n_pairs, height, width)
+
+    @staticmethod
+    def _unwrap1d_to_dates_numpy(phase_stack, weight_stack, pair_dates, device='auto',
+                                  max_iter=5, epsilon=0.1, batch_size=50000,
+                                  cumsum=True, debug=False):
+        """
+        L1-norm IRLS temporal unwrapping directly to date-based time series.
+
+        Two-step approach:
+        1. Unwrap pairs (apply 2π corrections for wrapped input)
+        2. Network inversion to get per-date time series
+
+        Parameters
+        ----------
+        phase_stack : np.ndarray
+            Wrapped or 2D-unwrapped phases, shape (n_pairs, height, width).
+        weight_stack : np.ndarray or None
+            Correlation weights, shape (n_pairs, height, width) or None.
+        pair_dates : list of tuple
+            List of (ref_date, rep_date) for each pair.
+        device : str
+            PyTorch device ('auto', 'cuda', 'mps', 'cpu').
+        max_iter : int
+            Maximum IRLS iterations.
+        epsilon : float
+            IRLS regularization parameter.
+        batch_size : int
+            Pixels per batch.
+        cumsum : bool
+            If True, return cumulative displacement. If False, return increments.
+        debug : bool
+            Print debug information.
+
+        Returns
+        -------
+        time_series : np.ndarray
+            Phase time series, shape (n_dates, height, width).
+        dates : list
+            Sorted unique dates.
+        """
+        import torch
+
+        n_pairs, height, width = phase_stack.shape
+        n_pixels = height * width
+
+        # Build incidence matrix
+        A, dates = Stack_unwrap1d._build_incidence_matrix(pair_dates)
+        n_intervals = len(dates) - 1
+        dev = Stack_unwrap1d._get_torch_device(device)
+
+        if debug:
+            print(f'IRLS 1D to dates: {n_pairs} pairs -> {len(dates)} dates')
+            print(f'  Device: {dev}, batch_size: {batch_size}')
+
+        # Move matrix to device
+        A_t = torch.from_numpy(A).to(dev)
+        A_cpu = A_t.cpu()
+        reg_cpu = 1e-4 * torch.eye(n_intervals)
+
+        # Reshape
+        phases_flat = phase_stack.reshape(n_pairs, n_pixels)
+        if weight_stack is not None:
+            weights_flat = weight_stack.reshape(n_pairs, n_pixels)
+        else:
+            weights_flat = np.ones_like(phases_flat)
+
+        # Step 1: Unwrap pairs (apply 2π corrections)
+        # Step 2: Compute increments from unwrapped pairs
+        increments_flat = np.zeros((n_intervals, n_pixels), dtype=np.float32)
+        n_batches = (n_pixels + batch_size - 1) // batch_size
+
+        for b in range(n_batches):
+            start = b * batch_size
+            end = min((b + 1) * batch_size, n_pixels)
+
+            if debug and (b == 0 or (b + 1) % 10 == 0 or b == n_batches - 1):
+                print(f'  Batch {b+1}/{n_batches}')
+
+            phi = torch.from_numpy(phases_flat[:, start:end].astype(np.float32)).to(dev)
+            W = torch.from_numpy(weights_flat[:, start:end].astype(np.float32)).to(dev)
+
+            # Step 1: Unwrap pairs (return_increments=False applies 2π corrections)
+            unwrapped = Stack_unwrap1d._irls_solve_1d(
+                phi, W, A_t, dev, max_iter=max_iter, epsilon=epsilon,
+                return_increments=False
+            )
+
+            # Step 2: Compute increments from unwrapped pairs using weighted least squares
+            # Solve: A @ x = unwrapped_pairs
+            unwrapped_cpu = unwrapped.cpu()
+            W_cpu = W.cpu()
+            W_T_cpu = W_cpu.T
+
+            # Build AtWA
+            AtWA = torch.einsum('pk,ki,kj->pij', W_T_cpu, A_cpu, A_cpu)
+            AtWA = AtWA + reg_cpu
+
+            # RHS: A^T W unwrapped
+            Wphi = W_cpu * unwrapped_cpu
+            AtWphi = (A_cpu.T @ Wphi).T
+
+            # Solve for increments
+            x = torch.linalg.solve(AtWA, AtWphi.unsqueeze(2)).squeeze(2)
+            x = x.T  # (n_intervals, n_pixels)
+
+            increments_flat[:, start:end] = x.numpy()
+
+            del phi, W, unwrapped, x
+            if dev.type == 'cuda':
+                torch.cuda.empty_cache()
+
+        # Build time series
+        if cumsum:
+            ts = np.zeros((len(dates), n_pixels), dtype=np.float32)
+            ts[1:, :] = np.cumsum(increments_flat, axis=0)
+        else:
+            ts = np.zeros((len(dates), n_pixels), dtype=np.float32)
+            ts[1:, :] = increments_flat
+
+        # Reshape: (n_dates, n_pixels) -> (n_dates, height, width)
+        time_series = ts.reshape(len(dates), height, width)
+
+        return time_series, dates
+
+    @staticmethod
+    def _lstsq_to_dates_numpy(phase_stack, weight_stack, pair_dates, device='auto',
+                               cumsum=True, debug=False):
+        """
+        Weighted least squares network inversion from pairs to dates.
+
+        Uses PyTorch batched least squares for GPU acceleration.
+
+        Parameters
+        ----------
+        phase_stack : np.ndarray
+            Unwrapped phases, shape (n_pairs, height, width).
+        weight_stack : np.ndarray or None
+            Correlation weights, shape (n_pairs, height, width).
+        pair_dates : list of tuple
+            List of (ref_date, rep_date) for each pair.
+        device : str
+            PyTorch device ('auto', 'cuda', 'mps', 'cpu').
+        cumsum : bool
+            If True, return cumulative displacement.
+        debug : bool
+            Print debug information.
+
+        Returns
+        -------
+        time_series : np.ndarray
+            Phase time series, shape (n_dates, height, width).
+        dates : list
+            Sorted unique dates.
+        """
+        import torch
+
+        n_pairs, height, width = phase_stack.shape
+        n_pixels = height * width
+
+        # Build incidence matrix
+        A, dates = Stack_unwrap1d._build_incidence_matrix(pair_dates)
+        n_dates = len(dates)
+        n_intervals = n_dates - 1
+
+        dev = Stack_unwrap1d._get_torch_device(device)
+        if debug:
+            print(f'lstsq: {n_pairs} pairs -> {n_dates} dates, {n_pixels} pixels, device={dev}')
+
+        # Reshape to (n_pairs, n_pixels)
+        phases_flat = phase_stack.reshape(n_pairs, n_pixels)  # (n_pairs, n_pixels)
+        if weight_stack is not None:
+            weights_flat = weight_stack.reshape(n_pairs, n_pixels)
+            # Clamp weights to (0, 1-eps) for numerical stability
+            weights_flat = np.clip(weights_flat, 1e-6, 1 - 1e-6)
+        else:
+            weights_flat = None
+
+        # Move to device
+        A_t = torch.from_numpy(A.astype(np.float32)).to(dev)  # (n_pairs, n_intervals)
+        phi = torch.from_numpy(phases_flat.astype(np.float32)).to(dev)  # (n_pairs, n_pixels)
+
+        # Handle NaN: set to 0 with weight 0
+        nan_mask = torch.isnan(phi)
+        phi = torch.where(nan_mask, torch.zeros_like(phi), phi)
+
+        if weights_flat is not None:
+            W = torch.from_numpy(weights_flat.astype(np.float32)).to(dev)
+            W = torch.where(nan_mask, torch.zeros_like(W), W)
+            # Transform correlation to least squares weight: w / sqrt(1 - w^2)
+            W_lstsq = W / torch.sqrt(1 - W**2)
+        else:
+            W_lstsq = torch.where(nan_mask, torch.zeros(1, device=dev), torch.ones(1, device=dev))
+            W_lstsq = W_lstsq.expand(n_pairs, n_pixels)
+
+        # Weighted least squares: solve (W*A)x = W*b for each pixel
+        # Transpose to (n_pixels, n_pairs) for batched solve
+        phi_T = phi.T  # (n_pixels, n_pairs)
+        W_T = W_lstsq.T  # (n_pixels, n_pairs)
+
+        # Apply weights: WA and Wb
+        # WA: (n_pixels, n_pairs, n_intervals) = W_T[:, :, None] * A_t[None, :, :]
+        # Wb: (n_pixels, n_pairs) = W_T * phi_T
+        WA = W_T.unsqueeze(2) * A_t.unsqueeze(0)  # (n_pixels, n_pairs, n_intervals)
+        Wb = (W_T * phi_T).unsqueeze(2)  # (n_pixels, n_pairs, 1)
+
+        # Batched least squares solve on CPU (faster for small matrices)
+        WA_cpu = WA.cpu()
+        Wb_cpu = Wb.cpu()
+
+        # torch.linalg.lstsq returns (solution, residuals, rank, singular_values)
+        result = torch.linalg.lstsq(WA_cpu, Wb_cpu)
+        x = result.solution.squeeze(2)  # (n_pixels, n_intervals)
+
+        # Mark all-NaN pixels
+        all_nan = nan_mask.all(dim=0).cpu()
+        x[all_nan, :] = float('nan')
+
+        # Build time series
+        if cumsum:
+            # Cumulative sum: first date = 0, then cumsum of increments
+            ts = torch.zeros((n_pixels, n_dates), dtype=torch.float32)
+            ts[:, 1:] = torch.cumsum(x, dim=1)
+        else:
+            ts = torch.zeros((n_pixels, n_dates), dtype=torch.float32)
+            ts[:, 1:] = x
+
+        # Reshape: (n_pixels, n_dates) -> (n_dates, height, width)
+        time_series = ts.T.numpy().reshape(n_dates, height, width)
+
+        return time_series, dates
+
+    def lstsq(self, data, weight=None, device='auto', cumsum=True, debug=False):
+        """
+        Weighted least squares network inversion to date-based time series.
+
+        Takes unwrapped pair phases and inverts the network to get per-date
+        accumulated phase. Uses PyTorch batched least squares for GPU acceleration.
+
+        Parameters
+        ----------
+        data : Batch
+            Unwrapped phase data with 'pair' dimension.
+        weight : BatchUnit, optional
+            Correlation weights for each pair.
+        device : str, optional
+            PyTorch device ('auto', 'cuda', 'mps', 'cpu'). Default 'auto'.
+        cumsum : bool, optional
+            If True (default), return cumulative displacement time series.
+            If False, return incremental phase changes between dates.
+        debug : bool, optional
+            Print debug information.
+
+        Returns
+        -------
+        Batch
+            Phase time series with 'date' dimension instead of 'pair'.
+
+        Notes
+        -----
+        Typical workflow:
+        1. stack.unwrap1d(intf, corr) - unwrap pairs temporally
+        2. stack.lstsq(unwrapped, corr) - network inversion to dates
+
+        Examples
+        --------
+        >>> unwrapped = stack.unwrap1d(intf, corr)
+        >>> displacement = stack.lstsq(unwrapped, corr)
         """
         import xarray as xr
-        import numpy as np
+        import pandas as pd
+        from .Batch import Batch, BatchWrap, BatchUnit
 
+        # Validate input types
+        if isinstance(data, BatchWrap):
+            raise TypeError(
+                'lstsq() requires unwrapped phase (Batch), got BatchWrap. '
+                'Use unwrap1d() first to unwrap wrapped phase data.'
+            )
+        if not isinstance(data, Batch):
+            raise TypeError(
+                f'data must be Batch (unwrapped phase), got {type(data).__name__}.'
+            )
+        if weight is not None and not isinstance(weight, BatchUnit):
+            raise TypeError(
+                f'weight must be a BatchUnit, got {type(weight).__name__}. '
+                'Use BatchUnit(data) to convert correlation data.'
+            )
+
+        # Process each burst
+        results = {}
+        for key in data.keys():
+            ds = data[key]
+            w_ds = weight[key] if weight is not None else None
+
+            result_vars = {}
+            for pol in [v for v in ds.data_vars if v != 'spatial_ref']:
+                da = ds[pol]
+                w_da = w_ds[pol] if w_ds is not None else None
+
+                result = self._lstsq_dataarray(da, w_da, device, cumsum, debug)
+                result_vars[pol] = result
+
+            result_ds = xr.Dataset(result_vars)
+            result_ds.attrs = ds.attrs
+            if ds.rio.crs is not None:
+                result_ds = result_ds.rio.write_crs(ds.rio.crs)
+            results[key] = result_ds
+
+        return Batch(results)
+
+    def _lstsq_dataarray(self, data, weight, device, cumsum, debug):
+        """Internal method for lstsq on DataArray - LAZY dask processing."""
+        import xarray as xr
+        import pandas as pd
+        import dask
+        import dask.array
+
+        # Get pairs
         pairs = self._get_pairs(data)
-        matrix = self.unwrap1d_matrix(pairs)
+        pair_dates = [(str(row.ref), str(row.rep)) for _, row in pairs.iterrows()]
 
-        if not 'stack' in data.dims:
-            chunks_z, chunks_y, chunks_x = data.chunks if data.chunks is not None else np.inf, np.inf, np.inf
-            if np.max(chunks_y) > self.netcdf_chunksize or np.max(chunks_x) > self.netcdf_chunksize:
-                print (f'Note: data chunk size ({np.max(chunks_y)}, {np.max(chunks_x)}) is too large for stack processing')
-                chunks_y = chunks_x = self.netcdf_chunksize//2
-                print (f'Note: auto tune data chunk size to a half of NetCDF chunk: ({chunks_y}, {chunks_x})')
-            chunks = dict(pair=-1, y=chunks_y, x=chunks_x)
+        # Build incidence matrix once (needed for all blocks)
+        A, dates = Stack_unwrap1d._build_incidence_matrix(pair_dates)
+        n_dates = len(dates)
+
+        # Ensure data is chunked for lazy processing
+        if 'y' in data.dims and 'x' in data.dims:
+            # 3D case (pair, y, x)
+            if data.chunks is None:
+                chunks = {'y': self.netcdf_chunksize, 'x': self.netcdf_chunksize}
+                data = data.chunk(chunks)
+                if weight is not None:
+                    weight = weight.chunk(chunks)
+
+            chunks_pair, chunks_y, chunks_x = data.chunks
+
+            def lstsq_block(ys, xs):
+                """Process a spatial block - all pairs, subset of y,x."""
+                data_block = data.isel(y=ys, x=xs).compute(n_workers=1).values
+                if weight is not None:
+                    weight_block = weight.isel(y=ys, x=xs).compute(n_workers=1).values
+                else:
+                    weight_block = None
+
+                # PyTorch batched weighted least squares
+                ts_block, _ = Stack_unwrap1d._lstsq_to_dates_numpy(
+                    data_block, weight_block, pair_dates,
+                    device=device, cumsum=cumsum, debug=False
+                )
+                return ts_block.astype(np.float32)
+
+            # Build lazy dask array from blocks
+            ys_blocks = np.array_split(np.arange(data.y.size), np.cumsum(chunks_y)[:-1])
+            xs_blocks = np.array_split(np.arange(data.x.size), np.cumsum(chunks_x)[:-1])
+
+            blocks_total = []
+            for ys_block in ys_blocks:
+                blocks_row = []
+                for xs_block in xs_blocks:
+                    block = dask.array.from_delayed(
+                        dask.delayed(lstsq_block)(ys_block, xs_block),
+                        shape=(n_dates, ys_block.size, xs_block.size),
+                        dtype=np.float32
+                    )
+                    blocks_row.append(block)
+                blocks_total.append(blocks_row)
+
+            ts_dask = dask.array.block(blocks_total)
+
+            # Build coordinates
+            coords = {
+                'date': pd.to_datetime(dates),
+                'y': data.coords['y'],
+                'x': data.coords['x']
+            }
+            dims = ('date', 'y', 'x')
+
+        elif 'stack' in data.dims:
+            # 2D case (pair, stack)
+            if data.chunks is None:
+                chunks = {'stack': self.chunksize1d}
+                data = data.chunk(chunks)
+                if weight is not None:
+                    weight = weight.chunk(chunks)
+
+            chunks_pair, chunks_stack = data.chunks
+
+            def lstsq_block_stack(stacks):
+                """Process a stack block - all pairs, subset of stack."""
+                data_block = data.isel(stack=stacks).compute(n_workers=1).values
+                if weight is not None:
+                    weight_block = weight.isel(stack=stacks).compute(n_workers=1).values
+                else:
+                    weight_block = None
+
+                # Reshape: (n_pairs, n_stack) -> (n_pairs, 1, n_stack)
+                data_block_3d = data_block[:, np.newaxis, :]
+                weight_block_3d = weight_block[:, np.newaxis, :] if weight_block is not None else None
+
+                ts_block, _ = Stack_unwrap1d._lstsq_to_dates_numpy(
+                    data_block_3d, weight_block_3d, pair_dates,
+                    device=device, cumsum=cumsum, debug=False
+                )
+                # Reshape back: (n_dates, 1, n_stack) -> (n_dates, n_stack)
+                return ts_block[:, 0, :].astype(np.float32)
+
+            stacks_blocks = np.array_split(np.arange(data['stack'].size), np.cumsum(chunks_stack)[:-1])
+
+            blocks_total = []
+            for stacks_block in stacks_blocks:
+                block = dask.array.from_delayed(
+                    dask.delayed(lstsq_block_stack)(stacks_block),
+                    shape=(n_dates, stacks_block.size),
+                    dtype=np.float32
+                )
+                blocks_total.append(block)
+
+            ts_dask = dask.array.concatenate(blocks_total, axis=1)
+
+            coords = {
+                'date': pd.to_datetime(dates),
+                'stack': data.coords['stack']
+            }
+            dims = ('date', 'stack')
+
         else:
-            chunks_z, chunks_stack = data.chunks if data.chunks is not None else np.inf, np.inf
-            if np.max(chunks_stack) > self.chunksize1d:
-                print (f'Note: data chunk size ({np.max(chunks_stack)} is too large for stack processing')
-                chunks_stack = self.chunksize1d
-                print (f'Note: auto tune data chunk size to 1D chunk: ({chunks_stack})')
-            chunks = dict(pair=-1, stack=chunks_stack)
+            # Fallback: eager processing
+            phase_np = data.values
+            weight_np = weight.values if weight is not None else None
 
-        # xarray wrapper
-        input_core_dims = [['pair']]
-        args = [self.wrap(data).chunk(chunks)]
-        if weight is not None:
-            input_core_dims.append(['pair'])
-            args.append(weight.chunk(chunks))
-        model = xr.apply_ufunc(
-            self._unwrap1d_pairs,
-            *args,
-            dask='parallelized',
-            vectorize=True,
-            input_core_dims=input_core_dims,
-            output_core_dims=[['pair']],
-            output_dtypes=[np.float32],
-            kwargs={'matrix': matrix, 'tolerance': tolerance}
-        ).transpose('pair',...)
-        del args
+            ts_np, dates = Stack_unwrap1d._lstsq_to_dates_numpy(
+                phase_np, weight_np, pair_dates,
+                device=device, cumsum=cumsum, debug=debug
+            )
 
-        return model.rename('unwrap')
+            coords = {'date': pd.to_datetime(dates)}
+            if 'y' in data.coords:
+                coords['y'] = data.coords['y']
+            if 'x' in data.coords:
+                coords['x'] = data.coords['x']
+            dims = ('date', 'y', 'x')
+
+            return xr.DataArray(ts_np, coords=coords, dims=dims, name='displacement')
+
+        return xr.DataArray(
+            ts_dask,
+            coords=coords,
+            dims=dims,
+            name='displacement'
+        )
+
+    def unwrap1d(self, data, weight=None, device='auto', max_iter=5,
+                 epsilon=0.1, batch_size=50000, debug=False):
+        """
+        L1-norm IRLS temporal phase unwrapping returning unwrapped pairs.
+
+        Performs temporal unwrapping across the interferogram network,
+        applying 2π corrections to make pairs consistent.
+
+        Parameters
+        ----------
+        data : BatchWrap or Batch
+            Phase data with 'pair' dimension (wrapped or 2D-unwrapped).
+        weight : BatchUnit, optional
+            Correlation weights for each pair.
+        device : str, optional
+            PyTorch device ('auto', 'cuda', 'mps', 'cpu'). Default 'auto'.
+        max_iter : int, optional
+            Maximum IRLS iterations. Default 5.
+        epsilon : float, optional
+            IRLS regularization parameter. Default 0.1.
+        batch_size : int, optional
+            Pixels per batch for memory efficiency. Default 50000.
+        debug : bool, optional
+            Print debug information.
+
+        Returns
+        -------
+        Batch
+            Temporally unwrapped phase data with 'pair' dimension.
+
+        Notes
+        -----
+        Typical workflow:
+        1. stack.unwrap1d(intf, corr) - unwrap pairs temporally
+        2. stack.lstsq(unwrapped, corr) - network inversion to dates
+
+        Examples
+        --------
+        >>> unwrapped = stack.unwrap1d(intf, corr)
+        >>> displacement = stack.lstsq(unwrapped, corr)
+        """
+        import xarray as xr
+        from .Batch import Batch, BatchWrap, BatchUnit
+
+        # Auto-detect device based on Dask cluster resources and hardware
+        device = Stack_unwrap1d._get_torch_device(device, debug=debug)
+
+        if debug:
+            print(f"DEBUG: unwrap1d using device={device}")
+
+        # Validate input types
+        if not isinstance(data, (Batch, BatchWrap)):
+            raise TypeError(
+                f'data must be BatchWrap or Batch, got {type(data).__name__}.'
+            )
+        if weight is not None and not isinstance(weight, BatchUnit):
+            raise TypeError(
+                f'weight must be a BatchUnit, got {type(weight).__name__}. '
+                'Use BatchUnit(data) to convert correlation data.'
+            )
+
+        # Process each burst
+        results = {}
+        for key in data.keys():
+            ds = data[key]
+            w_ds = weight[key] if weight is not None else None
+
+            result_vars = {}
+            for pol in [v for v in ds.data_vars if v != 'spatial_ref']:
+                da = ds[pol]
+                w_da = w_ds[pol] if w_ds is not None else None
+
+                result = self._unwrap1d_pairs_dataarray(
+                    da, w_da, device, max_iter, epsilon, batch_size, debug
+                )
+                result_vars[pol] = result
+
+            result_ds = xr.Dataset(result_vars)
+            result_ds.attrs = ds.attrs
+            if ds.rio.crs is not None:
+                result_ds = result_ds.rio.write_crs(ds.rio.crs)
+            results[key] = result_ds
+
+        return Batch(results)
+
+    def _unwrap1d_pairs_dataarray(self, data, weight, device, max_iter,
+                                   epsilon, batch_size, debug):
+        """Internal method for IRLS unwrapping on DataArray returning pairs - LAZY."""
+        import xarray as xr
+        import dask
+        import dask.array
+
+        # Get pairs
+        pairs = self._get_pairs(data)
+        pair_dates = [(str(row.ref), str(row.rep)) for _, row in pairs.iterrows()]
+        n_pairs = len(pair_dates)
+
+        # Save original coordinates before chunking
+        original_coords = {}
+        for k, v in data.coords.items():
+            if hasattr(v, 'data') and hasattr(v.data, 'compute'):
+                vals = v.compute().values
+            elif hasattr(v, 'values'):
+                vals = v.values
+            else:
+                vals = v
+            if hasattr(v, 'dims') and len(v.dims) > 0 and v.dims != (k,):
+                original_coords[k] = (v.dims, vals)
+            else:
+                original_coords[k] = vals
+
+        # Ensure data is chunked for lazy processing
+        if 'y' in data.dims and 'x' in data.dims:
+            # 3D case (pair, y, x)
+            if data.chunks is None:
+                chunks = {'y': self.netcdf_chunksize, 'x': self.netcdf_chunksize}
+                data = data.chunk(chunks)
+                if weight is not None:
+                    weight = weight.chunk(chunks)
+
+            chunks_pair, chunks_y, chunks_x = data.chunks
+
+            def unwrap1d_pairs_block(ys, xs):
+                """Process a spatial block - all pairs, subset of y,x."""
+                from contextlib import nullcontext
+                data_block = data.isel(y=ys, x=xs).compute(n_workers=1).values
+                if weight is not None:
+                    weight_block = weight.isel(y=ys, x=xs).compute(n_workers=1).values
+                else:
+                    weight_block = None
+
+                # Use MPS lock to serialize GPU access on Apple Silicon
+                with Stack_unwrap1d._mps_lock() if device.type == 'mps' else nullcontext():
+                    unwrapped_block = Stack_unwrap1d._unwrap1d_pairs_numpy(
+                        data_block, weight_block, pair_dates,
+                        device=device, max_iter=max_iter, epsilon=epsilon,
+                        batch_size=batch_size, debug=False
+                    )
+                return unwrapped_block.astype(np.float32)
+
+            # Build lazy dask array from blocks
+            # Use GPU annotation to prevent MPS command buffer conflicts
+            ys_blocks = np.array_split(np.arange(data.y.size), np.cumsum(chunks_y)[:-1])
+            xs_blocks = np.array_split(np.arange(data.x.size), np.cumsum(chunks_x)[:-1])
+
+            blocks_total = []
+            with dask.annotate(resources={'gpu': 1} if device.type != 'cpu' else {}):
+                for ys_block in ys_blocks:
+                    blocks_row = []
+                    for xs_block in xs_blocks:
+                        block = dask.array.from_delayed(
+                            dask.delayed(unwrap1d_pairs_block)(ys_block, xs_block),
+                            shape=(n_pairs, ys_block.size, xs_block.size),
+                            dtype=np.float32
+                        )
+                        blocks_row.append(block)
+                    blocks_total.append(blocks_row)
+
+            unwrapped_dask = dask.array.block(blocks_total)
+
+        elif 'stack' in data.dims:
+            # 2D case (pair, stack)
+            if data.chunks is None:
+                chunks = {'stack': self.chunksize1d}
+                data = data.chunk(chunks)
+                if weight is not None:
+                    weight = weight.chunk(chunks)
+
+            chunks_pair, chunks_stack = data.chunks
+
+            def unwrap1d_pairs_block_stack(stacks):
+                """Process a stack block - all pairs, subset of stack."""
+                from contextlib import nullcontext
+                data_block = data.isel(stack=stacks).compute(n_workers=1).values
+                if weight is not None:
+                    weight_block = weight.isel(stack=stacks).compute(n_workers=1).values
+                else:
+                    weight_block = None
+
+                # Reshape: (n_pairs, n_stack) -> (n_pairs, 1, n_stack)
+                data_block_3d = data_block[:, np.newaxis, :]
+                weight_block_3d = weight_block[:, np.newaxis, :] if weight_block is not None else None
+
+                # Use MPS lock to serialize GPU access on Apple Silicon
+                with Stack_unwrap1d._mps_lock() if device.type == 'mps' else nullcontext():
+                    unwrapped_block = Stack_unwrap1d._unwrap1d_pairs_numpy(
+                        data_block_3d, weight_block_3d, pair_dates,
+                        device=device, max_iter=max_iter, epsilon=epsilon,
+                        batch_size=batch_size, debug=False
+                    )
+                # Reshape: (n_pairs, 1, n_stack) -> (n_pairs, n_stack)
+                return unwrapped_block[:, 0, :].astype(np.float32)
+
+            stacks_blocks = np.array_split(np.arange(data['stack'].size), np.cumsum(chunks_stack)[:-1])
+
+            # Use GPU annotation to prevent MPS command buffer conflicts
+            blocks_total = []
+            with dask.annotate(resources={'gpu': 1} if device.type != 'cpu' else {}):
+                for stacks_block in stacks_blocks:
+                    block = dask.array.from_delayed(
+                        dask.delayed(unwrap1d_pairs_block_stack)(stacks_block),
+                        shape=(n_pairs, stacks_block.size),
+                        dtype=np.float32
+                    )
+                    blocks_total.append(block)
+
+            unwrapped_dask = dask.array.concatenate(blocks_total, axis=1)
+
+        else:
+            # Fallback: eager processing
+            phase_np = data.values
+            weight_np = weight.values if weight is not None else None
+
+            unwrapped_np = self._unwrap1d_pairs_numpy(
+                phase_np, weight_np, pair_dates,
+                device=device, max_iter=max_iter, epsilon=epsilon,
+                batch_size=batch_size, debug=debug
+            )
+
+            return xr.DataArray(unwrapped_np, coords=data.coords, dims=data.dims, name='unwrap')
+
+        result = xr.DataArray(
+            unwrapped_dask,
+            dims=data.dims,
+            name='unwrap'
+        )
+        result = result.assign_coords(original_coords)
+
+        return result
+

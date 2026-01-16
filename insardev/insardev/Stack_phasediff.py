@@ -27,7 +27,8 @@ class Stack_phasediff(Stack_base):
                        gaussian_threshold:float=0.5,
                        multilook:bool=True,
                        goldstein:int|list[int,int]|None=None,
-                       complex:bool=False
+                       complex:bool=False,
+                       center:bool=True
                        ) -> tuple[xr.DataArray,xr.DataArray]:
         """
         Compute phase difference (interferogram) between pairs of dates.
@@ -51,6 +52,9 @@ class Stack_phasediff(Stack_base):
             Goldstein filter patch size.
         complex : bool
             Return complex values instead of phase angles (default False).
+        center : bool
+            Remove circular mean from each interferogram (default True).
+            This ensures zero-centered phase for consistent detrending and visualization.
 
         Returns
         -------
@@ -83,12 +87,20 @@ class Stack_phasediff(Stack_base):
             raise ValueError(f'Input pairs contain duplicates: {duplicates.tolist()}')
         ref_dates = pairs[:,0]
         rep_dates = pairs[:,1]
+        n_pairs = len(ref_dates)
 
+        # Rename date->pair and reset to integer index (dates can have duplicates across pairs)
         data1 = self.isel(date=ref_dates).rename(date='pair')
         data2 = self.isel(date=rep_dates).rename(date='pair')
-        phasediff = BatchComplex(data1).drop_vars('pair') * BatchComplex(data2).drop_vars('pair').conj()
+        data1 = data1.map(lambda ds: ds.assign_coords(pair=np.arange(n_pairs)))
+        data2 = data2.map(lambda ds: ds.assign_coords(pair=np.arange(n_pairs)))
+        phasediff = BatchComplex(data1) * BatchComplex(data2).conj()
         if phase is not None:
-            phasediff = phasediff * (phase.iexp(-1) if not isinstance(phase, BatchComplex) else phase)
+            if isinstance(phase, BatchComplex):
+                phasediff = phasediff * phase
+            else:
+                # Convert phase to complex phasor
+                phasediff = phasediff * phase.iexp(-1)
 
         corr_look = None
         if wavelength is not None:
@@ -97,8 +109,8 @@ class Stack_phasediff(Stack_base):
 
             # Gaussian filtering with cut-off wavelength on amplitudes
             # Extract only the needed dates FIRST, then compute power and filter
-            data1_power = BatchComplex(data1).drop_vars('pair').power()
-            data2_power = BatchComplex(data2).drop_vars('pair').power()
+            data1_power = BatchComplex(data1).power()
+            data2_power = BatchComplex(data2).power()
             intensity_look1 = data1_power.gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold)
             intensity_look2 = data2_power.gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold)
 
@@ -118,19 +130,24 @@ class Stack_phasediff(Stack_base):
         
         if not complex:
             phasediff_look = phasediff_look.angle()
+            # Remove circular mean (BatchWrap.mean uses circular mean via complex domain)
+            if center:
+                phasediff_look = phasediff_look - phasediff_look.mean(['y', 'x'])
 
         # BPR differences aligned with pair dimension: BPR(rep) - BPR(ref)
-        bpr = data2[['BPR']].drop_vars('pair') - data1[['BPR']].drop_vars('pair')
+        bpr = data2[['BPR']] - data1[['BPR']]
         #print ('bpr', bpr.to_dict())
 
+        # Store original datetime values for ref/rep before they get replaced with integers
+        ref_values = self.isel(date=ref_dates).coords['date'].values
+        rep_values = self.isel(date=rep_dates).coords['date'].values
+
         def as_xarray(batch):
-            # Add ref/rep/BPR as coordinates along pair dimension
-            # BPR is passed as a Batch for per-burst assignment
-            # Note: we keep pair as simple tuple index (not MultiIndex) for consistency
-            # across all processing functions that use .values extraction
+            # Add ref/rep/BPR as non-dimension coordinates along pair dimension
+            # pair dimension uses positional indexing (no explicit coordinate needed)
             return batch.assign_coords(
-                ref=('pair', data1.coords['pair'].values),
-                rep=('pair', data2.coords['pair'].values),
+                ref=('pair', ref_values),
+                rep=('pair', rep_values),
                 BPR=('pair', bpr)
             )
         

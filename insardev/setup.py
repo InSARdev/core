@@ -45,7 +45,6 @@ setup(
     install_requires=['insardev_toolkit',
                       'xarray',
                       'numpy',
-                      'numba',
                       'torch',
                       'torch_dct',
                       'ortools',

@@ -8,9 +8,80 @@
 # See the LICENSE file in the insardev directory for license terms.
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
-from .Stack_lstsq import Stack_lstsq
+from .Stack_sbas import Stack_sbas
+from .Batch import Batch
 
-class Stack_stl(Stack_lstsq):
+class Stack_stl(Stack_sbas):
+
+    def stl(self, data, freq='W', periods=52, robust=False):
+        """
+        Perform Seasonal-Trend decomposition using LOESS (STL) on Batch data.
+
+        Decomposes time series into trend, seasonal, and residual components.
+        The input Batch must have a 'date' dimension.
+
+        Parameters
+        ----------
+        data : Batch
+            Input Batch with 'date' dimension containing time series data.
+        freq : str, optional
+            Frequency string for resampling (default 'W' for weekly).
+            Examples: '1W' for 1 week, '2W' for 2 weeks, '10d' for 10 days.
+        periods : int, optional
+            Number of periods for seasonal decomposition (default 52 for weekly data = 1 year).
+        robust : bool, optional
+            Whether to use robust fitting (slower but handles outliers better). Default False.
+
+        Returns
+        -------
+        Batch
+            Batch containing 'trend', 'seasonal', and 'resid' variables for each polarization.
+
+        Examples
+        --------
+        >>> displacement = stack.lstsq(phase, corr)
+        >>> stl_result = stack.stl(displacement, freq='W', periods=52)
+        >>> stl_result.plot()  # Shows trend, seasonal, resid components
+
+        See Also
+        --------
+        statsmodels.tsa.seasonal.STL : Seasonal-Trend decomposition using LOESS
+        """
+        import xarray as xr
+
+        # Validate input
+        if not isinstance(data, dict):
+            raise TypeError(f"data must be a Batch, got {type(data).__name__}")
+
+        sample_ds = next(iter(data.values()))
+        if 'date' not in sample_ds.dims:
+            raise ValueError("Input Batch must have 'date' dimension for STL decomposition")
+
+        # Get polarizations from the first dataset
+        polarizations = [v for v in sample_ds.data_vars if v != 'spatial_ref']
+
+        results = {}
+        for key, ds in data.items():
+            result_vars = {}
+            for pol in polarizations:
+                if pol not in ds.data_vars:
+                    continue
+                da = ds[pol]
+                # Apply STL decomposition
+                stl_ds = self._stl(da, freq=freq, periods=periods, robust=robust)
+                # Rename variables to include polarization
+                for var in ['trend', 'seasonal', 'resid']:
+                    result_vars[f'{pol}_{var}'] = stl_ds[var]
+
+            result_ds = xr.Dataset(result_vars)
+            result_ds.attrs = ds.attrs
+            # Preserve CRS if available
+            if hasattr(ds, 'rio') and ds.rio.crs is not None:
+                import rioxarray
+                result_ds = result_ds.rio.write_crs(ds.rio.crs)
+            results[key] = result_ds
+
+        return Batch(results)
 
     @staticmethod
     def _stl1d(ts, dt, dt_periodic, periods=52, robust=False):
@@ -134,22 +205,36 @@ class Stack_stl(Stack_lstsq):
 
         assert data.dims[0] == 'date', 'The first data dimension should be date'
 
-        if not 'stack' in data.dims:
-            chunks_z, chunks_y, chunks_x = data.chunks if data.chunks is not None else np.inf, np.inf, np.inf
-            if np.max(chunks_y) > self.netcdf_chunksize or np.max(chunks_x) > self.netcdf_chunksize:
-                print (f'Note: data chunk size ({np.max(chunks_y)}, {np.max(chunks_x)}) is too large for stack processing')
-                chunks_y = chunks_x = self.netcdf_chunksize//2
-                print (f'Note: auto tune data chunk size to a half of NetCDF chunk: ({chunks_y}, {chunks_x})')
+        # Default chunk sizes if not set on Stack
+        netcdf_chunksize = getattr(self, 'netcdf_chunksize', 512)
+        chunksize1d = getattr(self, 'chunksize1d', 10000)
+
+        if 'stack' not in data.dims:
+            # 3D case (date, y, x)
+            # Use dask auto-chunking based on available memory (similar to to_dataset())
+            # Include date dimension size for proper 3D memory estimation
+            # Uses 8 * n_dates to account for STL's internal memory requirements
+            # (8 × complex128 = 128 bytes effective per element)
+            # to account for STL internal variables (trend, seasonal, resid, weights, etc.)
+            n_dates = data.date.size
+            auto_chunks = dask.array.core.normalize_chunks('auto', (8 * n_dates, data.y.size, data.x.size), dtype=np.complex128)
+            chunks_y, chunks_x = auto_chunks[1][0], auto_chunks[2][0]
+            print (f'Note: auto tune data chunk size using dask: ({chunks_y}, {chunks_x})')
             chunks = {'y': chunks_y, 'x': chunks_x}
+            data = data.chunk(chunks)
         else:
-            chunks_z, chunks_stack = data.chunks if data.chunks is not None else np.inf, np.inf
-            if np.max(chunks_stack) > self.chunksize1d:
+            # 2D case (date, stack)
+            if data.chunks is None:
+                chunks = {'stack': chunksize1d}
+                data = data.chunk(chunks)
+
+            chunks_z, chunks_stack = data.chunks
+            if np.max(chunks_stack) > chunksize1d:
                 print (f'Note: data chunk size ({np.max(chunks_stack)} is too large for stack processing')
-                # 1D chunk size can be defined straightforward
-                chunks_stack = self.chunksize1d
+                chunks_stack = chunksize1d
                 print (f'Note: auto tune data chunk size to 1D chunk: ({chunks_stack})')
-            chunks = {'stack': chunks_stack}
-        data = data.chunk(chunks)
+                chunks = {'stack': chunks_stack}
+                data = data.chunk(chunks)
         
         if isinstance(data, xr.DataArray):
             pass

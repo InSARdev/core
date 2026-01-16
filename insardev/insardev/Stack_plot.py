@@ -265,11 +265,11 @@ class Stack_plot(Stack_export):
     
         axs[0].set_title('Histogram')
         if threshold is not None:
-            data.where(data > threshold).plot.imshow(cmap=cmap, vmin=0, vmax=1, ax=axs[1])
+            data.where(data > threshold).plot.imshow(cmap=cmap, vmin=0, vmax=1, ax=axs[1], interpolation='none')
             axs[1].set_title(f'Threshold = {threshold:0.3f}')
             axs[0].axvline(threshold, linestyle='dashed', color='black', label=f'Threshold {threshold:0.3f}')
         else:
-            data.where(data).plot.imshow(cmap=cmap, vmin=0, vmax=1, ax=axs[1])
+            data.where(data).plot.imshow(cmap=cmap, vmin=0, vmax=1, ax=axs[1], interpolation='none')
         axs[0].legend()
         plt.suptitle(caption)
         plt.tight_layout()

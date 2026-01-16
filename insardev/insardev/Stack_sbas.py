@@ -104,6 +104,25 @@ class Stack_sbas(Stack_detrend):
         matrix = np.stack(matrix).astype(np.float32)
         return matrix
 
+    def lstsq_matrix(self, pairs):
+        """
+        Create an incidence matrix for least squares computation based on interferogram date pairs.
+
+        Parameters
+        ----------
+        pairs : pandas.DataFrame or Xarray object
+            DataFrame containing interferogram date pairs.
+
+        Returns
+        -------
+        numpy.ndarray
+            Matrix with one row for every interferogram and one column for every date.
+            Each element in the matrix is an integer, with 1 representing that the date
+            is between the corresponding interferogram's reference and repeat dates, and
+            0 otherwise.
+        """
+        return (self._get_pairs_matrix(pairs)>=0).astype(int)
+
 #    def baseline_pairs(self, days=100, meters=None, invert=False, **kwargs):
 #        print('Note: function baseline_pairs() renamed to sbas_pairs(). Use separate filtering functions when needed.')
 #        return self.sbas_pairs(days=days, meters=meters, invert=invert)

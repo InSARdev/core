@@ -7,9 +7,15 @@
 #
 # See the LICENSE file in the insardev_toolkit directory for license terms.
 # ----------------------------------------------------------------------------
+
+# Patch tqdm.auto to use text mode globally (fixes white background in VSCode dark theme)
+import tqdm.auto
+import tqdm.std
+tqdm.auto.tqdm = tqdm.std.tqdm
+
 from distributed.diagnostics.progressbar import ProgressBar
 from distributed.utils import LoopRunner
-from tqdm.auto import tqdm
+from tqdm.std import tqdm
 from tornado.ioloop import IOLoop
 
 class TqdmDaskProgress(ProgressBar):
@@ -56,12 +62,12 @@ class TqdmDaskProgress(ProgressBar):
 
         if start:
             loop_runner.run_sync(self.listen)
-        
+
     @property
     def loop(self):
         """
         Get the current Tornado IOLoop.
-        
+
         Returns
         -------
         IOLoop
@@ -75,7 +81,7 @@ class TqdmDaskProgress(ProgressBar):
             # loop is still acceptable - so we cache access to the loop.
             self.__loop = loop = self._loop_runner.loop
         return loop
-        
+
     @loop.setter
     def loop(self, value):
         """
@@ -112,7 +118,7 @@ class TqdmDaskProgress(ProgressBar):
     def _draw_stop(self, **kwargs):
         """
         Close the progress bar.
-        
+
         **kwargs : dict
             Additional keyword arguments.
         """
@@ -130,7 +136,6 @@ def progressbar(futures, **kwargs):
         Additional keyword arguments for TqdmDaskProgress.
     """
     from distributed.client import futures_of
-    
     futures = futures_of(futures)
     if not isinstance(futures, (set, list)):
         futures = [futures]

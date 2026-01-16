@@ -65,7 +65,10 @@ def nanconvolve2d_gaussian(data,
         conv_complex = gaussian_filter(np.nan_to_num(data_complex, 0), **kwargs)
         #conv = conv_complex.real/conv_complex.imag
         # to prevent "RuntimeWarning: invalid value encountered in divide" even when warning filter is defined
-        conv = np.where(conv_complex.imag <= threshold*(weight if weight is not None else 1), np.nan, conv_complex.real/(conv_complex.imag + 1e-17))
+        # threshold check: mask pixels where accumulated weight is too low
+        # when weight is provided, conv_complex.imag is smoothed(weight), only mask near-zero values
+        # (matching PyGMTSAR behavior)
+        conv = np.where(conv_complex.imag <= threshold if weight is None else conv_complex.imag < 1e-10, np.nan, conv_complex.real/(conv_complex.imag + 1e-17))
         del data_complex, conv_complex
         return conv
 

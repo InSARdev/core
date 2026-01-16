@@ -175,15 +175,13 @@ class Stack(Stack_plot, BatchCore):
             except Exception:
                 return str(val)
 
-        def _format_pair(val):
-            if isinstance(val, (list, tuple)) and len(val) == 2:
-                return f"{_format_dt(val[0])}_{_format_dt(val[1])}"
-            # Handle string format from to_dataset(): "2019-07-02 2019-07-08"
-            if isinstance(val, str) and ' ' in val:
-                parts = val.split()
-                if len(parts) == 2:
-                    return f"{_format_dt(parts[0])}_{_format_dt(parts[1])}"
-            return _format_dt(val)
+        def _format_pair(da, idx):
+            """Format pair label from ref/rep coordinates at given index."""
+            if 'ref' in da.coords and 'rep' in da.coords:
+                ref_val = da.coords['ref'].values[idx]
+                rep_val = da.coords['rep'].values[idx]
+                return f"{_format_dt(ref_val)}_{_format_dt(rep_val)}"
+            return str(idx)
 
         os.makedirs(path, exist_ok=True)
 
@@ -244,14 +242,14 @@ class Stack(Stack_plot, BatchCore):
 
                 # Handle pair dimension
                 if 'pair' in da.dims:
-                    pair_coord = da.coords.get('pair')
-                    pair_values = pair_coord.values if pair_coord is not None else range(da.sizes.get('pair', 0))
+                    n_pairs = da.sizes['pair']
                     export_items = []
-                    for i, pair_val in enumerate(pair_values):
+                    for i in range(n_pairs):
                         da_slice = da.isel(pair=i)
                         if 'pair' in da_slice.dims:
                             da_slice = da_slice.squeeze('pair', drop=True)
-                        export_items.append((pair_val, da_slice))
+                        pair_label = _format_pair(da, i)
+                        export_items.append((pair_label, da_slice))
                 else:
                     export_items = [(None, da)]
 
@@ -292,8 +290,8 @@ class Stack(Stack_plot, BatchCore):
                     layers.append(ov.rename('colors'))
 
                 # Add data arrays with pair names
-                for pair_val, da_item in export_items:
-                    var_name = _format_pair(pair_val) if pair_val is not None else data_var
+                for pair_label, da_item in export_items:
+                    var_name = pair_label if pair_label is not None else data_var
                     layers.append(da_item.rename(var_name))
 
                 ds_out = xr.merge(layers, compat='override', join='left')
@@ -1175,15 +1173,15 @@ class Stack(Stack_plot, BatchCore):
 
             Returns the apparent elevation offset (meters) to add to current burst.
             """
-            prf = float(ds_prev.attrs['PRF'])
-            lpb = int(ds_prev.attrs['linesPerBurst'])
-            clock_start_prev = float(ds_prev.attrs['clock_start'])
-            clock_start_curr = float(ds_curr.attrs['clock_start'])
+            prf = float(ds_prev['PRF'].isel(date=0).values)
+            lpb = int(ds_prev['linesPerBurst'].isel(date=0).values)
+            clock_start_prev = float(ds_prev['clock_start'].isel(date=0).values)
+            clock_start_curr = float(ds_curr['clock_start'].isel(date=0).values)
 
-            ksr_prev = int(ds_prev.attrs['ksr'])
-            ker_prev = int(ds_prev.attrs['ker'])
-            ksr_curr = int(ds_curr.attrs['ksr'])
-            ker_curr = int(ds_curr.attrs['ker'])
+            ksr_prev = int(ds_prev['ksr'].isel(date=0).values)
+            ker_prev = int(ds_prev['ker'].isel(date=0).values)
+            ksr_curr = int(ds_curr['ksr'].isel(date=0).values)
+            ker_curr = int(ds_curr['ker'].isel(date=0).values)
 
             # Lines from burst1 start to burst2 start
             nl = int(np.floor((clock_start_curr - clock_start_prev) * 86400.0 * prf + 0.5))
@@ -1197,10 +1195,10 @@ class Stack(Stack_plot, BatchCore):
             azi_curr = azi_prev - nl
 
             # Satellite height at overlap midpoint for each burst
-            H_prev_start = float(ds_prev.attrs['SC_height_start'])
-            H_prev_end = float(ds_prev.attrs['SC_height_end'])
-            H_curr_start = float(ds_curr.attrs['SC_height_start'])
-            H_curr_end = float(ds_curr.attrs['SC_height_end'])
+            H_prev_start = float(ds_prev['SC_height_start'].isel(date=0).values)
+            H_prev_end = float(ds_prev['SC_height_end'].isel(date=0).values)
+            H_curr_start = float(ds_curr['SC_height_start'].isel(date=0).values)
+            H_curr_end = float(ds_curr['SC_height_end'].isel(date=0).values)
 
             H_prev = H_prev_start + (H_prev_end - H_prev_start) * azi_prev / lpb
             H_curr = H_curr_start + (H_curr_end - H_curr_start) * azi_curr / lpb
@@ -1208,8 +1206,8 @@ class Stack(Stack_plot, BatchCore):
 
             # Compute apparent elevation difference from satellite height change
             # Using radar geometry: range, Earth radius, incidence angle
-            earth_radius = float(ds_prev.attrs['earth_radius'])
-            near_range = float(ds_prev.attrs['near_range'])
+            earth_radius = float(ds_prev['earth_radius'].isel(date=0).values)
+            near_range = float(ds_prev['near_range'].isel(date=0).values)
             H_avg = (H_prev + H_curr) / 2
             c = earth_radius + H_avg
             ret = earth_radius

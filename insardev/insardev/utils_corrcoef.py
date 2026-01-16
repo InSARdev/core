@@ -26,7 +26,7 @@ def corrcoef(data, mask_diagonal=False):
     # plot variance-covariance matrix
     corr_stack = corr60m.mean('pair')
     corr = utils.corrcoef(unwrap.phase.where(corr_stack.where(corr_stack>0.7)))
-    corr.where((corr)>0.7).plot.imshow(vmin=-1, vmax=1)
+    corr.where((corr)>0.7).plot.imshow(vmin=-1, vmax=1, interpolation='none')
     plt.xticks(rotation=90)
     plt.show()
     

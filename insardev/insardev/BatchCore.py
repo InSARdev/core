@@ -53,6 +53,80 @@ class BatchCore(dict):
         def items(self):
             return self._ds.coords.items()
 
+    @staticmethod
+    def _get_torch_device(device='auto', debug=False):
+        """
+        Get PyTorch device for GPU-accelerated operations.
+
+        Checks Dask cluster resources:
+        - If workers have resources={'gpu': 0}, GPU is disabled → CPU
+        - Otherwise auto-detects best available device
+        - For MPS, use _mps_lock() context manager to serialize access
+
+        Parameters
+        ----------
+        device : str
+            Device specification: 'auto', 'cuda', 'mps', or 'cpu'.
+            'auto' checks Dask cluster resources, then selects best available.
+        debug : bool
+            Print debug information.
+
+        Returns
+        -------
+        torch.device
+            PyTorch device object.
+        """
+        import torch
+
+        if device == 'auto':
+            gpu_disabled = False
+
+            try:
+                from dask.distributed import get_client
+                client = get_client()
+                workers = client.scheduler_info().get('workers', {})
+                if workers:
+                    gpu_defined = any('gpu' in w.get('resources', {}) for w in workers.values())
+                    if gpu_defined:
+                        gpu_disabled = all(w.get('resources', {}).get('gpu', 0) == 0 for w in workers.values())
+                        if debug and gpu_disabled:
+                            print(f"DEBUG: Dask cluster has gpu=0, using CPU")
+            except ValueError:
+                # No Dask client active
+                pass
+
+            if gpu_disabled:
+                device = 'cpu'
+            elif torch.cuda.is_available():
+                device = 'cuda'
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                device = 'mps'
+            else:
+                device = 'cpu'
+
+        return torch.device(device)
+
+    @staticmethod
+    def _mps_lock():
+        """
+        Get a distributed lock for MPS serialization.
+
+        MPS on Apple Silicon can only handle one concurrent operation.
+        Use this lock in GPU functions to serialize MPS access across Dask workers.
+
+        Returns
+        -------
+        contextmanager
+            A lock context manager (Dask Lock if client active, else dummy).
+        """
+        from contextlib import nullcontext
+        try:
+            from dask.distributed import Lock, get_client
+            get_client()  # Check if client is active
+            return Lock('mps_gpu_lock')
+        except (ImportError, ValueError):
+            return nullcontext()
+
     def __init__(self, mapping: Mapping[str, xr.Dataset] | Stack | BatchComplex | None = None):
         from .Stack import Stack
         from .Batch import Batch, BatchWrap, BatchUnit, BatchComplex
@@ -331,7 +405,6 @@ class BatchCore(dict):
         if isinstance(other, (int, float, np.floating, np.integer)):
             return type(self)({k: v + other for k, v in self.items()})
         keys = self.keys()
-        #& other.keys()
         return type(self)({k: (self[k] + other[k] if k in other else self[k]) for k in keys})
 
     def __radd__(self, other):
@@ -363,8 +436,7 @@ class BatchCore(dict):
                         result[k] = ds - self[[k]].polyval({k: val})[k]
                     elif has_pair_dim and len(val) == n_pairs:
                         # Multi-pair degree=0: [off0, off1, ...]
-                        offsets = xr.DataArray(val, dims=['pair'],
-                                               coords={'pair': sample_da.coords['pair']})
+                        offsets = xr.DataArray(val, dims=['pair'])
                         result[k] = ds - offsets
                     else:
                         # Single pair degree=1: [ramp, offset] or other
@@ -378,7 +450,6 @@ class BatchCore(dict):
                             new_ds[var] = ds[var] - val
                     result[k] = new_ds
                 else:
-                    # Dataset/DataArray subtraction: apply normally
                     result[k] = ds - val
         return type(self)(result)
 
@@ -870,16 +941,12 @@ class BatchCore(dict):
                 ds = self[k]
                 other_ds = keys[k]
 
-                # Align 'pair' dimension if both have it (per burst key)
+                # Align 'pair' dimension if both have it - use minimum size (positional indexing)
                 if hasattr(other_ds, 'dims') and 'pair' in getattr(other_ds, 'dims', []):
                     if hasattr(ds, 'dims') and 'pair' in ds.dims:
-                        # Get pairs from the other dataset for THIS key
-                        other_pairs = set(other_ds.coords['pair'].values)
-                        my_pairs = ds.coords['pair'].values
-                        matching = [p for p in my_pairs if p in other_pairs]
-                        if matching:
-                            ds = ds.sel(pair=matching)
-                        # If no matching pairs, keep ds as-is (will have 0 after filtering)
+                        n_pairs = min(ds.sizes['pair'], other_ds.sizes['pair'])
+                        if n_pairs < ds.sizes['pair']:
+                            ds = ds.isel(pair=slice(n_pairs))
 
                 result[k] = ds
             return type(self)(result)
@@ -1314,8 +1381,6 @@ class BatchCore(dict):
                         corrections.append(corr)
                     # Stack along pair dimension
                     correction = xr.concat(corrections, dim='pair')
-                    if has_pair_dim:
-                        correction = correction.assign_coords(pair=sample_da.coords['pair'])
 
                 elif has_pair_dim and len(coeff) == n_pairs and not isinstance(first_elem, (list, tuple)):
                     # Multi-pair degree=0: [off0, off1, ...] - all scalars matching pair count
@@ -1327,7 +1392,6 @@ class BatchCore(dict):
                         # Multi-pair degree=0
                         corrections = [xr.full_like(coord, off, dtype=float) for off in coeff]
                         correction = xr.concat(corrections, dim='pair')
-                        correction = correction.assign_coords(pair=sample_da.coords['pair'])
 
                 else:
                     # Single pair degree=1: [ramp, offset]
@@ -1804,6 +1868,12 @@ class BatchCore(dict):
             result = xr.DataArray(data, coords={stackvar: stackval, 'y': ys, 'x': xs})\
                 .rename(pol)\
                 .assign_attrs(datas[0].attrs)
+            # Preserve ref/rep coordinates along pair dimension
+            if stackvar == 'pair':
+                if 'ref' in datas[0].coords:
+                    result = result.assign_coords(ref=(stackvar, datas[0].coords['ref'].values))
+                if 'rep' in datas[0].coords:
+                    result = result.assign_coords(rep=(stackvar, datas[0].coords['rep'].values))
             result = datagrid.spatial_ref(result, datas)
             if stackvar == 'fake':
                 result = result.isel({stackvar: 0})
@@ -2078,6 +2148,7 @@ class BatchCore(dict):
                 col_wrap=min(cols, da[stackvar].size), size=size, aspect=aspect,
                 vmin=_vmin, vmax=_vmax,
                 cmap=cmap, alpha=alpha,
+                interpolation='none',
                 cbar_kwargs={'label': caption or polarization},
             )
             fg.set_axis_labels('easting [km]', 'northing [km]')
@@ -2108,17 +2179,18 @@ class BatchCore(dict):
                     ax.set_title('')
                 elif stackvar in ('pair', 'date') and idx < da[stackvar].size:
                     # Format pair/date titles nicely
-                    coord_val = da[stackvar].values[idx]
                     if stackvar == 'pair':
-                        # pair is a tuple of (ref_date, rep_date)
-                        if hasattr(coord_val, '__iter__') and len(coord_val) == 2:
-                            ref, rep = coord_val
-                            ref_str = pd.Timestamp(ref).strftime('%Y-%m-%d')
-                            rep_str = pd.Timestamp(rep).strftime('%Y-%m-%d')
-                            ax.set_title(f'pair={ref_str} {rep_str}')
-                        elif hasattr(coord_val, 'strftime'):
-                            ax.set_title(f'pair={coord_val.strftime("%Y-%m-%d")}')
+                        # Get ref/rep from non-dimension coordinates
+                        if 'ref' in da.coords and 'rep' in da.coords:
+                            ref_val = da.coords['ref'].values[idx]
+                            rep_val = da.coords['rep'].values[idx]
+                            ref_str = pd.Timestamp(ref_val).strftime('%Y-%m-%d')
+                            rep_str = pd.Timestamp(rep_val).strftime('%Y-%m-%d')
+                            ax.set_title(f'{ref_str} {rep_str}')
+                        else:
+                            ax.set_title(f'pair={idx}')
                     elif stackvar == 'date':
+                        coord_val = da[stackvar].values[idx]
                         if hasattr(coord_val, 'strftime'):
                             ax.set_title(f'date={coord_val.strftime("%Y-%m-%d")}')
                         else:

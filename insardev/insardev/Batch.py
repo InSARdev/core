@@ -61,33 +61,142 @@ class Batch(BatchCore):
         kwargs["caption"] = caption
         return super().plot(*args, **kwargs)
 
-    def velocity(self) -> "Batch":
+    @staticmethod
+    def _velocity_torch(data, times_years, min_valid=3, device='auto', debug=False):
+        """
+        Compute velocity using PyTorch closed-form linear regression.
+
+        Uses the closed-form solution for weighted linear regression which is
+        much more GPU-efficient than batched lstsq:
+            slope = (Σw·Σ(w·t·y) - Σ(w·t)·Σ(w·y)) / (Σw·Σ(w·t²) - (Σ(w·t))²)
+
+        Parameters
+        ----------
+        data : np.ndarray
+            3D array (n_times, height, width) or 2D (n_times, n_pixels).
+        times_years : np.ndarray
+            1D array of time values in years from first date.
+        min_valid : int
+            Minimum valid points required.
+        device : str
+            PyTorch device.
+        debug : bool
+            Print debug info.
+
+        Returns
+        -------
+        np.ndarray
+            2D array (height, width) or 1D (n_pixels) of velocities.
+        """
+        import torch
+        import numpy as np
+
+        # Select device using shared helper (inherited from BatchCore)
+        dev = Batch._get_torch_device(device)
+
+        if debug:
+            print(f'DEBUG: _velocity_torch device={dev}, shape={data.shape}')
+
+        original_shape = data.shape
+        n_times = data.shape[0]
+
+        # Reshape to 2D: (n_times, n_pixels)
+        if data.ndim == 3:
+            data_2d = data.reshape(n_times, -1)
+        else:
+            data_2d = data
+
+        # Move to device
+        y = torch.from_numpy(data_2d.astype(np.float32)).to(dev)  # (n_times, n_pixels)
+        t = torch.from_numpy(times_years.astype(np.float32)).to(dev)  # (n_times,)
+
+        # Handle NaN: create weight mask (1 for valid, 0 for NaN)
+        nan_mask = torch.isnan(y)
+        valid_count = (~nan_mask).sum(dim=0)  # (n_pixels,)
+        w = (~nan_mask).float()  # (n_times, n_pixels)
+
+        # Replace NaN with 0 for computation
+        y_filled = torch.where(nan_mask, torch.zeros_like(y), y)
+
+        # Closed-form weighted linear regression
+        # slope = (Σw·Σ(w·t·y) - Σ(w·t)·Σ(w·y)) / (Σw·Σ(w·t²) - (Σ(w·t))²)
+        # All sums are over the time dimension (dim=0)
+
+        # Broadcast t to match y shape: (n_times,) -> (n_times, n_pixels)
+        t_expanded = t.unsqueeze(1)  # (n_times, 1)
+
+        # Compute weighted sums (all results are (n_pixels,))
+        sum_w = w.sum(dim=0)                           # Σw
+        sum_wt = (w * t_expanded).sum(dim=0)           # Σ(w·t)
+        sum_wy = (w * y_filled).sum(dim=0)             # Σ(w·y)
+        sum_wt2 = (w * t_expanded * t_expanded).sum(dim=0)  # Σ(w·t²)
+        sum_wty = (w * t_expanded * y_filled).sum(dim=0)    # Σ(w·t·y)
+
+        # Compute denominator: Σw·Σ(w·t²) - (Σ(w·t))²
+        denom = sum_w * sum_wt2 - sum_wt * sum_wt
+
+        # Compute numerator: Σw·Σ(w·t·y) - Σ(w·t)·Σ(w·y)
+        numer = sum_w * sum_wty - sum_wt * sum_wy
+
+        # Compute slope (velocity)
+        velocity = numer / denom
+
+        # Mask pixels with insufficient valid points or zero denominator
+        velocity = torch.where(
+            (valid_count >= min_valid) & (denom.abs() > 1e-10),
+            velocity,
+            torch.tensor(float('nan'), device=dev)
+        )
+
+        # Reshape back
+        vel_np = velocity.cpu().numpy()
+        if len(original_shape) == 3:
+            vel_np = vel_np.reshape(original_shape[1], original_shape[2])
+
+        return vel_np
+
+    def velocity(self, min_valid=3, device=None, debug=False) -> "Batch":
         """
         Compute velocity (linear trend) from time series.
 
         Calculates the slope per year for each pixel using linear regression
-        on the 'date' dimension.
+        on the 'date' dimension. Uses PyTorch for GPU acceleration.
+
+        Parameters
+        ----------
+        min_valid : int, optional
+            Minimum number of valid (non-NaN) data points required to compute
+            velocity. Pixels with fewer valid points will be set to NaN.
+            Default is 3.
+        device : str, optional
+            PyTorch device ('cuda', 'mps', 'cpu'). Auto-detected if None.
+            Respects Dask cluster resources={'gpu': 0} to disable GPU.
+        debug : bool, optional
+            Print debug information. Default False.
 
         Returns
         -------
         Batch
-            Batch with velocity (slope per year) for each pixel.
+            Batch with velocity (slope per year) for each pixel (lazy).
 
         Examples
         --------
         >>> displacement = stack.lstsq(detrend, corr)
         >>> velocity = displacement.velocity()
         """
+        import dask
         import numpy as np
+        import pandas as pd
+        import xarray as xr
         import rioxarray  # for .rio accessor
 
         nanoseconds_per_year = 365.25 * 24 * 60 * 60 * 1e9
 
-        def _velocity_da(data):
-            """Compute velocity for a single DataArray."""
-            return (nanoseconds_per_year * data.polyfit('date', 1)
-                    .polyfit_coefficients.sel(degree=1)
-                    .astype(np.float32).rename('velocity'))
+        # Auto-detect device based on Dask cluster resources and hardware
+        device = Batch._get_torch_device(device if device is not None else 'auto', debug=debug)
+
+        if debug:
+            print(f"DEBUG: velocity using device={device}")
 
         # Get CRS from input batch
         crs = self.crs
@@ -97,7 +206,35 @@ class Batch(BatchCore):
             result_vars = {}
             for var in [v for v in ds.data_vars if v != 'spatial_ref']:
                 da = ds[var]
-                result_vars[var] = _velocity_da(da)
+
+                # Convert dates to years from first date
+                dates = pd.to_datetime(da.date.values)
+                times_ns = (dates - dates[0]).total_seconds() * 1e9
+                times_years = np.array(times_ns / nanoseconds_per_year, dtype=np.float32)
+
+                # Create wrapper for apply_ufunc
+                def compute_velocity(data, times_years=times_years, min_valid=min_valid, device=device):
+                    from contextlib import nullcontext
+                    # Use MPS lock to serialize GPU access on Apple Silicon
+                    with Batch._mps_lock() if device.type == 'mps' else nullcontext():
+                        return Batch._velocity_torch(data, times_years, min_valid=min_valid, device=device)
+
+                # Use apply_ufunc with dask='parallelized' for lazy evaluation
+                with dask.annotate(resources={'gpu': 1} if device.type != 'cpu' else {}):
+                    vel_da = xr.apply_ufunc(
+                        compute_velocity,
+                        da,
+                        input_core_dims=[['date', 'y', 'x']],
+                        output_core_dims=[['y', 'x']],
+                        dask='parallelized',
+                        output_dtypes=[np.float32],
+                        dask_gufunc_kwargs={'allow_rechunk': True},
+                    )
+
+                # Assign coordinates
+                vel_da = vel_da.assign_coords({'y': da.y, 'x': da.x})
+                result_vars[var] = vel_da
+
             result_ds = xr.Dataset(result_vars)
             result_ds.attrs = ds.attrs
             # Preserve CRS
@@ -128,6 +265,23 @@ class Batch(BatchCore):
             out[key] = result_ds
         return Batch(out)
 
+    def iexp(self, sign: int = -1, **kwargs):
+        """
+        Apply exp(sign * 1j * da) to convert phase to complex phasor.
+
+        Parameters
+        ----------
+        sign : int, optional
+            Sign of the exponent. Default is -1 for exp(-1j * phase).
+
+        Returns
+        -------
+        BatchComplex
+            Complex phasor representation.
+        """
+        import xarray as xr
+        return BatchComplex(self.map_da(lambda da: xr.ufuncs.exp(sign * 1j * da), **kwargs))
+
 class BatchWrap(BatchCore):
     """
     This class has 'pair' stack variable for the datasets in the dict and stores wrapped phase (real values).
@@ -149,8 +303,7 @@ class BatchWrap(BatchCore):
 
     def __add__(self, other: Batch):
         keys = self.keys()
-        #& other.keys()
-        return type(self)({k: self[k] + other[k] if k in other else self[k] for k in keys})
+        return type(self)({k: (self[k] + other[k] if k in other else self[k]) for k in keys})
 
     def __sub__(self, other: Batch):
         import xarray as xr
@@ -175,8 +328,7 @@ class BatchWrap(BatchCore):
                         result[k] = ds - self[[k]].polyval({k: val})[k]
                     elif has_pair_dim and len(val) == n_pairs:
                         # Multi-pair degree=0: [off0, off1, ...]
-                        offsets = xr.DataArray(val, dims=['pair'],
-                                               coords={'pair': sample_da.coords['pair']})
+                        offsets = xr.DataArray(val, dims=['pair'])
                         result[k] = ds - offsets
                     elif len(val) == 1:
                         # Single value wrapped in list: [offset]
@@ -272,11 +424,6 @@ class BatchWrap(BatchCore):
             
             # Convert back to wrapped phase
             out[key] = agg_result.astype('float32')
-
-            # xarray coarsen + aggregate do not preserve multiindex pair
-            if all(coord in out[key].coords for coord in ('pair', 'ref','rep')) \
-                   and not isinstance(out[key].coords['pair'], pd.MultiIndex):
-                out[key] = out[key].set_index(pair=['ref', 'rep'])
             
         #print ('wrap _agg self.chunks', self.chunks)
         #return type(self)(out).chunk(self.chunks)
@@ -421,7 +568,7 @@ class BatchUnit(BatchCore):
     def plot(
         self,
         cmap = 'auto',
-        caption='Correlation',
+        caption=None,
         alpha=1,
         vmin=0,
         vmax=1,
@@ -622,13 +769,15 @@ class BatchComplex(BatchCore):
             return wgt * data
 
         def apply_goldstein_filter(data, corr, psize, wgt_matrix):
-            # Create an empty array for the output
-            out = np.zeros(data.shape, dtype=np.complex64)
-            # ignore processing for empty chunks 
+            # Create an empty array for the output initialized with NaN
+            out = np.full(data.shape, np.nan + 1j*np.nan, dtype=np.complex64)
+            # ignore processing for empty chunks
             if np.all(np.isnan(data)):
                 return out
-            # Create the weight matrix
-            #wgt_matrix = make_wgt(psize)
+            # Track which pixels are processed (for proper overlap accumulation)
+            processed = np.zeros(data.shape, dtype=np.float32)
+            # Temporary array for accumulation
+            acc = np.zeros(data.shape, dtype=np.complex64)
             # Iterate over windows of the data
             for i in range(0, data.shape[0] - psize['y'], psize['y'] // 2):
                 for j in range(0, data.shape[1] - psize['x'], psize['x'] // 2):
@@ -641,10 +790,14 @@ class BatchComplex(BatchCore):
                         wgt_window = wgt_matrix[:data_window.shape[0],:data_window.shape[1]]
                         # Apply the filter to the window
                         filtered_window = patch_goldstein_filter(data_window, corr_window, wgt_window, psize)
-                        # Add the result to the output array
+                        # Add the result to the accumulation array
                         slice_i = slice(i, min(i + psize['y'], out.shape[0]))
                         slice_j = slice(j, min(j + psize['x'], out.shape[1]))
-                        out[slice_i, slice_j] += filtered_window[:slice_i.stop - slice_i.start, :slice_j.stop - slice_j.start]
+                        acc[slice_i, slice_j] += filtered_window[:slice_i.stop - slice_i.start, :slice_j.stop - slice_j.start]
+                        processed[slice_i, slice_j] += 1
+            # Only set output where pixels were processed
+            mask = processed > 0
+            out[mask] = acc[mask]
             return out
 
         assert phase.shape == corr.shape, f'ERROR: phase and correlation variables have different shape \

@@ -13,62 +13,197 @@ from insardev_toolkit import progressbar
 
 class Stack_ps(Stack_stl):
 
-    #Stack.ps = ps    
-    #stack.ps(interactive=True)
-    #stack.ps()
-    #adi = stack.open_grids(None, 'ps')
-    #adi
-    #ps_decimator = stack.pixel_decimator(resolution=60, grid=adi, debug=True)
-    #adi_dec = adi.coarsen({'y': 4, 'x': 16}, boundary='trim').min()
-    #adi_dec
-    # define PS candidates using Amplitude Dispersion Index (ADI)
-    def compute_ps(self, geometry=None, dates=None, data='auto', name='ps', interactive=False):
-        import xarray as xr
+    def compute_ps(self, *args, **kwargs):
+        """
+        Deprecated. Use psfunction() instead which computes PS function directly using PyTorch.
+
+        Example:
+            psf = stack.psfunction()
+            sintf, scorr = stack.phasediff_multilook(pairs, wavelength=30, weight=psf)
+        """
+        raise NotImplementedError(
+            "compute_ps() is deprecated. Use psfunction() instead:\n"
+            "    psf = stack.psfunction()\n"
+            "    sintf, scorr = stack.phasediff_multilook(pairs, wavelength=30, weight=psf)"
+        )
+
+    @staticmethod
+    def _psfunction_torch(amplitudes, device='auto', debug=False):
+        """
+        Compute PS function using PyTorch for GPU acceleration.
+
+        Parameters
+        ----------
+        amplitudes : np.ndarray
+            3D array of shape (n_dates, height, width) containing amplitude values.
+        device : str
+            Device to use ('auto', 'mps', 'cuda', 'cpu').
+        debug : bool
+            Print debug information.
+
+        Returns
+        -------
+        np.ndarray
+            2D array of shape (height, width) containing PS function values.
+        """
+        import torch
         import numpy as np
+
+        # Select device using shared helper
+        dev = Stack_ps._get_torch_device(device)
+
+        if debug:
+            print(f'DEBUG: _psfunction_torch using device={dev}')
+
+        n_dates, height, width = amplitudes.shape
+
+        # Convert to intensity (|z|^2) and move to device
+        intensity = torch.from_numpy(amplitudes.astype(np.float32) ** 2).to(dev)
+
+        # Compute mean intensity per date for normalization
+        # Shape: (n_dates,)
+        mean_intensity_per_date = intensity.nanmean(dim=(1, 2))
+
+        # Global mean across all dates
+        global_mean = mean_intensity_per_date.nanmean()
+
+        # Normalize each date: intensity * (global_mean / date_mean)
+        # Reshape for broadcasting: (n_dates, 1, 1)
+        norm_factor = global_mean / mean_intensity_per_date
+        norm_factor = norm_factor.view(n_dates, 1, 1)
+        intensity_norm = intensity * norm_factor
+
+        # Compute mean and std across date dimension
+        # Use masked operations to handle NaN
+        mean_amp = intensity_norm.nanmean(dim=0)  # (height, width)
+
+        # PyTorch nanstd - compute manually since not built-in
+        # std = sqrt(E[(x - mean)^2])
+        diff = intensity_norm - mean_amp.unsqueeze(0)
+        # Count non-NaN values
+        valid_mask = ~torch.isnan(intensity_norm)
+        n_valid = valid_mask.sum(dim=0).float()
+        n_valid = torch.clamp(n_valid, min=1)  # Avoid division by zero
+
+        # Variance with Bessel's correction (n-1)
+        variance = torch.where(
+            valid_mask, diff ** 2, torch.tensor(0.0, device=dev)
+        ).sum(dim=0) / (n_valid - 1).clamp(min=1)
+        std_amp = torch.sqrt(variance)
+
+        # PS function: mean / (2 * std)
+        psf = mean_amp / (2 * std_amp)
+
+        # Handle invalid values (inf, nan)
+        psf = torch.where(torch.isfinite(psf), psf, torch.tensor(float('nan'), device=dev))
+
+        # Move back to CPU and convert to numpy
+        return psf.cpu().numpy()
+
+    def psfunction(self, device='auto', debug=False):
+        """
+        Compute PS (Persistent Scatterer) function for weighting in single-look processing.
+
+        The PS function identifies stable scatterers by computing the ratio of mean
+        amplitude to amplitude standard deviation across the temporal stack:
+
+            psfunction = mean_intensity / (2 * std_intensity)
+
+        Higher values indicate more stable scatterers (consistent backscatter).
+
+        Parameters
+        ----------
+        device : str
+            Device for PyTorch computation ('auto', 'mps', 'cuda', 'cpu').
+        debug : bool
+            Print debug information.
+
+        Returns
+        -------
+        BatchUnit
+            Per-burst PS function values for use as weight in phasediff_multilook() (lazy).
+
+        Examples
+        --------
+        # Use PS function as weight for single-look interferograms
+        psf = stack.psfunction()
+        sintf, scorr = stack.phasediff_multilook(pairs, wavelength=30, weight=psf)
+        """
         import dask
-        import os
-        import warnings
-        # suppress Dask warning "RuntimeWarning: invalid value encountered in divide"
-        warnings.filterwarnings('ignore')
-        warnings.filterwarnings('ignore', module='dask')
-        warnings.filterwarnings('ignore', module='dask.core')
-
-        if isinstance(data, str) and data == 'auto':
-            # open SLC data as real intensities
-            data = np.square(np.abs(self.open_data(dates=dates)))
-
-        if geometry is not None:
-            bounds = self.get_bounds(geometry)
-            data = data.sel(y=slice(bounds[1], bounds[3]), x=slice(bounds[0], bounds[2]))
-            if isinstance(geometry, xr.DataArray):
-                data = data.where(geometry).where(np.isfinite(geometry))
-
-        # normalize image amplitudes (intensities)
-        # dask.persist returns tuple
-        progressbar(mean := dask.persist(data.mean(dim=['y','x']))[0], desc='Intensity Normalization')
-        # workaround: apply compute() to calculated mean to prevent weird dask 2025.1.0 error:
-        # Exception: 'AttributeError("\'tuple\' object has no attribute \'size\'")'
-        mean = mean.compute()
-        data_norm = data * (mean.mean(dim='date') / mean)
-        del data
-        # compute average and std.dev.
-        ds = xr.merge([
-            data_norm.mean(dim='date').rename('average'),
-            data_norm.std(dim='date').rename('deviation'),
-            mean.rename('stack_average')
-        ])
-        del mean, data_norm
-        if interactive:
-            return ds
-        self.save_cube(ds, name, 'Compute Stability Measures')
-        del ds
-
-    def psfunction(self, ps='auto', name='ps'):
+        import dask.array
         import numpy as np
-        if isinstance(ps, str) and ps == 'auto':
-            ps = self.get_ps(name)
-        psfunction = (ps.average/(2*ps.deviation))
-        return psfunction.where(np.isfinite(psfunction)).rename('psf')
+        import torch
+        import xarray as xr
+        from .Batch import BatchUnit
+
+        # Auto-detect device based on Dask cluster resources and hardware
+        device = Stack_ps._get_torch_device(device, debug=debug)
+
+        if debug:
+            print(f"DEBUG: psfunction using device={device}")
+
+        results = {}
+        for key, ds in self.items():
+            # Get complex SLC data variable (usually 'VV' or 'VH')
+            complex_vars = [v for v in ds.data_vars if ds[v].dtype.kind == 'c']
+            if not complex_vars:
+                raise ValueError(f"No complex data found in burst {key}")
+
+            # Use first complex variable
+            var_name = complex_vars[0]
+            slc_data = ds[var_name]
+
+            # Ensure data is chunked for lazy processing (chunk in y,x, not date)
+            if not isinstance(slc_data.data, dask.array.Array):
+                slc_data = slc_data.chunk({'y': 512, 'x': 512})
+
+            if debug:
+                print(f'DEBUG: psfunction for {key}: shape={slc_data.shape}, chunks={slc_data.chunks}')
+
+            # Create wrapper that captures device and debug
+            def make_wrapper(dev, dbg):
+                def process_wrapper(slc_chunk):
+                    """Process spatial chunk: (chunk_y, chunk_x, n_dates) -> (chunk_y, chunk_x)
+
+                    Note: input_core_dims=[['date']] moves date to last axis.
+                    """
+                    from contextlib import nullcontext
+                    # Transpose to (n_dates, chunk_y, chunk_x) for _psfunction_torch
+                    slc_transposed = np.moveaxis(slc_chunk, -1, 0)
+                    # Compute amplitude |z|
+                    amplitudes = np.abs(slc_transposed)
+                    # Use MPS lock to serialize GPU access on Apple Silicon
+                    with Stack_ps._mps_lock() if dev.type == 'mps' else nullcontext():
+                        # Compute PS function using PyTorch
+                        psf_values = Stack_ps._psfunction_torch(amplitudes, device=dev, debug=dbg)
+                    return psf_values.astype(np.float32)
+                return process_wrapper
+
+            wrapper = make_wrapper(device, debug)
+
+            # Rechunk so date is a single chunk (required for core dim reduction)
+            slc_data = slc_data.chunk({'date': -1})
+
+            # Use xr.apply_ufunc with dask='parallelized' for lazy execution
+            # Core dim is 'date' (reduction), chunked dims are y, x
+            # Note: input_core_dims moves 'date' to last axis, wrapper transposes back
+            # Use GPU annotation to prevent MPS command buffer conflicts
+            with dask.annotate(resources={'gpu': 1} if device.type != 'cpu' else {}):
+                psf_da = xr.apply_ufunc(
+                    wrapper,
+                    slc_data,
+                    input_core_dims=[['date']],
+                    output_core_dims=[[]],
+                    dask='parallelized',
+                    output_dtypes=[np.float32],
+                )
+
+            # Assign name to match SLC variable
+            psf_da.name = var_name
+
+            results[key] = xr.Dataset({var_name: psf_da})
+
+        return BatchUnit(results)
 
     def plot_psfunction(self, data='auto', caption='PS Function', cmap='gray', quantile=None, vmin=None, vmax=None, **kwargs):
         import numpy as np
@@ -87,7 +222,7 @@ class Stack_ps(Stack_stl):
             vmin, vmax = np.nanquantile(data, quantile)
 
         plt.figure()
-        data.plot.imshow(cmap=cmap, vmin=vmin, vmax=vmax)
+        data.plot.imshow(cmap=cmap, vmin=vmin, vmax=vmax, interpolation='none')
         #self.plot_AOI(**kwargs)
         #self.plot_POI(**kwargs)
         #plt.xlabel('Range')

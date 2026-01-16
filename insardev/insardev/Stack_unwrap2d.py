@@ -910,8 +910,8 @@ class Stack_unwrap2d(Stack_unwrap1d):
     # =========================================================================
 
     @staticmethod
-    def _irls_unwrap_2d(phase, weight=None, device=None, max_iter=10, tol=1e-2,
-                        cg_max_iter=10, cg_tol=1e-3, epsilon=1e-2, debug=False):
+    def _irls_unwrap_2d(phase, weight=None, device=None, max_iter=50, tol=1e-3,
+                        cg_max_iter=20, cg_tol=1e-4, epsilon=1e-2, debug=False):
         """
         Unwrap 2D phase using GPU/TPU-accelerated Iteratively Reweighted Least Squares (L¹ norm).
 
@@ -932,13 +932,13 @@ class Stack_unwrap2d(Stack_unwrap1d):
         device : torch.device, optional
             PyTorch device to use. If None, auto-detects best device.
         max_iter : int, optional
-            Maximum IRLS iterations. Default is 10.
+            Maximum IRLS iterations. Default is 50.
         tol : float, optional
-            Convergence tolerance for relative change in solution. Default is 1e-2.
+            Convergence tolerance for relative change in solution. Default is 1e-3.
         cg_max_iter : int, optional
-            Maximum conjugate gradient iterations per IRLS step. Default is 10.
+            Maximum conjugate gradient iterations per IRLS step. Default is 20.
         cg_tol : float, optional
-            Conjugate gradient convergence tolerance. Default is 1e-3.
+            Conjugate gradient convergence tolerance. Default is 1e-4.
         epsilon : float, optional
             Smoothing parameter for L¹ approximation. Default is 1e-2.
         debug : bool, optional
@@ -961,16 +961,14 @@ class Stack_unwrap2d(Stack_unwrap1d):
 
         Achieves 10-20x speedup over SNAPHU on GPU/TPU.
 
-        Default parameters are optimized for InSAR processing with float32:
-        - epsilon=1e-2: Larger than paper's 1e-6 for numerical stability.
-          Smaller values give sharper L¹ approximation but need more iterations.
-        - tol=1e-2: Stops at ~1% relative change (~0.03 rad for typical phase).
-          Use tol=1e-3 for higher precision at ~2x slower speed.
-        - max_iter=10, cg_max_iter=10: Sufficient for most InSAR data.
-          For complex scenes, try max_iter=20, cg_max_iter=15.
+        Default parameters ensure robust convergence for InSAR processing:
+        - max_iter=50, cg_max_iter=20: Ensures full convergence, avoiding
+          phase discontinuities from early termination.
+        - tol=1e-3, cg_tol=1e-4: Tight tolerances for accurate results.
+        - epsilon=1e-2: Balances L¹ approximation quality with stability.
 
-        For higher accuracy (closer to original paper, ~2-3x slower):
-        >>> stack.unwrap2d(intf, corr, epsilon=1e-4, tol=1e-3, max_iter=20)
+        For faster processing on clean data (may have artifacts on noisy data):
+        >>> stack.unwrap2d(intf, corr, max_iter=20, tol=1e-2)
         """
         import torch
         from torch_dct import dct_2d, idct_2d
@@ -1315,7 +1313,7 @@ class Stack_unwrap2d(Stack_unwrap1d):
         return unwrapped
 
     def unwrap2d_irls(self, phase, weight=None, conncomp=False, conncomp_size=100, device=None,
-                      max_iter=10, tol=1e-2, cg_max_iter=10, cg_tol=1e-3, epsilon=1e-2, debug=False):
+                      max_iter=50, tol=1e-2, cg_max_iter=10, cg_tol=1e-3, epsilon=1e-2, debug=False):
         """
         Unwrap phase using GPU-accelerated IRLS algorithm (L¹ norm).
 
@@ -1345,7 +1343,7 @@ class Stack_unwrap2d(Stack_unwrap1d):
             'auto' selects the best available GPU, falling back to CPU.
             Use 'tpu' on Google Colab/Cloud TPU instances (experimental).
         max_iter : int, optional
-            Maximum IRLS iterations. Default is 10.
+            Maximum IRLS iterations. Default is 50.
         tol : float, optional
             Convergence tolerance for relative change. Default is 1e-2.
         cg_max_iter : int, optional
@@ -1382,21 +1380,9 @@ class Stack_unwrap2d(Stack_unwrap1d):
         assert isinstance(phase, BatchWrap), 'ERROR: phase should be a BatchWrap object'
         assert weight is None or isinstance(weight, BatchUnit), 'ERROR: weight should be a BatchUnit object'
 
-        # Resolve device
-        if device is None:
-            if torch.cuda.is_available():
-                device = 'cuda'
-                device_name = f"CUDA ({torch.cuda.get_device_name(0)})"
-            elif torch.backends.mps.is_available():
-                device = 'mps'
-                device_name = "MPS (Apple Silicon GPU)"
-            else:
-                device = 'cpu'
-                device_name = "CPU"
-        elif device == 'tpu':
-            device_name = "TPU (Google Cloud TPU via XLA)"
-        else:
-            device_name = device.upper()
+        # Resolve device using shared helper (handles Dask cluster resources)
+        device = Stack_unwrap2d._get_torch_device(device if device is not None else 'auto', debug=debug)
+        device_name = str(device).upper()
 
         if debug:
             print(f'Using device: {device_name}')
@@ -1424,30 +1410,27 @@ class Stack_unwrap2d(Stack_unwrap1d):
                 phase_da = phase_ds[var]
                 weight_da = weight_ds[var] if weight_ds is not None else None
 
-                # Save original coordinates before chunking (they may become lazy)
-                # For dask arrays, compute() to get actual values
-                # Preserve dimension info for non-dimension coordinates (like BPR along 'pair')
-                original_coords = {}
-                for k, v in phase_da.coords.items():
-                    if hasattr(v, 'data') and hasattr(v.data, 'compute'):
-                        vals = v.compute().values
-                    elif hasattr(v, 'values'):
-                        vals = v.values
-                    else:
-                        vals = v
-                    # Preserve dimension tuple for coordinates that have dimensions
-                    # different from their name (e.g., BPR with dims=('pair',))
-                    if hasattr(v, 'dims') and len(v.dims) > 0 and v.dims != (k,):
-                        original_coords[k] = (v.dims, vals)
-                    else:
-                        original_coords[k] = vals
-
                 # Ensure data is chunked for lazy processing (1 chunk per pair)
                 if 'pair' in phase_da.dims:
                     if not isinstance(phase_da.data, dask.array.Array):
                         phase_da = phase_da.chunk({'pair': 1})
                     if weight_da is not None and not isinstance(weight_da.data, dask.array.Array):
                         weight_da = weight_da.chunk({'pair': 1})
+
+                # Save non-dimension coords along pair (ref, rep, BPR) for output
+                pair_coords = {}
+                n_pairs = None
+                if 'pair' in phase_da.dims:
+                    n_pairs = phase_da.sizes['pair']
+                    for k, v in phase_da.coords.items():
+                        if k != 'pair' and hasattr(v, 'dims') and v.dims == ('pair',):
+                            vals = v.values if hasattr(v, 'values') else v
+                            pair_coords[k] = ('pair', vals)
+                    # Drop pair coordinate - use positional indexing only
+                    if 'pair' in phase_da.indexes:
+                        phase_da = phase_da.reset_index('pair', drop=True)
+                    if weight_da is not None and 'pair' in weight_da.indexes:
+                        weight_da = weight_da.reset_index('pair', drop=True)
 
                 # Use xr.apply_ufunc with dask='parallelized' for proper lazy execution
                 # With chunk={'pair': 1}, dask splits (n_pairs, y, x) into n_pairs chunks of (1, y, x)
@@ -1459,14 +1442,17 @@ class Stack_unwrap2d(Stack_unwrap1d):
                     Input: phase_chunk shape (1, y, x) - single pair chunk
                     Output: shape (1, 2, y, x) where dim 1 is [unwrapped, labels]
                     """
+                    from contextlib import nullcontext
                     # Squeeze to 2D for processing
                     phase_2d = phase_chunk[0]
                     weight_2d = weight_chunk[0] if weight_chunk is not None else None
 
-                    unwrapped, labels = self._process_irls_slice(
-                        phase_2d, weight_2d, device, conncomp_size,
-                        max_iter, tol, cg_max_iter, cg_tol, epsilon, debug
-                    )
+                    # Use MPS lock to serialize GPU access on Apple Silicon
+                    with Stack_unwrap2d._mps_lock() if device.type == 'mps' else nullcontext():
+                        unwrapped, labels = self._process_irls_slice(
+                            phase_2d, weight_2d, device, conncomp_size,
+                            max_iter, tol, cg_max_iter, cg_tol, epsilon, debug
+                        )
                     # Stack and add pair dim back: (2, y, x) -> (1, 2, y, x)
                     result = np.stack([unwrapped, labels.astype(np.float32)], axis=0)
                     result = result[np.newaxis, ...]
@@ -1474,7 +1460,7 @@ class Stack_unwrap2d(Stack_unwrap1d):
 
                 # dask='parallelized' processes each chunk independently
                 # input_core_dims=[['y', 'x']] so pair dim is chunked, function receives (1, y, x)
-                with dask.annotate(resources={'gpu': 1} if device != 'cpu' else {}):
+                with dask.annotate(resources={'gpu': 1} if device.type != 'cpu' else {}):
                     result = xr.apply_ufunc(
                         process_wrapper,
                         *([phase_da] if weight_da is None else [phase_da, weight_da]),
@@ -1490,9 +1476,10 @@ class Stack_unwrap2d(Stack_unwrap1d):
                 result_da.attrs['units'] = 'radians'
                 comp_da = result.isel(output=1).astype(np.int32)
 
-                # Restore coordinates from original (non-lazy) values
-                result_da = result_da.assign_coords(original_coords)
-                comp_da = comp_da.assign_coords(original_coords)
+                # Assign non-dimension coords (ref, rep, BPR) - pair uses positional indexing
+                if pair_coords:
+                    result_da = result_da.assign_coords(**pair_coords)
+                    comp_da = comp_da.assign_coords(**pair_coords)
 
                 unwrap_vars[var] = result_da
                 comp_vars[var] = comp_da
@@ -1584,3 +1571,621 @@ class Stack_unwrap2d(Stack_unwrap1d):
             print(f'  Final result: {nan_in_final}/{np.sum(valid_original)} NaN in valid region')
 
         return result, labels
+
+    # =========================================================================
+    # Discontinuity Detection for Phase Unwrapping
+    # =========================================================================
+
+    @staticmethod
+    def _wrap(phase):
+        """Wrap phase to [-π, π]."""
+        return np.arctan2(np.sin(phase), np.cos(phase))
+
+    @staticmethod
+    def _wrapped_gradient(phase):
+        """Compute wrapped phase gradients (handling phase wrapping)."""
+        dx = np.zeros_like(phase)
+        dx[:, :-1] = phase[:, 1:] - phase[:, :-1]
+        dx = Stack_unwrap2d._wrap(dx)
+
+        dy = np.zeros_like(phase)
+        dy[:-1, :] = phase[1:, :] - phase[:-1, :]
+        dy = Stack_unwrap2d._wrap(dy)
+
+        return dx, dy
+
+    @staticmethod
+    def _detect_discontinuity_hough_focal(phase, grad_threshold=2.0, mask_width=3, debug=False):
+        """
+        Detect discontinuity using Hough transform with focal point (tip) detection.
+
+        Finds the fault direction via Hough transform, then locates the tip
+        by finding where gradient magnitude drops along the line.
+
+        Parameters
+        ----------
+        phase : np.ndarray
+            2D wrapped phase array.
+        grad_threshold : float
+            Gradient magnitude threshold for edge detection (radians).
+            Default 2.0 rad ≈ 0.64π.
+        mask_width : int
+            Half-width of the mask along the detected line. Default 3.
+        debug : bool
+            Print diagnostic information.
+
+        Returns
+        -------
+        mask : np.ndarray
+            Boolean mask, True = discontinuity pixels to be masked as NaN.
+        info : dict
+            Detection info: focal_point, angle, n_masked.
+        """
+        import cv2
+
+        height, width = phase.shape
+
+        # Compute gradient magnitude
+        dx, dy = Stack_unwrap2d._wrapped_gradient(phase)
+        grad_mag = np.sqrt(dx**2 + dy**2)
+
+        # Create binary edge image
+        edges = (grad_mag > grad_threshold).astype(np.uint8) * 255
+        nan_mask = np.isnan(phase)
+        edges[nan_mask] = 0
+
+        # Standard Hough transform to find dominant line direction
+        lines = cv2.HoughLines(edges, rho=1, theta=np.pi/180, threshold=100)
+
+        if lines is None or len(lines) == 0:
+            if debug:
+                print('  No lines detected by Hough transform')
+            return np.zeros((height, width), dtype=bool), {'focal_point': None, 'angle': None, 'n_masked': 0}
+
+        # Get dominant line parameters
+        rho, theta = lines[0][0]
+        cos_t, sin_t = np.cos(theta), np.sin(theta)
+
+        if debug:
+            print(f'  Hough detected line: rho={rho:.1f}, theta={np.rad2deg(theta):.1f}°')
+
+        # Sample points along the detected line
+        if abs(sin_t) > abs(cos_t):
+            x_samples = np.arange(0, width, 5)
+            y_samples = ((rho - x_samples * cos_t) / sin_t).astype(int)
+            valid = (y_samples >= 0) & (y_samples < height)
+            x_samples, y_samples = x_samples[valid], y_samples[valid]
+        else:
+            y_samples = np.arange(0, height, 5)
+            x_samples = ((rho - y_samples * sin_t) / cos_t).astype(int)
+            valid = (x_samples >= 0) & (x_samples < width)
+            x_samples, y_samples = x_samples[valid], y_samples[valid]
+
+        if len(x_samples) == 0:
+            return np.zeros((height, width), dtype=bool), {'focal_point': None, 'angle': None, 'n_masked': 0}
+
+        # Compute gradient magnitude along the line
+        grad_along_line = []
+        for x, y in zip(x_samples, y_samples):
+            y_min, y_max = max(0, y-5), min(height, y+5)
+            x_min, x_max = max(0, x-5), min(width, x+5)
+            window_grad = grad_mag[y_min:y_max, x_min:x_max]
+            grad_along_line.append(np.nanmean(window_grad))
+
+        grad_along_line = np.array(grad_along_line)
+
+        # Find segment of line with high gradient (the fault)
+        threshold = grad_threshold * 0.5
+        high_grad = grad_along_line > threshold
+
+        if not np.any(high_grad):
+            return np.zeros((height, width), dtype=bool), {'focal_point': None, 'angle': None, 'n_masked': 0}
+
+        # Find the extent of high-gradient region (the fault segment)
+        high_indices = np.where(high_grad)[0]
+        start_idx = high_indices[0]
+        end_idx = high_indices[-1]
+
+        # Get start and end points of the fault segment
+        start_y, start_x = int(y_samples[start_idx]), int(x_samples[start_idx])
+        end_y, end_x = int(y_samples[end_idx]), int(x_samples[end_idx])
+
+        # Apply edge margin constraint - don't let mask touch image boundaries
+        # This prevents disconnecting the two sides of the fault
+        edge_margin = int(min(height, width) * 0.05)  # 5% margin
+        if start_x < edge_margin or start_y < edge_margin or \
+           start_x >= width - edge_margin or start_y >= height - edge_margin:
+            # Find first point that's inside the margin
+            for idx in high_indices:
+                y, x = int(y_samples[idx]), int(x_samples[idx])
+                if edge_margin <= x < width - edge_margin and edge_margin <= y < height - edge_margin:
+                    start_idx = idx
+                    start_y, start_x = y, x
+                    break
+
+        if end_x < edge_margin or end_y < edge_margin or \
+           end_x >= width - edge_margin or end_y >= height - edge_margin:
+            # Find last point that's inside the margin
+            for idx in reversed(high_indices):
+                y, x = int(y_samples[idx]), int(x_samples[idx])
+                if edge_margin <= x < width - edge_margin and edge_margin <= y < height - edge_margin:
+                    end_idx = idx
+                    end_y, end_x = y, x
+                    break
+
+        if debug:
+            print(f'  Fault segment: ({start_y}, {start_x}) to ({end_y}, {end_x})')
+
+        # Create mask along the entire fault segment
+        mask = np.zeros((height, width), dtype=bool)
+
+        # Mask all points along the line segment from start to end
+        n_points = max(abs(end_x - start_x), abs(end_y - start_y)) * 2
+        if n_points > 0:
+            for i in range(n_points + 1):
+                t = i / n_points
+                py = int(start_y + t * (end_y - start_y))
+                px = int(start_x + t * (end_x - start_x))
+
+                if 0 <= py < height and 0 <= px < width:
+                    for ddy in range(-mask_width, mask_width + 1):
+                        for ddx in range(-mask_width, mask_width + 1):
+                            yy, xx = py + ddy, px + ddx
+                            if 0 <= yy < height and 0 <= xx < width:
+                                mask[yy, xx] = True
+
+        n_masked = np.sum(mask)
+        if debug:
+            print(f'  Mask: {n_masked} pixels')
+
+        # Check if mask splits image into disconnected regions
+        from scipy import ndimage
+        valid_region = ~mask
+        labeled, n_components = ndimage.label(valid_region)
+        splits_image = n_components > 1
+
+        if debug and splits_image:
+            print(f'  WARNING: Mask splits image into {n_components} disconnected regions!')
+
+        info = {
+            'start_point': (start_y, start_x),
+            'end_point': (end_y, end_x),
+            'angle': theta,
+            'n_masked': n_masked,
+            'splits_image': splits_image,
+            'n_components': n_components
+        }
+
+        return mask, info
+
+    @staticmethod
+    def _detect_discontinuity_hough(phase, grad_threshold=2.0, mask_width=3, debug=False):
+        """
+        Detect discontinuity using Hough transform - masks the full detected line.
+
+        Unlike hough_focal which tries to find the fault segment, this method
+        masks the entire Hough line across the image. Use this when you want
+        to see if the line would split the image.
+
+        Parameters
+        ----------
+        phase : np.ndarray
+            2D wrapped phase array
+        grad_threshold : float
+            Gradient threshold for Hough detection
+        mask_width : int
+            Half-width of mask
+        debug : bool
+            Print debug info
+
+        Returns
+        -------
+        mask : np.ndarray
+            Boolean mask
+        info : dict
+            Detection info including 'splits_image' flag
+        """
+        import cv2
+        from scipy import ndimage
+
+        phase = np.asarray(phase)
+        height, width = phase.shape
+
+        # Compute gradient magnitude using wrap-aware gradient
+        dx, dy = Stack_unwrap2d._wrapped_gradient(phase)
+        grad_mag = np.sqrt(dx**2 + dy**2)
+
+        # Binary edge image
+        edges = (grad_mag > grad_threshold).astype(np.uint8) * 255
+        nan_mask = np.isnan(phase)
+        edges[nan_mask] = 0
+
+        if not np.any(edges):
+            return np.zeros((height, width), dtype=bool), {
+                'angle': None, 'n_masked': 0, 'splits_image': False, 'n_components': 1
+            }
+
+        # Hough transform using OpenCV
+        lines = cv2.HoughLines(edges, rho=1, theta=np.pi/180, threshold=50)
+
+        if lines is None or len(lines) == 0:
+            return np.zeros((height, width), dtype=bool), {
+                'angle': None, 'n_masked': 0, 'splits_image': False, 'n_components': 1
+            }
+
+        # Get strongest line
+        rho, theta = lines[0][0]
+
+        if debug:
+            print(f'  Hough line: rho={rho:.1f}, theta={np.rad2deg(theta):.1f}°')
+
+        angle = theta
+        dist = rho
+
+        # Create mask along the FULL line (not just high-gradient segment)
+        # OpenCV Hough: x*cos(theta) + y*sin(theta) = rho
+        mask = np.zeros((height, width), dtype=bool)
+
+        cos_t = np.cos(angle)
+        sin_t = np.sin(angle)
+
+        # Sample points along the line across the entire image
+        if abs(sin_t) > abs(cos_t):
+            # Line is more horizontal - iterate over x
+            for x in range(width):
+                y = int((dist - x * cos_t) / sin_t)
+                if 0 <= y < height:
+                    for ddy in range(-mask_width, mask_width + 1):
+                        for ddx in range(-mask_width, mask_width + 1):
+                            yy, xx = y + ddy, x + ddx
+                            if 0 <= yy < height and 0 <= xx < width:
+                                mask[yy, xx] = True
+        else:
+            # Line is more vertical - iterate over y
+            for y in range(height):
+                x = int((dist - y * sin_t) / cos_t)
+                if 0 <= x < width:
+                    for ddy in range(-mask_width, mask_width + 1):
+                        for ddx in range(-mask_width, mask_width + 1):
+                            yy, xx = y + ddy, x + ddx
+                            if 0 <= yy < height and 0 <= xx < width:
+                                mask[yy, xx] = True
+
+        n_masked = np.sum(mask)
+
+        # Check if mask splits image
+        valid_region = ~mask
+        labeled, n_components = ndimage.label(valid_region)
+        splits_image = n_components > 1
+
+        if debug:
+            print(f'  Mask: {n_masked} pixels')
+            if splits_image:
+                print(f'  WARNING: Mask splits image into {n_components} disconnected regions!')
+
+        info = {
+            'angle': angle,
+            'rho': dist,
+            'n_masked': n_masked,
+            'splits_image': splits_image,
+            'n_components': n_components
+        }
+
+        return mask, info
+
+    def unwrap2d_dataset_mask(self, phase, method='hough_focal', grad_threshold=2.0,
+                               mask_width=3, debug=False):
+        """
+        Detect discontinuities in wrapped phase and return a mask for unwrapping.
+
+        This function identifies phase discontinuities (e.g., fault lines) that
+        should be masked before phase unwrapping to prevent smoothing artifacts.
+
+        Parameters
+        ----------
+        phase : xr.Dataset
+            Wrapped phase dataset.
+        method : str
+            Detection method. Currently supported:
+            - 'hough_focal': Hough transform with focal point (tip) detection.
+              Best for linear discontinuities with a clear endpoint.
+        grad_threshold : float
+            Gradient magnitude threshold for edge detection (radians).
+            Default 2.0 rad ≈ 0.64π. Lower values detect more edges.
+        mask_width : int
+            Half-width of the mask along detected discontinuities. Default 3.
+        debug : bool
+            Print diagnostic information. Default False.
+
+        Returns
+        -------
+        mask : xr.Dataset
+            Boolean mask dataset with same coordinates as input.
+            True = discontinuity pixels that should be masked as NaN before unwrapping.
+
+        Examples
+        --------
+        Detect and mask discontinuities before unwrapping:
+
+        >>> # Get wrapped phase
+        >>> intf_ds = intf.align().dissolve().compute().to_dataset()
+        >>> corr_ds = corr.dissolve().compute().to_dataset()
+        >>>
+        >>> # Detect discontinuities
+        >>> mask = stack.unwrap2d_dataset_mask(intf_ds, method='hough_focal')
+        >>>
+        >>> # Apply mask to phase
+        >>> intf_masked = intf_ds.where(~mask)
+        >>> corr_masked = corr_ds.where(~mask)
+        >>>
+        >>> # Unwrap
+        >>> unwrapped = stack.unwrap2d_dataset(intf_masked, corr_masked)
+
+        Notes
+        -----
+        The 'hough_focal' method works by:
+        1. Computing wrapped phase gradients
+        2. Finding high-gradient pixels (potential discontinuities)
+        3. Using Hough transform to detect dominant line direction
+        4. Finding the "tip" where gradient magnitude drops
+        5. Creating a mask from the tip along the fault direction
+
+        This preserves the discontinuity while allowing smooth regions to
+        unwrap correctly around the fault tip.
+        """
+        import xarray as xr
+
+        if not isinstance(phase, xr.Dataset):
+            raise TypeError(f"phase must be xr.Dataset, got {type(phase).__name__}")
+
+        # Get data variable name (first one)
+        var_names = list(phase.data_vars)
+        if not var_names:
+            raise ValueError("phase dataset has no data variables")
+        var_name = var_names[0]
+
+        # Get phase data as numpy array
+        phase_data = phase[var_name].values
+
+        if phase_data.ndim != 2:
+            raise ValueError(f"Expected 2D phase data, got {phase_data.ndim}D")
+
+        # Detect discontinuities
+        if method == 'hough_focal':
+            mask_data, info = self._detect_discontinuity_hough_focal(
+                phase_data,
+                grad_threshold=grad_threshold,
+                mask_width=mask_width,
+                debug=debug
+            )
+        else:
+            raise ValueError(f"Unknown method: {method}. Supported: 'hough_focal'")
+
+        if debug:
+            if info['focal_point'] is not None:
+                print(f"Discontinuity detected:")
+                print(f"  Focal point: {info['focal_point']}")
+                print(f"  Angle: {np.rad2deg(info['angle']):.1f}°")
+                print(f"  Masked pixels: {info['n_masked']}")
+            else:
+                print("No discontinuity detected")
+
+        # Create output dataset with same structure
+        mask_da = xr.DataArray(
+            mask_data,
+            dims=phase[var_name].dims,
+            coords=phase[var_name].coords,
+            name='mask'
+        )
+
+        return mask_da.to_dataset(name=var_name)
+
+    @staticmethod
+    def _snaphu_unwrap_array(phase_arr, corr_arr=None, defomax=0, debug=False):
+        """
+        Unwrap a single 2D phase array using SNAPHU via pipes.
+
+        Parameters
+        ----------
+        phase_arr : np.ndarray
+            2D wrapped phase array in radians.
+        corr_arr : np.ndarray, optional
+            2D correlation array (0-1). If None, uniform weight is used.
+        defomax : float, optional
+            Maximum expected deformation in cycles. 0 = smooth mode. Default 0.
+        debug : bool, optional
+            Print debug info. Default False.
+
+        Returns
+        -------
+        unwrap_arr : np.ndarray
+            2D unwrapped phase array.
+        """
+        import subprocess
+        import os
+        import tempfile
+
+        nrow, ncol = phase_arr.shape
+
+        # Build SNAPHU config
+        # Note: NPROC only applies to tiled mode, non-tiled uses 1 CPU
+        conf = f"""
+INFILEFORMAT   FLOAT_DATA
+OUTFILEFORMAT  FLOAT_DATA
+CORRFILEFORMAT FLOAT_DATA
+ALTITUDE       693000.0
+EARTHRADIUS    6378000.0
+NEARRANGE      831000
+DR             18.4
+DA             28.2
+RANGERES       28
+AZRES          44
+LAMBDA         0.0554658
+NLOOKSRANGE    1
+NLOOKSAZ       1
+NPROC          1
+DEFOMAX_CYCLE  {defomax}
+"""
+
+        # Create temp directory for SNAPHU files
+        with tempfile.TemporaryDirectory(prefix='snaphu_') as tmpdir:
+            phase_file = os.path.join(tmpdir, 'phase.bin')
+            mask_file = os.path.join(tmpdir, 'mask.bin')
+            corr_file = os.path.join(tmpdir, 'corr.bin')
+            unwrap_file = os.path.join(tmpdir, 'unwrap.bin')
+
+            # Write phase (NaN -> 0)
+            phase_filled = np.where(np.isnan(phase_arr), 0, phase_arr).astype(np.float32)
+            phase_filled.tofile(phase_file)
+
+            # Write mask (valid=1, NaN=0)
+            mask = np.where(np.isnan(phase_arr), 0, 1).astype(np.uint8)
+            mask.tofile(mask_file)
+
+            # Build command
+            argv = ['snaphu', phase_file, str(ncol), '-M', mask_file,
+                    '-f', '/dev/stdin', '-o', unwrap_file, '-d']
+
+            # Add correlation if provided
+            if corr_arr is not None:
+                corr_filled = np.where(np.isnan(corr_arr), 0, corr_arr).astype(np.float32)
+                corr_filled.tofile(corr_file)
+                argv.extend(['-c', corr_file])
+
+            if debug:
+                argv.append('-v')
+                print(f'DEBUG: snaphu argv: {argv}')
+
+            # Run SNAPHU
+            p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, encoding='utf8')
+            stdout, stderr = p.communicate(input=conf)
+
+            if debug and stderr:
+                print(f'DEBUG: snaphu stderr:\n{stderr}')
+
+            # Read output
+            if os.path.exists(unwrap_file):
+                unwrap_arr = np.fromfile(unwrap_file, dtype=np.float32).reshape(nrow, ncol)
+                # Restore NaN mask
+                unwrap_arr = np.where(np.isnan(phase_arr), np.nan, unwrap_arr)
+                # Remove mean (same as IRLS does for consistency)
+                valid_mask = ~np.isnan(unwrap_arr)
+                if np.any(valid_mask):
+                    unwrap_arr[valid_mask] -= np.nanmean(unwrap_arr)
+            else:
+                if debug:
+                    print(f'DEBUG: SNAPHU failed, output file not found')
+                unwrap_arr = np.full((nrow, ncol), np.nan, dtype=np.float32)
+
+        return unwrap_arr
+
+    def unwrap2d_snaphu(self, phase, corr=None, defomax=0, debug=False):
+        """
+        Unwrap phase using SNAPHU algorithm.
+
+        Simplified SNAPHU wrapper for single-burst processing.
+        No tiling needed as bursts are small enough.
+
+        Parameters
+        ----------
+        phase : BatchWrap
+            Batch of wrapped phase datasets with 'pair' dimension.
+        corr : BatchUnit, optional
+            Batch of correlation values. If None, uniform weight is used.
+        defomax : float, optional
+            Maximum expected deformation in cycles per pixel.
+            0 = smooth mode (default), good for atmospheric/orbital signals.
+            Use higher values (e.g., 1.2) for deformation with discontinuities.
+        debug : bool, optional
+            Print debug information. Default False.
+
+        Returns
+        -------
+        Batch
+            Batch of unwrapped phase datasets (lazy).
+
+        Examples
+        --------
+        >>> intf, corr = stack.phasediff_multilook(pairs, wavelength=30)
+        >>> unwrapped = stack.unwrap2d_snaphu(intf, corr).compute()
+        """
+        import dask
+        import dask.array
+        import xarray as xr
+        from .Batch import Batch
+
+        results = {}
+
+        for key in phase.keys():
+            phase_ds = phase[key]
+            corr_ds = corr[key] if corr is not None else None
+
+            result_vars = {}
+            for var in phase_ds.data_vars:
+                if var == 'spatial_ref':
+                    continue
+
+                phase_da = phase_ds[var]
+                corr_da = corr_ds[var] if corr_ds is not None and var in corr_ds else None
+
+                # Ensure data is chunked for lazy processing (1 chunk per pair)
+                if 'pair' in phase_da.dims:
+                    if not isinstance(phase_da.data, dask.array.Array):
+                        phase_da = phase_da.chunk({'pair': 1})
+                    if corr_da is not None and not isinstance(corr_da.data, dask.array.Array):
+                        corr_da = corr_da.chunk({'pair': 1})
+
+                # Save non-dimension coords along pair (ref, rep, BPR) for output
+                pair_coords = {}
+                if 'pair' in phase_da.dims:
+                    for k, v in phase_da.coords.items():
+                        if k != 'pair' and hasattr(v, 'dims') and v.dims == ('pair',):
+                            vals = v.values if hasattr(v, 'values') else v
+                            pair_coords[k] = ('pair', vals)
+
+                # Create wrapper that captures defomax and debug
+                def make_wrapper(defomax_val, debug_val):
+                    def process_wrapper(phase_chunk, corr_chunk=None):
+                        """Process single pair chunk: (1, y, x) -> (1, y, x)"""
+                        phase_2d = phase_chunk[0]
+                        corr_2d = corr_chunk[0] if corr_chunk is not None else None
+                        unwrap_2d = Stack_unwrap2d._snaphu_unwrap_array(
+                            phase_2d, corr_2d, defomax=defomax_val, debug=debug_val
+                        )
+                        return unwrap_2d[np.newaxis, ...].astype(np.float32)
+                    return process_wrapper
+
+                wrapper = make_wrapper(defomax, debug)
+
+                # Use xr.apply_ufunc with dask='parallelized' for lazy execution
+                if corr_da is None:
+                    unwrap_da = xr.apply_ufunc(
+                        wrapper,
+                        phase_da,
+                        input_core_dims=[['y', 'x']],
+                        output_core_dims=[['y', 'x']],
+                        dask='parallelized',
+                        output_dtypes=[np.float32],
+                    )
+                else:
+                    unwrap_da = xr.apply_ufunc(
+                        wrapper,
+                        phase_da, corr_da,
+                        input_core_dims=[['y', 'x'], ['y', 'x']],
+                        output_core_dims=[['y', 'x']],
+                        dask='parallelized',
+                        output_dtypes=[np.float32],
+                    )
+
+                # Restore pair coords
+                if pair_coords:
+                    unwrap_da = unwrap_da.assign_coords(**pair_coords)
+
+                result_vars[var] = unwrap_da
+
+            result_ds = xr.Dataset(result_vars)
+            result_ds.attrs = phase_ds.attrs
+            results[key] = result_ds
+
+        return Batch(results)

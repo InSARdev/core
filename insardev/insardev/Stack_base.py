@@ -8,8 +8,9 @@
 # See the LICENSE file in the insardev directory for license terms.
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
+from .BatchCore import BatchCore
 
-class Stack_base():
+class Stack_base(BatchCore):
     pass
 
     # def apply(self, *args, **kwarg):
