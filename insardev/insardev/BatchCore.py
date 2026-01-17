@@ -127,6 +127,116 @@ class BatchCore(dict):
         except (ImportError, ValueError):
             return nullcontext()
 
+    @staticmethod
+    def _gaussian(data_np, weight_np=None, sigma=None, truncate=4.0, threshold=0.5, device='auto'):
+        """
+        2D Gaussian convolution using PyTorch with separable kernels.
+
+        Supports complex values, weights, and NaN handling.
+        Uses replicate padding for real InSAR boundaries.
+
+        Parameters
+        ----------
+        data_np : np.ndarray
+            2D numpy array to convolve, can be real or complex.
+        weight_np : np.ndarray, optional
+            Weight array for weighted convolution.
+        sigma : float or tuple of floats
+            Standard deviation of Gaussian kernel (y, x).
+        truncate : float, optional
+            Truncation factor for kernel size (default 4.0).
+        threshold : float, optional
+            Minimum weight fraction for valid output (default 0.5).
+        device : str, optional
+            PyTorch device: 'auto', 'cuda', 'mps', or 'cpu'.
+
+        Returns
+        -------
+        np.ndarray
+            Convolved array with same shape as input.
+        """
+        import numpy as np
+        import torch
+        import torch.nn.functional as F
+
+        if sigma is None:
+            return data_np
+
+        if not isinstance(sigma, (list, tuple, np.ndarray)):
+            sigma = (sigma, sigma)
+
+        # Handle (1, y, x) arrays from apply_ufunc with core_dims=[['y', 'x']]
+        squeeze = False
+        if data_np.ndim == 3 and data_np.shape[0] == 1:
+            data_np = data_np[0]
+            squeeze = True
+
+        # Get device
+        dev = BatchCore._get_torch_device(device)
+        is_complex = np.issubdtype(data_np.dtype, np.complexfloating)
+
+        # Create 1D Gaussian kernels
+        def make_kernel_1d(s, trunc):
+            size = int(2 * np.ceil(s * trunc) + 1)
+            x = torch.arange(size, device=dev, dtype=torch.float32) - size // 2
+            k = torch.exp(-0.5 * (x / s) ** 2)
+            return k / k.sum()
+
+        kernel_y = make_kernel_1d(sigma[0], truncate)
+        kernel_x = make_kernel_1d(sigma[1], truncate)
+        pad_y = len(kernel_y) // 2
+        pad_x = len(kernel_x) // 2
+
+        # Reshape kernels for conv2d: (out_ch, in_ch, H, W)
+        kernel_y = kernel_y.view(1, 1, -1, 1)
+        kernel_x = kernel_x.view(1, 1, 1, -1)
+
+        def separable_conv(t):
+            """Apply separable Gaussian convolution with replicate padding."""
+            t = t.unsqueeze(0).unsqueeze(0)
+            t = F.pad(t, (0, 0, pad_y, pad_y), mode='replicate')
+            t = F.conv2d(t, kernel_y)
+            t = F.pad(t, (pad_x, pad_x, 0, 0), mode='replicate')
+            t = F.conv2d(t, kernel_x)
+            return t.squeeze()
+
+        def convolve_real(arr, wgt=None):
+            """Convolve a real 2D array with NaN/weight handling."""
+            t_data = torch.from_numpy(arr.astype(np.float32)).to(dev)
+
+            # Valid mask (1 where not NaN)
+            valid = (~torch.isnan(t_data)).float()
+            t_data = torch.nan_to_num(t_data, 0.0)
+
+            # Combine with external weights
+            if wgt is not None:
+                t_weight = torch.from_numpy(wgt.astype(np.float32)).to(dev)
+                t_weight = torch.nan_to_num(t_weight, 0.0)
+                combined_weight = valid * t_weight
+            else:
+                combined_weight = valid
+
+            # Weighted convolution
+            numerator = separable_conv(t_data * combined_weight)
+            denominator = separable_conv(combined_weight)
+
+            # Result with threshold masking
+            if wgt is None:
+                result = torch.where(denominator > threshold, numerator / (denominator + 1e-10), torch.nan)
+            else:
+                result = torch.where(denominator > 1e-10, numerator / (denominator + 1e-10), torch.nan)
+
+            return result.cpu().numpy()
+
+        if is_complex:
+            result = convolve_real(data_np.real, weight_np) + 1j * convolve_real(data_np.imag, weight_np)
+        else:
+            result = convolve_real(data_np, weight_np)
+
+        if squeeze:
+            result = result[np.newaxis, ...]
+        return result
+
     def __init__(self, mapping: Mapping[str, xr.Dataset] | Stack | BatchComplex | None = None):
         from .Stack import Stack
         from .Batch import Batch, BatchWrap, BatchUnit, BatchComplex
@@ -2252,8 +2362,6 @@ class BatchCore(dict):
         """
         import xarray as xr
         import numpy as np
-        import dask
-        from .utils_gaussian import nanconvolve2d_gaussian
         from .Batch import BatchUnit
         # constant 5.3 defines half-gain at filter_wavelength
         cutoff = 5.3
@@ -2282,34 +2390,26 @@ class BatchCore(dict):
         for key, ds in self.items():
             w = weight[key] if weight is not None else None
 
-            def gaussian_da(da: xr.DataArray, w: xr.DataArray | None = None) -> xr.DataArray:
-                # apply the 2D Gaussian convolver slice‐by‐slice
-                def one_slice(arr):
-                    return nanconvolve2d_gaussian(
-                        arr, w, sigmas, threshold=threshold
-                    )
+            def gaussian_da(da: xr.DataArray, w_da: xr.DataArray | None = None) -> xr.DataArray:
+                import dask.array as dask_array
 
-                # handle an optional first dimension (e.g. 'pair' or 'time')
-                if da.ndim == 3:
-                    dim0 = da.dims[0]
-                    pieces = [
-                        one_slice(da.sel({dim0: v}))
-                        for v in da.coords[dim0].values
-                    ]
-                    out_da = xr.concat(
-                        [xr.DataArray(p, dims=da.dims[1:], coords={d: da.coords[d] for d in da.dims[1:]})
-                         for p in pieces],
-                        dim=dim0
-                    ).assign_coords({dim0: da.coords[dim0]})
-                else:
-                    out_da = xr.DataArray(
-                        one_slice(da),
-                        dims=da.dims,
-                        coords=da.coords
-                    )
+                is_complex = np.issubdtype(da.dtype, np.complexfloating)
+                out_dtype = np.complex64 if is_complex else np.float32
 
-                # preserve original chunking
-                return out_da.chunk({d: da.chunks[i][0] for i, d in enumerate(da.dims)})
+                # Wrapper for _gaussian that handles weight
+                def apply_gaussian(data_2d, weight_np=w_da.values if w_da is not None else None):
+                    return BatchCore._gaussian(data_2d, weight_np, sigma=sigmas, threshold=threshold).astype(out_dtype)
+
+                # Use apply_ufunc - xarray broadcasts over non-core dims (e.g., 'pair')
+                result = xr.apply_ufunc(
+                    apply_gaussian,
+                    da,
+                    input_core_dims=[['y', 'x']],
+                    output_core_dims=[['y', 'x']],
+                    dask='parallelized',
+                    output_dtypes=[out_dtype],
+                )
+                return result.assign_coords({'y': da.y, 'x': da.x})
 
             # determine weight for each variable:
             # - if w is DataArray: use same weight for all variables
