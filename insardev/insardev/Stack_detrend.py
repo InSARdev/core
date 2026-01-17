@@ -719,6 +719,10 @@ class Stack_detrend(Stack_unwrap2d):
                             dtype=np.float32,
                         )
 
+                # Rechunk back to per-slice for efficient downstream operations
+                if hasattr(result_dask, 'rechunk'):
+                    result_dask = result_dask.rechunk({0: 1})
+
                 fit_da = xr.DataArray(
                     result_dask,
                     dims=data_da.dims,
@@ -866,6 +870,178 @@ class Stack_detrend(Stack_unwrap2d):
 
             return result.cpu().numpy().reshape(ny, nx).astype(np.float32)
 
+    @staticmethod
+    def _regression1d_pairs_chunk(data_chunk, weight_chunk, ref_values, rep_values,
+                                   device, degree, days_filter, count_filter, wrap, iterations):
+        """
+        Process a spatial chunk for regression1d_pairs.
+
+        Parameters
+        ----------
+        data_chunk : np.ndarray
+            3D array (n_pairs, chunk_y, chunk_x)
+        weight_chunk : np.ndarray or None
+            Weight array, same shape as data_chunk
+        ref_values : np.ndarray
+            1D array of ref dates as int64 (nanoseconds since epoch)
+        rep_values : np.ndarray
+            1D array of rep dates as int64 (nanoseconds since epoch)
+        device : torch.device
+            PyTorch device
+        degree : int
+            Polynomial degree (0=mean, 1=linear)
+        days_filter : int or None
+            Maximum time interval filter
+        count_filter : int or None
+            Maximum pairs per date filter
+        wrap : bool
+            Use circular fitting
+        iterations : int
+            Number of fitting iterations
+
+        Returns
+        -------
+        np.ndarray
+            Trend array (n_pairs, chunk_y, chunk_x)
+        """
+        import torch
+        import numpy as np
+
+        n_pairs, ny, nx = data_chunk.shape
+
+        # Convert int64 nanoseconds to days (relative to first date)
+        # This avoids datetime64 issues in the chunk function
+        ns_per_day = 86400 * 1e9
+        ref_days = ref_values / ns_per_day
+        rep_days = rep_values / ns_per_day
+
+        # Get unique dates
+        all_days = np.concatenate([ref_days, rep_days])
+        unique_days = np.unique(all_days)
+
+        # Build per-date models
+        if wrap:
+            models_sin = {}
+            models_cos = {}
+        else:
+            models = {}
+
+        for date_day in unique_days:
+            # Find pairs containing this date
+            is_ref = np.isclose(ref_days, date_day)
+            is_rep = np.isclose(rep_days, date_day)
+            mask = is_ref | is_rep
+            pair_indices = np.where(mask)[0]
+
+            if len(pair_indices) == 0:
+                continue
+
+            # Compute time intervals (days) and signs
+            time_values = []
+            signs = []
+            for idx in pair_indices:
+                if is_rep[idx]:
+                    # date is rep, pair goes ref -> date
+                    days_val = date_day - ref_days[idx]
+                    signs.append(-1.0)
+                else:
+                    # date is ref, pair goes date -> rep
+                    days_val = rep_days[idx] - date_day
+                    signs.append(1.0)
+                time_values.append(days_val)
+
+            time_values = np.array(time_values, dtype=np.float32)
+            signs = np.array(signs, dtype=np.float32)
+
+            # Sort by absolute time interval
+            sort_idx = np.argsort(np.abs(time_values))
+            time_values = time_values[sort_idx]
+            signs = signs[sort_idx]
+            pair_indices = pair_indices[sort_idx]
+
+            # Apply count filter
+            if count_filter is not None and len(pair_indices) > count_filter:
+                time_values = time_values[:count_filter]
+                signs = signs[:count_filter]
+                pair_indices = pair_indices[:count_filter]
+
+            # Apply days filter
+            if days_filter is not None:
+                keep = np.abs(time_values) <= days_filter
+                time_values = time_values[keep]
+                signs = signs[keep]
+                pair_indices = pair_indices[keep]
+
+            if len(pair_indices) == 0:
+                continue
+
+            # Extract data for selected pairs
+            selected_data = data_chunk[pair_indices]
+            selected_weight = weight_chunk[pair_indices] if weight_chunk is not None else None
+
+            # Fit polynomial using PyTorch
+            result = Stack_detrend._polyfit1d_pytorch(
+                selected_data, time_values, selected_weight, signs,
+                device, degree=degree, wrap=wrap, iterations=iterations
+            )
+
+            if wrap:
+                sin_coeff, cos_coeff = result
+                models_sin[date_day] = sin_coeff
+                models_cos[date_day] = cos_coeff
+            else:
+                models[date_day] = result
+
+        # Reconstruct pair-wise trends
+        trend_data = np.full((n_pairs, ny, nx), np.nan, dtype=np.float32)
+
+        if wrap:
+            for i in range(n_pairs):
+                ref_day = ref_days[i]
+                rep_day = rep_days[i]
+
+                # Find matching keys (use isclose for float comparison)
+                ref_key = None
+                rep_key = None
+                for key in models_sin.keys():
+                    if np.isclose(key, ref_day):
+                        ref_key = key
+                    if np.isclose(key, rep_day):
+                        rep_key = key
+
+                if ref_key is None or rep_key is None:
+                    continue
+
+                sin_ref = models_sin[ref_key]
+                cos_ref = models_cos[ref_key]
+                sin_rep = models_sin[rep_key]
+                cos_rep = models_cos[rep_key]
+
+                # Angle difference: atan2(sin(A-B), cos(A-B))
+                sin_diff = sin_ref * cos_rep - cos_ref * sin_rep
+                cos_diff = cos_ref * cos_rep + sin_ref * sin_rep
+                trend_data[i] = np.arctan2(sin_diff, cos_diff)
+        else:
+            for i in range(n_pairs):
+                ref_day = ref_days[i]
+                rep_day = rep_days[i]
+
+                # Find matching keys
+                ref_key = None
+                rep_key = None
+                for key in models.keys():
+                    if np.isclose(key, ref_day):
+                        ref_key = key
+                    if np.isclose(key, rep_day):
+                        rep_key = key
+
+                if ref_key is None or rep_key is None:
+                    continue
+
+                trend_data[i] = models[ref_key] - models[rep_key]
+
+        return trend_data
+
     def regression1d_pairs(self, data, weight=None, degree=0, days=None, count=None, wrap=False, iterations=1, device='auto', debug=False):
         """
         Fit 1D polynomial trend along temporal pairs for each date using PyTorch.
@@ -922,6 +1098,9 @@ class Stack_detrend(Stack_unwrap2d):
         # Auto-detect device
         device = Stack_detrend._get_torch_device(device, debug=debug)
 
+        if debug:
+            print(f"DEBUG: regression1d_pairs using device={device}")
+
         # Handle Batch input
         if isinstance(data, (Batch, BatchWrap)):
             is_wrap = isinstance(data, BatchWrap)
@@ -936,137 +1115,69 @@ class Stack_detrend(Stack_unwrap2d):
                     data_da = burst_ds[pol]
                     weight_da = burst_weight[pol] if burst_weight is not None else None
 
-                    # Get pairs info
-                    pairs, dates = self._get_pairs(data_da, dates=True)
-
                     if debug:
+                        pairs, dates = self._get_pairs(data_da, dates=True)
                         print(f"DEBUG {burst_id}: {len(dates)} dates, {len(pairs)} pairs")
 
-                    # Compute data and weight (need actual values for per-date processing)
-                    data_np = data_da.values
-                    weight_np = weight_da.values if weight_da is not None else None
+                    # Get ref/rep as int64 nanoseconds (avoids datetime64 serialization issues)
+                    ref_values = burst_ds['ref'].values.astype('datetime64[ns]').astype(np.int64)
+                    rep_values = burst_ds['rep'].values.astype('datetime64[ns]').astype(np.int64)
 
-                    # Process each date
-                    if wrap:
-                        models_sin = []
-                        models_cos = []
-                    else:
-                        models = []
+                    # Ensure pair dimension is first
+                    if data_da.dims[0] != 'pair':
+                        data_da = data_da.transpose('pair', ...)
+                        if weight_da is not None:
+                            weight_da = weight_da.transpose('pair', ...)
 
-                    for date in dates:
-                        # Find pairs containing this date
-                        date_ts = pd.Timestamp(date)
-                        mask = (pairs.ref == date_ts) | (pairs.rep == date_ts)
-                        date_pairs = pairs[mask]
+                    # Get dask arrays and rechunk (all pairs in one chunk)
+                    data_dask = data_da.data
+                    if hasattr(data_dask, 'rechunk'):
+                        data_dask = data_dask.rechunk({0: -1})
 
-                        if len(date_pairs) == 0:
-                            continue
+                    # Create wrapper that captures parameters
+                    def make_wrapper(ref_vals, rep_vals, dev, deg, days_f, count_f, wrp, iters):
+                        def process_chunk(data_block, weight_block=None):
+                            return Stack_detrend._regression1d_pairs_chunk(
+                                data_block, weight_block, ref_vals, rep_vals,
+                                torch.device(dev), deg, days_f, count_f, wrp, iters
+                            )
+                        return process_chunk
 
-                        # Get pair indices
-                        pair_indices = [list(pairs.pair.values).index(p) for p in date_pairs.pair.values]
+                    wrapper = make_wrapper(ref_values, rep_values, str(device), degree, days, count, wrap, iterations)
 
-                        # Compute time intervals (days)
-                        time_values = []
-                        signs = []
-                        for _, row in date_pairs.iterrows():
-                            if row.ref < date_ts:
-                                # date is rep, pair goes ref -> date
-                                days_val = (date_ts - row.ref).days
-                                signs.append(-1.0)  # flip sign
-                            else:
-                                # date is ref, pair goes date -> rep
-                                days_val = (row.rep - date_ts).days
-                                signs.append(1.0)
-                            time_values.append(days_val)
+                    dim_str = ''.join(chr(ord('a') + i) for i in range(data_dask.ndim))
 
-                        time_values = np.array(time_values, dtype=np.float32)
-                        signs = np.array(signs, dtype=np.float32)
+                    with dask.annotate(resources={'gpu': 1} if device.type != 'cpu' else {}):
+                        if weight_da is not None:
+                            weight_dask = weight_da.data
+                            if hasattr(weight_dask, 'rechunk'):
+                                weight_dask = weight_dask.rechunk({0: -1})
 
-                        # Sort by absolute time interval
-                        sort_idx = np.argsort(np.abs(time_values))
-                        time_values = time_values[sort_idx]
-                        signs = signs[sort_idx]
-                        pair_indices = [pair_indices[i] for i in sort_idx]
+                            def make_weighted_wrapper(wrapper_fn):
+                                def process_with_weight(data_block, weight_block):
+                                    return wrapper_fn(data_block, weight_block)
+                                return process_with_weight
 
-                        # Apply count filter
-                        if count is not None and len(pair_indices) > count:
-                            time_values = time_values[:count]
-                            signs = signs[:count]
-                            pair_indices = pair_indices[:count]
-
-                        # Apply days filter
-                        if days is not None:
-                            keep = np.abs(time_values) <= days
-                            time_values = time_values[keep]
-                            signs = signs[keep]
-                            pair_indices = [pair_indices[i] for i, k in enumerate(keep) if k]
-
-                        if len(pair_indices) == 0:
-                            continue
-
-                        # Extract data for selected pairs
-                        selected_data = data_np[pair_indices]
-                        selected_weight = weight_np[pair_indices] if weight_np is not None else None
-
-                        # Fit polynomial using PyTorch
-                        result = Stack_detrend._polyfit1d_pytorch(
-                            selected_data, time_values, selected_weight, signs,
-                            device, degree=degree, wrap=wrap, iterations=iterations
-                        )
-
-                        if wrap:
-                            sin_coeff, cos_coeff = result
-                            models_sin.append((date, sin_coeff))
-                            models_cos.append((date, cos_coeff))
+                            result_dask = da.blockwise(
+                                make_weighted_wrapper(wrapper), dim_str,
+                                data_dask, dim_str,
+                                weight_dask, dim_str,
+                                dtype=np.float32,
+                            )
                         else:
-                            models.append((date, result))
+                            result_dask = da.blockwise(
+                                wrapper, dim_str,
+                                data_dask, dim_str,
+                                dtype=np.float32,
+                            )
 
-                    # Reconstruct pair-wise trends
-                    ny, nx = data_np.shape[1], data_np.shape[2]
-
-                    if wrap:
-                        # Build date -> model dictionaries
-                        sin_dict = {pd.Timestamp(d): m for d, m in models_sin}
-                        cos_dict = {pd.Timestamp(d): m for d, m in models_cos}
-
-                        trend_data = np.full_like(data_np, np.nan)
-                        for i, (_, row) in enumerate(pairs.iterrows()):
-                            ref_ts = pd.Timestamp(row.ref)
-                            rep_ts = pd.Timestamp(row.rep)
-
-                            if ref_ts not in sin_dict or rep_ts not in sin_dict:
-                                trend_data[i] = np.nan
-                                continue
-
-                            sin_ref = sin_dict[ref_ts]
-                            cos_ref = cos_dict[ref_ts]
-                            sin_rep = sin_dict[rep_ts]
-                            cos_rep = cos_dict[rep_ts]
-
-                            # Angle difference: atan2(sin(A-B), cos(A-B))
-                            # sin(A-B) = sin(A)cos(B) - cos(A)sin(B)
-                            # cos(A-B) = cos(A)cos(B) + sin(A)sin(B)
-                            sin_diff = sin_ref * cos_rep - cos_ref * sin_rep
-                            cos_diff = cos_ref * cos_rep + sin_ref * sin_rep
-                            trend_data[i] = np.arctan2(sin_diff, cos_diff)
-                    else:
-                        # Build date -> model dictionary
-                        model_dict = {pd.Timestamp(d): m for d, m in models}
-
-                        trend_data = np.full_like(data_np, np.nan)
-                        for i, (_, row) in enumerate(pairs.iterrows()):
-                            ref_ts = pd.Timestamp(row.ref)
-                            rep_ts = pd.Timestamp(row.rep)
-
-                            if ref_ts not in model_dict or rep_ts not in model_dict:
-                                trend_data[i] = np.nan
-                                continue
-
-                            trend_data[i] = model_dict[ref_ts] - model_dict[rep_ts]
+                    # Rechunk back to per-slice for efficient downstream operations
+                    if hasattr(result_dask, 'rechunk'):
+                        result_dask = result_dask.rechunk({0: 1})
 
                     # Create output DataArray
                     trend_da = xr.DataArray(
-                        trend_data.astype(np.float32),
+                        result_dask,
                         dims=data_da.dims,
                         coords=data_da.coords
                     )
