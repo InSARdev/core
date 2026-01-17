@@ -1040,6 +1040,14 @@ class Stack_unwrap2d(Stack_unwrap1d):
         else:
             weight_filled = np.where(nan_mask, 0.0, 1.0)
 
+        # Save input circular mean for later restoration (unwrapping removes DC component)
+        # Use circular mean for wrapped phase: atan2(mean(sin), mean(cos))
+        if valid_mask.any():
+            phase_valid = phase[valid_mask]
+            input_mean = np.arctan2(np.mean(np.sin(phase_valid)), np.mean(np.cos(phase_valid)))
+        else:
+            input_mean = 0.0
+
         # Convert to torch tensors
         phi = torch.from_numpy(phase_filled.astype(np_dtype)).to(device)
         w = torch.from_numpy(weight_filled.astype(np_dtype)).to(device)
@@ -1310,6 +1318,16 @@ class Stack_unwrap2d(Stack_unwrap1d):
             k_values = np.round(diff / (2 * np.pi))
             k_median = np.median(k_values)
             unwrapped[valid_mask] = unwrapped[valid_mask] - k_median * 2 * np.pi
+
+        # Restore input circular mean (unwrapping removes DC component)
+        # Wrap the output to compute its circular mean, then adjust
+        if np.any(valid_mask):
+            unwrapped_valid = unwrapped[valid_mask]
+            # Wrap to [-π, π] for circular mean computation
+            wrapped_output = np.mod(unwrapped_valid + np.pi, 2 * np.pi) - np.pi
+            output_mean = np.arctan2(np.mean(np.sin(wrapped_output)), np.mean(np.cos(wrapped_output)))
+            # Adjust by the difference in circular means
+            unwrapped[valid_mask] = unwrapped_valid + (input_mean - output_mean)
 
         if debug:
             print(f'TIMING irls_unwrap_2d ({height}x{width}) on {device_name}:')
