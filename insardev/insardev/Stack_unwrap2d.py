@@ -545,14 +545,22 @@ class Stack_unwrap2d(Stack_unwrap1d):
 
         def _reorder_2d(labels_2d):
             """Reorder labels in a single 2D array."""
+            # Handle (1, y, x) arrays from apply_ufunc with core_dims=[['y', 'x']]
+            squeeze = False
+            if labels_2d.ndim == 3 and labels_2d.shape[0] == 1:
+                labels_2d = labels_2d[0]
+                squeeze = True
+
             # Get unique labels (excluding 0 and NaN)
             valid_mask = ~np.isnan(labels_2d) & (labels_2d > 0)
             if not np.any(valid_mask):
-                return labels_2d
+                result = labels_2d.astype(np.float32)
+                return result[np.newaxis, ...] if squeeze else result
 
             unique_labels = np.unique(labels_2d[valid_mask])
             if len(unique_labels) == 0:
-                return labels_2d
+                result = labels_2d.astype(np.float32)
+                return result[np.newaxis, ...] if squeeze else result
 
             # Count pixels per label
             sizes = []
@@ -572,7 +580,8 @@ class Stack_unwrap2d(Stack_unwrap1d):
             for old_label, new_label in label_mapping.items():
                 result[labels_2d == old_label] = new_label
 
-            return result.astype(np.float32)
+            result = result.astype(np.float32)
+            return result[np.newaxis, ...] if squeeze else result
 
         # Process each dataset in the batch
         result = {}
@@ -590,7 +599,6 @@ class Stack_unwrap2d(Stack_unwrap1d):
                     da,
                     input_core_dims=[['y', 'x']],
                     output_core_dims=[['y', 'x']],
-                    vectorize=True,
                     dask='parallelized',
                     output_dtypes=[np.float32],
                 )
@@ -633,16 +641,23 @@ class Stack_unwrap2d(Stack_unwrap1d):
             """Link components in a single 2D array."""
             import time
 
+            # Handle (1, y, x) arrays from apply_ufunc with core_dims=[['y', 'x']]
+            squeeze = False
+            if phase_2d.ndim == 3 and phase_2d.shape[0] == 1:
+                phase_2d = phase_2d[0]
+                squeeze = True
+
             # Find connected components - use efficient labeling
             valid_mask = ~np.isnan(phase_2d)
             if not np.any(valid_mask):
-                return phase_2d
+                return phase_2d[np.newaxis, ...] if squeeze else phase_2d
 
             min_size = max(conncomp_size, 4)
             labeled, components, n_total, sizes = Stack_unwrap2d._get_connected_components(valid_mask, min_size)
 
             if len(components) < 2:
-                return phase_2d  # Not enough components to link
+                result = phase_2d  # Not enough components to link
+                return result[np.newaxis, ...] if squeeze else result
 
             # Create masks for valid components (already sorted by size, largest first)
             processed_components = [(labeled == comp['label']) for comp in components]
@@ -661,7 +676,8 @@ class Stack_unwrap2d(Stack_unwrap1d):
                 print(f'    Found {len(connections)} connections')
 
             if len(connections) == 0:
-                return phase_2d  # No connections found
+                result = phase_2d  # No connections found
+                return result[np.newaxis, ...] if squeeze else result
 
             # Apply ILP to find optimal offsets
             result = Stack_unwrap2d._connect_components_ilp(
@@ -673,7 +689,7 @@ class Stack_unwrap2d(Stack_unwrap1d):
                 elapsed = time.time() - t0
                 print(f'  Component linking done ({elapsed:.2f}s)')
 
-            return result
+            return result[np.newaxis, ...] if squeeze else result
 
         # Process each dataset in the batch
         result = {}
@@ -692,7 +708,6 @@ class Stack_unwrap2d(Stack_unwrap1d):
                     da,
                     input_core_dims=[['y', 'x']],
                     output_core_dims=[['y', 'x']],
-                    vectorize=True,
                     dask='parallelized',
                     output_dtypes=[np.float32],
                 )
