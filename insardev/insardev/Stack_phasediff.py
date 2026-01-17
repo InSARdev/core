@@ -18,7 +18,6 @@ class Stack_phasediff(Stack_base):
     import numpy as np
     import pandas as pd
 
-    # internal method to compute interferogram on single polarization data array(s)
     def phasediff(self,
                        pairs:list[tuple[str|int,str|int]]|np.ndarray|pd.DataFrame|None=None,
                        weight:BatchUnit|None=None,
@@ -123,7 +122,7 @@ class Stack_phasediff(Stack_base):
         if weight is not None:
             phasediff_look = phasediff_look.where(weight.isfinite())
             corr_look = corr_look.where(weight.isfinite()) if corr_look is not None else None
-        
+
         if not complex:
             phasediff_look = phasediff_look.angle()
 
@@ -143,7 +142,7 @@ class Stack_phasediff(Stack_base):
                 rep=('pair', rep_values),
                 BPR=('pair', bpr)
             )
-        
+
         if corr_look is None:
             return as_xarray(phasediff_look)
         return (as_xarray(phasediff_look), as_xarray(corr_look))
@@ -152,8 +151,6 @@ class Stack_phasediff(Stack_base):
         from .Batch import BatchComplex
         kwarg['multilook'] = False
         return self.phasediff(*args, **kwarg)
-        #intfs, corrs = self.phasediff(**kwarg)
-        #return BatchWrap(intfs), BatchUnit(corrs)
 
     def phasediff_multilook(self, *args, **kwarg):
         from .Batch import BatchComplex

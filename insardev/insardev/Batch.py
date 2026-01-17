@@ -654,7 +654,8 @@ class BatchComplex(BatchCore):
 
     def power(self, **kwargs):
         """ element-wise |x|², i.e. signal intensity """
-        return Batch(self.map_da(lambda da: xr.ufuncs.abs(da)**2, **kwargs))
+        # Optimized: avoid sqrt in abs() by computing real² + imag² directly
+        return Batch(self.map_da(lambda da: da.real**2 + da.imag**2, **kwargs))
 
     def conj(self, **kwargs):
         """intfs.iexp().conj() for np.exp(-1j * intfs)"""
@@ -707,151 +708,177 @@ class BatchComplex(BatchCore):
         )
 
     @staticmethod
-    def _goldstein(phase, corr, psize=32, debug=False):
-        import xarray as xr
-        import numpy as np
-        import dask
-        from numbers import Real
-        from collections.abc import Mapping
-        import warnings
-        # Ignore *any* RuntimeWarning coming from dask/_task_spec.py
-        warnings.filterwarnings(
-            'ignore',
-            category=RuntimeWarning,
-            module=r'dask\._task_spec'
-        )
-        # …and just in case you want to match by message too:
-        warnings.filterwarnings(
-            'ignore',
-            message='invalid value encountered in divide',
-            category=RuntimeWarning,
-            module=r'dask\._task_spec'
-        )
+    def _goldstein(phase_np, corr_np, psize=32, device='auto', batch_size=None):
+        """
+        Apply Goldstein adaptive filter using PyTorch with vectorized unfold/fold.
 
-        if debug:
-            print ('DEBUG: goldstein')
+        Uses torch.nn.functional.unfold/fold for efficient patch extraction and
+        accumulation, avoiding slow Python loops.
+
+        Parameters
+        ----------
+        phase_np : np.ndarray
+            2D complex numpy array of phase data.
+        corr_np : np.ndarray
+            2D real numpy array of correlation values.
+        psize : int or dict
+            Patch size for the filter. Default is 32.
+        device : str, optional
+            PyTorch device: 'auto', 'cuda', 'mps', or 'cpu'.
+        batch_size : int, optional
+            Ignored (kept for API compatibility).
+
+        Returns
+        -------
+        np.ndarray
+            Filtered complex array with same shape as input.
+        """
+        import numpy as np
+        import torch
+        import torch.nn.functional as F
+        from .BatchCore import BatchCore
 
         if psize is None:
-            # miss the processing
-            return phase
-        
-        if not isinstance(psize, (Real, Mapping)):
-            raise ValueError('ERROR: psize should be an integer, float, or dictionary')
+            return phase_np
 
-        if isinstance(psize, Real):
-            psize = {'y': psize, 'x': psize}
+        # Handle (1, y, x) arrays from apply_ufunc
+        squeeze = False
+        if phase_np.ndim == 3 and phase_np.shape[0] == 1:
+            phase_np = phase_np[0]
+            corr_np = corr_np[0] if corr_np.ndim == 3 else corr_np
+            squeeze = True
 
-        # Handle Dataset objects by extracting the first DataArray
-        if isinstance(phase, xr.Dataset):
-            phase = next(iter(phase.data_vars.values()))
-        if isinstance(corr, xr.Dataset):
-            corr = next(iter(corr.data_vars.values()))
+        if isinstance(psize, dict):
+            psize_y, psize_x = psize['y'], psize['x']
+        else:
+            psize_y, psize_x = int(psize), int(psize)
 
-        def apply_pspec(data, alpha):
-            # NaN is allowed value
-            assert not(alpha < 0), f'Invalid parameter value {alpha} < 0'
-            wgt = np.power(np.abs(data)**2, alpha / 2)
-            data = wgt * data
-            return data
+        dev = BatchCore._get_torch_device(device)
+        ny, nx = phase_np.shape
+        step_y, step_x = psize_y // 2, psize_x // 2
 
-        def make_wgt(psize):
-            nyp, nxp = psize['y'], psize['x']
-            # Create arrays of horizontal and vertical weights
-            wx = 1.0 - np.abs(np.arange(nxp // 2) - (nxp / 2.0 - 1.0)) / (nxp / 2.0 - 1.0)
-            wy = 1.0 - np.abs(np.arange(nyp // 2) - (nyp / 2.0 - 1.0)) / (nyp / 2.0 - 1.0)
-            # Compute the outer product of wx and wy to create the top-left quadrant of the weight matrix
-            quadrant = np.outer(wy, wx)
-            # Create a full weight matrix by mirroring the quadrant along both axes
-            wgt = np.block([[quadrant, np.flip(quadrant, axis=1)],
-                            [np.flip(quadrant, axis=0), np.flip(np.flip(quadrant, axis=0), axis=1)]])
-            return wgt
+        # Save NaN mask before modifying
+        nan_mask = ~np.isfinite(phase_np)
 
-        def patch_goldstein_filter(data, corr, wgt, psize):
-            """
-            Apply the Goldstein adaptive filter to the given data.
+        # Create triangular weight matrix
+        wx = 1.0 - np.abs(np.arange(psize_x // 2) - (psize_x / 2.0 - 1.0)) / (psize_x / 2.0 - 1.0)
+        wy = 1.0 - np.abs(np.arange(psize_y // 2) - (psize_y / 2.0 - 1.0)) / (psize_y / 2.0 - 1.0)
+        quadrant = np.outer(wy, wx)
+        wgt_np = np.block([[quadrant, np.flip(quadrant, axis=1)],
+                           [np.flip(quadrant, axis=0), np.flip(np.flip(quadrant, axis=0), axis=1)]]).astype(np.float32)
+        wgt = torch.from_numpy(wgt_np).to(dev)
+        wgt_sum = wgt.sum()
+        del wx, wy, quadrant, wgt_np
 
-            Args:
-                data: 2D numpy array of complex values representing the data to be filtered.
-                corr: 2D numpy array of correlation values. Must have the same shape as `data`.
+        # Prepare data - fill NaN with 0
+        phase_clean = np.nan_to_num(phase_np, nan=0.0, posinf=0.0, neginf=0.0, copy=True)
+        corr_clean = np.nan_to_num(corr_np, nan=0.0, copy=True)
 
-            Returns:
-                2D numpy array of filtered data.
-            """
-            # Calculate alpha
-            alpha = 1 - (wgt * corr).sum() / wgt.sum()
-            data = np.fft.fft2(data, s=(psize['y'], psize['x']))
-            data = apply_pspec(data, alpha)
-            data = np.fft.ifft2(data, s=(psize['y'], psize['x']))
-            return wgt * data
+        with torch.no_grad():
+            # Pad to make dimensions work with unfold/fold
+            pad_h = (step_y - ((ny - psize_y) % step_y)) % step_y
+            pad_w = (step_x - ((nx - psize_x) % step_x)) % step_x
 
-        def apply_goldstein_filter(data, corr, psize, wgt_matrix):
-            # Create an empty array for the output initialized with NaN
-            out = np.full(data.shape, np.nan + 1j*np.nan, dtype=np.complex64)
-            # ignore processing for empty chunks
-            if np.all(np.isnan(data)):
-                return out
-            # Track which pixels are processed (for proper overlap accumulation)
-            processed = np.zeros(data.shape, dtype=np.float32)
-            # Temporary array for accumulation
-            acc = np.zeros(data.shape, dtype=np.complex64)
-            # Iterate over windows of the data
-            for i in range(0, data.shape[0] - psize['y'], psize['y'] // 2):
-                for j in range(0, data.shape[1] - psize['x'], psize['x'] // 2):
-                    # Create proocessing windows
-                    data_window = data[i:i+psize['y'], j:j+psize['x']]
-                    corr_window = corr[i:i+psize['y'], j:j+psize['x']]
-                    # do not process NODATA areas filled with zeros
-                    fraction_valid = np.count_nonzero(data_window != 0) / data_window.size
-                    if fraction_valid >= 0.5:
-                        wgt_window = wgt_matrix[:data_window.shape[0],:data_window.shape[1]]
-                        # Apply the filter to the window
-                        filtered_window = patch_goldstein_filter(data_window, corr_window, wgt_window, psize)
-                        # Add the result to the accumulation array
-                        slice_i = slice(i, min(i + psize['y'], out.shape[0]))
-                        slice_j = slice(j, min(j + psize['x'], out.shape[1]))
-                        acc[slice_i, slice_j] += filtered_window[:slice_i.stop - slice_i.start, :slice_j.stop - slice_j.start]
-                        processed[slice_i, slice_j] += 1
-            # Only set output where pixels were processed
-            mask = processed > 0
-            out[mask] = acc[mask]
-            return out
+            if pad_h > 0 or pad_w > 0:
+                phase_clean = np.pad(phase_clean, ((0, pad_h), (0, pad_w)), mode='constant', constant_values=0)
+                corr_clean = np.pad(corr_clean, ((0, pad_h), (0, pad_w)), mode='constant', constant_values=0)
 
-        assert phase.shape == corr.shape, f'ERROR: phase and correlation variables have different shape \
-                                          ({phase.shape} vs {corr.shape})'
+            padded_h, padded_w = phase_clean.shape
 
-        stack =[]
-        for ind in range(len(phase)):
-            # Apply function with overlap; psize//2 overlap is not enough (some empty lines produced)
-            # use complex data and real correlation
-            # fill NaN values in correlation by zeroes to prevent empty output blocks
-            block = dask.array.map_overlap(apply_goldstein_filter,
-                                           phase[ind].fillna(0).data,
-                                           corr[ind].fillna(0).data,
-                                           depth=(psize['y'] // 2 + 2, psize['x'] // 2 + 2),
-                                           dtype=np.complex64, 
-                                           meta=np.array(()),
-                                           psize=psize,
-                                           wgt_matrix = make_wgt(psize))
-            # Calculate the phase
-            stack.append(block)
-            del block
+            # Convert to torch tensors - split complex into 2 channels: (1, 2, H, W)
+            phase_t = torch.from_numpy(
+                np.stack([phase_clean.real, phase_clean.imag], axis=0)
+            ).unsqueeze(0).float().to(dev)
+            corr_t = torch.from_numpy(corr_clean).unsqueeze(0).unsqueeze(0).to(dev)
+            del phase_clean, corr_clean
 
-        # Create DataArray with proper coordinates and attributes
-        ds = xr.DataArray(
-            dask.array.stack(stack),
-            coords=phase.coords,
-            dims=phase.dims,
-            name=phase.name,
-            attrs=phase.attrs
-        )
-        del stack
-        # replace zeros produces in NODATA areas
-        return ds.where(np.isfinite(phase))
+            # Use unfold to extract all patches at once
+            # Output: (1, C*kH*kW, num_patches)
+            phase_patches = F.unfold(phase_t, kernel_size=(psize_y, psize_x), stride=(step_y, step_x))
+            corr_patches = F.unfold(corr_t, kernel_size=(psize_y, psize_x), stride=(step_y, step_x))
+            del phase_t, corr_t
+
+            num_patches = phase_patches.shape[2]
+
+            # Reshape phase: (1, 2*psize*psize, L) -> (L, 2, psize, psize) -> complex (L, psize, psize)
+            phase_patches = phase_patches.squeeze(0).view(2, psize_y, psize_x, num_patches).permute(3, 0, 1, 2)
+            phase_patches = torch.complex(phase_patches[:, 0], phase_patches[:, 1])
+
+            # Reshape corr: (1, psize*psize, L) -> (L, psize, psize)
+            corr_patches = corr_patches.squeeze(0).view(psize_y, psize_x, num_patches).permute(2, 0, 1)
+
+            # Compute alpha for each patch
+            weighted_corr = (wgt.unsqueeze(0) * corr_patches).sum(dim=(1, 2))
+            alpha = 1.0 - weighted_corr / wgt_sum
+            del corr_patches, weighted_corr
+
+            # Check valid patches (at least 50% non-zero)
+            valid_count = (phase_patches != 0).sum(dim=(1, 2)).float()
+            valid_mask = valid_count >= (psize_y * psize_x * 0.5)
+            del valid_count
+
+            # Batched FFT and power spectrum filtering
+            fft_patches = torch.fft.fft2(phase_patches)
+            del phase_patches
+            magnitude = torch.abs(fft_patches).clamp(min=1e-10)
+            pspec_weight = torch.pow(magnitude, alpha.unsqueeze(1).unsqueeze(2))
+            del magnitude, alpha
+            fft_filtered = pspec_weight * fft_patches
+            del pspec_weight, fft_patches
+
+            # Batched IFFT
+            filtered = torch.fft.ifft2(fft_filtered)
+            del fft_filtered
+
+            # Apply weight and mask invalid patches
+            weighted = wgt.unsqueeze(0) * filtered
+            del filtered
+            weighted = torch.where(valid_mask.unsqueeze(1).unsqueeze(2), weighted, torch.zeros_like(weighted))
+
+            # Prepare for fold: (1, 2*psize*psize, num_patches)
+            weighted_ri = torch.stack([weighted.real, weighted.imag], dim=1)
+            del weighted
+            weighted_ri = weighted_ri.permute(1, 2, 3, 0).reshape(1, 2 * psize_y * psize_x, num_patches)
+
+            # Fold valid_mask for counting overlaps
+            valid_for_fold = valid_mask.float().view(1, 1, num_patches).expand(1, psize_y * psize_x, num_patches)
+            del valid_mask
+
+            # Fold back - accumulates overlapping patches
+            result_ri = F.fold(weighted_ri, output_size=(padded_h, padded_w),
+                               kernel_size=(psize_y, psize_x), stride=(step_y, step_x))
+            count = F.fold(valid_for_fold, output_size=(padded_h, padded_w),
+                           kernel_size=(psize_y, psize_x), stride=(step_y, step_x))
+            del weighted_ri, valid_for_fold
+
+            # Normalize
+            result_ri = result_ri / count.clamp(min=1)
+            result_ri = result_ri.squeeze(0)  # (2, H, W)
+            del count
+
+            # Crop to original size and combine real/imag
+            result = torch.complex(result_ri[0, :ny, :nx], result_ri[1, :ny, :nx])
+            result = result.cpu().numpy()
+            del result_ri
+
+        # Clear GPU cache
+        if dev.type == 'mps':
+            torch.mps.empty_cache()
+        elif dev.type == 'cuda':
+            torch.cuda.empty_cache()
+        del wgt
+
+        # Mask where original was NaN
+        result[nan_mask] = np.nan + 1j * np.nan
+
+        if squeeze:
+            result = result[np.newaxis, ...]
+        return result
 
     def goldstein(self, corr: BatchUnit, psize: int | dict[str, int] = 32, debug: bool = False):
         """
         Apply Goldstein adaptive filter to each dataset in the batch.
-        
+
         Parameters
         ----------
         corr : BatchUnit
@@ -861,43 +888,75 @@ class BatchComplex(BatchCore):
             If dict, specify {'y': size_y, 'x': size_x}. Default is 32.
         debug : bool, optional
             Print debug information. Default is False.
-            
+
         Returns
         -------
         BatchComplex
             New batch with filtered phase values
         """
+        import numpy as np
+        import dask.array as da
+
+        if debug:
+            print('DEBUG: goldstein')
+
+        if psize is None:
+            return self
+
         # Check if correlation is a BatchUnit by checking its class name
         if corr.__class__.__name__ != 'BatchUnit':
             raise ValueError("corr must be a BatchUnit")
-            
+
         if set(corr.keys()) != set(self.keys()):
             raise ValueError("corr must have the same keys as self")
-            
+
+        if isinstance(psize, int):
+            psize = {'y': psize, 'x': psize}
+
+        # Use MPS on Apple Silicon for best performance
+        device = 'mps'
+
         # Apply Goldstein filter to each dataset
         result = {}
         for k in self.keys():
             ds = self[k]
+            corr_ds = corr[k]
             filtered_vars = {}
-            
+
             # Process each complex data variable in the dataset
             for var_name, var_data in ds.data_vars.items():
                 if var_data.dtype.kind == 'c':  # Only process complex variables
-                    filtered_data = self._goldstein(
-                        phase=var_data,
-                        corr=corr[k],
-                        psize=psize,
-                        debug=debug
+                    corr_da = corr_ds[var_name]
+                    phase_dask = var_data.data
+                    corr_dask = corr_da.data
+
+                    # Wrapper for _goldstein
+                    def goldstein_block(phase_block, corr_block):
+                        return BatchComplex._goldstein(phase_block, corr_block, psize=psize, device=device)
+
+                    # Build dimension string based on ndim (e.g., 'yx' for 2D, 'pyx' for 3D)
+                    dim_str = ''.join(chr(ord('a') + i) for i in range(phase_dask.ndim))
+
+                    # Use da.blockwise for efficient dask integration
+                    filtered_dask = da.blockwise(
+                        goldstein_block, dim_str,
+                        phase_dask, dim_str,
+                        corr_dask, dim_str,
+                        dtype=np.complex64,
                     )
-                    filtered_vars[var_name] = filtered_data
+                    filtered_vars[var_name] = xr.DataArray(
+                        filtered_dask,
+                        dims=var_data.dims,
+                        coords=var_data.coords
+                    )
                 else:
                     filtered_vars[var_name] = var_data
-            
+
             # Create a new dataset with the filtered variables
             result[k] = xr.Dataset(
                 filtered_vars,
                 coords=ds.coords,
                 attrs=ds.attrs
             )
-            
+
         return type(self)(result)

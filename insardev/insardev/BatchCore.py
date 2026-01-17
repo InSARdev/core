@@ -2385,31 +2385,40 @@ class BatchCore(dict):
         else:
             sigmas = None
 
+        import dask.array as da
+
         out = {}
         # loop over each key
         for key, ds in self.items():
             w = weight[key] if weight is not None else None
 
-            def gaussian_da(da: xr.DataArray, w_da: xr.DataArray | None = None) -> xr.DataArray:
-                import dask.array as dask_array
-
-                is_complex = np.issubdtype(da.dtype, np.complexfloating)
+            def gaussian_da(data_arr: xr.DataArray, w_da: xr.DataArray | None = None) -> xr.DataArray:
+                is_complex = np.issubdtype(data_arr.dtype, np.complexfloating)
                 out_dtype = np.complex64 if is_complex else np.float32
 
-                # Wrapper for _gaussian that handles weight
-                def apply_gaussian(data_2d, weight_np=w_da.values if w_da is not None else None):
-                    return BatchCore._gaussian(data_2d, weight_np, sigma=sigmas, threshold=threshold).astype(out_dtype)
+                # Get weight numpy array if provided
+                weight_np = w_da.values if w_da is not None else None
 
-                # Use apply_ufunc - xarray broadcasts over non-core dims (e.g., 'pair')
-                result = xr.apply_ufunc(
-                    apply_gaussian,
-                    da,
-                    input_core_dims=[['y', 'x']],
-                    output_core_dims=[['y', 'x']],
-                    dask='parallelized',
-                    output_dtypes=[out_dtype],
+                # Create wrapper for _gaussian
+                def apply_gaussian(block):
+                    return BatchCore._gaussian(block, weight_np, sigma=sigmas, threshold=threshold).astype(out_dtype)
+
+                # Use da.blockwise for efficient dask integration
+                dask_data = data_arr.data
+                # Build dimension string based on ndim (e.g., 'yx' for 2D, 'pyx' for 3D)
+                dim_str = ''.join(chr(ord('a') + i) for i in range(dask_data.ndim))
+
+                result_dask = da.blockwise(
+                    apply_gaussian, dim_str,
+                    dask_data, dim_str,
+                    dtype=out_dtype,
                 )
-                return result.assign_coords({'y': da.y, 'x': da.x})
+
+                return xr.DataArray(
+                    result_dask,
+                    dims=data_arr.dims,
+                    coords=data_arr.coords
+                )
 
             # determine weight for each variable:
             # - if w is DataArray: use same weight for all variables
