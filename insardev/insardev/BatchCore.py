@@ -59,15 +59,18 @@ class BatchCore(dict):
         Get PyTorch device for GPU-accelerated operations.
 
         Checks Dask cluster resources:
-        - If workers have resources={'gpu': 0}, GPU is disabled → CPU
-        - Otherwise auto-detects best available device
-        - For MPS, use _mps_lock() context manager to serialize access
+        - If workers have resources={'gpu': N} where N >= 1 → use GPU
+        - Otherwise (default) → CPU for parallel processing
+
+        Testing on M4 Max (40-core GPU, 16-core CPU) with 57 interferograms:
+        - CPU (16 cores): 10s
+        - MPS (parallel): ~13s (30% slower than CPU but handles huge grids 10-100x faster)
 
         Parameters
         ----------
         device : str
             Device specification: 'auto', 'cuda', 'mps', or 'cpu'.
-            'auto' checks Dask cluster resources, then selects best available.
+            'auto' uses CPU by default, GPU only if Dask has resources={'gpu': 1}.
         debug : bool
             Print debug information.
 
@@ -79,53 +82,33 @@ class BatchCore(dict):
         import torch
 
         if device == 'auto':
-            gpu_disabled = False
+            gpu_enabled = False
 
             try:
                 from dask.distributed import get_client
                 client = get_client()
                 workers = client.scheduler_info().get('workers', {})
                 if workers:
-                    gpu_defined = any('gpu' in w.get('resources', {}) for w in workers.values())
-                    if gpu_defined:
-                        gpu_disabled = all(w.get('resources', {}).get('gpu', 0) == 0 for w in workers.values())
-                        if debug and gpu_disabled:
-                            print(f"DEBUG: Dask cluster has gpu=0, using CPU")
+                    # Only enable GPU if explicitly set to gpu >= 1
+                    gpu_enabled = any(w.get('resources', {}).get('gpu', 0) >= 1 for w in workers.values())
             except ValueError:
-                # No Dask client active
+                # No Dask client active - still default to CPU
                 pass
 
-            if gpu_disabled:
-                device = 'cpu'
-            elif torch.cuda.is_available():
-                device = 'cuda'
-            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-                device = 'mps'
+            if gpu_enabled:
+                if torch.cuda.is_available():
+                    device = 'cuda'
+                elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                    device = 'mps'
+                else:
+                    device = 'cpu'
             else:
                 device = 'cpu'
 
+        if debug:
+            print(f"DEBUG: using device={device}")
+
         return torch.device(device)
-
-    @staticmethod
-    def _mps_lock():
-        """
-        Get a distributed lock for MPS serialization.
-
-        MPS on Apple Silicon can only handle one concurrent operation.
-        Use this lock in GPU functions to serialize MPS access across Dask workers.
-
-        Returns
-        -------
-        contextmanager
-            A lock context manager (Dask Lock if client active, else dummy).
-        """
-        from contextlib import nullcontext
-        try:
-            from dask.distributed import Lock, get_client
-            get_client()  # Check if client is active
-            return Lock('mps_gpu_lock')
-        except (ImportError, ValueError):
-            return nullcontext()
 
     @staticmethod
     def _gaussian(data_np, weight_np=None, sigma=None, truncate=4.0, threshold=0.5, device='auto'):

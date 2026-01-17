@@ -222,10 +222,7 @@ class Batch(BatchCore):
 
                 # Create wrapper for apply_ufunc
                 def compute_velocity(data, times_years=times_years, min_valid=min_valid, device=device):
-                    from contextlib import nullcontext
-                    # Use MPS lock to serialize GPU access on Apple Silicon
-                    with Batch._mps_lock() if device.type == 'mps' else nullcontext():
-                        return Batch._velocity_torch(data, times_years, min_valid=min_valid, device=device)
+                    return Batch._velocity_torch(data, times_years, min_valid=min_valid, device=device)
 
                 # Use apply_ufunc with dask='parallelized' for lazy evaluation
                 with dask.annotate(resources={'gpu': 1} if device.type != 'cpu' else {}):

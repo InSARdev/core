@@ -172,10 +172,8 @@ class Stack_ps(Stack_stl):
                     slc_transposed = np.moveaxis(slc_chunk, -1, 0)
                     # Compute amplitude |z|
                     amplitudes = np.abs(slc_transposed)
-                    # Use MPS lock to serialize GPU access on Apple Silicon
-                    with Stack_ps._mps_lock() if dev.type == 'mps' else nullcontext():
-                        # Compute PS function using PyTorch
-                        psf_values = Stack_ps._psfunction_torch(amplitudes, device=dev, debug=dbg)
+                    # Compute PS function using PyTorch
+                    psf_values = Stack_ps._psfunction_torch(amplitudes, device=dev, debug=dbg)
                     return psf_values.astype(np.float32)
                 return process_wrapper
 

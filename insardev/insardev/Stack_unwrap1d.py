@@ -852,13 +852,11 @@ class Stack_unwrap1d(Stack_phasediff):
                 else:
                     weight_block = None
 
-                # Use MPS lock to serialize GPU access on Apple Silicon
-                with Stack_unwrap1d._mps_lock() if device.type == 'mps' else nullcontext():
-                    unwrapped_block = Stack_unwrap1d._unwrap1d_pairs_numpy(
-                        data_block, weight_block, pair_dates,
-                        device=device, max_iter=max_iter, epsilon=epsilon,
-                        batch_size=batch_size, debug=False
-                    )
+                unwrapped_block = Stack_unwrap1d._unwrap1d_pairs_numpy(
+                    data_block, weight_block, pair_dates,
+                    device=device, max_iter=max_iter, epsilon=epsilon,
+                    batch_size=batch_size, debug=False
+                )
                 return unwrapped_block.astype(np.float32)
 
             # Build lazy dask array from blocks
@@ -904,13 +902,11 @@ class Stack_unwrap1d(Stack_phasediff):
                 data_block_3d = data_block[:, np.newaxis, :]
                 weight_block_3d = weight_block[:, np.newaxis, :] if weight_block is not None else None
 
-                # Use MPS lock to serialize GPU access on Apple Silicon
-                with Stack_unwrap1d._mps_lock() if device.type == 'mps' else nullcontext():
-                    unwrapped_block = Stack_unwrap1d._unwrap1d_pairs_numpy(
-                        data_block_3d, weight_block_3d, pair_dates,
-                        device=device, max_iter=max_iter, epsilon=epsilon,
-                        batch_size=batch_size, debug=False
-                    )
+                unwrapped_block = Stack_unwrap1d._unwrap1d_pairs_numpy(
+                    data_block_3d, weight_block_3d, pair_dates,
+                    device=device, max_iter=max_iter, epsilon=epsilon,
+                    batch_size=batch_size, debug=False
+                )
                 # Reshape: (n_pairs, 1, n_stack) -> (n_pairs, n_stack)
                 return unwrapped_block[:, 0, :].astype(np.float32)
 

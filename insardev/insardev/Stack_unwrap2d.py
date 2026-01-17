@@ -1471,12 +1471,10 @@ class Stack_unwrap2d(Stack_unwrap1d):
                     phase_2d = phase_chunk[0]
                     weight_2d = weight_chunk[0] if weight_chunk is not None else None
 
-                    # Use MPS lock to serialize GPU access on Apple Silicon
-                    with Stack_unwrap2d._mps_lock() if device.type == 'mps' else nullcontext():
-                        unwrapped, labels = self._process_irls_slice(
-                            phase_2d, weight_2d, device, conncomp_size,
-                            max_iter, tol, cg_max_iter, cg_tol, epsilon, debug
-                        )
+                    unwrapped, labels = self._process_irls_slice(
+                        phase_2d, weight_2d, device, conncomp_size,
+                        max_iter, tol, cg_max_iter, cg_tol, epsilon, debug
+                    )
                     # Stack and add pair dim back: (2, y, x) -> (1, 2, y, x)
                     result = np.stack([unwrapped, labels.astype(np.float32)], axis=0)
                     result = result[np.newaxis, ...]
