@@ -2338,6 +2338,7 @@ class BatchCore(dict):
         weight: BatchUnit | None = None,
         wavelength: float | None = None,
         threshold: float = 0.5,
+        device: str = 'auto',
         debug: bool = False
     ) -> Batch:
         """
@@ -2352,6 +2353,9 @@ class BatchCore(dict):
             Gaussian sigma via 5.3 cutoff formula. Must be positive if provided.
         threshold : float
             Drop-off threshold for the kernel.
+        device : str, optional
+            PyTorch device: 'auto' (default), 'cuda', 'mps', or 'cpu'.
+            'auto' uses GPU if Dask client has resources={'gpu': 1}.
         debug : bool
             Print sigma values if True.
 
@@ -2385,7 +2389,11 @@ class BatchCore(dict):
         else:
             sigmas = None
 
+        import dask
         import dask.array as da
+
+        # Determine if GPU resource annotation is needed
+        use_gpu = device in ('cuda', 'mps')
 
         out = {}
         # loop over each key
@@ -2401,18 +2409,19 @@ class BatchCore(dict):
 
                 # Create wrapper for _gaussian
                 def apply_gaussian(block):
-                    return BatchCore._gaussian(block, weight_np, sigma=sigmas, threshold=threshold).astype(out_dtype)
+                    return BatchCore._gaussian(block, weight_np, sigma=sigmas, threshold=threshold, device=device).astype(out_dtype)
 
                 # Use da.blockwise for efficient dask integration
                 dask_data = data_arr.data
                 # Build dimension string based on ndim (e.g., 'yx' for 2D, 'pyx' for 3D)
                 dim_str = ''.join(chr(ord('a') + i) for i in range(dask_data.ndim))
 
-                result_dask = da.blockwise(
-                    apply_gaussian, dim_str,
-                    dask_data, dim_str,
-                    dtype=out_dtype,
-                )
+                with dask.annotate(resources={'gpu': 1} if use_gpu else {}):
+                    result_dask = da.blockwise(
+                        apply_gaussian, dim_str,
+                        dask_data, dim_str,
+                        dtype=out_dtype,
+                    )
 
                 return xr.DataArray(
                     result_dask,

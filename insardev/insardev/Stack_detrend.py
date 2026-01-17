@@ -10,44 +10,11 @@
 # ----------------------------------------------------------------------------
 from contextlib import nullcontext
 from .Stack_unwrap2d import Stack_unwrap2d
-from .utils_regression2d import regression2d
-from . import utils_xarray
 from .Batch import Batch, BatchWrap
+
 class Stack_detrend(Stack_unwrap2d):
     import numpy as np
     import xarray as xr
-
-    # def trend2d_interferogram(self, datas, weights=None, variables=['azi', 'rng'], compute=False, **kwarg):
-    #     return self.trend2d(datas, weights, variables, compute, wrap=True, **kwarg)
-
-    def trend2d_sklearn(self, datas, weights, transform, debug=False, **kwarg):
-        """
-        Compute 2D polynomial trend using sklearn (legacy implementation).
-
-        For most use cases, use trend2d() instead which uses PyTorch and is faster.
-        """
-        if debug:
-            print(f"DEBUG trend2d_sklearn: degree={kwarg.get('degree', 1)}")
-
-        def _regression2d(data, weight, transform, **kwarg):
-            key = kwarg.pop('key')
-            trend = regression2d(data,
-                                 variables=[transform[v] for v in transform.data_vars],
-                                 weight=weight,
-                                 **kwarg)
-            return trend
-
-        if transform is not None:
-            # unify keys to datas
-            transform = transform.sel(datas)
-
-        # prevent chunking of the stack dimension, it produces performance issues and incorrect results in 2D functions
-        assert datas.chunks['pair']==1, 'ERROR: datas must be chunked as (1, ...)'
-        assert weights is None or weights.chunks['pair']==1, 'ERROR: weights must be chunked as (1, ...)'
-
-        wrap = True if isinstance(datas, BatchWrap) else False
-        data = utils_xarray.apply_pol(datas, weights, transform, func=_regression2d, add_key=True, wrap=wrap, **kwarg)
-        return BatchWrap(data) if wrap else Batch(data)
 
     @staticmethod
     def _trend2d_array(phase, weight, variables, device, degree=1):
@@ -179,7 +146,7 @@ class Stack_detrend(Stack_unwrap2d):
 
         return trends.astype(np.float32)
 
-    def trend2d(self, phase, weight=None, transform=None, degree=1, device=None, debug=False):
+    def trend2d(self, phase, weight=None, transform=None, degree=1, device='auto', debug=False):
         """
         Compute 2D polynomial trend using PyTorch (GPU-accelerated).
 
@@ -197,8 +164,9 @@ class Stack_detrend(Stack_unwrap2d):
             - degree=1: linear (a₁*v₁ + a₂*v₂ + ... + c)
             - degree=2: includes v₁², v₂², ... terms
             - degree=3: includes v₁³, v₂³, ... terms
-        device : str or None
-            PyTorch device ('cuda', 'mps', 'cpu'). Auto-detected if None.
+        device : str, optional
+            PyTorch device: 'auto' (default), 'cuda', 'mps', or 'cpu'.
+            'auto' uses GPU if Dask client has resources={'gpu': 1}.
         debug : bool
             Print debug information.
 
@@ -219,7 +187,7 @@ class Stack_detrend(Stack_unwrap2d):
         import numpy as np
 
         # Auto-detect device based on Dask cluster resources and hardware
-        device = Stack_detrend._get_torch_device(device if device is not None else 'auto', debug=debug)
+        device = Stack_detrend._get_torch_device(device, debug=debug)
 
         if debug:
             print(f"DEBUG: using device={device}")
@@ -275,7 +243,7 @@ class Stack_detrend(Stack_unwrap2d):
                 coords = dict(phase_da.coords)
                 dims = phase_da.dims
 
-                # Create wrapper function for apply_ufunc
+                # Create wrapper function for blockwise
                 def process_chunk(phase_chunk, weight_chunk=None, variables=variables, device=device, degree=degree):
                     import torch
                     # Ensure 3D input (pair, y, x)
@@ -290,30 +258,33 @@ class Stack_detrend(Stack_unwrap2d):
                         )
                     return result
 
-                # Use apply_ufunc with dask='parallelized' for efficient processing
-                # This avoids serializing variables for each chunk
+                # Use da.blockwise for efficient dask integration
+                phase_dask = phase_da.data
+                dim_str = ''.join(chr(ord('a') + i) for i in range(phase_dask.ndim))
+
                 with dask.annotate(resources={'gpu': 1} if device.type != 'cpu' else {}):
                     if weight_da is not None:
-                        trend_da = xr.apply_ufunc(
-                            process_chunk,
-                            phase_da,
-                            weight_da,
-                            input_core_dims=[['y', 'x'], ['y', 'x']],
-                            output_core_dims=[['y', 'x']],
-                            dask='parallelized',
-                            output_dtypes=[np.float32],
-                            dask_gufunc_kwargs={'allow_rechunk': True},
+                        weight_dask = weight_da.data
+                        def process_with_weight(phase_block, weight_block):
+                            return process_chunk(phase_block, weight_block)
+                        result_dask = da.blockwise(
+                            process_with_weight, dim_str,
+                            phase_dask, dim_str,
+                            weight_dask, dim_str,
+                            dtype=np.float32,
                         )
                     else:
-                        trend_da = xr.apply_ufunc(
-                            process_chunk,
-                            phase_da,
-                            input_core_dims=[['y', 'x']],
-                            output_core_dims=[['y', 'x']],
-                            dask='parallelized',
-                            output_dtypes=[np.float32],
-                            dask_gufunc_kwargs={'allow_rechunk': True},
+                        result_dask = da.blockwise(
+                            process_chunk, dim_str,
+                            phase_dask, dim_str,
+                            dtype=np.float32,
                         )
+
+                trend_da = xr.DataArray(
+                    result_dask,
+                    dims=phase_da.dims,
+                    coords=phase_da.coords
+                )
 
                 result_ds[pol] = trend_da
 
@@ -321,9 +292,9 @@ class Stack_detrend(Stack_unwrap2d):
 
         return BatchWrap(result) if wrap else Batch(result)
 
-    def trend2d_dataset(self, phase, weight=None, transform=None, **kwargs):
+    def trend2d_dataset(self, phase, weight=None, transform=None, degree=1, device='auto', debug=False):
         """
-        Compute 2D trend from phase Dataset using regression.
+        Compute 2D trend from phase Dataset using PyTorch (GPU-accelerated).
 
         Convenience wrapper around trend2d() for working with merged datasets
         instead of per-burst batches. Useful when you have already dissolved
@@ -336,9 +307,14 @@ class Stack_detrend(Stack_unwrap2d):
         weight : xr.Dataset, optional
             Correlation/weight dataset (from corr.to_dataset()).
         transform : xr.Dataset, optional
-            Transform dataset with 'azi' and 'rng' variables.
-        **kwargs
-            Additional arguments passed to regression2d (degree, algorithm, etc.).
+            Transform dataset with variables to use as regressors (e.g., 'azi', 'rng', 'ele').
+        degree : int, optional
+            Polynomial degree for each variable (default 1).
+        device : str, optional
+            PyTorch device: 'auto' (default), 'cuda', 'mps', or 'cpu'.
+            'auto' uses GPU if Dask client has resources={'gpu': 1}.
+        debug : bool, optional
+            Print debug information.
 
         Returns
         -------
@@ -351,13 +327,13 @@ class Stack_detrend(Stack_unwrap2d):
         >>> phase_ds = phase.to_dataset()
         >>> corr_ds = corr.to_dataset()
         >>> transform_ds = transform[['azi','rng']].to_dataset()
-        >>> trend = stack.trend2d_dataset(phase_ds, corr_ds, transform_ds, degree=1, algorithm='linear')
+        >>> trend = stack.trend2d_dataset(phase_ds, corr_ds, transform_ds, degree=1)
 
         Convert back to per-burst Batch:
         >>> trend_batch = phase.from_dataset(trend)
         """
         import xarray as xr
-        import numpy as np
+        from .Batch import Batch, BatchWrap, BatchUnit
 
         # Validate input types
         if not isinstance(phase, xr.Dataset):
@@ -367,67 +343,24 @@ class Stack_detrend(Stack_unwrap2d):
         if transform is not None and not isinstance(transform, xr.Dataset):
             raise TypeError(f"transform must be xr.Dataset, got {type(transform).__name__}")
 
-        # Helper to chunk only dimensions that exist in a dataset
-        def safe_chunk(ds, base_spec):
-            valid_spec = {k: v for k, v in base_spec.items() if k in ds.dims}
-            return ds.chunk(valid_spec)
+        # Wrap datasets in single-key Batches for trend2d()
+        dummy_key = '__dataset__'
+        phase_batch = BatchWrap({dummy_key: phase})
+        weight_batch = BatchUnit({dummy_key: weight}) if weight is not None else None
+        transform_batch = Batch({dummy_key: transform}) if transform is not None else None
 
-        # Rechunk: 1 pair per chunk, full y/x
-        chunk_spec = {'y': -1, 'x': -1}
-        if 'pair' in phase.dims:
-            chunk_spec['pair'] = 1
-        phase = safe_chunk(phase, chunk_spec)
-        if weight is not None:
-            weight = safe_chunk(weight, chunk_spec)
+        # Call PyTorch-based trend2d()
+        trend_batch = self.trend2d(
+            phase_batch,
+            weight=weight_batch,
+            transform=transform_batch,
+            degree=degree,
+            device=device,
+            debug=debug
+        )
 
-        # Get polarization variables (spatial, with y/x dims) - excludes converted attributes
-        polarizations = [v for v in phase.data_vars
-                        if 'y' in phase[v].dims and 'x' in phase[v].dims]
-
-        # Detect stack dimension
-        sample_da = phase[polarizations[0]]
-        dims = sample_da.dims
-        stackvar = dims[0] if len(dims) > 2 else None
-        n_stack = sample_da.sizes[stackvar] if stackvar else 1
-
-        # Prepare transform variables list
-        transform_vars = [transform[v] for v in transform.data_vars] if transform is not None else []
-
-        results = {}
-        for pol in polarizations:
-            phase_da = phase[pol]
-            weight_da = weight[pol] if weight is not None else None
-
-            if stackvar and n_stack > 1:
-                # Process each stack element using regression2d directly
-                trend_slices = []
-                for i in range(n_stack):
-                    phase_slice = phase_da.isel({stackvar: i})
-                    weight_slice = weight_da.isel({stackvar: i}) if weight_da is not None else None
-
-                    # Call regression2d directly - it handles dask arrays properly via apply_ufunc
-                    trend_slice = regression2d(
-                        phase_slice,
-                        variables=transform_vars,
-                        weight=weight_slice,
-                        **kwargs
-                    )
-                    trend_slices.append(trend_slice.expand_dims({stackvar: [phase_da[stackvar].values[i]]}))
-
-                # Concatenate along stack dimension and rechunk
-                result_da = xr.concat(trend_slices, dim=stackvar).chunk({stackvar: 1, 'y': -1, 'x': -1})
-            else:
-                # Single 2D case - call regression2d directly
-                result_da = regression2d(
-                    phase_da,
-                    variables=transform_vars,
-                    weight=weight_da,
-                    **kwargs
-                )
-
-            results[pol] = result_da.rename(pol)
-
-        output = xr.merge(list(results.values()))
+        # Extract result Dataset
+        output = trend_batch[dummy_key]
         output.attrs = phase.attrs
         return output
 
@@ -640,9 +573,4 @@ class Stack_detrend(Stack_unwrap2d):
         self.plot_velocity(self.los_displacement_mm(data),
                            caption=caption, aspect=aspect, alpha=alpha,
                            quantile=quantile, vmin=vmin, vmax=vmax, symmetrical=symmetrical, **kwargs)
-
-    def _trend(self, data, dim='auto', degree=1):
-        print ('NOTE: Function is deprecated. Use Stack.regression1d() instead.')
-        return self.regression1d(data=data, dim=dim, degree=degree)
-
 

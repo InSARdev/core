@@ -541,11 +541,12 @@ class Stack_unwrap2d(Stack_unwrap1d):
             Batch with reordered labels (1=largest, 2=second largest, etc.).
         """
         import xarray as xr
+        import dask.array
         from .Batch import BatchUnit
 
         def _reorder_2d(labels_2d):
             """Reorder labels in a single 2D array."""
-            # Handle (1, y, x) arrays from apply_ufunc with core_dims=[['y', 'x']]
+            # Handle (1, y, x) arrays from blockwise
             squeeze = False
             if labels_2d.ndim == 3 and labels_2d.shape[0] == 1:
                 labels_2d = labels_2d[0]
@@ -591,18 +592,23 @@ class Stack_unwrap2d(Stack_unwrap1d):
 
             reordered_vars = {}
             for var in data_vars:
-                da = ds[var]
+                data_arr = ds[var]
 
-                # Apply reordering to each 2D slice
-                reordered_da = xr.apply_ufunc(
-                    _reorder_2d,
-                    da,
-                    input_core_dims=[['y', 'x']],
-                    output_core_dims=[['y', 'x']],
-                    dask='parallelized',
-                    output_dtypes=[np.float32],
+                # Use da.blockwise for efficient dask integration
+                dask_data = data_arr.data
+                dim_str = ''.join(chr(ord('a') + i) for i in range(dask_data.ndim))
+
+                result_dask = dask.array.blockwise(
+                    _reorder_2d, dim_str,
+                    dask_data, dim_str,
+                    dtype=np.float32,
                 )
 
+                reordered_da = xr.DataArray(
+                    result_dask,
+                    dims=data_arr.dims,
+                    coords=data_arr.coords
+                )
                 reordered_vars[var] = reordered_da
 
             result[key] = xr.Dataset(reordered_vars, coords=ds.coords, attrs=ds.attrs)
@@ -635,13 +641,14 @@ class Stack_unwrap2d(Stack_unwrap1d):
             Batch of unwrapped phase with linked components.
         """
         import xarray as xr
+        import dask.array
         from .Batch import Batch
 
         def _link_2d(phase_2d):
             """Link components in a single 2D array."""
             import time
 
-            # Handle (1, y, x) arrays from apply_ufunc with core_dims=[['y', 'x']]
+            # Handle (1, y, x) arrays from blockwise
             squeeze = False
             if phase_2d.ndim == 3 and phase_2d.shape[0] == 1:
                 phase_2d = phase_2d[0]
@@ -699,19 +706,23 @@ class Stack_unwrap2d(Stack_unwrap1d):
 
             linked_vars = {}
             for var in data_vars:
-                da = ds[var]
-                stackvar = da.dims[0]  # 'pair'
+                data_arr = ds[var]
 
-                # Apply linking to each 2D slice
-                linked_da = xr.apply_ufunc(
-                    _link_2d,
-                    da,
-                    input_core_dims=[['y', 'x']],
-                    output_core_dims=[['y', 'x']],
-                    dask='parallelized',
-                    output_dtypes=[np.float32],
+                # Use da.blockwise for efficient dask integration
+                dask_data = data_arr.data
+                dim_str = ''.join(chr(ord('a') + i) for i in range(dask_data.ndim))
+
+                result_dask = dask.array.blockwise(
+                    _link_2d, dim_str,
+                    dask_data, dim_str,
+                    dtype=np.float32,
                 )
 
+                linked_da = xr.DataArray(
+                    result_dask,
+                    dims=data_arr.dims,
+                    coords=data_arr.coords
+                )
                 linked_vars[var] = linked_da
 
             result[key] = xr.Dataset(linked_vars, coords=ds.coords, attrs=ds.attrs)
@@ -720,7 +731,7 @@ class Stack_unwrap2d(Stack_unwrap1d):
 
     def unwrap2d(self, phase, weight=None, conncomp=False,
                 conncomp_size=1000, conncomp_gap=None,
-                conncomp_linksize=5, conncomp_linkcount=30, device='cpu', debug=False, **kwargs):
+                conncomp_linksize=5, conncomp_linkcount=30, device='auto', debug=False, **kwargs):
         """
         Unwrap phase using GPU-accelerated IRLS algorithm (L¹ norm).
 
@@ -764,9 +775,8 @@ class Stack_unwrap2d(Stack_unwrap1d):
             connections but increase computation. Default is 30.
             Only used when conncomp=False.
         device : str, optional
-            PyTorch device to use: 'cpu' (default), 'cuda', 'mps', or 'tpu'.
-            None selects the best available GPU or falls back to CPU.
-            Use 'tpu' on Google Colab/Cloud TPU instances (experimental).
+            PyTorch device: 'auto' (default), 'cuda', 'mps', 'cpu', or 'tpu'.
+            'auto' uses GPU if Dask client has resources={'gpu': 1}.
         debug : bool, optional
             If True, print diagnostic information. Default is False.
         **kwargs
@@ -836,7 +846,7 @@ class Stack_unwrap2d(Stack_unwrap1d):
 
     def unwrap2d_dataset(self, phase, weight=None, conncomp=False,
                          conncomp_size=1000, conncomp_gap=None,
-                         conncomp_linksize=5, conncomp_linkcount=30, device='cpu', debug=False, **kwargs):
+                         conncomp_linksize=5, conncomp_linkcount=30, device='auto', debug=False, **kwargs):
         """
         Unwrap a single phase Dataset using GPU-accelerated IRLS algorithm.
 
@@ -862,7 +872,8 @@ class Stack_unwrap2d(Stack_unwrap1d):
         conncomp_linkcount : int, optional
             Maximum neighbor components to consider. Default is 30.
         device : str, optional
-            PyTorch device: 'cpu', 'cuda', 'mps', or 'tpu'. Default is 'cpu'.
+            PyTorch device: 'auto' (default), 'cuda', 'mps', 'cpu', or 'tpu'.
+            'auto' uses GPU if Dask client has resources={'gpu': 1}.
         debug : bool, optional
             Print diagnostic information. Default is False.
         **kwargs
@@ -925,7 +936,7 @@ class Stack_unwrap2d(Stack_unwrap1d):
     # =========================================================================
 
     @staticmethod
-    def _irls_unwrap_2d(phase, weight=None, device=None, max_iter=50, tol=1e-3,
+    def _irls_unwrap_2d(phase, weight=None, device='auto', max_iter=50, tol=1e-3,
                         cg_max_iter=20, cg_tol=1e-4, epsilon=1e-2, debug=False):
         """
         Unwrap 2D phase using GPU/TPU-accelerated Iteratively Reweighted Least Squares (L¹ norm).
@@ -944,8 +955,9 @@ class Stack_unwrap2d(Stack_unwrap1d):
         weight : np.ndarray, optional
             2D array of quality weights (e.g., correlation). Higher values
             indicate more reliable phase. If None, uniform weights are used.
-        device : torch.device, optional
-            PyTorch device to use. If None, auto-detects best device.
+        device : str or torch.device, optional
+            PyTorch device: 'auto' (default), 'cuda', 'mps', 'cpu', or 'tpu'.
+            'auto' uses GPU if Dask client has resources={'gpu': 1}.
         max_iter : int, optional
             Maximum IRLS iterations. Default is 50.
         tol : float, optional
@@ -988,36 +1000,16 @@ class Stack_unwrap2d(Stack_unwrap1d):
         import torch
         from torch_dct import dct_2d, idct_2d
         import time
+        from .BatchCore import BatchCore
 
-        # Validate and set device
-        if device is None or device == 'auto':
-            # Auto-select best available device
-            if torch.cuda.is_available():
-                device = torch.device('cuda')
-            elif torch.backends.mps.is_available():
-                device = torch.device('mps')
-            else:
-                device = torch.device('cpu')
-        elif isinstance(device, str):
+        # Validate and set device using shared helper
+        if isinstance(device, str):
             if device == 'tpu':
                 # TPU uses torch_xla device
                 import torch_xla.core.xla_model as xm
                 device = xm.xla_device()
             else:
-                device = torch.device(device)
-
-        # Check GPU availability for explicit device requests
-        device_type = device.type if hasattr(device, 'type') else str(device)
-        if device_type == 'cuda' and not torch.cuda.is_available():
-            raise RuntimeError(
-                f"CUDA device requested but not available. "
-                f"Use device='cpu' or device='auto' instead."
-            )
-        if device_type == 'mps' and not torch.backends.mps.is_available():
-            raise RuntimeError(
-                f"MPS device requested but not available. "
-                f"Use device='cpu' or device='auto' instead."
-            )
+                device = BatchCore._get_torch_device(device, debug=debug)
 
         device_name = str(device)
         height, width = phase.shape
@@ -1327,7 +1319,7 @@ class Stack_unwrap2d(Stack_unwrap1d):
 
         return unwrapped
 
-    def unwrap2d_irls(self, phase, weight=None, conncomp=False, conncomp_size=100, device=None,
+    def unwrap2d_irls(self, phase, weight=None, conncomp=False, conncomp_size=100, device='auto',
                       max_iter=50, tol=1e-2, cg_max_iter=10, cg_tol=1e-3, epsilon=1e-2, debug=False):
         """
         Unwrap phase using GPU-accelerated IRLS algorithm (L¹ norm).
@@ -1354,9 +1346,8 @@ class Stack_unwrap2d(Stack_unwrap1d):
             Minimum number of pixels for a connected component to be processed.
             Components smaller than this are left as NaN. Default is 100.
         device : str, optional
-            Device for computation: 'auto' (default), 'cpu', 'cuda', 'mps', or 'tpu'.
-            'auto' selects the best available GPU, falling back to CPU.
-            Use 'tpu' on Google Colab/Cloud TPU instances (experimental).
+            PyTorch device: 'auto' (default), 'cuda', 'mps', 'cpu', or 'tpu'.
+            'auto' uses GPU if Dask client has resources={'gpu': 1}.
         max_iter : int, optional
             Maximum IRLS iterations. Default is 50.
         tol : float, optional
@@ -1396,7 +1387,7 @@ class Stack_unwrap2d(Stack_unwrap1d):
         assert weight is None or isinstance(weight, BatchUnit), 'ERROR: weight should be a BatchUnit object'
 
         # Resolve device using shared helper (handles Dask cluster resources)
-        device = Stack_unwrap2d._get_torch_device(device if device is not None else 'auto', debug=debug)
+        device = Stack_unwrap2d._get_torch_device(device, debug=debug)
         device_name = str(device).upper()
 
         if debug:
@@ -1448,9 +1439,8 @@ class Stack_unwrap2d(Stack_unwrap1d):
                     if weight_da is not None and 'pair' in weight_da.indexes:
                         weight_da = weight_da.reset_index('pair', drop=True)
 
-                # Use xr.apply_ufunc with dask='parallelized' for proper lazy execution
+                # Use da.blockwise for efficient dask integration
                 # With chunk={'pair': 1}, dask splits (n_pairs, y, x) into n_pairs chunks of (1, y, x)
-                # input_core_dims=[['y', 'x']] means pair is non-core and gets chunked
 
                 def process_wrapper(phase_chunk, weight_chunk=None):
                     """Wrapper for IRLS processing that returns stacked results.
@@ -1474,18 +1464,36 @@ class Stack_unwrap2d(Stack_unwrap1d):
                     result = result[np.newaxis, ...]
                     return result
 
-                # dask='parallelized' processes each chunk independently
-                # input_core_dims=[['y', 'x']] so pair dim is chunked, function receives (1, y, x)
+                # Use da.blockwise for efficient chunk processing
+                phase_dask = phase_da.data
+                weight_dask = weight_da.data if weight_da is not None else None
+
                 with dask.annotate(resources={'gpu': 1} if device.type != 'cpu' else {}):
-                    result = xr.apply_ufunc(
-                        process_wrapper,
-                        *([phase_da] if weight_da is None else [phase_da, weight_da]),
-                        input_core_dims=[['y', 'x']] if weight_da is None else [['y', 'x'], ['y', 'x']],
-                        output_core_dims=[['output', 'y', 'x']],
-                        dask='parallelized',
-                        output_dtypes=[np.float32],
-                        dask_gufunc_kwargs={'output_sizes': {'output': 2}}
-                    )
+                    if weight_dask is None:
+                        result_dask = dask.array.blockwise(
+                            process_wrapper, 'poyx',
+                            phase_dask, 'pyx',
+                            new_axes={'o': 2},
+                            dtype=np.float32,
+                        )
+                    else:
+                        def process_wrapper_with_weight(phase_chunk, weight_chunk):
+                            return process_wrapper(phase_chunk, weight_chunk)
+                        result_dask = dask.array.blockwise(
+                            process_wrapper_with_weight, 'poyx',
+                            phase_dask, 'pyx',
+                            weight_dask, 'pyx',
+                            new_axes={'o': 2},
+                            dtype=np.float32,
+                        )
+
+                # Build xarray result with proper dimensions
+                result_dims = ('pair', 'output', 'y', 'x') if 'pair' in phase_da.dims else ('output', 'y', 'x')
+                result = xr.DataArray(
+                    result_dask,
+                    dims=result_dims,
+                    coords={'y': phase_da.y, 'x': phase_da.x}
+                )
 
                 # Extract unwrapped phase and connected components
                 result_da = result.isel(output=0)
@@ -2174,25 +2182,32 @@ DEFOMAX_CYCLE  {defomax}
 
                 wrapper = make_wrapper(defomax, debug)
 
-                # Use xr.apply_ufunc with dask='parallelized' for lazy execution
+                # Use da.blockwise for efficient dask integration
+                phase_dask = phase_da.data
+                dim_str = ''.join(chr(ord('a') + i) for i in range(phase_dask.ndim))
+
                 if corr_da is None:
-                    unwrap_da = xr.apply_ufunc(
-                        wrapper,
-                        phase_da,
-                        input_core_dims=[['y', 'x']],
-                        output_core_dims=[['y', 'x']],
-                        dask='parallelized',
-                        output_dtypes=[np.float32],
+                    result_dask = dask.array.blockwise(
+                        wrapper, dim_str,
+                        phase_dask, dim_str,
+                        dtype=np.float32,
                     )
                 else:
-                    unwrap_da = xr.apply_ufunc(
-                        wrapper,
-                        phase_da, corr_da,
-                        input_core_dims=[['y', 'x'], ['y', 'x']],
-                        output_core_dims=[['y', 'x']],
-                        dask='parallelized',
-                        output_dtypes=[np.float32],
+                    corr_dask = corr_da.data
+                    def wrapper_with_corr(phase_chunk, corr_chunk):
+                        return wrapper(phase_chunk, corr_chunk)
+                    result_dask = dask.array.blockwise(
+                        wrapper_with_corr, dim_str,
+                        phase_dask, dim_str,
+                        corr_dask, dim_str,
+                        dtype=np.float32,
                     )
+
+                unwrap_da = xr.DataArray(
+                    result_dask,
+                    dims=phase_da.dims,
+                    coords=phase_da.coords
+                )
 
                 # Restore pair coords
                 if pair_coords:

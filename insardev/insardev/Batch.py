@@ -158,7 +158,7 @@ class Batch(BatchCore):
 
         return vel_np, int_np
 
-    def velocity(self, min_valid=3, device=None, debug=False) -> tuple["Batch", "Batch"]:
+    def velocity(self, min_valid=3, device='auto', debug=False) -> tuple["Batch", "Batch"]:
         """
         Compute velocity (linear trend) and intercept from time series.
 
@@ -172,8 +172,8 @@ class Batch(BatchCore):
             velocity. Pixels with fewer valid points will be set to NaN.
             Default is 3.
         device : str, optional
-            PyTorch device ('cuda', 'mps', 'cpu'). Auto-detected if None.
-            Respects Dask cluster resources={'gpu': 0} to disable GPU.
+            PyTorch device: 'auto' (default), 'cuda', 'mps', or 'cpu'.
+            'auto' uses GPU if Dask client has resources={'gpu': 1}.
         debug : bool, optional
             Print debug information. Default False.
 
@@ -197,7 +197,7 @@ class Batch(BatchCore):
         nanoseconds_per_year = 365.25 * 24 * 60 * 60 * 1e9
 
         # Auto-detect device based on Dask cluster resources and hardware
-        device = Batch._get_torch_device(device if device is not None else 'auto', debug=debug)
+        device = Batch._get_torch_device(device, debug=debug)
 
         if debug:
             print(f"DEBUG: velocity using device={device}")
@@ -875,7 +875,7 @@ class BatchComplex(BatchCore):
             result = result[np.newaxis, ...]
         return result
 
-    def goldstein(self, corr: BatchUnit, psize: int | dict[str, int] = 32, debug: bool = False):
+    def goldstein(self, corr: BatchUnit, psize: int | dict[str, int] = 32, device: str = 'auto', debug: bool = False):
         """
         Apply Goldstein adaptive filter to each dataset in the batch.
 
@@ -886,6 +886,9 @@ class BatchComplex(BatchCore):
         psize : int or dict[str, int], optional
             Patch size for the filter. If int, same size used for both dimensions.
             If dict, specify {'y': size_y, 'x': size_x}. Default is 32.
+        device : str, optional
+            PyTorch device: 'auto' (default), 'cuda', 'mps', or 'cpu'.
+            'auto' uses GPU if Dask client has resources={'gpu': 1}.
         debug : bool, optional
             Print debug information. Default is False.
 
@@ -895,6 +898,7 @@ class BatchComplex(BatchCore):
             New batch with filtered phase values
         """
         import numpy as np
+        import dask
         import dask.array as da
 
         if debug:
@@ -913,8 +917,8 @@ class BatchComplex(BatchCore):
         if isinstance(psize, int):
             psize = {'y': psize, 'x': psize}
 
-        # Use MPS on Apple Silicon for best performance
-        device = 'mps'
+        # Determine if GPU resource annotation is needed
+        use_gpu = device in ('cuda', 'mps')
 
         # Apply Goldstein filter to each dataset
         result = {}
@@ -938,12 +942,13 @@ class BatchComplex(BatchCore):
                     dim_str = ''.join(chr(ord('a') + i) for i in range(phase_dask.ndim))
 
                     # Use da.blockwise for efficient dask integration
-                    filtered_dask = da.blockwise(
-                        goldstein_block, dim_str,
-                        phase_dask, dim_str,
-                        corr_dask, dim_str,
-                        dtype=np.complex64,
-                    )
+                    with dask.annotate(resources={'gpu': 1} if use_gpu else {}):
+                        filtered_dask = da.blockwise(
+                            goldstein_block, dim_str,
+                            phase_dask, dim_str,
+                            corr_dask, dim_str,
+                            dtype=np.complex64,
+                        )
                     filtered_vars[var_name] = xr.DataArray(
                         filtered_dask,
                         dims=var_data.dims,

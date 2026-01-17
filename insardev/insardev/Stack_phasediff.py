@@ -26,7 +26,8 @@ class Stack_phasediff(Stack_base):
                        gaussian_threshold:float=0.5,
                        multilook:bool=True,
                        goldstein:int|list[int,int]|None=None,
-                       complex:bool=False
+                       complex:bool=False,
+                       device:str='auto'
                        ) -> tuple[xr.DataArray,xr.DataArray]:
         """
         Compute phase difference (interferogram) between pairs of dates.
@@ -50,6 +51,9 @@ class Stack_phasediff(Stack_base):
             Goldstein filter patch size.
         complex : bool
             Return complex values instead of phase angles (default False).
+        device : str, optional
+            PyTorch device: 'auto' (default), 'cuda', 'mps', or 'cpu'.
+            'auto' uses GPU if Dask client has resources={'gpu': 1}.
 
         Returns
         -------
@@ -100,14 +104,14 @@ class Stack_phasediff(Stack_base):
         corr_look = None
         if wavelength is not None:
             # Gaussian filtering with cut-off wavelength on phase difference
-            phasediff_look = phasediff.gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold)
+            phasediff_look = phasediff.gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold, device=device)
 
             # Gaussian filtering with cut-off wavelength on amplitudes
             # Extract only the needed dates FIRST, then compute power and filter
             data1_power = BatchComplex(data1).power()
             data2_power = BatchComplex(data2).power()
-            intensity_look1 = data1_power.gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold)
-            intensity_look2 = data2_power.gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold)
+            intensity_look1 = data1_power.gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold, device=device)
+            intensity_look2 = data2_power.gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold, device=device)
 
             # correlation requires multilooking to detect influence between pixels
             corr_look = (phasediff_look.abs() / (intensity_look1 * intensity_look2).sqrt()).clip(0, 1)
@@ -116,7 +120,7 @@ class Stack_phasediff(Stack_base):
         if not multilook or wavelength is None:
             phasediff_look = phasediff
         if goldstein is not None:
-            phasediff_look = phasediff_look.goldstein(corr_look, goldstein)
+            phasediff_look = phasediff_look.goldstein(corr_look, goldstein, device=device)
 
         # filter out not valid pixels (per-burst masking using weight)
         if weight is not None:
