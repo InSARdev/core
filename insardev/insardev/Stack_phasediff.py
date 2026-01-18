@@ -8,12 +8,12 @@
 # See the LICENSE file in the insardev directory for license terms.
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
-from .Stack_base import Stack_base
+from .BatchCore import BatchCore
 from insardev_toolkit import progressbar
-from .Batch import Batch, BatchWrap, BatchUnit, BatchComplex
+from .Batch import Batch, BatchWrap, BatchUnit, BatchComplex, BatchList
 from . import utils_xarray
 
-class Stack_phasediff(Stack_base):
+class Stack_phasediff(BatchCore):
     import xarray as xr
     import numpy as np
     import pandas as pd
@@ -149,7 +149,7 @@ class Stack_phasediff(Stack_base):
 
         if corr_look is None:
             return as_xarray(phasediff_look)
-        return (as_xarray(phasediff_look), as_xarray(corr_look))
+        return BatchList([as_xarray(phasediff_look), as_xarray(corr_look)])
 
     def phasediff_singlelook(self, *args, **kwarg):
         from .Batch import BatchComplex

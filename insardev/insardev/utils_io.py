@@ -228,9 +228,6 @@ def open(store: str, storage_options: dict[str, str] | None = None, compat: bool
 
     if interleave:
         # unpack interleaved datasets
-        if len(dss) == 2 and 'i0_default' in dss and 'i1_default' in dss:
-            # special case for two datasets
-            return dss['i0_default'], dss['i1_default']
         dss0 = {k[len('i0_'):]: v for k, v in dss.items() if k.startswith('i0_')}
         dss1 = {k[len('i1_'):]: v for k, v in dss.items() if k.startswith('i1_')}
         return classes[0](dss0), classes[1](dss1)

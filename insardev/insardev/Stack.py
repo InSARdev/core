@@ -513,6 +513,9 @@ class Stack(Stack_plot, BatchCore):
         dask graph execution, which is faster than computing them separately
         because shared computations are only performed once.
 
+        Stack serves as a unified interface - use empty Stack() for utility operations:
+        - stack.compute(batch1, batch2) or Stack().compute(batch1, batch2)
+
         Parameters
         ----------
         *batches : BatchCore
@@ -522,67 +525,79 @@ class Stack(Stack_plot, BatchCore):
         -------
         tuple
             Tuple of computed Batch objects in the same order as input.
-            If only one batch is provided, returns a single Batch (not a tuple).
 
         Examples
         --------
-        Compute two dependent batches together (faster than separate compute):
-
-        >>> intf, corr = stack.compute(
-        ...     intf.mask(landmask).downsample(100),
-        ...     corr.mask(landmask).downsample(100)
-        ... )
-
-        Instead of separate execution (about 2x slower):
-
-        >>> intf = intf.mask(landmask).downsample(100).compute()
-        >>> corr = corr.mask(landmask).downsample(100).compute()
-
-        Compute three batches:
-
-        >>> intf, corr, elevation = stack.compute(intf, corr, ele)
+        >>> mintf, mcorr = stack.phasediff(pairs, wavelength=200)
+        >>> mintf, mcorr = Stack().compute(mintf.downsample(20), mcorr.downsample(20))
         """
-        import dask
-        from insardev_toolkit.progressbar import progressbar
-
-        if not batches:
-            raise ValueError('At least one Batch must be provided')
-
-        # Convert all batches to dicts for dask.persist
-        batch_dicts = [dict(b) for b in batches]
-
-        # Persist all batches together in a single graph execution
-        progressbar(
-            result := dask.persist(*batch_dicts),
-            desc='Computing Batches...'.ljust(25)
-        )
-
-        # Convert back to Batch objects with computed coordinates
-        computed_batches = []
-        for i, batch_dict in enumerate(result):
-            computed = {}
-            for key, ds in batch_dict.items():
-                # Compute any lazy coordinates, preserving their dims
-                new_coords = {}
-                for name, coord in ds.coords.items():
-                    if hasattr(coord, 'data') and hasattr(coord.data, 'compute'):
-                        new_coords[name] = (coord.dims, coord.compute().values)
-                if new_coords:
-                    ds = ds.assign_coords(new_coords)
-                computed[key] = ds
-            # Preserve original Batch type
-            computed_batches.append(type(batches[i])(computed))
-
-        if len(computed_batches) == 1:
-            return computed_batches[0]
-        return tuple(computed_batches)
+        from .Batch import BatchList
+        return BatchList(batches).compute()
 
     def snapshot(self, *args, store: str | None = None, storage_options: dict[str, str] | None = None,
-                caption: str = 'Snapshotting...', n_jobs: int = -1, debug=False):
-        if len(args) > 2:
-            raise ValueError(f'ERROR: snapshot() accepts only one or two Batch or dict objects or no arguments.')
-        datas = utils_io.snapshot(*args, store=store, storage_options=storage_options, compat=True, caption=caption, n_jobs=n_jobs, debug=debug)
-        return datas
+                caption: str | None = None, n_jobs: int = -1, debug=False):
+        """Save or open a snapshot of the Stack or Batch objects.
+
+        Stack serves as a unified interface - use empty Stack() for utility operations:
+        - stack.snapshot('path') on non-empty Stack saves the Stack
+        - Stack().snapshot('path') on empty Stack opens existing snapshot
+        - stack.snapshot(batch1, batch2, store='path') saves batches
+
+        Parameters
+        ----------
+        *args : BatchCore or str
+            Batch objects to save, or store path string.
+        store : str, optional
+            Path to the Zarr store (alternative to first positional arg).
+        storage_options : dict, optional
+            Storage options for cloud stores.
+        caption : str, optional
+            Progress bar caption.
+        n_jobs : int
+            Number of parallel jobs (-1 for all cores).
+        debug : bool
+            Print debug information.
+
+        Returns
+        -------
+        Stack or tuple
+            The saved Stack, or tuple of opened/saved Batch objects.
+
+        Examples
+        --------
+        >>> # Save stack itself
+        >>> stack.snapshot('mystack')
+        >>> # Open existing snapshot
+        >>> mintf, mcorr = Stack().snapshot('mintf_corr')
+        >>> # Save batches
+        >>> mintf, mcorr = stack.snapshot(mintf, mcorr, store='mintf_corr')
+        """
+        from .Batch import BatchList
+        from . import utils_io
+
+        # Handle case where first arg is store path
+        if len(args) == 1 and isinstance(args[0], str):
+            store = args[0]
+            args = ()
+
+        # If no batch args provided
+        if len(args) == 0:
+            if store is None:
+                raise ValueError("store path is required to save/open snapshot")
+            # Empty Stack -> open mode, non-empty Stack -> save mode
+            if len(self) == 0:
+                result = BatchList().snapshot(store=store, storage_options=storage_options,
+                                             caption=caption, n_jobs=n_jobs, debug=debug)
+                # Unwrap single Stack from tuple
+                if len(result) == 1 and isinstance(result[0], Stack):
+                    return result[0]
+                return result
+            utils_io.save(self, store=store, storage_options=storage_options, compat=True,
+                         caption=caption or 'Snapshotting...', n_jobs=n_jobs, debug=debug)
+            return self
+
+        # Save mode - args are batches
+        return BatchList(args).snapshot(store=store, storage_options=storage_options, caption=caption, n_jobs=n_jobs, debug=debug)
 
     # def downsample(self, *args, coarsen=None, resolution=60, func='mean', debug:bool=False):
     #     datas = []

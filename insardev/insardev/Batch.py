@@ -968,3 +968,135 @@ class BatchComplex(BatchCore):
             )
 
         return type(self)(result)
+
+
+class BatchList(tuple):
+    """
+    A tuple-like container for multiple Batch objects that allows chained operations.
+
+    Enables operations like:
+        mintf, mcorr = stack.phasediff(...).downsample(20).compute()
+        mintf, mcorr = stack.phasediff(...).downsample(20).snapshot('mintf_corr')
+        mintf, mcorr = BatchList.open('mintf_corr')
+
+    Instead of:
+        mintf, mcorr = stack.phasediff(...)
+        mintf, mcorr = stack.compute(mintf.downsample(20), mcorr.downsample(20))
+    """
+
+    def __new__(cls, batches=()):
+        return super().__new__(cls, batches)
+
+    def snapshot(self, store: str | None = None, storage_options: dict[str, str] | None = None,
+                 caption: str | None = None, n_jobs: int = -1, debug: bool = False):
+        """Save or open a BatchList snapshot.
+
+        When called on a BatchList with data, saves all batches to Zarr store.
+        When called on an empty BatchList(), opens an existing store.
+
+        Parameters
+        ----------
+        store : str
+            Path to the Zarr store.
+        storage_options : dict, optional
+            Storage options for cloud stores.
+        caption : str, optional
+            Progress bar caption.
+        n_jobs : int
+            Number of parallel jobs (-1 for all cores).
+        debug : bool
+            Print debug information.
+
+        Returns
+        -------
+        tuple
+            Tuple of Batch objects for unpacking.
+
+        Examples
+        --------
+        >>> # Save
+        >>> mintf, mcorr = stack.phasediff(...).downsample(20).snapshot('mintf_corr')
+        >>> # Open
+        >>> mintf, mcorr = BatchList().snapshot('mintf_corr')
+        """
+        from . import utils_io
+
+        if len(self) == 0:
+            # Open mode - no data args
+            result = utils_io.snapshot(store=store, storage_options=storage_options,
+                                       compat=True, caption=caption or 'Opening...', n_jobs=n_jobs, debug=debug)
+        else:
+            # Save mode - pass batches directly to preserve types
+            result = utils_io.snapshot(*self, store=store, storage_options=storage_options,
+                                       compat=True, caption=caption or 'Snapshotting...', n_jobs=n_jobs, debug=debug)
+
+        if isinstance(result, tuple):
+            return result
+        return (result,)
+
+    def downsample(self, *args, **kwargs):
+        """Apply downsample to all batches."""
+        return BatchList([b.downsample(*args, **kwargs) for b in self])
+
+    def crop(self, *args, **kwargs):
+        """Apply crop to all batches."""
+        return BatchList([b.crop(*args, **kwargs) for b in self])
+
+    def sel(self, *args, **kwargs):
+        """Apply sel to all batches."""
+        return BatchList([b.sel(*args, **kwargs) for b in self])
+
+    def isel(self, *args, **kwargs):
+        """Apply isel to all batches."""
+        return BatchList([b.isel(*args, **kwargs) for b in self])
+
+    def compute(self):
+        """Compute all batches together efficiently and return as tuple for unpacking.
+
+        Computes all batches in a single dask graph execution, which is faster
+        than computing them separately because shared computations are only
+        performed once.
+        """
+        persisted = self.persist()
+        return tuple(b.compute() for b in persisted)
+
+    def persist(self):
+        """Persist all batches together efficiently and return as BatchList.
+
+        Persists all batches in a single dask graph execution, which is faster
+        than persisting them separately because shared computations are only
+        performed once.
+        """
+        import dask
+        from insardev_toolkit.progressbar import progressbar
+
+        # Convert all batches to dicts for dask.persist
+        batch_dicts = [dict(b) for b in self]
+
+        # Persist all batches together in a single graph execution
+        progressbar(
+            result := dask.persist(*batch_dicts),
+            desc='Persisting Batches...'.ljust(25)
+        )
+
+        # Convert back to Batch objects preserving types
+        persisted_batches = [type(self[i])(batch_dict) for i, batch_dict in enumerate(result)]
+        return BatchList(persisted_batches)
+
+    def __getattr__(self, name):
+        """Proxy unknown attributes to all batches if they're callable."""
+        if name.startswith('_'):
+            raise AttributeError(f"BatchList has no attribute '{name}'")
+
+        # Check if all batches have this attribute and it's callable
+        attrs = [getattr(b, name, None) for b in self]
+        if all(callable(a) for a in attrs if a is not None):
+            def method(*args, **kwargs):
+                results = [getattr(b, name)(*args, **kwargs) for b in self]
+                # If results are Batch-like, wrap in BatchList
+                if results and hasattr(results[0], 'keys') and callable(results[0].keys):
+                    return BatchList(results)
+                return tuple(results)
+            return method
+
+        raise AttributeError(f"BatchList has no attribute '{name}'")

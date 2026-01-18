@@ -13,5 +13,5 @@ __version__ = '2025.12.21.dev'
 # processing functions
 from .Stack import Stack
 from .BatchCore import BatchCore
-from .Batch import Batch, BatchWrap, BatchUnit, BatchComplex
+from .Batch import Batch, BatchWrap, BatchUnit, BatchComplex, BatchList
 from .Baseline import Baseline
