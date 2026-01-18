@@ -136,15 +136,24 @@ class Stack(Stack_plot, BatchCore):
         Parameters
         ----------
         path : str
-            Output directory for VTK files.
+            Output directory/filename for VTK files.
         data : BatchCore | dict | None, optional
-            Data to export. If ``None``, export this Stack. Accepts any mapping convertible to ``Batch``.
+            Data to export. If ``None``, export this Stack. Use ``data=None`` with
+            ``overlay`` to export just topography with image overlay.
         transform : Batch | None, optional
             Optional transform Batch providing topography (``ele`` or ``z``).
         overlay : xarray.DataArray | None, optional
             Optional overlay (e.g., imagery). If it lacks a ``band`` dim, one is added.
         mask : bool, optional
             If True, mask topography by valid data pixels.
+
+        Examples
+        --------
+        # Export data with overlay
+        stack.to_vtk('velocity', velocity, overlay=gmap)
+
+        # Export just topography with image overlay (like PyGMTSAR export_vtk)
+        stack.to_vtk('gmap', data=None, overlay=gmap)
         """
         import os
         import numpy as np
@@ -153,6 +162,50 @@ class Stack(Stack_plot, BatchCore):
         from tqdm.auto import tqdm
         from vtk import vtkStructuredGridWriter, VTK_BINARY
         from .utils_vtk import as_vtk
+
+        # Handle data=None case (export just overlay on topography)
+        if data is None and overlay is not None:
+            tfm = transform if transform is not None else self.transform()
+            if tfm is not None and not isinstance(tfm, BatchCore):
+                tfm = Batch(tfm)
+
+            if tfm is None:
+                raise ValueError("transform is required when data=None")
+
+            # Get topography at native resolution
+            topo_merged = tfm[['ele']].to_dataset()
+            topo_da = topo_merged['ele'] if 'ele' in topo_merged else None
+            if topo_da is None:
+                raise ValueError("transform must contain 'ele' variable")
+
+            # Interpolate overlay to topography grid (higher resolution)
+            ov = overlay
+            if 'band' not in ov.dims:
+                ov = ov.expand_dims('band')
+            ov_interp = ov.interp(y=topo_da.y, x=topo_da.x, method='cubic')
+
+            if mask:
+                # Mask by finite values in overlay
+                topo_da = topo_da.where(np.isfinite(ov_interp.isel(band=0)))
+
+            # Build output dataset
+            layers = [topo_da.rename('z'), ov_interp.rename('colors')]
+            ds_out = xr.merge(layers, compat='override', join='left')
+            vtk_grid = as_vtk(ds_out)
+
+            # Determine output filename
+            if path.endswith('.vtk'):
+                filename = path
+            else:
+                filename = f'{path}.vtk'
+            os.makedirs(os.path.dirname(filename) or '.', exist_ok=True)
+
+            writer = vtkStructuredGridWriter()
+            writer.SetFileName(filename)
+            writer.SetInputData(vtk_grid)
+            writer.SetFileType(VTK_BINARY)
+            writer.Write()
+            return
 
         target = data if data is not None else self
         if not isinstance(target, BatchCore):
@@ -293,7 +346,7 @@ class Stack(Stack_plot, BatchCore):
                     if ov.size == 0:
                         pass
                     else:
-                        ov = ov.interp(y=ref_da.y, x=ref_da.x, method='linear')
+                        ov = ov.interp(y=ref_da.y, x=ref_da.x, method='cubic')
                         layers.append(ov.rename('colors'))
 
                 # Add data arrays with pair names
