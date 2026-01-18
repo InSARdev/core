@@ -447,18 +447,22 @@ class Stack_unwrap1d(Stack_phasediff):
         A_t = torch.from_numpy(A.astype(np.float32)).to(dev)  # (n_pairs, n_intervals)
         phi = torch.from_numpy(phases_flat.astype(np.float32)).to(dev)  # (n_pairs, n_pixels)
 
-        # Handle NaN: set to 0 with weight 0
-        nan_mask = torch.isnan(phi)
-        phi = torch.where(nan_mask, torch.zeros_like(phi), phi)
+        # Handle NaN in phase
+        nan_mask_phi = torch.isnan(phi)
+        phi = torch.where(nan_mask_phi, torch.zeros_like(phi), phi)
 
         if weights_flat is not None:
             W = torch.from_numpy(weights_flat.astype(np.float32)).to(dev)
+            # Handle NaN in weights too
+            nan_mask_w = torch.isnan(W)
+            nan_mask = nan_mask_phi | nan_mask_w
             W = torch.where(nan_mask, torch.zeros_like(W), W)
             # Transform correlation to least squares weight: w / sqrt(1 - w^2)
             # Clamp to avoid Inf (W=1) and NaN (W>1)
             W_clamped = torch.clamp(W, 0.0, 0.9999)
             W_lstsq = W_clamped / torch.sqrt(1 - W_clamped**2)
         else:
+            nan_mask = nan_mask_phi
             W_lstsq = torch.where(nan_mask, torch.zeros(1, device=dev), torch.ones(1, device=dev))
             W_lstsq = W_lstsq.expand(n_pairs, n_pixels)
 
