@@ -2461,12 +2461,10 @@ class BatchCore(dict):
                 def apply_gaussian(block):
                     return BatchCore._gaussian(block, weight_np, sigma=sigmas, threshold=threshold, device=device).astype(out_dtype)
 
-                # Use da.blockwise for efficient dask integration
+                # Chunk first dim to 1 so _gaussian gets 2D slices (works for numpy and dask)
+                first_dim = data_arr.dims[0]
+                data_arr = data_arr.chunk({first_dim: 1})
                 dask_data = data_arr.data
-
-                # For 3D arrays, rechunk first dim to 1 so _gaussian gets 2D slices
-                if dask_data.ndim == 3:
-                    dask_data = dask_data.rechunk({0: 1})
 
                 # Build dimension string based on ndim (e.g., 'yx' for 2D, 'pyx' for 3D)
                 dim_str = ''.join(chr(ord('a') + i) for i in range(dask_data.ndim))
