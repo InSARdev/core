@@ -156,6 +156,12 @@ class Batch(BatchCore):
             vel_np = vel_np.reshape(original_shape[1], original_shape[2])
             int_np = int_np.reshape(original_shape[1], original_shape[2])
 
+        # Cleanup GPU memory
+        if dev.type == 'mps':
+            torch.mps.empty_cache()
+        elif dev.type == 'cuda':
+            torch.cuda.empty_cache()
+
         return vel_np, int_np
 
     def velocity(self, min_valid=3, device='auto', debug=False) -> tuple["Batch", "Batch"]:

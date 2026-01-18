@@ -261,7 +261,9 @@ class Stack_unwrap1d(Stack_phasediff):
             unwrapped_flat[:, start:end] = result.cpu().numpy()
 
             del phi, W, result
-            if dev.type == 'cuda':
+            if dev.type == 'mps':
+                torch.mps.empty_cache()
+            elif dev.type == 'cuda':
                 torch.cuda.empty_cache()
 
         # Reshape back
@@ -374,7 +376,9 @@ class Stack_unwrap1d(Stack_phasediff):
             increments_flat[:, start:end] = x.numpy()
 
             del phi, W, unwrapped, x
-            if dev.type == 'cuda':
+            if dev.type == 'mps':
+                torch.mps.empty_cache()
+            elif dev.type == 'cuda':
                 torch.cuda.empty_cache()
 
         # Build time series
@@ -504,6 +508,12 @@ class Stack_unwrap1d(Stack_phasediff):
 
         # Reshape: (n_pixels, n_dates) -> (n_dates, height, width)
         time_series = ts.T.numpy().reshape(n_dates, height, width)
+
+        # Cleanup GPU memory
+        if dev.type == 'mps':
+            torch.mps.empty_cache()
+        elif dev.type == 'cuda':
+            torch.cuda.empty_cache()
 
         return time_series, dates
 

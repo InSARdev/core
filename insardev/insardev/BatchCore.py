@@ -216,6 +216,12 @@ class BatchCore(dict):
         else:
             result = convolve_real(data_np, weight_np)
 
+        # Cleanup GPU memory
+        if dev.type == 'mps':
+            torch.mps.empty_cache()
+        elif dev.type == 'cuda':
+            torch.cuda.empty_cache()
+
         if squeeze:
             result = result[np.newaxis, ...]
         return result

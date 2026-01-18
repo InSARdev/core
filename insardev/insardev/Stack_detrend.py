@@ -855,8 +855,16 @@ class Stack_detrend(Stack_unwrap2d):
             result_sin[valid_indices] = cumulative_sin
             result_cos[valid_indices] = cumulative_cos
 
-            return (result_sin.cpu().numpy().reshape(ny, nx).astype(np.float32),
-                    result_cos.cpu().numpy().reshape(ny, nx).astype(np.float32))
+            result = (result_sin.cpu().numpy().reshape(ny, nx).astype(np.float32),
+                      result_cos.cpu().numpy().reshape(ny, nx).astype(np.float32))
+
+            # Cleanup GPU memory
+            if device.type == 'mps':
+                torch.mps.empty_cache()
+            elif device.type == 'cuda':
+                torch.cuda.empty_cache()
+
+            return result
         else:
             # Standard polynomial fitting
             coeffs = (XtX_inv_Xt @ data_valid).T  # (n_valid, degree+1)
@@ -868,7 +876,15 @@ class Stack_detrend(Stack_unwrap2d):
             result = torch.full((n_pixels,), float('nan'), dtype=dtype, device=device)
             result[valid_indices] = coeff
 
-            return result.cpu().numpy().reshape(ny, nx).astype(np.float32)
+            result_np = result.cpu().numpy().reshape(ny, nx).astype(np.float32)
+
+            # Cleanup GPU memory
+            if device.type == 'mps':
+                torch.mps.empty_cache()
+            elif device.type == 'cuda':
+                torch.cuda.empty_cache()
+
+            return result_np
 
     @staticmethod
     def _regression1d_pairs_chunk(data_chunk, weight_chunk, ref_values, rep_values,

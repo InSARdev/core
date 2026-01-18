@@ -98,7 +98,15 @@ class Stack_ps(Stack_stl):
         psf = torch.where(torch.isfinite(psf), psf, torch.tensor(float('nan'), device=dev))
 
         # Move back to CPU and convert to numpy
-        return psf.cpu().numpy()
+        result = psf.cpu().numpy()
+
+        # Cleanup GPU memory
+        if dev.type == 'mps':
+            torch.mps.empty_cache()
+        elif dev.type == 'cuda':
+            torch.cuda.empty_cache()
+
+        return result
 
     def psfunction(self, device='auto', debug=False):
         """
