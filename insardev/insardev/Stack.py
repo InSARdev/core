@@ -178,18 +178,19 @@ class Stack(Stack_plot, BatchCore):
             if topo_da is None:
                 raise ValueError("transform must contain 'ele' variable")
 
-            # Interpolate overlay to topography grid (higher resolution)
+            # Interpolate elevation to overlay grid (preserves image quality)
             ov = overlay
             if 'band' not in ov.dims:
                 ov = ov.expand_dims('band')
-            ov_interp = ov.interp(y=topo_da.y, x=topo_da.x, method='cubic')
+            # Interpolate elevation to match overlay coordinates
+            topo_da = topo_da.interp(y=ov.y, x=ov.x, method='linear')
 
             if mask:
                 # Mask by finite values in overlay
-                topo_da = topo_da.where(np.isfinite(ov_interp.isel(band=0)))
+                topo_da = topo_da.where(np.isfinite(ov.isel(band=0)))
 
             # Build output dataset
-            layers = [topo_da.rename('z'), ov_interp.rename('colors')]
+            layers = [topo_da.rename('z'), ov.rename('colors')]
             ds_out = xr.merge(layers, compat='override', join='left')
             vtk_grid = as_vtk(ds_out)
 
@@ -313,28 +314,18 @@ class Stack(Stack_plot, BatchCore):
                 ref_da = export_items[0][1]
                 layers = []
 
-                # Add topography from transform
-                if topo_merged is not None:
-                    topo_da = topo_merged['ele'] if 'ele' in topo_merged else None
-                    if topo_da is not None:
-                        topo_da = topo_da.interp(y=ref_da.y, x=ref_da.x, method='linear')
-                        if mask:
-                            topo_da = topo_da.where(np.isfinite(ref_da))
-                        layers.append(topo_da.rename('z'))
-
-                # Add overlay
+                # Determine target grid - use overlay grid if provided (preserves image quality)
+                ov = None
                 if overlay is not None:
                     if not isinstance(overlay, xr.DataArray):
                         raise TypeError("overlay must be an xarray.DataArray (e.g., an RGB raster)")
-
                     ov = overlay
                     if 'band' not in ov.dims:
                         ov = ov.expand_dims('band')
-                    # Select overlay region matching data extent (handle ascending/descending coords)
+                    # Select overlay region matching data extent
                     y_min, y_max = float(ref_da.y.min()), float(ref_da.y.max())
                     x_min, x_max = float(ref_da.x.min()), float(ref_da.x.max())
                     try:
-                        # Determine coordinate order (ascending or descending)
                         ov_y_asc = len(ov.y) < 2 or float(ov.y[1]) > float(ov.y[0])
                         ov_x_asc = len(ov.x) < 2 or float(ov.x[1]) > float(ov.x[0])
                         y_slice = slice(y_min, y_max) if ov_y_asc else slice(y_max, y_min)
@@ -342,16 +333,32 @@ class Stack(Stack_plot, BatchCore):
                         ov = ov.sel(y=y_slice, x=x_slice)
                     except Exception:
                         pass
-                    # Skip overlay if empty after selection
                     if ov.size == 0:
-                        pass
-                    else:
-                        ov = ov.interp(y=ref_da.y, x=ref_da.x, method='cubic')
-                        layers.append(ov.rename('colors'))
+                        ov = None
 
-                # Add data arrays with pair names
+                # Use overlay grid or data grid as target
+                target_y = ov.y if ov is not None else ref_da.y
+                target_x = ov.x if ov is not None else ref_da.x
+
+                # Add topography from transform
+                if topo_merged is not None:
+                    topo_da = topo_merged['ele'] if 'ele' in topo_merged else None
+                    if topo_da is not None:
+                        topo_da = topo_da.interp(y=target_y, x=target_x, method='linear')
+                        if mask:
+                            ref_for_mask = ref_da.interp(y=target_y, x=target_x, method='nearest') if ov is not None else ref_da
+                            topo_da = topo_da.where(np.isfinite(ref_for_mask))
+                        layers.append(topo_da.rename('z'))
+
+                # Add overlay at native resolution
+                if ov is not None:
+                    layers.append(ov.rename('colors'))
+
+                # Add data arrays - interpolate to target grid
                 for pair_label, da_item in export_items:
                     var_name = pair_label if pair_label is not None else data_var
+                    if ov is not None:
+                        da_item = da_item.interp(y=target_y, x=target_x, method='linear')
                     layers.append(da_item.rename(var_name))
 
                 ds_out = xr.merge(layers, compat='override', join='left')
