@@ -593,129 +593,62 @@ class Stack_unwrap1d(Stack_phasediff):
         A, dates = Stack_unwrap1d._build_incidence_matrix(pair_dates)
         n_dates = len(dates)
 
-        # Ensure data is chunked for lazy processing
-        if 'y' in data.dims and 'x' in data.dims:
-            # 3D case (pair, y, x)
-            if data.chunks is None:
-                chunks = {'y': self.netcdf_chunksize, 'x': self.netcdf_chunksize}
-                data = data.chunk(chunks)
-                if weight is not None:
-                    weight = weight.chunk(chunks)
+        # Ensure data is chunked for lazy processing (pair, y, x)
+        if data.chunks is None:
+            chunks = {'y': self.netcdf_chunksize, 'x': self.netcdf_chunksize}
+            data = data.chunk(chunks)
+            if weight is not None:
+                weight = weight.chunk(chunks)
 
-            chunks_pair, chunks_y, chunks_x = data.chunks
+        chunks_pair, chunks_y, chunks_x = data.chunks
 
-            def lstsq_block(ys, xs):
-                """Process a spatial block - all pairs, subset of y,x."""
-                data_block = data.isel(y=ys, x=xs).compute(n_workers=1).values
-                if weight is not None:
-                    weight_block = weight.isel(y=ys, x=xs).compute(n_workers=1).values
-                else:
-                    weight_block = None
+        def lstsq_block(ys, xs):
+            """Process a spatial block - all pairs, subset of y,x."""
+            data_block = data.isel(y=ys, x=xs).compute(n_workers=1).values
+            if weight is not None:
+                weight_block = weight.isel(y=ys, x=xs).compute(n_workers=1).values
+            else:
+                weight_block = None
 
-                # PyTorch batched weighted least squares
-                ts_block, _ = Stack_unwrap1d._lstsq_to_dates_numpy(
-                    data_block, weight_block, pair_dates,
-                    device=device, cumsum=cumsum, debug=False
-                )
-                return ts_block.astype(np.float32)
+            # PyTorch batched weighted least squares
+            ts_block, _ = Stack_unwrap1d._lstsq_to_dates_numpy(
+                data_block, weight_block, pair_dates,
+                device=device, cumsum=cumsum, debug=False
+            )
+            return ts_block.astype(np.float32)
 
-            # Build lazy dask array from blocks
-            ys_blocks = np.array_split(np.arange(data.y.size), np.cumsum(chunks_y)[:-1])
-            xs_blocks = np.array_split(np.arange(data.x.size), np.cumsum(chunks_x)[:-1])
+        # Build lazy dask array from blocks
+        ys_blocks = np.array_split(np.arange(data.y.size), np.cumsum(chunks_y)[:-1])
+        xs_blocks = np.array_split(np.arange(data.x.size), np.cumsum(chunks_x)[:-1])
 
-            blocks_total = []
-            for ys_block in ys_blocks:
-                blocks_row = []
-                for xs_block in xs_blocks:
-                    block = dask.array.from_delayed(
-                        dask.delayed(lstsq_block)(ys_block, xs_block),
-                        shape=(n_dates, ys_block.size, xs_block.size),
-                        dtype=np.float32
-                    )
-                    blocks_row.append(block)
-                blocks_total.append(blocks_row)
-
-            ts_dask = dask.array.block(blocks_total)
-
-            # Build coordinates
-            coords = {
-                'date': pd.to_datetime(dates),
-                'y': data.coords['y'],
-                'x': data.coords['x']
-            }
-            dims = ('date', 'y', 'x')
-
-        elif 'stack' in data.dims:
-            # 2D case (pair, stack)
-            if data.chunks is None:
-                chunks = {'stack': self.chunksize1d}
-                data = data.chunk(chunks)
-                if weight is not None:
-                    weight = weight.chunk(chunks)
-
-            chunks_pair, chunks_stack = data.chunks
-
-            def lstsq_block_stack(stacks):
-                """Process a stack block - all pairs, subset of stack."""
-                data_block = data.isel(stack=stacks).compute(n_workers=1).values
-                if weight is not None:
-                    weight_block = weight.isel(stack=stacks).compute(n_workers=1).values
-                else:
-                    weight_block = None
-
-                # Reshape: (n_pairs, n_stack) -> (n_pairs, 1, n_stack)
-                data_block_3d = data_block[:, np.newaxis, :]
-                weight_block_3d = weight_block[:, np.newaxis, :] if weight_block is not None else None
-
-                ts_block, _ = Stack_unwrap1d._lstsq_to_dates_numpy(
-                    data_block_3d, weight_block_3d, pair_dates,
-                    device=device, cumsum=cumsum, debug=False
-                )
-                # Reshape back: (n_dates, 1, n_stack) -> (n_dates, n_stack)
-                return ts_block[:, 0, :].astype(np.float32)
-
-            stacks_blocks = np.array_split(np.arange(data['stack'].size), np.cumsum(chunks_stack)[:-1])
-
-            blocks_total = []
-            for stacks_block in stacks_blocks:
+        blocks_total = []
+        for ys_block in ys_blocks:
+            blocks_row = []
+            for xs_block in xs_blocks:
                 block = dask.array.from_delayed(
-                    dask.delayed(lstsq_block_stack)(stacks_block),
-                    shape=(n_dates, stacks_block.size),
+                    dask.delayed(lstsq_block)(ys_block, xs_block),
+                    shape=(n_dates, ys_block.size, xs_block.size),
                     dtype=np.float32
                 )
-                blocks_total.append(block)
+                blocks_row.append(block)
+            blocks_total.append(blocks_row)
 
-            ts_dask = dask.array.concatenate(blocks_total, axis=1)
+        ts_dask = dask.array.block(blocks_total)
 
-            coords = {
-                'date': pd.to_datetime(dates),
-                'stack': data.coords['stack']
-            }
-            dims = ('date', 'stack')
+        # Rechunk to per-slice for efficient downstream operations (e.g., plot)
+        ts_dask = ts_dask.rechunk({0: 1})
 
-        else:
-            # Fallback: eager processing
-            phase_np = data.values
-            weight_np = weight.values if weight is not None else None
-
-            ts_np, dates = Stack_unwrap1d._lstsq_to_dates_numpy(
-                phase_np, weight_np, pair_dates,
-                device=device, cumsum=cumsum, debug=debug
-            )
-
-            coords = {'date': pd.to_datetime(dates)}
-            if 'y' in data.coords:
-                coords['y'] = data.coords['y']
-            if 'x' in data.coords:
-                coords['x'] = data.coords['x']
-            dims = ('date', 'y', 'x')
-
-            return xr.DataArray(ts_np, coords=coords, dims=dims, name='displacement')
+        # Build coordinates
+        coords = {
+            'date': pd.to_datetime(dates),
+            'y': data.coords['y'],
+            'x': data.coords['x']
+        }
 
         return xr.DataArray(
             ts_dask,
             coords=coords,
-            dims=dims,
+            dims=('date', 'y', 'x'),
             name='displacement'
         )
 
@@ -832,111 +765,51 @@ class Stack_unwrap1d(Stack_phasediff):
             else:
                 original_coords[k] = vals
 
-        # Ensure data is chunked for lazy processing
-        if 'y' in data.dims and 'x' in data.dims:
-            # 3D case (pair, y, x)
-            if data.chunks is None:
-                chunks = {'y': self.netcdf_chunksize, 'x': self.netcdf_chunksize}
-                data = data.chunk(chunks)
-                if weight is not None:
-                    weight = weight.chunk(chunks)
+        # Ensure data is chunked for lazy processing (pair, y, x)
+        if data.chunks is None:
+            chunks = {'y': self.netcdf_chunksize, 'x': self.netcdf_chunksize}
+            data = data.chunk(chunks)
+            if weight is not None:
+                weight = weight.chunk(chunks)
 
-            chunks_pair, chunks_y, chunks_x = data.chunks
+        chunks_pair, chunks_y, chunks_x = data.chunks
 
-            def unwrap1d_pairs_block(ys, xs):
-                """Process a spatial block - all pairs, subset of y,x."""
-                from contextlib import nullcontext
-                data_block = data.isel(y=ys, x=xs).compute(n_workers=1).values
-                if weight is not None:
-                    weight_block = weight.isel(y=ys, x=xs).compute(n_workers=1).values
-                else:
-                    weight_block = None
+        def unwrap1d_pairs_block(ys, xs):
+            """Process a spatial block - all pairs, subset of y,x."""
+            data_block = data.isel(y=ys, x=xs).compute(n_workers=1).values
+            if weight is not None:
+                weight_block = weight.isel(y=ys, x=xs).compute(n_workers=1).values
+            else:
+                weight_block = None
 
-                unwrapped_block = Stack_unwrap1d._unwrap1d_pairs_numpy(
-                    data_block, weight_block, pair_dates,
-                    device=device, max_iter=max_iter, epsilon=epsilon,
-                    batch_size=batch_size, debug=False
-                )
-                return unwrapped_block.astype(np.float32)
+            unwrapped_block = Stack_unwrap1d._unwrap1d_pairs_numpy(
+                data_block, weight_block, pair_dates,
+                device=device, max_iter=max_iter, epsilon=epsilon,
+                batch_size=batch_size, debug=False
+            )
+            return unwrapped_block.astype(np.float32)
 
-            # Build lazy dask array from blocks
-            # Use GPU annotation to prevent MPS command buffer conflicts
-            ys_blocks = np.array_split(np.arange(data.y.size), np.cumsum(chunks_y)[:-1])
-            xs_blocks = np.array_split(np.arange(data.x.size), np.cumsum(chunks_x)[:-1])
+        # Build lazy dask array from blocks
+        ys_blocks = np.array_split(np.arange(data.y.size), np.cumsum(chunks_y)[:-1])
+        xs_blocks = np.array_split(np.arange(data.x.size), np.cumsum(chunks_x)[:-1])
 
-            blocks_total = []
-            with dask.annotate(resources={'gpu': 1} if device.type != 'cpu' else {}):
-                for ys_block in ys_blocks:
-                    blocks_row = []
-                    for xs_block in xs_blocks:
-                        block = dask.array.from_delayed(
-                            dask.delayed(unwrap1d_pairs_block)(ys_block, xs_block),
-                            shape=(n_pairs, ys_block.size, xs_block.size),
-                            dtype=np.float32
-                        )
-                        blocks_row.append(block)
-                    blocks_total.append(blocks_row)
-
-            unwrapped_dask = dask.array.block(blocks_total)
-
-        elif 'stack' in data.dims:
-            # 2D case (pair, stack)
-            if data.chunks is None:
-                chunks = {'stack': self.chunksize1d}
-                data = data.chunk(chunks)
-                if weight is not None:
-                    weight = weight.chunk(chunks)
-
-            chunks_pair, chunks_stack = data.chunks
-
-            def unwrap1d_pairs_block_stack(stacks):
-                """Process a stack block - all pairs, subset of stack."""
-                from contextlib import nullcontext
-                data_block = data.isel(stack=stacks).compute(n_workers=1).values
-                if weight is not None:
-                    weight_block = weight.isel(stack=stacks).compute(n_workers=1).values
-                else:
-                    weight_block = None
-
-                # Reshape: (n_pairs, n_stack) -> (n_pairs, 1, n_stack)
-                data_block_3d = data_block[:, np.newaxis, :]
-                weight_block_3d = weight_block[:, np.newaxis, :] if weight_block is not None else None
-
-                unwrapped_block = Stack_unwrap1d._unwrap1d_pairs_numpy(
-                    data_block_3d, weight_block_3d, pair_dates,
-                    device=device, max_iter=max_iter, epsilon=epsilon,
-                    batch_size=batch_size, debug=False
-                )
-                # Reshape: (n_pairs, 1, n_stack) -> (n_pairs, n_stack)
-                return unwrapped_block[:, 0, :].astype(np.float32)
-
-            stacks_blocks = np.array_split(np.arange(data['stack'].size), np.cumsum(chunks_stack)[:-1])
-
-            # Use GPU annotation to prevent MPS command buffer conflicts
-            blocks_total = []
-            with dask.annotate(resources={'gpu': 1} if device.type != 'cpu' else {}):
-                for stacks_block in stacks_blocks:
+        blocks_total = []
+        with dask.annotate(resources={'gpu': 1} if device.type != 'cpu' else {}):
+            for ys_block in ys_blocks:
+                blocks_row = []
+                for xs_block in xs_blocks:
                     block = dask.array.from_delayed(
-                        dask.delayed(unwrap1d_pairs_block_stack)(stacks_block),
-                        shape=(n_pairs, stacks_block.size),
+                        dask.delayed(unwrap1d_pairs_block)(ys_block, xs_block),
+                        shape=(n_pairs, ys_block.size, xs_block.size),
                         dtype=np.float32
                     )
-                    blocks_total.append(block)
+                    blocks_row.append(block)
+                blocks_total.append(blocks_row)
 
-            unwrapped_dask = dask.array.concatenate(blocks_total, axis=1)
+        unwrapped_dask = dask.array.block(blocks_total)
 
-        else:
-            # Fallback: eager processing
-            phase_np = data.values
-            weight_np = weight.values if weight is not None else None
-
-            unwrapped_np = self._unwrap1d_pairs_numpy(
-                phase_np, weight_np, pair_dates,
-                device=device, max_iter=max_iter, epsilon=epsilon,
-                batch_size=batch_size, debug=debug
-            )
-
-            return xr.DataArray(unwrapped_np, coords=data.coords, dims=data.dims, name='unwrap')
+        # Rechunk to per-slice for efficient downstream operations (e.g., plot)
+        unwrapped_dask = unwrapped_dask.rechunk({0: 1})
 
         result = xr.DataArray(
             unwrapped_dask,

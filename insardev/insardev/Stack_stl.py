@@ -301,7 +301,13 @@ class Stack_stl(Stack_sbas):
         # transform to separate variables
         # transform to separate variables variables returned from Stack.stl() function
         varnames = ['trend', 'seasonal', 'resid']
-        keys_vars = {varname: xr.DataArray(models[varidx], coords=coords) for (varidx, varname) in enumerate(varnames)}
+        keys_vars = {}
+        for varidx, varname in enumerate(varnames):
+            var_data = models[varidx]
+            # Rechunk to per-slice for efficient downstream operations (e.g., plot)
+            if hasattr(var_data, 'rechunk'):
+                var_data = var_data.rechunk({0: 1})
+            keys_vars[varname] = xr.DataArray(var_data, coords=coords)
         model = xr.Dataset({**keys_vars})
         del models
 
