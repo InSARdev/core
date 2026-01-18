@@ -277,17 +277,24 @@ class Stack(Stack_plot, BatchCore):
                     ov = overlay
                     if 'band' not in ov.dims:
                         ov = ov.expand_dims('band')
+                    # Select overlay region matching data extent (handle ascending/descending coords)
+                    y_min, y_max = float(ref_da.y.min()), float(ref_da.y.max())
+                    x_min, x_max = float(ref_da.x.min()), float(ref_da.x.max())
                     try:
-                        ov = ov.sel(y=slice(float(ref_da.y.min()), float(ref_da.y.max())),
-                                    x=slice(float(ref_da.x.min()), float(ref_da.x.max())))
+                        # Determine coordinate order (ascending or descending)
+                        ov_y_asc = len(ov.y) < 2 or float(ov.y[1]) > float(ov.y[0])
+                        ov_x_asc = len(ov.x) < 2 or float(ov.x[1]) > float(ov.x[0])
+                        y_slice = slice(y_min, y_max) if ov_y_asc else slice(y_max, y_min)
+                        x_slice = slice(x_min, x_max) if ov_x_asc else slice(x_max, x_min)
+                        ov = ov.sel(y=y_slice, x=x_slice)
                     except Exception:
-                        try:
-                            ov = ov.sel(lat=slice(float(ref_da.lat.min()), float(ref_da.lat.max())),
-                                        lon=slice(float(ref_da.lon.min()), float(ref_da.lon.max())))
-                        except Exception:
-                            pass
-                    ov = ov.interp(y=ref_da.y, x=ref_da.x, method='linear')
-                    layers.append(ov.rename('colors'))
+                        pass
+                    # Skip overlay if empty after selection
+                    if ov.size == 0:
+                        pass
+                    else:
+                        ov = ov.interp(y=ref_da.y, x=ref_da.x, method='linear')
+                        layers.append(ov.rename('colors'))
 
                 # Add data arrays with pair names
                 for pair_label, da_item in export_items:
@@ -899,12 +906,16 @@ class Stack(Stack_plot, BatchCore):
                 if name in ds:
                     var = ds[name]
                     if var.ndim == 0:
-                        return var.item()
+                        return float(var.item())
+                    # For per-date variables, return mean value
+                    return float(var.mean().item())
                 return ds.attrs.get(name)
 
             wavelength = _scalar_from_ds(tfm, 'radar_wavelength')
             slant_start = _scalar_from_ds(tfm, 'SC_height_start')
             slant_end = _scalar_from_ds(tfm, 'SC_height_end')
+            if wavelength is None or slant_start is None or slant_end is None:
+                raise KeyError(f"Missing parameters in transform for burst {first_key}: radar_wavelength, SC_height_start, SC_height_end")
             slant_range = (slant_start + slant_end) / 2  # average slant range
 
             # Get average incidence angle
@@ -940,7 +951,9 @@ class Stack(Stack_plot, BatchCore):
                 if name in ds:
                     var = ds[name]
                     if var.ndim == 0:
-                        return var.item()
+                        return float(var.item())
+                    # For per-date variables, return mean value
+                    return float(var.mean().item())
                 return ds.attrs.get(name)
 
             wavelength = _scalar_from_ds(tfm, 'radar_wavelength')
