@@ -61,29 +61,39 @@ def as_vtk(dataset):
                 f'Unsupported dimensions {dims} for variable {data_var}; expected (y, x) or (band, y, x)'
             )
 
-        if np.issubdtype(da.dtype, np.floating):
-            values = np.asarray(da.values, dtype=np.float32)
-            fill_value = da.attrs.get('_FillValue')
-            if fill_value is not None and not np.isnan(fill_value):
-                values = np.where(values == fill_value, np.nan, values)
-        else:
-            values = np.asarray(da.values)
-
         if dims == ('band', 'y', 'x'):
+            # RGB/RGBA data - don't apply fill_value handling (0/255 are valid colors)
+            values = np.asarray(da.values)
             bands = values.shape[0]
             if bands in (3, 4):
+                # Clip to valid range and convert to uint8
                 array = vn.numpy_to_vtk(
-                    values[:3].round().astype(np.uint8).reshape(3, -1).T,
+                    values[:3].clip(0, 255).round().astype(np.uint8).reshape(3, -1).T,
                     deep=True,
                     array_type=VTK_UNSIGNED_CHAR,
                 )
             elif bands == 1:
-                array = vn.numpy_to_vtk(values.reshape(1, -1).T, deep=True, array_type=VTK_FLOAT)
+                # Single band - treat as scalar, apply fill_value handling
+                values_1b = values[0]
+                if np.issubdtype(da.dtype, np.floating):
+                    values_1b = np.asarray(values_1b, dtype=np.float32)
+                    fill_value = da.attrs.get('_FillValue')
+                    if fill_value is not None and not np.isnan(fill_value):
+                        values_1b = np.where(values_1b == fill_value, np.nan, values_1b)
+                array = vn.numpy_to_vtk(values_1b.ravel(order='C'), deep=True, array_type=VTK_FLOAT)
             else:
                 raise ValueError(
                     f'Unsupported band count {bands} for variable {data_var} (expected 1, 3, or 4)'
                 )
         else:
+            # Scalar (y, x) data - apply fill_value handling
+            if np.issubdtype(da.dtype, np.floating):
+                values = np.asarray(da.values, dtype=np.float32)
+                fill_value = da.attrs.get('_FillValue')
+                if fill_value is not None and not np.isnan(fill_value):
+                    values = np.where(values == fill_value, np.nan, values)
+            else:
+                values = np.asarray(da.values)
             array = vn.numpy_to_vtk(values.ravel(order='C'), deep=True, array_type=VTK_FLOAT)
 
         array.SetName(da.name)
