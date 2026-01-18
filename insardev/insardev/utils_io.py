@@ -55,7 +55,7 @@ def snapshot(*args, store: str | None = None, storage_options: dict[str, str] | 
         save(*args, store=store, storage_options=storage_options, compat=compat, caption=caption, n_jobs=n_jobs, debug=debug)
     return open(store=store, storage_options=storage_options, compat=compat, n_jobs=n_jobs, debug=debug)
 
-def save(*args, store: str, storage_options: dict[str, str] | None = None, compat: bool = True,
+def save(*args, store, storage_options: dict[str, str] | None = None, compat: bool = True,
             caption: str | None = 'Saving...', n_jobs: int = -1, debug=False):
     """
     Save multiple xarray.Datasets into one Zarr store, each under its own subgroup.
@@ -123,6 +123,9 @@ def save(*args, store: str, storage_options: dict[str, str] | None = None, compa
             else:
                 raise ValueError('Arguments must be xarray.Datasets or dictionaries of xarray.Datasets when compat is True')
     
+    # Check if store is a string path or a store object
+    is_store_object = not isinstance(store, str)
+
     def _save_grp(grp, ds):
         # silently drop problematic attributes
         ds_clean = ds.copy()
@@ -131,17 +134,26 @@ def save(*args, store: str, storage_options: dict[str, str] | None = None, compa
         # prevent chunks mismatch between variables and coordinates
         for coord in ds_clean.coords:
             ds_clean[coord].encoding.pop('chunks', None)
-        # save to subdirectory
-        #print (ds_clean)
-        ds_clean.to_zarr(
-            store=f'{store}/{grp}',
-            mode='w',
-            consolidated=True,
-            zarr_format=3
-        )
+        # save to subdirectory/subgroup
+        if is_store_object:
+            # Use group parameter for store objects (e.g., ZipStore)
+            ds_clean.to_zarr(
+                store=store,
+                group=grp,
+                mode='a',  # append mode for store objects
+                consolidated=True,
+                zarr_format=3
+            )
+        else:
+            ds_clean.to_zarr(
+                store=f'{store}/{grp}',
+                mode='w',
+                consolidated=True,
+                zarr_format=3
+            )
         del ds_clean
 
-    # open to drop existing store
+    # open to drop existing store (for string paths) or initialize (for store objects)
     root = zarr.group(store=store, zarr_format=3, overwrite=True)
     root.attrs['__class__'] = [
         f'{cls.__module__}.{cls.__qualname__}'
@@ -194,6 +206,9 @@ def open(store: str, storage_options: dict[str, str] | None = None, compat: bool
     from tqdm.auto import tqdm
     from pydoc import locate
 
+    # Check if store is a string path or a store object
+    is_store_object = not isinstance(store, str)
+
     root = zarr.open_consolidated(store, storage_options=storage_options, zarr_format=3, mode='r')
     classes = [locate(c) for c in root.attrs.get('__class__')]
     interleave = len(classes) > 1
@@ -205,8 +220,10 @@ def open(store: str, storage_options: dict[str, str] | None = None, compat: bool
 
     def _load_grp(grp):
         import rioxarray
-        #ds = xr.open_zarr(store, group=grp, consolidated=True, zarr_format=3)
-        ds = xr.open_zarr(f'{store}/{grp}', storage_options=storage_options, consolidated=True, zarr_format=3)
+        if is_store_object:
+            ds = xr.open_zarr(store, group=grp, storage_options=storage_options, consolidated=True, zarr_format=3)
+        else:
+            ds = xr.open_zarr(f'{store}/{grp}', storage_options=storage_options, consolidated=True, zarr_format=3)
         # restore rioxarray CRS from spatial_ref coordinate/variable if present
         if ds.rio.crs is None:
             # check both coords and data_vars for spatial_ref

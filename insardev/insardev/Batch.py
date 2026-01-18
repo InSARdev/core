@@ -1034,6 +1034,88 @@ class BatchList(tuple):
             return result
         return (result,)
 
+    def archive(self, store: str, caption: str | None = None, compression: int = 6,
+                n_jobs: int = -1, debug: bool = False):
+        """Save or open a BatchList archive as a single ZIP file.
+
+        Wrapper around snapshot() that uses ZipStore for single-file storage.
+        Useful for downloading data from Google Colab or similar environments.
+
+        Parameters
+        ----------
+        store : str
+            Path to the ZIP file. Must end with '.zip'.
+        caption : str, optional
+            Progress bar caption.
+        compression : int
+            ZIP compression level 0-9 (0=no compression, 9=max). Default 6.
+            Higher values produce smaller files but take longer.
+        n_jobs : int
+            Number of parallel jobs (-1 for all cores).
+        debug : bool
+            Print debug information.
+
+        Returns
+        -------
+        tuple
+            Tuple of Batch objects for unpacking.
+
+        Examples
+        --------
+        >>> # Save to zip
+        >>> mintf, mcorr = stack.phasediff(...).downsample(20).archive('mintf_corr.zip')
+        >>> # Save with max compression (for GitHub 100MB limit)
+        >>> mintf, mcorr = stack.phasediff(...).archive('mintf_corr.zip', compression=9)
+        >>> # Save to cloud storage (GCS, S3, etc.)
+        >>> mintf, mcorr = stack.phasediff(...).archive('gs://bucket/mintf_corr.zip')
+        >>> # Open from zip
+        >>> mintf, mcorr = BatchList().archive('mintf_corr.zip')
+        """
+        import zarr
+        import zipfile
+        import tempfile
+        import os
+        import fsspec
+
+        if not store.endswith('.zip'):
+            raise ValueError(f"Archive store must have '.zip' extension, got: {store}")
+
+        # Check if cloud storage path
+        is_cloud = '://' in store
+
+        if len(self) == 0:
+            # Open mode - check file exists first
+            if is_cloud:
+                fs, path = fsspec.core.url_to_fs(store)
+                if not fs.exists(path):
+                    raise FileNotFoundError(f"Archive not found: {store}")
+            elif not os.path.exists(store):
+                raise FileNotFoundError(f"Archive not found: {store}")
+            # Use ZipStore directly for reading
+            zip_store = zarr.storage.ZipStore(store, mode='r')
+            result = self.snapshot(store=zip_store, caption=caption or 'Opening archive...', n_jobs=n_jobs, debug=debug)
+            zip_store.close()
+            return result
+        else:
+            # Save mode - write to temp directory, then zip
+            # This avoids ZipStore's duplicate entry problem
+            temp_dir = tempfile.mkdtemp()
+            try:
+                result = self.snapshot(store=temp_dir, caption=caption or 'Archiving...', n_jobs=n_jobs, debug=debug)
+                # Create zip with specified compression level
+                # Use fsspec for cloud storage support
+                with fsspec.open(store, 'wb') as f:
+                    with zipfile.ZipFile(f, 'w', zipfile.ZIP_DEFLATED, compresslevel=compression) as zf:
+                        for root, dirs, files in os.walk(temp_dir):
+                            for file in files:
+                                file_path = os.path.join(root, file)
+                                arcname = os.path.relpath(file_path, temp_dir)
+                                zf.write(file_path, arcname)
+            finally:
+                import shutil
+                shutil.rmtree(temp_dir)
+            return result
+
     def downsample(self, *args, **kwargs):
         """Apply downsample to all batches."""
         return BatchList([b.downsample(*args, **kwargs) for b in self])

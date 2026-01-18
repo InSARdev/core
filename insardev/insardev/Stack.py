@@ -599,6 +599,115 @@ class Stack(Stack_plot, BatchCore):
         # Save mode - args are batches
         return BatchList(args).snapshot(store=store, storage_options=storage_options, caption=caption, n_jobs=n_jobs, debug=debug)
 
+    def archive(self, *args, store: str | None = None, caption: str | None = None,
+                compression: int = 6, n_jobs: int = -1, debug=False):
+        """Save or open an archive of the Stack or Batch objects as a single ZIP file.
+
+        Wrapper around snapshot() that uses ZipStore for single-file storage.
+        Useful for downloading data from Google Colab or similar environments.
+
+        Stack serves as a unified interface - use empty Stack() for utility operations:
+        - stack.archive('path.zip') on non-empty Stack saves the Stack
+        - Stack().archive('path.zip') on empty Stack opens existing archive
+        - stack.archive(batch1, batch2, store='path.zip') saves batches
+
+        Parameters
+        ----------
+        *args : BatchCore or str
+            Batch objects to save, or store path string.
+        store : str, optional
+            Path to the ZIP file. Must end with '.zip'.
+        caption : str, optional
+            Progress bar caption.
+        compression : int
+            ZIP compression level 0-9 (0=no compression, 9=max). Default 6.
+            Higher values produce smaller files but take longer.
+        n_jobs : int
+            Number of parallel jobs (-1 for all cores).
+        debug : bool
+            Print debug information.
+
+        Returns
+        -------
+        Stack or tuple
+            The saved Stack, or tuple of opened/saved Batch objects.
+
+        Examples
+        --------
+        >>> # Save stack itself
+        >>> stack.archive('mystack.zip')
+        >>> # Save with max compression (for GitHub 100MB limit)
+        >>> stack.archive('mystack.zip', compression=9)
+        >>> # Save to cloud storage (GCS, S3, etc.)
+        >>> stack.archive('gs://bucket/mystack.zip')
+        >>> # Open existing archive
+        >>> mintf, mcorr = Stack().archive('mintf_corr.zip')
+        >>> # Save batches
+        >>> mintf, mcorr = stack.archive(mintf, mcorr, store='mintf_corr.zip')
+        """
+        import zipfile
+        import tempfile
+        import os
+        import fsspec
+        import zarr
+        from .Batch import BatchList
+        from . import utils_io
+
+        # Handle case where first arg is store path
+        if len(args) == 1 and isinstance(args[0], str):
+            store = args[0]
+            args = ()
+
+        if store is None:
+            raise ValueError("store path is required for archive")
+
+        if not store.endswith('.zip'):
+            raise ValueError(f"Archive store must have '.zip' extension, got: {store}")
+
+        # Check if cloud storage path
+        is_cloud = '://' in store
+
+        # If no batch args provided
+        if len(args) == 0:
+            # Empty Stack -> open mode, non-empty Stack -> save mode
+            if len(self) == 0:
+                # Open mode - check file exists first
+                if is_cloud:
+                    fs, path = fsspec.core.url_to_fs(store)
+                    if not fs.exists(path):
+                        raise FileNotFoundError(f"Archive not found: {store}")
+                elif not os.path.exists(store):
+                    raise FileNotFoundError(f"Archive not found: {store}")
+                # Use ZipStore directly for reading
+                zip_store = zarr.storage.ZipStore(store, mode='r')
+                result = BatchList().snapshot(store=zip_store, caption=caption or 'Opening archive...', n_jobs=n_jobs, debug=debug)
+                zip_store.close()
+                # Unwrap single Stack from tuple
+                if len(result) == 1 and isinstance(result[0], Stack):
+                    return result[0]
+                return result
+            # Save self - write to temp directory, then zip
+            temp_dir = tempfile.mkdtemp()
+            try:
+                utils_io.save(self, store=temp_dir, storage_options=None, compat=True,
+                             caption=caption or 'Archiving...', n_jobs=n_jobs, debug=debug)
+                # Create zip with specified compression level
+                # Use fsspec for cloud storage support
+                with fsspec.open(store, 'wb') as f:
+                    with zipfile.ZipFile(f, 'w', zipfile.ZIP_DEFLATED, compresslevel=compression) as zf:
+                        for root, dirs, files in os.walk(temp_dir):
+                            for file in files:
+                                file_path = os.path.join(root, file)
+                                arcname = os.path.relpath(file_path, temp_dir)
+                                zf.write(file_path, arcname)
+            finally:
+                import shutil
+                shutil.rmtree(temp_dir)
+            return self
+
+        # Save mode - args are batches
+        return BatchList(args).archive(store, caption=caption, compression=compression, n_jobs=n_jobs, debug=debug)
+
     # def downsample(self, *args, coarsen=None, resolution=60, func='mean', debug:bool=False):
     #     datas = []
     #     for arg in args:
