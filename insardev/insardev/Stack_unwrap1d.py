@@ -478,8 +478,8 @@ class Stack_unwrap1d(Stack_phasediff):
         Wb_cpu = Wb.cpu()
 
         # Replace any non-finite values with 0 (CUDA lstsq is strict)
-        WA_cpu = torch.where(torch.isfinite(WA_cpu), WA_cpu, torch.zeros_like(WA_cpu))
-        Wb_cpu = torch.where(torch.isfinite(Wb_cpu), Wb_cpu, torch.zeros_like(Wb_cpu))
+        WA_cpu = torch.nan_to_num(WA_cpu, nan=0.0, posinf=0.0, neginf=0.0)
+        Wb_cpu = torch.nan_to_num(Wb_cpu, nan=0.0, posinf=0.0, neginf=0.0)
 
         # torch.linalg.lstsq returns (solution, residuals, rank, singular_values)
         result = torch.linalg.lstsq(WA_cpu, Wb_cpu)
