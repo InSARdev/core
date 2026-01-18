@@ -1139,8 +1139,29 @@ class BatchList(tuple):
         than computing them separately because shared computations are only
         performed once.
         """
-        persisted = self.persist()
-        return tuple(b.compute() for b in persisted)
+        import dask
+        from insardev_toolkit.progressbar import progressbar
+
+        # persist() computes shared graph with progress tracking
+        batch_dicts = [dict(b) for b in self]
+        progressbar(
+            result := dask.persist(*batch_dicts),
+            desc='Computing Batches...'.ljust(25)
+        )
+        # materialize coordinates to local memory (same as BatchCore.compute)
+        computed_batches = []
+        for i, batch_dict in enumerate(result):
+            computed = {}
+            for key, ds in batch_dict.items():
+                new_coords = {}
+                for name, coord in ds.coords.items():
+                    if hasattr(coord, 'data') and hasattr(coord.data, 'compute'):
+                        new_coords[name] = (coord.dims, coord.compute().values)
+                if new_coords:
+                    ds = ds.assign_coords(new_coords)
+                computed[key] = ds
+            computed_batches.append(type(self[i])(computed))
+        return tuple(computed_batches)
 
     def persist(self):
         """Persist all batches together efficiently and return as BatchList.
