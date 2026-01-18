@@ -56,7 +56,7 @@ class XYZTiles(datagrid, progressbar_joblib):
             raise ValueError('Expected background "Mapnik" or None')
         return self.download(geometry, zoom, filename, **kwargs)
 
-    def download(self, geometry, zoom, filename=None, url='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', n_jobs=8, skip_exist=True, fill_value=0, debug=False):
+    def download(self, geometry, zoom, filename=None, url='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', n_jobs=8, skip_exist=True, fill_value=255, debug=False):
         """
         Downloads map tiles for a specified geometry and zoom level from a given tile map service.
 
@@ -205,23 +205,24 @@ class XYZTiles(datagrid, progressbar_joblib):
             da = da.reindex(lat=da.lat[::-1])
         # crop geometry extent
         da = da.sel(lat=slice(bounds[1], bounds[3]), lon=slice(bounds[0], bounds[2]))
-        # set spatial attributes
+        # set spatial attributes for rioxarray
         da = da.rio.set_spatial_dims(y_dim='lat', x_dim='lon', inplace=True).rio.write_crs(4326, inplace=True)
-        # fix for white pixels
+        # replace background pixels (255) with fill_value for dark theme support
         fill = da.attrs.get('_FillValue', 255)
         if fill_value != fill:
             mask = (da.values == fill)
             if mask.any():
                 da.values[mask] = fill_value
             da.attrs['_FillValue'] = fill_value
-
         # reproject to the geometry CRS when possible
         try:
+            from rasterio.enums import Resampling
             if isinstance(geometry, (gpd.GeoDataFrame, gpd.GeoSeries)):
                 crs = geometry.crs
             else:
                 crs = geometry.rio.crs
-            da = da.rio.reproject(crs)
+            # Use nearest resampling to preserve RGB pixel colors
+            da = da.rio.reproject(crs, resampling=Resampling.nearest)
         except Exception:
             pass
 
