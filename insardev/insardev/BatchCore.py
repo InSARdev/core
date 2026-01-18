@@ -859,6 +859,73 @@ class BatchCore(dict):
             out[key] = ds.where(mask_burst, other)
         return type(self)(out)
 
+    def crop(self, geometry):
+        """
+        Crop each burst to the bounding rectangle of a geometry.
+
+        Unlike mask() which clips to the exact geometry shape, crop() selects
+        the bounding box (rectangular extent) of the geometry.
+
+        Parameters
+        ----------
+        geometry : GeoDataFrame, GeoSeries, or Shapely Geometry
+            Geometry whose bounding box defines the crop extent.
+
+        Returns
+        -------
+        Batch
+            Cropped batch with same type as self.
+
+        Examples
+        --------
+        # Crop to AOI bounding box
+        cropped = velocity.crop(AOI.buffer(500))
+
+        # Compare with mask (exact geometry)
+        masked = velocity.mask(AOI.buffer(500))  # clips to exact shape
+        cropped = velocity.crop(AOI.buffer(500))  # crops to bounding rectangle
+        """
+        import geopandas as gpd
+        from shapely import Geometry
+
+        # Extract bounds from geometry
+        if isinstance(geometry, gpd.GeoDataFrame):
+            bounds = geometry.total_bounds  # (minx, miny, maxx, maxy)
+            geom_crs = geometry.crs
+        elif isinstance(geometry, gpd.GeoSeries):
+            bounds = geometry.total_bounds
+            geom_crs = geometry.crs
+        elif isinstance(geometry, Geometry):
+            bounds = geometry.bounds  # (minx, miny, maxx, maxy)
+            geom_crs = None
+        else:
+            raise TypeError(f"geometry must be GeoDataFrame, GeoSeries, or Shapely Geometry, got {type(geometry).__name__}")
+
+        minx, miny, maxx, maxy = bounds
+
+        # Reproject bounds to batch CRS if needed
+        crs = self.crs
+        if crs is not None and geom_crs is not None and geom_crs != crs:
+            from shapely.geometry import box
+            bbox = gpd.GeoSeries([box(minx, miny, maxx, maxy)], crs=geom_crs).to_crs(crs)
+            minx, miny, maxx, maxy = bbox.total_bounds
+
+        out = {}
+        for key, ds in self.items():
+            # Determine coordinate order (ascending or descending)
+            y_asc = len(ds.y) < 2 or float(ds.y[1]) > float(ds.y[0])
+            x_asc = len(ds.x) < 2 or float(ds.x[1]) > float(ds.x[0])
+
+            # Create slices based on coordinate order
+            y_slice = slice(miny, maxy) if y_asc else slice(maxy, miny)
+            x_slice = slice(minx, maxx) if x_asc else slice(maxx, minx)
+
+            clipped = ds.sel(y=y_slice, x=x_slice)
+            if clipped.y.size > 0 and clipped.x.size > 0:
+                out[key] = clipped
+
+        return type(self)(out)
+
     def __pow__(self, exponent, **kwargs):
         return self.map_da(lambda da: da**exponent, **kwargs)
 
@@ -2390,12 +2457,17 @@ class BatchCore(dict):
                 # Get weight numpy array if provided
                 weight_np = w_da.values if w_da is not None else None
 
-                # Create wrapper for _gaussian
+                # Create wrapper for _gaussian (expects 2D input)
                 def apply_gaussian(block):
                     return BatchCore._gaussian(block, weight_np, sigma=sigmas, threshold=threshold, device=device).astype(out_dtype)
 
                 # Use da.blockwise for efficient dask integration
                 dask_data = data_arr.data
+
+                # For 3D arrays, rechunk first dim to 1 so _gaussian gets 2D slices
+                if dask_data.ndim == 3:
+                    dask_data = dask_data.rechunk({0: 1})
+
                 # Build dimension string based on ndim (e.g., 'yx' for 2D, 'pyx' for 3D)
                 dim_str = ''.join(chr(ord('a') + i) for i in range(dask_data.ndim))
 
