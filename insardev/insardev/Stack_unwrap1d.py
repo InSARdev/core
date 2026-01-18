@@ -593,7 +593,7 @@ class Stack_unwrap1d(Stack_phasediff):
         import xarray as xr
         import pandas as pd
         import dask
-        import dask.array
+        import dask.array as da
 
         # Get pairs
         pairs = self._get_pairs(data)
@@ -602,24 +602,24 @@ class Stack_unwrap1d(Stack_phasediff):
         # Build incidence matrix once (needed for all blocks)
         A, dates = Stack_unwrap1d._build_incidence_matrix(pair_dates)
         n_dates = len(dates)
+        n_pairs = len(pair_dates)
 
-        # Ensure data is chunked for lazy processing (pair, y, x)
-        if data.chunks is None:
-            chunks = {'y': self.netcdf_chunksize, 'x': self.netcdf_chunksize}
-            data = data.chunk(chunks)
-            if weight is not None:
-                weight = weight.chunk(chunks)
+        # Use dask auto-chunking for y,x based on memory
+        # Multiplier accounts for lstsq internal memory (matrices, solutions)
+        auto_chunks = dask.array.core.normalize_chunks(
+            'auto', (4 * n_pairs, data.y.size, data.x.size), dtype=np.complex128
+        )
+        chunks_y, chunks_x = auto_chunks[1][0], auto_chunks[2][0]
 
-        chunks_pair, chunks_y, chunks_x = data.chunks
+        # Rechunk: all pairs together (-1), auto-chunked y,x
+        first_dim = data.dims[0]
+        data = data.chunk({first_dim: -1, 'y': chunks_y, 'x': chunks_x})
+        if weight is not None:
+            weight = weight.chunk({first_dim: -1, 'y': chunks_y, 'x': chunks_x})
 
-        def lstsq_block(ys, xs):
+        # Use blockwise to avoid embedding large arrays in the graph
+        def process_block(data_block, weight_block=None):
             """Process a spatial block - all pairs, subset of y,x."""
-            data_block = data.isel(y=ys, x=xs).compute(n_workers=1).values
-            if weight is not None:
-                weight_block = weight.isel(y=ys, x=xs).compute(n_workers=1).values
-            else:
-                weight_block = None
-
             # PyTorch batched weighted least squares
             ts_block, _ = Stack_unwrap1d._lstsq_to_dates_numpy(
                 data_block, weight_block, pair_dates,
@@ -627,26 +627,29 @@ class Stack_unwrap1d(Stack_phasediff):
             )
             return ts_block.astype(np.float32)
 
-        # Build lazy dask array from blocks
-        ys_blocks = np.array_split(np.arange(data.y.size), np.cumsum(chunks_y)[:-1])
-        xs_blocks = np.array_split(np.arange(data.x.size), np.cumsum(chunks_x)[:-1])
+        data_dask = data.data
+        if weight is not None:
+            weight_dask = weight.data
+            result_dask = da.map_blocks(
+                process_block, data_dask, weight_dask,
+                dtype=np.float32,
+                drop_axis=0,
+                new_axis=0,
+                chunks=(n_dates,) + data_dask.chunks[1:],
+            )
+        else:
+            def process_block_no_weight(data_block):
+                return process_block(data_block, None)
+            result_dask = da.map_blocks(
+                process_block_no_weight, data_dask,
+                dtype=np.float32,
+                drop_axis=0,
+                new_axis=0,
+                chunks=(n_dates,) + data_dask.chunks[1:],
+            )
 
-        blocks_total = []
-        for ys_block in ys_blocks:
-            blocks_row = []
-            for xs_block in xs_blocks:
-                block = dask.array.from_delayed(
-                    dask.delayed(lstsq_block)(ys_block, xs_block),
-                    shape=(n_dates, ys_block.size, xs_block.size),
-                    dtype=np.float32
-                )
-                blocks_row.append(block)
-            blocks_total.append(blocks_row)
-
-        ts_dask = dask.array.block(blocks_total)
-
-        # Rechunk to per-slice for efficient downstream operations (e.g., plot)
-        ts_dask = ts_dask.rechunk({0: 1})
+        # Rechunk to (1, -1, -1) for efficient per-slice downstream operations (e.g., plot)
+        ts_dask = result_dask.rechunk({0: 1, 1: -1, 2: -1})
 
         # Build coordinates
         coords = {
@@ -775,23 +778,23 @@ class Stack_unwrap1d(Stack_phasediff):
             else:
                 original_coords[k] = vals
 
-        # Ensure data is chunked for lazy processing (pair, y, x)
-        if data.chunks is None:
-            chunks = {'y': self.netcdf_chunksize, 'x': self.netcdf_chunksize}
-            data = data.chunk(chunks)
-            if weight is not None:
-                weight = weight.chunk(chunks)
+        # Use dask auto-chunking for y,x based on memory
+        # Multiplier accounts for unwrap1d internal memory (IRLS iterations)
+        import dask.array as da
+        auto_chunks = dask.array.core.normalize_chunks(
+            'auto', (4 * n_pairs, data.y.size, data.x.size), dtype=np.complex128
+        )
+        chunks_y, chunks_x = auto_chunks[1][0], auto_chunks[2][0]
 
-        chunks_pair, chunks_y, chunks_x = data.chunks
+        # Rechunk: all pairs together (-1), auto-chunked y,x
+        first_dim = data.dims[0]
+        data = data.chunk({first_dim: -1, 'y': chunks_y, 'x': chunks_x})
+        if weight is not None:
+            weight = weight.chunk({first_dim: -1, 'y': chunks_y, 'x': chunks_x})
 
-        def unwrap1d_pairs_block(ys, xs):
+        # Use blockwise to avoid embedding large arrays in the graph
+        def process_block(data_block, weight_block=None):
             """Process a spatial block - all pairs, subset of y,x."""
-            data_block = data.isel(y=ys, x=xs).compute(n_workers=1).values
-            if weight is not None:
-                weight_block = weight.isel(y=ys, x=xs).compute(n_workers=1).values
-            else:
-                weight_block = None
-
             unwrapped_block = Stack_unwrap1d._unwrap1d_pairs_numpy(
                 data_block, weight_block, pair_dates,
                 device=device, max_iter=max_iter, epsilon=epsilon,
@@ -799,27 +802,28 @@ class Stack_unwrap1d(Stack_phasediff):
             )
             return unwrapped_block.astype(np.float32)
 
-        # Build lazy dask array from blocks
-        ys_blocks = np.array_split(np.arange(data.y.size), np.cumsum(chunks_y)[:-1])
-        xs_blocks = np.array_split(np.arange(data.x.size), np.cumsum(chunks_x)[:-1])
+        data_dask = data.data
+        if weight is not None:
+            weight_dask = weight.data
+            with dask.annotate(resources={'gpu': 1} if device.type != 'cpu' else {}):
+                unwrapped_dask = da.blockwise(
+                    process_block, 'pyx',
+                    data_dask, 'pyx',
+                    weight_dask, 'pyx',
+                    dtype=np.float32,
+                )
+        else:
+            def process_block_no_weight(data_block):
+                return process_block(data_block, None)
+            with dask.annotate(resources={'gpu': 1} if device.type != 'cpu' else {}):
+                unwrapped_dask = da.blockwise(
+                    process_block_no_weight, 'pyx',
+                    data_dask, 'pyx',
+                    dtype=np.float32,
+                )
 
-        blocks_total = []
-        with dask.annotate(resources={'gpu': 1} if device.type != 'cpu' else {}):
-            for ys_block in ys_blocks:
-                blocks_row = []
-                for xs_block in xs_blocks:
-                    block = dask.array.from_delayed(
-                        dask.delayed(unwrap1d_pairs_block)(ys_block, xs_block),
-                        shape=(n_pairs, ys_block.size, xs_block.size),
-                        dtype=np.float32
-                    )
-                    blocks_row.append(block)
-                blocks_total.append(blocks_row)
-
-        unwrapped_dask = dask.array.block(blocks_total)
-
-        # Rechunk to per-slice for efficient downstream operations (e.g., plot)
-        unwrapped_dask = unwrapped_dask.rechunk({0: 1})
+        # Rechunk to (1, -1, -1) for efficient per-slice downstream operations (e.g., plot)
+        unwrapped_dask = unwrapped_dask.rechunk({0: 1, 1: -1, 2: -1})
 
         result = xr.DataArray(
             unwrapped_dask,

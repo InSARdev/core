@@ -210,103 +210,58 @@ class Stack_stl(Stack_sbas):
         netcdf_chunksize = getattr(self, 'netcdf_chunksize', 512)
         chunksize1d = getattr(self, 'chunksize1d', 10000)
 
-        if 'stack' not in data.dims:
-            # 3D case (date, y, x)
-            # Use dask auto-chunking based on available memory (similar to to_dataset())
-            # Include date dimension size for proper 3D memory estimation
-            # Uses 8 * n_dates to account for STL's internal memory requirements
-            # (8 × complex128 = 128 bytes effective per element)
-            # to account for STL internal variables (trend, seasonal, resid, weights, etc.)
-            n_dates = data.date.size
-            auto_chunks = dask.array.core.normalize_chunks('auto', (8 * n_dates, data.y.size, data.x.size), dtype=np.complex128)
-            chunks_y, chunks_x = auto_chunks[1][0], auto_chunks[2][0]
-            print (f'Note: auto tune data chunk size using dask: ({chunks_y}, {chunks_x})')
-            chunks = {'y': chunks_y, 'x': chunks_x}
-            data = data.chunk(chunks)
-        else:
-            # 2D case (date, stack)
-            if data.chunks is None:
-                chunks = {'stack': chunksize1d}
-                data = data.chunk(chunks)
-
-            chunks_z, chunks_stack = data.chunks
-            if np.max(chunks_stack) > chunksize1d:
-                print (f'Note: data chunk size ({np.max(chunks_stack)} is too large for stack processing')
-                chunks_stack = chunksize1d
-                print (f'Note: auto tune data chunk size to 1D chunk: ({chunks_stack})')
-                chunks = {'stack': chunks_stack}
-                data = data.chunk(chunks)
-        
-        if isinstance(data, xr.DataArray):
-            pass
-        else:
+        if not isinstance(data, xr.DataArray):
             raise Exception('Invalid input: The "data" parameter should be of type xarray.DataArray.')
 
         dt, dt_periodic = self._stl_periodic(data.date, freq)
+        n_dates_out = len(dt_periodic)
+        n_dates_in = data.date.size
 
-        def stl_block(ys, xs, stacks=None):
-            # use external variables dt, dt_periodic, periods, robust
-            if stacks is None:
-                # 3D array
-                data_block = data.isel(y=ys, x=xs).chunk(-1).compute(n_workers=1).values.transpose(1,2,0)
-            else:
-                # 2D array
-                data_block = data.isel(stack=stacks).chunk(-1).compute(n_workers=1).values.transpose(1,0)
-            # Vectorize vec_lstsq
-            #vec_stl = np.vectorize(lambda data: self._stl(data, dt, dt_periodic, periods, robust), signature='(n)->(3,m)')
-            vec_stl = np.vectorize(lambda data: self._stl1d(data, dt, dt_periodic, periods, robust), signature='(n)->(m),(m),(m)')
-            # Apply vec_lstsq to data_block and revert the original dimensions order
-            block = np.asarray(vec_stl(data_block))
-            del vec_stl, data_block
-            if stacks is None:
-                return block.transpose(0,3,1,2)
-            return block.transpose(0,2,1)
+        # Use dask auto-chunking for y,x based on memory
+        # Multiplier accounts for STL internal memory (trend, seasonal, resid, weights, etc.)
+        auto_chunks = dask.array.core.normalize_chunks(
+            'auto', (8 * n_dates_in, data.y.size, data.x.size), dtype=np.complex128
+        )
+        chunks_y, chunks_x = auto_chunks[1][0], auto_chunks[2][0]
 
-        # split to chunks
-        # use indices instead of the coordinate values to prevent the weird error raising occasionally:
-        # "Reindexing only valid with uniquely valued Index objects"
-        blocks_total = []
-        if not 'stack' in data.dims:
-            # re-check the chunk sizes as it can be tunned above
-            chunks_z, chunks_y, chunks_x = data.chunks
-            ys_blocks = np.array_split(np.arange(data.y.size), np.cumsum(chunks_y)[:-1])
-            xs_blocks = np.array_split(np.arange(data.x.size), np.cumsum(chunks_x)[:-1])
-    
-            for ys_block in ys_blocks:
-                blocks = []
-                for xs_block in xs_blocks:
-                    block = dask.array.from_delayed(dask.delayed(stl_block)(ys_block, xs_block),
-                                                    shape=(3, len(dt_periodic), ys_block.size, xs_block.size),
-                                                    dtype=np.float32)
-                    blocks.append(block)
-                    del block
-                blocks_total.append(blocks)
-                del blocks
-            # specify 3D output coordinates
-            coords = {'date': dt_periodic.astype('datetime64[ns]'), 'y': data.y, 'x': data.x}
-        else:
-            chunks_z, chunks_stack = data.chunks
-            stacks_blocks = np.array_split(np.arange(data['stack'].size), np.cumsum(chunks_stack)[:-1])
-            for stacks_block in stacks_blocks:
-                block = dask.array.from_delayed(dask.delayed(stl_block)(None, None, stacks_block),
-                                                shape=(3, len(dt_periodic), stacks_block.size),
-                                                dtype=np.float32)
-                blocks_total.append(block)
-                del block
-            # specify 2D output coordinates
-            coords = {'date': dt_periodic.astype('datetime64[ns]'), 'stack': data['stack']}
-        models = dask.array.block(blocks_total)
-        del blocks_total
+        # Rechunk: all dates together (-1), auto-chunked y,x
+        first_dim = data.dims[0]
+        data = data.chunk({first_dim: -1, 'y': chunks_y, 'x': chunks_x})
+
+        # Use blockwise to avoid embedding large arrays in the graph
+        def process_block(data_block):
+            # data_block: (n_dates, y_chunk, x_chunk)
+            # transpose to (y, x, n_dates) for vectorized STL
+            data_transposed = data_block.transpose(1, 2, 0)
+            vec_stl = np.vectorize(
+                lambda ts: self._stl1d(ts, dt, dt_periodic, periods, robust),
+                signature='(n)->(m),(m),(m)'
+            )
+            # result: (3, y, x, n_dates_out) after asarray
+            block = np.asarray(vec_stl(data_transposed))
+            del vec_stl, data_transposed
+            # transpose to (3, n_dates_out, y, x)
+            return block.transpose(0, 3, 1, 2).astype(np.float32)
+
+        data_dask = data.data
+        models = dask.array.map_blocks(
+            process_block, data_dask,
+            dtype=np.float32,
+            drop_axis=0,
+            new_axis=[0, 1],
+            chunks=(3, n_dates_out) + data_dask.chunks[1:],
+        )
+
+        coords = {'date': dt_periodic.astype('datetime64[ns]'), 'y': data.y, 'x': data.x}
 
         # transform to separate variables
-        # transform to separate variables variables returned from Stack.stl() function
         varnames = ['trend', 'seasonal', 'resid']
         keys_vars = {}
         for varidx, varname in enumerate(varnames):
             var_data = models[varidx]
-            # Rechunk to per-slice for efficient downstream operations (e.g., plot)
+            # Rechunk to (1, -1, -1) for efficient per-slice downstream operations (e.g., plot)
             if hasattr(var_data, 'rechunk'):
-                var_data = var_data.rechunk({0: 1})
+                var_data = var_data.rechunk({0: 1, 1: -1, 2: -1})
             keys_vars[varname] = xr.DataArray(var_data, coords=coords)
         model = xr.Dataset({**keys_vars})
         del models
