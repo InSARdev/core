@@ -455,7 +455,9 @@ class Stack_unwrap1d(Stack_phasediff):
             W = torch.from_numpy(weights_flat.astype(np.float32)).to(dev)
             W = torch.where(nan_mask, torch.zeros_like(W), W)
             # Transform correlation to least squares weight: w / sqrt(1 - w^2)
-            W_lstsq = W / torch.sqrt(1 - W**2)
+            # Clamp to avoid Inf (W=1) and NaN (W>1)
+            W_clamped = torch.clamp(W, 0.0, 0.9999)
+            W_lstsq = W_clamped / torch.sqrt(1 - W_clamped**2)
         else:
             W_lstsq = torch.where(nan_mask, torch.zeros(1, device=dev), torch.ones(1, device=dev))
             W_lstsq = W_lstsq.expand(n_pairs, n_pixels)
@@ -474,6 +476,10 @@ class Stack_unwrap1d(Stack_phasediff):
         # Batched least squares solve on CPU (faster for small matrices)
         WA_cpu = WA.cpu()
         Wb_cpu = Wb.cpu()
+
+        # Replace any non-finite values with 0 (CUDA lstsq is strict)
+        WA_cpu = torch.where(torch.isfinite(WA_cpu), WA_cpu, torch.zeros_like(WA_cpu))
+        Wb_cpu = torch.where(torch.isfinite(Wb_cpu), Wb_cpu, torch.zeros_like(Wb_cpu))
 
         # torch.linalg.lstsq returns (solution, residuals, rank, singular_values)
         result = torch.linalg.lstsq(WA_cpu, Wb_cpu)
