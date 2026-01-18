@@ -11,6 +11,12 @@
 from contextlib import nullcontext
 from .Stack_unwrap2d import Stack_unwrap2d
 from .Batch import Batch, BatchWrap
+import threading
+
+# Lock for CUDA torch.linalg lazy initialization (prevents multi-threading bug)
+# See: https://github.com/pytorch/pytorch/issues/90613
+_linalg_init_lock = threading.Lock()
+_linalg_initialized = False
 
 class Stack_detrend(Stack_unwrap2d):
     import numpy as np
@@ -235,6 +241,16 @@ class Stack_detrend(Stack_unwrap2d):
         import numpy as np
         from itertools import combinations_with_replacement
 
+        # Force torch.linalg lazy initialization to avoid CUDA multi-threading bug
+        # See: https://github.com/pytorch/pytorch/issues/90613
+        global _linalg_initialized
+        if device.type == 'cuda' and not _linalg_initialized:
+            with _linalg_init_lock:
+                if not _linalg_initialized:
+                    with torch.cuda.device(device):
+                        _ = torch.linalg.solve(torch.eye(2, device=device), torch.ones(2, device=device))
+                    _linalg_initialized = True
+
         # Handle 2D vs 3D input
         squeeze = phase.ndim == 2
         if squeeze:
@@ -321,9 +337,10 @@ class Stack_detrend(Stack_unwrap2d):
                 b_valid = b_valid * w
 
             # Solve normal equations: (A^T A) coeffs = A^T b
-            AtA = A_valid_scaled.T @ A_valid_scaled
-            Atb = A_valid_scaled.T @ b_valid
-            coeffs = torch.linalg.solve(AtA, Atb)
+            # Move to CPU for solve (faster for small matrices and avoids CUDA lazy init race)
+            AtA = (A_valid_scaled.T @ A_valid_scaled).cpu()
+            Atb = (A_valid_scaled.T @ b_valid).cpu()
+            coeffs = torch.linalg.solve(AtA, Atb).to(device)
 
             # Compute trend for all pixels using the same scaling
             A_all_scaled = torch.cat([
