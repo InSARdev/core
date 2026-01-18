@@ -199,6 +199,13 @@ class Stack_detrend(Stack_unwrap2d):
 
         # Reshape back to (n_samples, ny, nx)
         result = result_t.cpu().numpy().reshape(n_samples, ny, nx)
+
+        # Cleanup GPU memory
+        if device.type == 'mps':
+            torch.mps.empty_cache()
+        elif device.type == 'cuda':
+            torch.cuda.empty_cache()
+
         return result.astype(np.float32)
 
     @staticmethod
@@ -329,6 +336,12 @@ class Stack_detrend(Stack_unwrap2d):
         if squeeze:
             trends = trends[0]
 
+        # Cleanup GPU memory
+        if device.type == 'mps':
+            torch.mps.empty_cache()
+        elif device.type == 'cuda':
+            torch.cuda.empty_cache()
+
         return trends.astype(np.float32)
 
     def trend2d(self, phase, weight=None, transform=None, degree=1, device='auto', debug=False):
@@ -395,73 +408,108 @@ class Stack_detrend(Stack_unwrap2d):
             pols = [v for v in ds.data_vars
                    if 'y' in ds[v].dims and 'x' in ds[v].dims]
 
-            # Get variables from transform or use y/x coordinates
-            if transform is not None:
-                trans_ds = transform[key]
-                # Filter for spatial variables (with y, x dims) - excludes converted attributes
-                var_names = [v for v in trans_ds.data_vars
-                            if 'y' in trans_ds[v].dims and 'x' in trans_ds[v].dims]
-                # Get transform variables (compute if lazy)
-                var_arrays = [trans_ds[v] for v in var_names]
-                if any(hasattr(arr.data, 'compute') for arr in var_arrays):
-                    computed = dask.compute(*var_arrays)
-                    variables = [arr.values if hasattr(arr, 'values') else arr for arr in computed]
-                else:
-                    variables = [arr.values for arr in var_arrays]
-            else:
-                # Use y/x coordinates as default variables
-                y = ds[pols[0]].y.values
-                x = ds[pols[0]].x.values
-                Y, X = np.meshgrid(y, x, indexing='ij')
-                variables = [Y.astype(np.float32), X.astype(np.float32)]
-                var_names = ['y', 'x']
+            # Get variables from transform (required)
+            if transform is None:
+                raise ValueError("transform is required for trend2d. Use stack.transform()[['azi','rng','ele']] or stack.transform()[['azi','rng']].")
+
+            trans_ds = transform[key]
+            # Filter for spatial variables (with y, x dims) - excludes converted attributes
+            var_names = [v for v in trans_ds.data_vars
+                        if 'y' in trans_ds[v].dims and 'x' in trans_ds[v].dims]
+
+            # Check that transform and weight resolutions match phase resolution
+            phase_da_ref = ds[pols[0]]
+            phase_shape = phase_da_ref.shape[-2:]  # (y, x)
+            phase_dy = float(phase_da_ref.y.diff('y')[0])
+            phase_dx = float(phase_da_ref.x.diff('x')[0])
+
+            trans_da_ref = trans_ds[var_names[0]]
+            trans_shape = trans_da_ref.shape
+            if phase_shape != trans_shape:
+                trans_dy = float(trans_da_ref.y.diff('y')[0])
+                trans_dx = float(trans_da_ref.x.diff('x')[0])
+                raise ValueError(
+                    f"Transform shape {trans_shape} does not match phase shape {phase_shape}. "
+                    f"Phase spacing: dy={phase_dy:.1f}, dx={phase_dx:.1f}. "
+                    f"Transform spacing: dy={trans_dy:.1f}, dx={trans_dx:.1f}. "
+                    f"Use stack.transform()[['azi','rng','ele']].downsample(N) to match."
+                )
+
+            if weight is not None:
+                weight_ds = weight[key]
+                weight_pols = [v for v in weight_ds.data_vars
+                              if 'y' in weight_ds[v].dims and 'x' in weight_ds[v].dims]
+                if weight_pols:
+                    weight_da_ref = weight_ds[weight_pols[0]]
+                    weight_shape = weight_da_ref.shape[-2:]
+                    if phase_shape != weight_shape:
+                        weight_dy = float(weight_da_ref.y.diff('y')[0])
+                        weight_dx = float(weight_da_ref.x.diff('x')[0])
+                        raise ValueError(
+                            f"Weight shape {weight_shape} does not match phase shape {phase_shape}. "
+                            f"Phase spacing: dy={phase_dy:.1f}, dx={phase_dx:.1f}. "
+                            f"Weight spacing: dy={weight_dy:.1f}, dx={weight_dx:.1f}. "
+                            f"Use weight.downsample(N) to match."
+                        )
 
             if debug:
-                print(f"DEBUG {key}: variables={var_names}, shapes={[v.shape for v in variables]}")
+                print(f"DEBUG {key}: variables={var_names}")
 
             result_ds = {}
             for pol in pols:
                 phase_da = ds[pol]
                 weight_da = weight[key][pol] if weight is not None else None
 
-                # Save coordinates for output
-                coords = dict(phase_da.coords)
-                dims = phase_da.dims
-
-                # Create wrapper function for blockwise
-                def process_chunk(phase_chunk, weight_chunk=None, variables=variables, device=device, degree=degree):
-                    import torch
-                    # Ensure 3D input (pair, y, x)
-                    if phase_chunk.ndim == 2:
-                        phase_chunk = phase_chunk[np.newaxis, ...]
-                        if weight_chunk is not None:
-                            weight_chunk = weight_chunk[np.newaxis, ...]
-                    result = Stack_detrend._trend2d_array(
-                        phase_chunk, weight_chunk, variables, torch.device(device), degree
-                    )
-                    return result
-
                 # Use da.blockwise for efficient dask integration
                 phase_dask = phase_da.data
+
+                # Get transform variables as dask arrays (keep lazy, already have correct 2D chunks)
+                var_dask_list = [trans_ds[v].data for v in var_names]
+
+                # Create wrapper function for blockwise - receives variable chunks
+                def make_process_chunk(n_vars, device, degree):
+                    def process_chunk(*args):
+                        import torch
+                        # First arg is phase, optional second is weight, rest are variable chunks
+                        phase_chunk = args[0]
+                        if len(args) == 1 + n_vars:
+                            # No weight
+                            weight_chunk = None
+                            var_chunks = args[1:]
+                        else:
+                            # With weight
+                            weight_chunk = args[1]
+                            var_chunks = args[2:]
+                        # Ensure 3D input (pair, y, x)
+                        if phase_chunk.ndim == 2:
+                            phase_chunk = phase_chunk[np.newaxis, ...]
+                            if weight_chunk is not None:
+                                weight_chunk = weight_chunk[np.newaxis, ...]
+                        result = Stack_detrend._trend2d_array(
+                            phase_chunk, weight_chunk, list(var_chunks), torch.device(device), degree
+                        )
+                        return result
+                    return process_chunk
+
+                process_fn = make_process_chunk(len(var_dask_list), str(device), degree)
                 dim_str = ''.join(chr(ord('a') + i) for i in range(phase_dask.ndim))
+                spatial_dim_str = dim_str[-2:]  # Last 2 chars for y, x
 
                 with dask.annotate(resources={'gpu': 1} if device.type != 'cpu' else {}):
+                    # Build blockwise args: phase, [weight], *variables
+                    blockwise_args = [phase_dask, dim_str]
                     if weight_da is not None:
                         weight_dask = weight_da.data
-                        def process_with_weight(phase_block, weight_block):
-                            return process_chunk(phase_block, weight_block)
-                        result_dask = da.blockwise(
-                            process_with_weight, dim_str,
-                            phase_dask, dim_str,
-                            weight_dask, dim_str,
-                            dtype=np.float32,
-                        )
-                    else:
-                        result_dask = da.blockwise(
-                            process_chunk, dim_str,
-                            phase_dask, dim_str,
-                            dtype=np.float32,
-                        )
+                        blockwise_args.extend([weight_dask, dim_str])
+                    # Add all variable arrays with spatial-only dims
+                    for var_dask in var_dask_list:
+                        blockwise_args.extend([var_dask, spatial_dim_str])
+
+                    result_dask = da.blockwise(
+                        process_fn, dim_str,
+                        *blockwise_args,
+                        dtype=np.float32,
+                    )
 
                 trend_da = xr.DataArray(
                     result_dask,
