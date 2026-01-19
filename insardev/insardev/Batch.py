@@ -1161,7 +1161,7 @@ class BatchList(tuple):
                     ds = ds.assign_coords(new_coords)
                 computed[key] = ds
             computed_batches.append(type(self[i])(computed))
-        return tuple(computed_batches)
+        return BatchList(computed_batches)
 
     def persist(self):
         """Persist all batches together efficiently and return as BatchList.
