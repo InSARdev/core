@@ -3330,10 +3330,22 @@ class BatchCore(dict):
         cross-contamination between the two.
         """
         from .Batch import Batch, BatchWrap
+        import warnings
 
         # Validate class type
         if not isinstance(self, (Batch, BatchWrap)):
             raise TypeError(f"align() only works with Batch (unwrapped) or BatchWrap (wrapped) phase data, not {type(self).__name__}")
+
+        # Warn if data is lazy (has dask arrays) - align() triggers expensive recomputation
+        if len(self) > 0:
+            first_ds = next(iter(self.values()))
+            has_dask = any(hasattr(var.data, 'dask') for var in first_ds.data_vars.values())
+            if has_dask:
+                warnings.warn(
+                    "align() called on lazy data. This triggers expensive recomputation. "
+                    "Consider calling .compute() before .align() for better performance.",
+                    UserWarning
+                )
 
         # Auto-detect polarization if not specified
         if polarization is None:
