@@ -157,3 +157,55 @@ class UI:
 
         except ImportError:
             pass
+
+        # Monkey-patch PyVista trame Widget for dark theme (removes light gray border)
+        try:
+            from pyvista.trame.jupyter import Widget as PyVistaWidget
+            from ipywidgets import HTML
+
+            if not getattr(PyVistaWidget, '_dark_patched', False):
+                _original_pv_widget_init = PyVistaWidget.__init__
+                def _dark_pv_widget_init(self, viewer, src, width=None, height=None, iframe_attrs=None, **kwargs):
+                    if iframe_attrs is None:
+                        iframe_attrs = {}
+                    # Override border to black/none for dark theme
+                    border = 'border: none; background-color: black;'
+                    iframe_attrs = {
+                        **iframe_attrs,
+                        'src': src,
+                        'class': 'pyvista',
+                        'style': f'width: {width}; height: {height}; {border}',
+                    }
+                    iframe_attrs_str = ' '.join(f'{key}="{value!s}"' for key, value in iframe_attrs.items())
+                    value = f'<iframe {iframe_attrs_str}></iframe>'
+                    HTML.__init__(self, value, **kwargs)
+                    self._viewer = viewer
+                    self._src = src
+                PyVistaWidget.__init__ = _dark_pv_widget_init
+                PyVistaWidget._dark_patched = True
+        except ImportError:
+            pass
+
+        # Monkey-patch PyVista trame Viewer.ui for dark theme (inject CSS into trame app)
+        try:
+            from pyvista.trame.ui.vuetify3 import Viewer as PyVistaViewer
+            from trame.widgets import html as trame_html
+
+            if not getattr(PyVistaViewer, '_dark_ui_patched', False):
+                _original_ui = PyVistaViewer.ui
+                def _dark_ui(self, *args, **kwargs):
+                    result = _original_ui(self, *args, **kwargs)
+                    # Inject dark theme CSS into the trame app
+                    trame_html.Style('''
+                        .v-application, .v-app-bar, body, html {
+                            background-color: #000000 !important;
+                        }
+                        .v-main, .v-container {
+                            background-color: transparent !important;
+                        }
+                    ''')
+                    return result
+                PyVistaViewer.ui = _dark_ui
+                PyVistaViewer._dark_ui_patched = True
+        except ImportError:
+            pass
