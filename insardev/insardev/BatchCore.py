@@ -111,12 +111,14 @@ class BatchCore(dict):
         return torch.device(device)
 
     @staticmethod
-    def _gaussian(data_np, weight_np=None, sigma=None, truncate=4.0, threshold=0.5, device='auto'):
+    def _gaussian(data_np, weight_np=None, sigma=None, truncate=4.0, threshold=0.5, device='auto',
+                  pixel_sizes=None, resolution=67.0):
         """
-        2D Gaussian convolution using PyTorch with separable kernels.
+        2D Gaussian convolution with separable kernels.
 
+        Uses scipy.ndimage for CPU (memory-efficient) and PyTorch for GPU.
         Supports complex values, weights, and NaN handling.
-        Uses replicate padding for real InSAR boundaries.
+        For large sigmas with pixel_sizes provided, automatically decimates like PyGMTSAR.
 
         Parameters
         ----------
@@ -125,28 +127,34 @@ class BatchCore(dict):
         weight_np : np.ndarray, optional
             Weight array for weighted convolution.
         sigma : float or tuple of floats
-            Standard deviation of Gaussian kernel (y, x).
+            Standard deviation of Gaussian kernel (y, x) in pixels.
         truncate : float, optional
             Truncation factor for kernel size (default 4.0).
         threshold : float, optional
             Minimum weight fraction for valid output (default 0.5).
         device : str, optional
             PyTorch device: 'auto', 'cuda', 'mps', or 'cpu'.
+        pixel_sizes : tuple of floats, optional
+            Pixel sizes (dy, dx) in meters. Required for decimation.
+        resolution : float, optional
+            Processing resolution in meters for decimation (default 67.0).
+            Decimation triggers when scales > 1 and wavelength/resolution > 3.
+            With 67m, common 200m wavelength uses direct filtering (200/67=2.98).
 
         Returns
         -------
         np.ndarray
             Convolved array with same shape as input.
         """
-        import numpy as np
-        import torch
-        import torch.nn.functional as F
+        from .utils_gaussian import nanconvolve2d_gaussian_scipy_numpy, nanconvolve2d_gaussian_pytorch
+        from scipy.ndimage import zoom
 
         if sigma is None:
             return data_np
 
         if not isinstance(sigma, (list, tuple, np.ndarray)):
             sigma = (sigma, sigma)
+        sigma = np.array(sigma, dtype=np.float64)
 
         # Handle (1, y, x) arrays from apply_ufunc with core_dims=[['y', 'x']]
         squeeze = False
@@ -156,71 +164,81 @@ class BatchCore(dict):
 
         # Get device
         dev = BatchCore._get_torch_device(device)
-        is_complex = np.issubdtype(data_np.dtype, np.complexfloating)
 
-        # Create 1D Gaussian kernels
-        def make_kernel_1d(s, trunc):
-            size = int(2 * np.ceil(s * trunc) + 1)
-            x = torch.arange(size, device=dev, dtype=torch.float32) - size // 2
-            k = torch.exp(-0.5 * (x / s) ** 2)
-            return k / k.sum()
+        # GMTSAR constant
+        cutoff = 5.3
 
-        kernel_y = make_kernel_1d(sigma[0], truncate)
-        kernel_x = make_kernel_1d(sigma[1], truncate)
-        pad_y = len(kernel_y) // 2
-        pad_x = len(kernel_x) // 2
-
-        # Reshape kernels for conv2d: (out_ch, in_ch, H, W)
-        kernel_y = kernel_y.view(1, 1, -1, 1)
-        kernel_x = kernel_x.view(1, 1, 1, -1)
-
-        def separable_conv(t):
-            """Apply separable Gaussian convolution with replicate padding."""
-            t = t.unsqueeze(0).unsqueeze(0)
-            t = F.pad(t, (0, 0, pad_y, pad_y), mode='replicate')
-            t = F.conv2d(t, kernel_y)
-            t = F.pad(t, (pad_x, pad_x, 0, 0), mode='replicate')
-            t = F.conv2d(t, kernel_x)
-            return t.squeeze()
-
-        def convolve_real(arr, wgt=None):
-            """Convolve a real 2D array with NaN/weight handling."""
-            t_data = torch.from_numpy(arr.astype(np.float32)).to(dev)
-
-            # Valid mask (1 where not NaN)
-            valid = (~torch.isnan(t_data)).float()
-            t_data = torch.nan_to_num(t_data, 0.0)
-
-            # Combine with external weights
-            if wgt is not None:
-                t_weight = torch.from_numpy(wgt.astype(np.float32)).to(dev)
-                t_weight = torch.nan_to_num(t_weight, 0.0)
-                combined_weight = valid * t_weight
-            else:
-                combined_weight = valid
-
-            # Weighted convolution
-            numerator = separable_conv(t_data * combined_weight)
-            denominator = separable_conv(combined_weight)
-
-            # Result with threshold masking
-            if wgt is None:
-                result = torch.where(denominator > threshold, numerator / (denominator + 1e-10), torch.nan)
-            else:
-                result = torch.where(denominator > 1e-10, numerator / (denominator + 1e-10), torch.nan)
-
-            return result.cpu().numpy()
-
-        if is_complex:
-            result = convolve_real(data_np.real, weight_np) + 1j * convolve_real(data_np.imag, weight_np)
+        # Check if decimation needed (PyGMTSAR approach with fixed resolution)
+        if pixel_sizes is not None:
+            dy, dx = pixel_sizes
+            scale_y = int(np.round(resolution / dy))
+            scale_x = int(np.round(resolution / dx))
+            # Recover wavelength from sigma: wavelength = sigma * cutoff * pixel_size
+            wavelength = sigma[0] * cutoff * dy
         else:
-            result = convolve_real(data_np, weight_np)
+            scale_y = scale_x = 1
+            wavelength = None
 
-        # Cleanup GPU memory
-        if dev.type == 'mps':
-            torch.mps.empty_cache()
-        elif dev.type == 'cuda':
-            torch.cuda.empty_cache()
+        # Decimate only if both scales > 1 and wavelength is large enough (like PyGMTSAR)
+        if scale_y > 1 and scale_x > 1 and wavelength is not None and wavelength / resolution > 3:
+            original_shape = data_np.shape
+
+            # AA sigma from resolution wavelength (same for both dimensions like PyGMTSAR)
+            sigma_aa = (resolution / cutoff / dy, resolution / cutoff / dx)
+
+            # wavelength_dec = sqrt(wavelength^2 - resolution^2)
+            wavelength_dec = np.sqrt(wavelength**2 - resolution**2)
+
+            # After coarsen, pixel sizes become (dy*scale_y, dx*scale_x)
+            dy_dec = dy * scale_y
+            dx_dec = dx * scale_x
+            sigma_dec = (wavelength_dec / cutoff / dy_dec, wavelength_dec / cutoff / dx_dec)
+
+            # 1. Apply anti-aliasing filter
+            if dev.type == 'cpu':
+                data_aa = nanconvolve2d_gaussian_scipy_numpy(
+                    data_np, weight_np, sigma=sigma_aa, truncate=truncate, threshold=threshold
+                )
+            else:
+                data_aa = nanconvolve2d_gaussian_pytorch(
+                    data_np, weight_np, sigma=sigma_aa, truncate=truncate, threshold=threshold, device=dev
+                )
+
+            # 2. Coarsen with mean (block averaging)
+            ny_trim = (data_aa.shape[0] // scale_y) * scale_y
+            nx_trim = (data_aa.shape[1] // scale_x) * scale_x
+            data_trimmed = data_aa[:ny_trim, :nx_trim]
+            del data_aa
+            new_shape = (data_trimmed.shape[0] // scale_y, scale_y,
+                         data_trimmed.shape[1] // scale_x, scale_x)
+            data_dec = np.nanmean(data_trimmed.reshape(new_shape), axis=(1, 3))
+            del data_trimmed
+
+            # 3. Apply main filter on coarsened grid
+            if dev.type == 'cpu':
+                result_dec = nanconvolve2d_gaussian_scipy_numpy(
+                    data_dec, None, sigma=sigma_dec, truncate=truncate, threshold=threshold
+                )
+            else:
+                result_dec = nanconvolve2d_gaussian_pytorch(
+                    data_dec, None, sigma=sigma_dec, truncate=truncate, threshold=threshold, device=dev
+                )
+            del data_dec
+
+            # 4. Upsample back to original size (nearest neighbor)
+            result = zoom(result_dec, (original_shape[0] / result_dec.shape[0],
+                                        original_shape[1] / result_dec.shape[1]), order=0)
+            del result_dec
+        else:
+            # Direct filtering (no decimation)
+            if dev.type == 'cpu':
+                result = nanconvolve2d_gaussian_scipy_numpy(
+                    data_np, weight_np, sigma=tuple(sigma), truncate=truncate, threshold=threshold
+                )
+            else:
+                result = nanconvolve2d_gaussian_pytorch(
+                    data_np, weight_np, sigma=tuple(sigma), truncate=truncate, threshold=threshold, device=dev
+                )
 
         if squeeze:
             result = result[np.newaxis, ...]
@@ -2431,12 +2449,13 @@ class BatchCore(dict):
             if not isinstance(weight, BatchUnit) or set(weight.keys()) != set(self.keys()):
                 raise ValueError('`weight` must be a BatchUnit with the same keys as `self`')
 
+        # precompute pixel sizes for decimation
+        dy, dx = self.spacing
+
         # validate wavelength if provided
         if wavelength is not None:
             if wavelength <= 0:
                 raise ValueError('wavelength must be positive')
-            # precompute dy, dx, σ‐factors
-            dy, dx = self.spacing
             sig_y = wavelength / (dy * cutoff)
             sig_x = wavelength / (dx * cutoff)
             if debug:
@@ -2465,7 +2484,8 @@ class BatchCore(dict):
 
                 # Create wrapper for _gaussian (expects 2D input)
                 def apply_gaussian(block):
-                    return BatchCore._gaussian(block, weight_np, sigma=sigmas, threshold=threshold, device=device).astype(out_dtype)
+                    return BatchCore._gaussian(block, weight_np, sigma=sigmas, threshold=threshold,
+                                               device=device, pixel_sizes=(dy, dx)).astype(out_dtype)
 
                 # Chunk first dim to 1 so _gaussian gets 2D slices (works for numpy and dask)
                 first_dim = data_arr.dims[0]
