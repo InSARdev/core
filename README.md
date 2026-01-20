@@ -29,6 +29,11 @@ The resulting InSAR velocity map is available as a self-contained web page at: [
 
 <img src="assets/Imperial_Valley_Subsidence.jpg" />
 
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1KJgX69LyKLfGUkiRLiStR-SMnJOy-eDs?usp=sharing) **Golden Valley Subsidence, CA USA (2021).** This example demonstrates the case study 'Antelope Valley Freeway in Santa Clarita, CA,' as detailed in [SAR Technical Series Part 4 Sentinel-1 global velocity layer: Using global InSAR at scale](https://blog.descarteslabs.com/using-global-insar-at-scale) and [Sentinel-1 Technical Series Part 5 Targeted Analysis](https://blog.descarteslabs.com/sentinel-1-targeted-analysis) with a significant subsidence rate 'exceeding 5cm/year in places'.
+
+<img src="assets/Golden_Valley_Subsidence.jpg" />
+
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/12oss994Pabq_8JDv4Dj-R6iqfGEalHCe?usp=sharing) **Erzincan Elevation, Türkiye (2019).** This example reproduces 29-page ESA document [DEM generation with Sentinel-1 IW](https://step.esa.int/docs/tutorials/S1TBX%20DEM%20generation%20with%20Sentinel-1%20IW%20Tutorial.pdf).
 
 <img src="assets/Türkiye_Elevation_2019_ele.jpg" />
