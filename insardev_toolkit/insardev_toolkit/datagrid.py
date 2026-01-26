@@ -12,8 +12,9 @@ class datagrid:
     import numpy as np
 
     # NetCDF options, see https://docs.xarray.dev/en/stable/user-guide/io.html#zarr-compressors-and-filters
-    netcdf_engine_read: str = 'h5netcdf'
-    netcdf_engine_write: str = 'h5netcdf'
+    # Use netcdf4 engine for better compatibility with parallel/concurrent access (joblib workers)
+    netcdf_engine_read: str = 'netcdf4'
+    netcdf_engine_write: str = 'netcdf4'
     netcdf_format: str = 'NETCDF4'
     netcdf_chunksize: int = 1280
     netcdf_compression_algorithm: str = 'zlib'

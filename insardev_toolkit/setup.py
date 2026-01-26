@@ -54,7 +54,6 @@ setup(
                       'xmltodict',
                       'rioxarray',
                       'tifffile',
-                      'h5netcdf>=1.3.0',
                       'netCDF4',
                       'nc-time-axis',
                       'remotezip',
