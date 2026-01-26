@@ -1036,22 +1036,24 @@ def satellite_baseline(orbit_df1: "pd.DataFrame", orbit_df2: "pd.DataFrame",
             diff = 180 - diff  # Wrapped difference for vertical baseline flip
         return diff
 
-    alpha_var_sc = alpha_variation(alpha_start_deg, alpha_center_deg)
-    alpha_var_ce = alpha_variation(alpha_center_deg, alpha_end_deg)
-    assert alpha_var_sc < 5.0, (
-        f"Alpha varies too much between start and center: {alpha_var_sc:.2f}° "
-        f"(start={alpha_start_deg:.2f}°, center={alpha_center_deg:.2f}°). "
-        f"This indicates a sign computation bug."
-    )
-    assert alpha_var_ce < 5.0, (
-        f"Alpha varies too much between center and end: {alpha_var_ce:.2f}° "
-        f"(center={alpha_center_deg:.2f}°, end={alpha_end_deg:.2f}°). "
-        f"This indicates a sign computation bug."
-    )
-
-    # Baseline length should vary smoothly (< 10% variation)
+    # Only validate when baseline is significant (> 1m)
+    # For self-baseline (baseline ≈ 0), alpha is numerically undefined (arctan2 of tiny values)
     baseline_mean = (baseline_start + baseline_center + baseline_end) / 3
-    if baseline_mean > 1.0:  # Only check if baseline is significant
+    if baseline_mean > 1.0:
+        # Alpha should vary smoothly along the scene (< 5° variation)
+        alpha_var_sc = alpha_variation(alpha_start_deg, alpha_center_deg)
+        alpha_var_ce = alpha_variation(alpha_center_deg, alpha_end_deg)
+        assert alpha_var_sc < 5.0, (
+            f"Alpha varies too much between start and center: {alpha_var_sc:.2f}° "
+            f"(start={alpha_start_deg:.2f}°, center={alpha_center_deg:.2f}°). "
+            f"This indicates a sign computation bug."
+        )
+        assert alpha_var_ce < 5.0, (
+            f"Alpha varies too much between center and end: {alpha_var_ce:.2f}° "
+            f"(center={alpha_center_deg:.2f}°, end={alpha_end_deg:.2f}°). "
+            f"This indicates a sign computation bug."
+        )
+        # Baseline length should vary smoothly (< 10% variation)
         baseline_var_sc = abs(baseline_start - baseline_center) / baseline_mean * 100
         baseline_var_ce = abs(baseline_center - baseline_end) / baseline_mean * 100
         assert baseline_var_sc < 10.0, (
