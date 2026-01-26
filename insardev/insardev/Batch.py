@@ -711,7 +711,6 @@ class BatchComplex(BatchCore):
         )
 
     @staticmethod
-    @staticmethod
     def _goldstein(phase_np, corr_np, psize=32, device='auto', batch_size=None):
         """
         Apply Goldstein adaptive filter.
@@ -759,14 +758,18 @@ class BatchComplex(BatchCore):
         # Save NaN mask
         nan_mask = ~np.isfinite(phase_np)
 
+        # Ensure correct dtypes (goldstein functions require complex64/float32)
+        if phase_np.dtype != np.complex64:
+            phase_np = phase_np.astype(np.complex64)
+        if corr_np.dtype != np.float32:
+            corr_np = corr_np.astype(np.float32)
+
         # Dispatch based on device
         dev = BatchCore._get_torch_device(device)
 
         if dev.type == 'cpu':
-            # Use loop-based CPU implementation (constant memory)
             result = goldstein_numpy(phase_np, corr_np, psize_y, psize_x)
         else:
-            # Use GPU implementation with unfold/fold
             result = goldstein_pytorch(phase_np, corr_np, psize_y, psize_x, dev)
 
         # Mask where original was NaN

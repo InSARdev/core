@@ -1028,17 +1028,20 @@ class Stack_unwrap2d(Stack_unwrap1d):
         # Create valid mask for computation
         valid_mask = ~nan_mask
 
-        # Fill NaN with 0 for computation
-        phase_filled = np.where(nan_mask, 0.0, phase)
+        # Fill NaN with 0 for computation (avoid np.where temp array)
+        phase_filled = phase.copy()
+        np.copyto(phase_filled, 0.0, where=nan_mask)
 
-        # Prepare weights
+        # Prepare weights (avoid np.where temp arrays)
         if weight is not None:
             # Handle NaN in weights (both from phase nan_mask AND from weight itself)
-            weight_nan_mask = np.isnan(weight)
-            weight_filled = np.where(nan_mask | weight_nan_mask, 0.0, weight)
-            weight_filled = np.clip(weight_filled, 0.01, 1.0)  # Avoid zero weights
+            weight_filled = weight.copy()
+            np.copyto(weight_filled, 0.0, where=np.isnan(weight))
+            np.copyto(weight_filled, 0.0, where=nan_mask)
+            np.clip(weight_filled, 0.01, 1.0, out=weight_filled)
         else:
-            weight_filled = np.where(nan_mask, 0.0, 1.0)
+            # 1 where valid, 0 where NaN (avoid ~nan_mask temp bool array)
+            weight_filled = np.subtract(1.0, nan_mask, dtype=np.float32)
 
         # Save input circular mean for later restoration (unwrapping removes DC component)
         # Use circular mean for wrapped phase: atan2(mean(sin), mean(cos))
@@ -1601,8 +1604,8 @@ class Stack_unwrap2d(Stack_unwrap1d):
             if debug and nan_in_result > 0:
                 print(f'    WARNING: {nan_in_result}/{np.sum(valid_in_crop)} NaN in unwrapped result')
 
-            # Place back
-            result[r0:r1, c0:c1] = np.where(mask_crop, unwrapped_crop, result[r0:r1, c0:c1])
+            # Place back (direct indexing avoids np.where temp array)
+            result[r0:r1, c0:c1][mask_crop] = unwrapped_crop[mask_crop]
 
         # Final check
         if debug:
