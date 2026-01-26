@@ -9,6 +9,539 @@
 # ----------------------------------------------------------------------------
 from .S1_topo import S1_topo
 
+
+def _compute_transform_inverse_worker(prm_ref_df, prm_ref_orbit_df, dem_path, geometry_wkt, outdir,
+                               scale_factor, epsg, resolution, n_chunks, debug, result_queue):
+    """Worker function for compute_transform_inverse in spawned subprocess.
+
+    Must be at module level for multiprocessing spawn to pickle it.
+    Computes transform, saves to zarr, sends topo through queue.
+
+    Takes serialized prm_ref from main process - does NOT create S1 instance.
+    """
+    from insardev_pygmtsar.PRM import PRM
+    from insardev_pygmtsar.utils_satellite import compute_transform_inverse, get_dem_wgs84ellipsoid, save_transform
+    from shapely import wkt
+
+    # Reconstruct prm_ref from serialized dataframe
+    prm_ref = PRM()
+    for name, row in prm_ref_df.iterrows():
+        prm_ref.set(**{name: row['value']})
+    prm_ref.orbit_df = prm_ref_orbit_df
+
+    # Parse geometry and load DEM
+    geometry = wkt.loads(geometry_wkt)
+    dem = get_dem_wgs84ellipsoid(dem_path, geometry)
+
+    # Compute and save transform
+    topo, transform = compute_transform_inverse(
+        prm_ref, dem,
+        scale_factor=scale_factor, epsg=epsg,
+        resolution=resolution, n_chunks=n_chunks, debug=debug
+    )
+    save_transform(transform, outdir, scale_factor=scale_factor)
+
+    # Send topo and transform (without ele) through queue
+    result_queue.put({
+        'topo_values': topo.values,
+        'topo_a_coords': topo.coords['a'].values,
+        'topo_r_coords': topo.coords['r'].values,
+        'transform_azi': transform.azi.values,
+        'transform_rng': transform.rng.values,
+        'transform_y': transform.y.values,
+        'transform_x': transform.x.values,
+        'transform_attrs': dict(transform.attrs),
+    })
+
+
+def _offset2shift_standalone(xyz, rmax, amax, method='linear'):
+    """Convert offset coordinates to shift grid - standalone version."""
+    import numpy as np
+    import xarray as xr
+    from scipy.interpolate import griddata
+
+    rngs = np.arange(8/2, rmax+8/2, 8)
+    azis = np.arange(4/2, amax+4/2, 4)
+    grid_r, grid_a = np.meshgrid(rngs, azis)
+    grid = griddata((xyz[:, 0], xyz[:, 1]), xyz[:, 2], (grid_r, grid_a), method=method)
+    return xr.DataArray(grid, coords={'a': azis, 'r': rngs}, dims=['a', 'r'])
+
+
+def _process_date_worker(args):
+    """Worker function for processing a single date in spawned subprocess.
+
+    Must be at module level for multiprocessing spawn to pickle it.
+    Each worker processes one date then exits (max_tasks_per_child=1), releasing memory.
+
+    This worker does NOT create S1 instance - uses standalone functions only.
+    Computes alignment shifts for repeat dates internally (not passed from main).
+    """
+    (outdir, burst_item, burst_refs, is_reference,
+     xml_file, tiff_file, orbit_file, record_dict,
+     topo, transform,
+     prm_ref_df, prm_ref_orbit_df, sc_height,
+     topo_llt, epsg, debug) = args
+
+    import warnings
+    import numpy as np
+    from insardev_pygmtsar.PRM import PRM
+    from insardev_pygmtsar.utils_s1 import make_burst
+
+    # Suppress zarr v3 consolidated metadata warnings in worker
+    warnings.filterwarnings('ignore', message='.*Consolidated metadata.*', category=UserWarning)
+
+    burst_name = burst_item[-1]
+
+    # Reconstruct prm_ref from dataframe
+    prm_ref = PRM()
+    for name, row in prm_ref_df.iterrows():
+        prm_ref.set(**{name: row['value']})
+    prm_ref.orbit_df = prm_ref_orbit_df
+
+    # Load burst data using standalone make_burst (no S1 needed)
+    if is_reference:
+        # Reference: no alignment needed - just get SLC data
+        _, _, slc = make_burst(xml_file, tiff_file, orbit_file, mode=1, debug=debug)
+        # Use prm_ref as prm_rep (same object identity needed in transform_slc)
+        prm = prm_ref
+        baseline_params = None
+    else:
+        # Repeat: compute alignment shifts inside worker
+        # First get PRM without SLC to compute shifts
+        prm_rep_temp, orbit_df_temp = make_burst(xml_file, tiff_file, orbit_file, mode=0, debug=debug)
+        prm_rep_temp.orbit_df = orbit_df_temp
+        earth_radius = prm_ref.get('earth_radius')
+
+        # Compute time offset within burst (nl=0 for burst processing, same as align_rep)
+        t1, prf = prm_rep_temp.get('clock_start', 'PRF')
+        t2 = prm_rep_temp.get('clock_start')
+        nl = int((t2 - t1) * prf * 86400.0 + 0.2)
+
+        # Create shifted reference PRM
+        prm_ref_shifted = PRM(prm_ref)
+        prm_ref_shifted.orbit_df = prm_ref.orbit_df
+        prm_ref_shifted.set(
+            prm_ref.sel('clock_start', 'clock_stop', 'SC_clock_start', 'SC_clock_stop')
+            + nl / prf / 86400.0
+        )
+        prm_ref_shifted.calc_dop_orb(earth_radius, inplace=True, debug=debug)
+
+        # Compute offsets
+        tmpm_dat = prm_ref_shifted.SAT_llt2rat(coords=topo_llt, precise=1, debug=debug)
+        prm_rep_temp.calc_dop_orb(earth_radius, inplace=True, debug=debug)
+        tmp1_dat = prm_rep_temp.SAT_llt2rat(coords=topo_llt, precise=1, debug=debug)
+
+        # Compute offset table
+        offset_dat0 = np.hstack([tmpm_dat, tmp1_dat])
+        func = lambda row: [row[0], row[5] - row[0], row[1], row[6] - row[1], 100]
+        offset_dat = np.apply_along_axis(func, 1, offset_dat0)
+
+        # Prepare offset parameters for fitoffset (filter valid points)
+        rmax = prm_rep_temp.get('num_rng_bins')
+        amax = prm_rep_temp.get('num_lines')
+        par_tmp = offset_dat[
+            (offset_dat[:, 0] > 0) & (offset_dat[:, 0] < rmax) &
+            (offset_dat[:, 2] > 0) & (offset_dat[:, 2] < amax)
+        ].copy()
+        par_tmp[:, 2] += nl
+
+        # Compute shift grids
+        r_xyz = offset_dat[:, [0, 2, 1]]
+        a_xyz = offset_dat[:, [0, 2, 3]]
+        rshift_grid = _offset2shift_standalone(r_xyz, rmax, amax).values
+        ashift_grid = _offset2shift_standalone(a_xyz, rmax, amax).values
+
+        # Now load SLC with computed shifts
+        prm, orbit_df, slc = make_burst(xml_file, tiff_file, orbit_file, mode=1,
+                                        rshift_grid=rshift_grid, ashift_grid=ashift_grid, debug=debug)
+        prm.orbit_df = orbit_df
+
+        # Apply fitoffset parameters (same as align_rep)
+        prm.set(PRM.fitoffset(3, 3, par_tmp))
+
+        # Recompute Doppler with earth_radius
+        prm.calc_dop_orb(earth_radius, inplace=True, debug=debug)
+
+        baseline_result = prm_ref.SAT_baseline(prm)
+        baseline_params = {
+            'baseline_start': baseline_result.get('baseline_start'),
+            'baseline_center': baseline_result.get('baseline_center'),
+            'baseline_end': baseline_result.get('baseline_end'),
+            'alpha_start': baseline_result.get('alpha_start'),
+            'alpha_center': baseline_result.get('alpha_center'),
+            'alpha_end': baseline_result.get('alpha_end'),
+            'B_offset_start': baseline_result.get('B_offset_start'),
+            'B_offset_center': baseline_result.get('B_offset_center'),
+            'B_offset_end': baseline_result.get('B_offset_end')
+        }
+
+    # Call standalone transform function
+    _transform_slc_standalone(
+        outdir=outdir, transform=transform, topo=topo,
+        prm_rep=prm, prm_ref=prm_ref, slc_data=slc,
+        burst_name=burst_name, record_dict=record_dict,
+        epsg=epsg, baseline_params=baseline_params, sc_height_params=sc_height,
+        debug=debug
+    )
+    return burst_name
+
+
+def _transform_slc_standalone(outdir, transform, topo, prm_rep, prm_ref, slc_data,
+                               burst_name, record_dict, epsg, scale=2.5e-07,
+                               baseline_params=None, sc_height_params=None, debug=False):
+    """Standalone SLC transform function - no S1 instance needed.
+
+    This is a refactored version of S1_transform.transform_slc_int16 that
+    works without self, using standalone functions for geocode/spatial_ref.
+    """
+    import os
+    import time
+    import numpy as np
+    import xarray as xr
+    import pandas as pd
+    from insardev_pygmtsar.PRM import PRM
+    from insardev_toolkit.datagrid import datagrid
+
+    _t0 = time.perf_counter()
+    _timings = {}
+
+    # Convert SLC data to xarray
+    num_lines = prm_rep.get('num_lines')
+    num_rng_bins = prm_rep.get('num_rng_bins')
+
+    if slc_data.dtype == np.int16:
+        slc_reshaped = slc_data.reshape(num_lines, -1)
+        re = slc_reshaped[:, 0::2].astype(np.float32)
+        im = slc_reshaped[:, 1::2].astype(np.float32)
+        del slc_reshaped
+        slc_complex = scale * (re + 1j * im)
+        del re, im
+    else:
+        slc_complex = scale * slc_data.astype(np.complex64)
+
+    coords = {'a': np.arange(slc_complex.shape[0]) + 0.5, 'r': np.arange(slc_complex.shape[1]) + 0.5}
+
+    nonzero_mask = slc_complex != 0
+    col_valid = nonzero_mask.sum(axis=0) > 0.8 * slc_complex.shape[0]
+    row_valid = nonzero_mask.sum(axis=1) > 0.8 * slc_complex.shape[1]
+    slc_complex = np.where(col_valid[np.newaxis, :] & row_valid[:, np.newaxis], slc_complex, np.nan + 0j)
+
+    slc_xa = xr.DataArray(slc_complex, coords=coords, dims=['a', 'r']).rename('data')
+    del slc_complex
+    _timings['slc_prep'] = time.perf_counter() - _t0
+
+    # Compute topo phase using standalone function (imported from S1_transform class but doesn't use self)
+    _t0 = time.perf_counter()
+    phase = _flat_earth_topo_phase_standalone(topo, prm_rep, prm_ref,
+                                               baseline_params=baseline_params,
+                                               sc_height_params=sc_height_params)
+    _timings['flat_earth_topo_phase'] = time.perf_counter() - _t0
+
+    # Apply phase correction and optionally geocode
+    # Use Euler's formula to avoid complex128: exp(-1j*phase) = cos(phase) - 1j*sin(phase)
+    # Note: phase and slc_xa may have different shapes, so align via xarray first
+    # reindex_like is 70x faster than interp_like for this use case
+    _t0 = time.perf_counter()
+    phase_aligned = phase.reindex_like(slc_xa, method='nearest').values
+    del phase
+    cos_phase = np.cos(phase_aligned)
+    sin_phase = np.sin(phase_aligned)
+    del phase_aligned
+    slc_vals = slc_xa.values
+    # (re + 1j*im) * (cos - 1j*sin) = (re*cos + im*sin) + 1j*(im*cos - re*sin)
+    corrected_real = slc_vals.real * cos_phase + slc_vals.imag * sin_phase
+    corrected_imag = slc_vals.imag * cos_phase - slc_vals.real * sin_phase
+    del cos_phase, sin_phase
+    slc_corrected = xr.DataArray(
+        (corrected_real + 1j * corrected_imag).astype(np.complex64),
+        coords=slc_xa.coords, dims=slc_xa.dims
+    )
+    del corrected_real, corrected_imag, slc_vals, slc_xa
+
+    if epsg == 0:
+        complex_proj = slc_corrected.rename({'a': 'y', 'r': 'x'})
+        _timings['phase_apply'] = time.perf_counter() - _t0
+    else:
+        complex_proj = _geocode_standalone(transform, slc_corrected)
+        complex_proj = complex_proj.transpose('y', 'x')
+        _timings['geocode'] = time.perf_counter() - _t0
+    del slc_corrected
+
+    # Convert to int16
+    _t0 = time.perf_counter()
+    fill_value = np.iinfo(np.int16).max
+    re_vals = complex_proj.values.real
+    im_vals = complex_proj.values.imag
+
+    with np.errstate(invalid='ignore'):
+        re_int16 = np.round(re_vals / scale).astype(np.int16)
+        im_int16 = np.round(im_vals / scale).astype(np.int16)
+
+    nan_mask = ~np.isfinite(re_vals)
+    del re_vals, im_vals
+    re_int16[nan_mask] = fill_value
+    im_int16[nan_mask] = fill_value
+    del nan_mask
+
+    y_coords = complex_proj.y.values
+    x_coords = complex_proj.x.values
+    del complex_proj
+
+    data_proj = xr.Dataset({
+        're': xr.DataArray(re_int16, coords={'y': y_coords, 'x': x_coords}, dims=['y', 'x']),
+        'im': xr.DataArray(im_int16, coords={'y': y_coords, 'x': x_coords}, dims=['y', 'x'])
+    })
+    del re_int16, im_int16, y_coords, x_coords
+    _timings['int16_convert'] = time.perf_counter() - _t0
+
+    # Add PRM attributes
+    for name, value in prm_rep.df.itertuples():
+        if name not in ['input_file', 'SLC_file', 'led_file']:
+            data_proj.attrs[name] = value
+
+    # Add TOPS-specific parameters
+    for name, value in prm_rep.read_tops_params().items():
+        data_proj.attrs[name] = value
+
+    # Add baseline
+    if prm_rep is prm_ref:
+        BPR = 0.0
+    else:
+        baseline = prm_ref.SAT_baseline(prm_rep)
+        BPR = baseline.get('B_perpendicular')
+    data_proj.attrs['BPR'] = BPR + 0
+
+    # Add record attributes from dict (reverse order to match transform_slc_int16)
+    for name, value in list(record_dict.items())[::-1]:
+        if name not in ['orbit', 'path']:
+            if isinstance(value, (pd.Timestamp, np.datetime64)):
+                value = pd.Timestamp(value).strftime('%Y-%m-%d %H:%M:%S')
+            data_proj.attrs[name] = value
+    # DEBUG: check what was stored
+    if debug:
+        print(f'DEBUG: attrs stored: {sorted(data_proj.attrs.keys())}')
+
+    # Add storage attributes
+    for varname in ['re', 'im']:
+        data_proj[varname].attrs['scale_factor'] = scale
+        data_proj[varname].attrs['add_offset'] = 0
+        data_proj[varname].attrs['_FillValue'] = np.iinfo(np.int16).max
+
+    if epsg == 0:
+        radar_crs_wkt = '''ENGCRS["Radar Coordinates",EDATUM["Radar datum"],CS[Cartesian,2],AXIS["azimuth",south,ORDER[1],LENGTHUNIT["pixel",1]],AXIS["range",east,ORDER[2],LENGTHUNIT["pixel",1]]]'''
+        data_proj.attrs['spatial_ref'] = radar_crs_wkt
+    else:
+        data_proj = datagrid.spatial_ref(data_proj, epsg)
+        data_proj.attrs['spatial_ref'] = data_proj.spatial_ref.attrs['spatial_ref']
+        data_proj = data_proj.drop_vars('spatial_ref')
+        data_proj = data_proj.drop_vars(['x', 'y'])
+
+    _t0 = time.perf_counter()
+    shape = data_proj.re.shape
+    encoding = {var: {'chunks': shape} for var in ['re', 'im']}
+    data_proj.to_zarr(
+        store=os.path.join(outdir, burst_name),
+        mode='w',
+        zarr_format=3,
+        consolidated=True,
+        encoding=encoding
+    )
+    _timings['to_zarr'] = time.perf_counter() - _t0
+    del data_proj
+
+
+def _geocode_standalone(transform, data):
+    """Standalone geocode function - copied from S1_geocode.geocode."""
+    import cv2
+    import numpy as np
+    import xarray as xr
+
+    trans_azi = transform.azi.values
+    trans_rng = transform.rng.values
+    out_y = transform.y.values
+    out_x = transform.x.values
+
+    data_vals = data.values
+    coord_a = data.a.values
+    coord_r = data.r.values
+
+    inv_map_a = ((trans_azi - coord_a[0]) / (coord_a[1] - coord_a[0])).astype(np.float32)
+    inv_map_r = ((trans_rng - coord_r[0]) / (coord_r[1] - coord_r[0])).astype(np.float32)
+
+    n_y, n_x = inv_map_a.shape
+    OPENCV_MAX = 32766  # cv2.remap requires dimensions < 32767
+
+    if n_x <= OPENCV_MAX:
+        # Direct remap - no chunking needed
+        if np.iscomplexobj(data_vals):
+            grid_proj_re = cv2.remap(data_vals.real.astype(np.float32), inv_map_r, inv_map_a,
+                                     interpolation=cv2.INTER_LANCZOS4,
+                                     borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
+            grid_proj_im = cv2.remap(data_vals.imag.astype(np.float32), inv_map_r, inv_map_a,
+                                     interpolation=cv2.INTER_LANCZOS4,
+                                     borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
+            grid_proj = (grid_proj_re + 1j * grid_proj_im).astype(data.dtype)
+        else:
+            grid_proj = cv2.remap(data_vals.astype(np.float32), inv_map_r, inv_map_a,
+                                  interpolation=cv2.INTER_LANCZOS4,
+                                  borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
+    else:
+        # Chunked remap - split x dimension into minimal equal chunks
+        n_chunks = (n_x + OPENCV_MAX - 1) // OPENCV_MAX
+        x_indices = np.arange(n_x)
+        chunk_indices = np.array_split(x_indices, n_chunks)
+
+        if np.iscomplexobj(data_vals):
+            grid_proj = np.empty((n_y, n_x), dtype=data.dtype)
+            data_re = data_vals.real.astype(np.float32)
+            data_im = data_vals.imag.astype(np.float32)
+            for idx in chunk_indices:
+                x_slice = slice(idx[0], idx[-1] + 1)
+                re_chunk = cv2.remap(data_re, inv_map_r[:, x_slice], inv_map_a[:, x_slice],
+                                     interpolation=cv2.INTER_LANCZOS4,
+                                     borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
+                im_chunk = cv2.remap(data_im, inv_map_r[:, x_slice], inv_map_a[:, x_slice],
+                                     interpolation=cv2.INTER_LANCZOS4,
+                                     borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
+                grid_proj[:, x_slice] = (re_chunk + 1j * im_chunk).astype(data.dtype)
+            del data_re, data_im
+        else:
+            grid_proj = np.empty((n_y, n_x), dtype=np.float32)
+            data_f32 = data_vals.astype(np.float32)
+            for idx in chunk_indices:
+                x_slice = slice(idx[0], idx[-1] + 1)
+                grid_proj[:, x_slice] = cv2.remap(data_f32, inv_map_r[:, x_slice], inv_map_a[:, x_slice],
+                                                  interpolation=cv2.INTER_LANCZOS4,
+                                                  borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
+            del data_f32
+
+    coords = {'y': out_y, 'x': out_x}
+    return xr.DataArray(grid_proj, coords=coords, dims=['y', 'x']).rename(data.name)
+
+
+def _flat_earth_topo_phase_standalone(topo, prm_rep, prm_ref, baseline_params=None, sc_height_params=None):
+    """Standalone flat earth topo phase - copied from S1_transform.flat_earth_topo_phase."""
+    import numpy as np
+    import xarray as xr
+    from scipy import constants
+    from insardev_pygmtsar.PRM import PRM
+
+    is_reference = (prm_rep is prm_ref)
+
+    if topo is None:
+        xdim = prm_ref.get('num_rng_bins')
+        ydim = prm_ref.get('num_patches') * prm_ref.get('num_valid_az')
+        azis = np.arange(0.5, ydim, 1)
+        rngs = np.arange(0.5, xdim, 1)
+        topo = xr.DataArray(np.zeros((len(azis), len(rngs)), dtype=np.float32),
+                            dims=['a', 'r'], coords={'a': azis, 'r': rngs}).rename('topo')
+
+    def calc_drho(rho, topo_vals, earth_radius, height, b, alpha, Bx):
+        sina = np.sin(alpha)
+        cosa = np.cos(alpha)
+        c = earth_radius + height
+        ret = earth_radius + topo_vals
+        cost = ((rho**2 + c**2 - ret**2) / (2. * rho * c))
+        sint = np.sqrt(1. - cost**2)
+        term1 = rho**2 + b**2 - 2 * rho * b * (sint * cosa - cost * sina) - Bx**2
+        drho = -rho + np.sqrt(term1)
+        return drho
+
+    prm1 = PRM().set(prm_ref)
+    prm1.orbit_df = prm_ref.orbit_df
+    prm2 = PRM().set(prm_rep)
+    prm2.orbit_df = prm_rep.orbit_df
+
+    if is_reference:
+        prm2.set(
+            baseline_start=0, baseline_center=0, baseline_end=0,
+            alpha_start=0, alpha_center=0, alpha_end=0,
+            B_offset_start=0, B_offset_center=0, B_offset_end=0
+        ).fix_aligned()
+    elif baseline_params is not None:
+        prm2.set(**baseline_params).fix_aligned()
+    else:
+        prm2.set(prm1.SAT_baseline(prm2).sel(
+            'baseline_start', 'baseline_center', 'baseline_end',
+            'alpha_start', 'alpha_center', 'alpha_end',
+            'B_offset_start', 'B_offset_center', 'B_offset_end'
+        )).fix_aligned()
+
+    if sc_height_params is not None:
+        prm1.set(**sc_height_params).fix_aligned()
+    else:
+        prm1.set(prm1.SAT_baseline(prm1).sel('SC_height', 'SC_height_start', 'SC_height_end')).fix_aligned()
+
+    topo_vals = topo.values.copy()
+    np.copyto(topo_vals, 0, where=np.isnan(topo_vals))
+    y_coords = topo.a.values
+    x_coords = topo.r.values
+
+    xdim = prm1.get('num_rng_bins')
+    ydim = prm1.get('num_patches') * prm1.get('num_valid_az')
+
+    htc = prm1.get('SC_height')
+    ht0 = prm1.get('SC_height_start')
+    htf = prm1.get('SC_height_end')
+
+    tspan = 86400 * abs(prm2.get('SC_clock_stop') - prm2.get('SC_clock_start'))
+
+    drange = constants.speed_of_light / (2 * prm2.get('rng_samp_rate'))
+    alpha = prm2.get('alpha_start') * np.pi / 180
+    cnst = -4 * np.pi / prm2.get('radar_wavelength')
+
+    Bh0 = prm2.get('baseline_start') * np.cos(prm2.get('alpha_start') * np.pi / 180)
+    Bv0 = prm2.get('baseline_start') * np.sin(prm2.get('alpha_start') * np.pi / 180)
+    Bhf = prm2.get('baseline_end') * np.cos(prm2.get('alpha_end') * np.pi / 180)
+    Bvf = prm2.get('baseline_end') * np.sin(prm2.get('alpha_end') * np.pi / 180)
+    Bx0 = prm2.get('B_offset_start')
+    Bxf = prm2.get('B_offset_end')
+
+    if prm2.get('baseline_center') != 0 or prm2.get('alpha_center') != 0 or prm2.get('B_offset_center') != 0:
+        Bhc = prm2.get('baseline_center') * np.cos(prm2.get('alpha_center') * np.pi / 180)
+        Bvc = prm2.get('baseline_center') * np.sin(prm2.get('alpha_center') * np.pi / 180)
+        Bxc = prm2.get('B_offset_center')
+
+        dBh = (-3 * Bh0 + 4 * Bhc - Bhf) / tspan
+        dBv = (-3 * Bv0 + 4 * Bvc - Bvf) / tspan
+        ddBh = (2 * Bh0 - 4 * Bhc + 2 * Bhf) / (tspan * tspan)
+        ddBv = (2 * Bv0 - 4 * Bvc + 2 * Bvf) / (tspan * tspan)
+
+        dBx = (-3 * Bx0 + 4 * Bxc - Bxf) / tspan
+        ddBx = (2 * Bx0 - 4 * Bxc + 2 * Bxf) / (tspan * tspan)
+    else:
+        dBh = (Bhf - Bh0) / tspan
+        dBv = (Bvf - Bv0) / tspan
+        dBx = (Bxf - Bx0) / tspan
+        ddBh = ddBv = ddBx = 0
+
+    dht = (-3 * ht0 + 4 * htc - htf) / tspan
+    ddht = (2 * ht0 - 4 * htc + 2 * htf) / (tspan * tspan)
+
+    x_coords_f64 = x_coords.astype(np.float64)
+    y_coords_f64 = y_coords.astype(np.float64)
+    near_range = (prm1.get('near_range') + \
+        x_coords_f64.reshape(1, -1) * (1 + prm1.get('stretch_r')) * drange) + \
+        y_coords_f64.reshape(-1, 1) * prm1.get('a_stretch_r') * drange
+
+    t_arr = y_coords_f64 * tspan / (ydim - 1)
+    Bh = Bh0 + dBh * t_arr + ddBh * t_arr**2
+    Bv = Bv0 + dBv * t_arr + ddBv * t_arr**2
+    Bx = Bx0 + dBx * t_arr + ddBx * t_arr**2
+    B = np.sqrt(Bh * Bh + Bv * Bv)
+    alpha = np.arctan2(Bv, Bh)
+    height = ht0 + dht * t_arr + ddht * t_arr**2
+
+    drho = calc_drho(near_range, topo_vals, prm1.get('earth_radius'),
+                     height.reshape(-1, 1), B.reshape(-1, 1), alpha.reshape(-1, 1), Bx.reshape(-1, 1))
+
+    phase_shift = (cnst * drho).astype(np.float32)
+    topo_phase = xr.DataArray(phase_shift, topo.coords)
+    topo_phase = topo_phase.where(np.isfinite(topo)).rename('phase')
+
+    return topo_phase
+
+
 class S1_transform(S1_topo):
     import pandas as pd
     import xarray as xr
@@ -47,6 +580,7 @@ class S1_transform(S1_topo):
                   overwrite: bool=False,
                   append: bool=False,
                   n_jobs: int|None=None,
+                  scheduler: str|None=None,
                   tmpdir: str|None=None,
                   debug: bool=False):
         """
@@ -61,7 +595,8 @@ class S1_transform(S1_topo):
         records : pd.DataFrame, optional
             The records to use. By default, all records are used.
         epsg : str|int|None, optional
-            The EPSG code to use for the output data. By default, the EPSG code is computed automatically for each burst.
+            The EPSG code to use for the output data. By default ('auto'), the EPSG code is computed automatically.
+            Use epsg=0 to disable geocoding and keep radar coordinates (y=azimuth, x=range).
         resolution : tuple[int, int], optional
             The resolution to use in meters per pixel in the projected coordinate system.
         remove_topo_phase : bool, optional
@@ -77,6 +612,9 @@ class S1_transform(S1_topo):
             Append new burstID processed with the same parameters to the existing results.
         n_jobs : int, optional
             The number of jobs to run in parallel. Default is os.cpu_count().
+        scheduler : str, optional
+            The parallel scheduler to use: 'loky' (default, multiprocessing), 'threads' (threading),
+            or 'sequential' (no parallelism, lowest memory usage). Default is None which uses 'loky'.
         tmpdir : str, optional
             Directory for temporary files. Use fast local storage (e.g., '/mnt' on Google Colab)
             for better performance. Default is system temp directory.
@@ -85,7 +623,8 @@ class S1_transform(S1_topo):
 
         Notes
         -----
-        The processing is parallelized using joblib. GMTSAR files are saved in the temp directory.
+        The processing is parallelized using joblib. All intermediate data is kept in memory.
+        Only the final zarr output is written to disk.
         """
         from tqdm.auto import tqdm
         import joblib
@@ -93,6 +632,16 @@ class S1_transform(S1_topo):
         import tempfile
         import shutil
         import sys
+        import warnings
+
+        # Suppress zarr v3 consolidated metadata warnings
+        warnings.filterwarnings('ignore', message='.*Consolidated metadata.*', category=UserWarning)
+
+        # Control library threading to prevent over-subscription
+        # Must be set BEFORE workers spawn (loky inherits env from parent process)
+        for var in ['OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
+                    'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS']:
+            os.environ[var] = '1'
 
         if self.DEM is None:
             raise ValueError('ERROR: DEM is not set. Please create a new instance of S1 with a DEM.')
@@ -100,10 +649,13 @@ class S1_transform(S1_topo):
         if records is None:
             records = self.to_dataframe(ref=ref)
 
-        if epsg is None:
+        if epsg == 0:
+            print('NOTE: epsg=0, keeping radar coordinates (no geocoding).')
+        elif epsg is None:
             print('NOTE: EPSG code will be computed automatically for each burst. These projections can be different.')
         elif isinstance(epsg, str) and epsg == 'auto':
-            epsgs = self.to_dataframe().centroid.apply(lambda geom: self.get_utm_epsg(geom.y, geom.x)).unique()
+            from .utils_satellite import get_utm_epsg
+            epsgs = self.to_dataframe().centroid.apply(lambda geom: get_utm_epsg(geom.y, geom.x)).unique()
             if len(epsgs) > 1:
                 raise ValueError(f'ERROR: Multiple UTM zones found: {", ".join(map(str, epsgs))}. Specify the EPSG code manually.')
             epsg = epsgs[0]
@@ -133,112 +685,302 @@ class S1_transform(S1_topo):
         # Use user-specified tmpdir or fall back to system temp directory
         tmpdir_base = tmpdir if tmpdir is not None else tempfile.gettempdir()
 
-        def process_refrep(bursts, target, tmpdir_base, debug=False):
-            with tempfile.TemporaryDirectory(prefix=bursts[0][0][0], dir=tmpdir_base) as tmpdir:             
-                #print('working in:', basedir)
-                # polarization does not matter for geometry alignment, any polarization reference burst can be used
-                # burst format is like ('021_043788_IW1', 'S1_043788_IW1_20230129T033343_VH_DAAA-BURST')
-                burst_refs = bursts[0]
-                burst_reps = bursts[1]
-                # output directory
-                fullBurstId = self.fullBurstId(burst_refs[0][-1])
-                outdir = os.path.join(target, fullBurstId)
-                # check if the directory is already exists and processing completed
-                # consolidated metadata file zarr.json is saved at the end of the processing
-                metafile = os.path.join(outdir, 'zarr.json')
+        def process_burst_sequential(bursts, target, debug=False):
+            """Process a single burst with dates processed sequentially (efficient - caches prm/transform)."""
+            burst_refs = bursts[0]
+            burst_reps = bursts[1]
+            fullBurstId = self.fullBurstId(burst_refs[0][-1])
+            outdir = os.path.join(target, fullBurstId)
+            metafile = os.path.join(outdir, 'zarr.json')
 
-                # check the specific case when the directory exists and the processing is performed before, completed or not
-                if os.path.exists(outdir):
-                    # add asserts for the obvious expectations
-                    assert os.path.isdir(outdir), f'ERROR: {fullBurstId} exists but is not a directory'
-                    assert not os.path.exists(metafile) or os.path.isfile(metafile), f'ERROR: {fullBurstId} metadata is not a file'
-                    # check if the processing is completed
-                    if os.path.exists(metafile) and os.path.getsize(metafile) > 0:
-                        # file exists and is not empty, the burstID successfully processed before
-                        return
-                    else:
-                        # remove the directory when the consolidated metadata file is missing
-                        # processing is not completed before, data are corrupted
-                        print(f'NOTE: {fullBurstId} directory exists but metadata file is missing. Removing...')
-                        shutil.rmtree(outdir)
-
-                # prepare reference burst for all polarizations
-                for burst_ref in burst_refs:
-                    #print ('burst_ref', burst_ref)
-                    self.align_ref(burst_ref[-1], tmpdir, debug=debug)
-                #print ('compute_transform')
-                # transform is saved in the output directory to be used for the future analysis
-                self.compute_transform(outdir, burst_refs[0][-1], basedir=tmpdir, resolution=resolution, scale_factor=1/dem_vertical_accuracy, epsg=epsg)
-                # transformation matrix
-                transform = self.get_transform(outdir, burst_refs[0][-1])
-                # for topo phase calculation
-                #print ('compute_transform_inverse')
-                
-                if remove_topo_phase:
-                    # topo in radar coordinate saved in the temp directory for the processing time only
-                    self.compute_topo(target, transform, burst_refs[0][-1], basedir=tmpdir)
-                    topo = self.get_topo(burst_ref, tmpdir)
+            # Check if already completed
+            if os.path.exists(outdir):
+                assert os.path.isdir(outdir), f'ERROR: {fullBurstId} exists but is not a directory'
+                if os.path.exists(metafile) and os.path.getsize(metafile) > 0:
+                    return  # Already done
                 else:
-                    # keep topo phase intact (e.g., for DEM creation by interferogram)
-                    topo = None
+                    print(f'NOTE: {fullBurstId} directory exists but metadata file is missing. Removing...')
+                    shutil.rmtree(outdir)
 
-                # use sequential processing as it is well parallelized internally
-                #print ('transform_slc')
-                for burst_rep in burst_reps + burst_refs:
-                    burst_ref = [burst for burst in burst_refs if burst[:2]==burst_rep[:2]][0]
-                    #print (burst_rep[-1], '->', burst_ref[-1])
-                    # align repeat bursts to the reference burst
-                    if burst_rep not in burst_refs:
-                        #print ('align_rep', burst_rep, '=>', burst_ref)
-                        self.align_rep(burst_rep[-1], burst_ref=burst_refs[0][-1], basedir=tmpdir, degrees=alignment_spacing, debug=debug)
-                    # processed bursts saved in the output directory to be used for the future analysis
-                    self.transform_slc_int16(outdir, transform, topo, burst_rep[-1], burst_ref[-1], basedir=tmpdir, epsg=epsg)
-                #print ()
+            # Phase 1: Compute transform - cache PRMs (computed once, reused)
+            prm_cache = {}
+            for burst_ref in burst_refs:
+                prm, _ = self.align_ref(burst_ref[-1], debug=debug, return_slc=False)
+                prm_cache[burst_ref[-1]] = prm
 
-                # cleanup
-                del topo, transform
-            # consolidate zarr metadata for the bursts directory
-            self.consolidate_metadata(target, burst=burst_rep[-1])
+            ref_burst_name = burst_refs[0][-1]
+            prm_ref_main = prm_cache[ref_burst_name]
 
-        # get reference and repeat bursts as groups
+            # Load DEM and compute transform
+            from .utils_satellite import compute_transform_inverse, get_dem_wgs84ellipsoid, save_transform
+            record = self.get_record(ref_burst_name)
+            dem = get_dem_wgs84ellipsoid(self.DEM, record.geometry.iloc[0])
+            topo, transform = compute_transform_inverse(prm_ref_main, dem, scale_factor=1/dem_vertical_accuracy, epsg=epsg, resolution=resolution, debug=debug)
+
+            # Save transform to zarr
+            save_transform(transform, outdir, scale_factor=1/dem_vertical_accuracy)
+
+            if not remove_topo_phase:
+                topo = None
+            # Drop ele - not needed for geocoding
+            transform = transform.drop_vars('ele')
+
+            # Pre-compute SC_height (cached)
+            sc_height_cache = {}
+            for burst_ref in burst_refs:
+                burst_ref_name = burst_ref[-1]
+                prm_ref = prm_cache[burst_ref_name]
+                sc_height_result = prm_ref.SAT_baseline(prm_ref)
+                sc_height_cache[burst_ref_name] = {
+                    'SC_height': sc_height_result.get('SC_height'),
+                    'SC_height_start': sc_height_result.get('SC_height_start'),
+                    'SC_height_end': sc_height_result.get('SC_height_end')
+                }
+
+            # Phase 2: Process dates sequentially (efficient - reuses cached data)
+            all_dates = burst_reps + burst_refs
+            for burst_item in all_dates:
+                is_reference = burst_item in burst_refs
+                burst_ref = [b for b in burst_refs if b[:2] == burst_item[:2]][0]
+                burst_ref_name = burst_ref[-1]
+                burst_name = burst_item[-1]
+                prm_ref = prm_cache[burst_ref_name]
+
+                if is_reference:
+                    _, slc = self.align_ref(burst_name, debug=debug, return_slc=True)
+                    prm = prm_ref
+                    baseline_params = None
+                else:
+                    prm, slc = self.align_rep(burst_name, burst_ref_name, prm_ref,
+                                              degrees=alignment_spacing, debug=debug)
+                    baseline_result = prm_ref.SAT_baseline(prm)
+                    baseline_params = {
+                        'baseline_start': baseline_result.get('baseline_start'),
+                        'baseline_center': baseline_result.get('baseline_center'),
+                        'baseline_end': baseline_result.get('baseline_end'),
+                        'alpha_start': baseline_result.get('alpha_start'),
+                        'alpha_center': baseline_result.get('alpha_center'),
+                        'alpha_end': baseline_result.get('alpha_end'),
+                        'B_offset_start': baseline_result.get('B_offset_start'),
+                        'B_offset_center': baseline_result.get('B_offset_center'),
+                        'B_offset_end': baseline_result.get('B_offset_end')
+                    }
+
+                self.transform_slc_int16(outdir, transform, topo, prm, prm_ref, slc, epsg=epsg,
+                                        baseline_params=baseline_params,
+                                        sc_height_params=sc_height_cache[burst_ref_name])
+                del slc
+
+            # Cleanup and consolidate
+            del topo, transform, prm_cache
+            self.consolidate_metadata(target, resolution=resolution, burst=all_dates[-1][-1])
+
+        def process_burst_dates_parallel(bursts, target, n_jobs_inner, scheduler_inner=None, debug=False):
+            """Process a single burst with dates parallelized across n_jobs_inner processes."""
+            import multiprocessing as mp
+            import numpy as np
+            import xarray as xr
+            from .PRM import PRM
+
+            burst_refs = bursts[0]
+            burst_reps = bursts[1]
+            fullBurstId = self.fullBurstId(burst_refs[0][-1])
+            outdir = os.path.join(target, fullBurstId)
+            metafile = os.path.join(outdir, 'zarr.json')
+
+            # Check if already completed
+            if os.path.exists(outdir):
+                assert os.path.isdir(outdir), f'ERROR: {fullBurstId} exists but is not a directory'
+                if os.path.exists(metafile) and os.path.getsize(metafile) > 0:
+                    return  # Already done
+                else:
+                    print(f'NOTE: {fullBurstId} directory exists but metadata file is missing. Removing...')
+                    shutil.rmtree(outdir)
+
+            ref_burst_name = burst_refs[0][-1]
+
+            # Phase 1: Compute prm_ref with doppler correction (shared with subprocess and date workers)
+            prm_ref, _ = self.align_ref(ref_burst_name, debug=debug, return_slc=False)
+            prm_ref_df = prm_ref.df
+            prm_ref_orbit_df = prm_ref.orbit_df
+
+            # Get geometry for transform subprocess
+            record = self.get_record(ref_burst_name)
+            geometry_wkt = record.geometry.iloc[0].wkt
+
+            # Phase 2: Compute transform in spawned subprocess (memory released on exit)
+            # Use spawn context for true memory isolation (not fork which shares pages)
+            ctx = mp.get_context('spawn')
+            result_queue = ctx.Queue()
+            p = ctx.Process(target=_compute_transform_inverse_worker, args=(
+                prm_ref_df, prm_ref_orbit_df, self.DEM, geometry_wkt, outdir,
+                1/dem_vertical_accuracy, epsg, resolution, 8, debug, result_queue
+            ))
+            p.start()
+            result = result_queue.get()  # wait for result
+            p.join()
+
+            # Reconstruct topo from queue result
+            if remove_topo_phase:
+                topo = xr.DataArray(result['topo_values'],
+                                   coords={'a': result['topo_a_coords'], 'r': result['topo_r_coords']},
+                                   dims=['a', 'r'])
+            else:
+                topo = None
+
+            # Reconstruct transform from queue result (without ele - not needed for geocoding)
+            transform = xr.Dataset({
+                'rng': xr.DataArray(result['transform_rng'],
+                                   coords={'y': result['transform_y'], 'x': result['transform_x']},
+                                   dims=['y', 'x']),
+                'azi': xr.DataArray(result['transform_azi'],
+                                   coords={'y': result['transform_y'], 'x': result['transform_x']},
+                                   dims=['y', 'x']),
+            }, attrs=result['transform_attrs'])
+
+            # Get SC_height from prm_ref (already computed before subprocess)
+            sc_height_result = prm_ref.SAT_baseline(prm_ref)
+            sc_height = {
+                'SC_height': sc_height_result.get('SC_height'),
+                'SC_height_start': sc_height_result.get('SC_height_start'),
+                'SC_height_end': sc_height_result.get('SC_height_end')
+            }
+
+            # Phase 3: Process dates in parallel using spawned subprocesses
+            # Each worker processes one date then exits (max_tasks_per_child=1), releasing memory
+            all_dates = burst_reps + burst_refs
+
+            # prm_ref_df and prm_ref_orbit_df already serialized before subprocess
+
+            # Get topo_llt once (small, shared by all workers for alignment computation)
+            topo_llt = self._get_topo_llt(ref_burst_name, degrees=alignment_spacing)
+
+            # Build argument tuples for each date (no S1 instance needed in workers)
+            worker_args = []
+            for burst_item in all_dates:
+                is_ref = burst_item in burst_refs
+                burst_name = burst_item[-1]
+
+                # Get file paths for this burst
+                prefix = self.fullBurstId(burst_name)
+                record = self.get_record(burst_name)
+                xml_file = os.path.join(self.datadir, prefix, 'annotation', f'{burst_name}.xml')
+                tiff_file = os.path.join(self.datadir, prefix, 'measurement', f'{burst_name}.tiff')
+                orbit_file = os.path.join(self.datadir, record['orbit'].iloc[0])
+
+                # Build record dict for worker (use reset_index to include index values like polarization)
+                record_dict = {}
+                record_reset = record.reset_index()
+                if debug and burst_item == all_dates[0]:
+                    print(f'DEBUG: record_reset.columns = {list(record_reset.columns)}')
+                for col in record_reset.columns:
+                    val = record_reset[col].iloc[0]
+                    if hasattr(val, 'wkt'):  # geometry
+                        record_dict[col] = val.wkt
+                    else:
+                        record_dict[col] = val
+                if debug and burst_item == all_dates[0]:
+                    print(f'DEBUG: record_dict keys = {list(record_dict.keys())}')
+
+                worker_args.append((
+                    outdir, burst_item, burst_refs, is_ref,
+                    xml_file, tiff_file, orbit_file, record_dict,
+                    topo, transform,
+                    prm_ref_df, prm_ref_orbit_df, sc_height,
+                    topo_llt, epsg, debug
+                ))
+
+            # Use ProcessPoolExecutor or ThreadPoolExecutor based on scheduler
+            from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+
+            if scheduler_inner == 'threads':
+                with ThreadPoolExecutor(max_workers=n_jobs_inner) as executor:
+                    list(executor.map(_process_date_worker, worker_args))
+            else:
+                # Default: ProcessPoolExecutor with max_tasks_per_child=1 for memory isolation
+                with ProcessPoolExecutor(max_workers=n_jobs_inner, mp_context=mp.get_context('spawn'),
+                                         max_tasks_per_child=1) as executor:
+                    list(executor.map(_process_date_worker, worker_args))
+
+            # Cleanup and consolidate
+            del topo, transform, prm_ref
+            self.consolidate_metadata(target, resolution=resolution, burst=all_dates[-1][-1])
+
+        # Get reference and repeat bursts as groups
         refrep_dict = self.get_repref(ref=ref)
         refreps = [v for v in refrep_dict.values()]
 
-        # Default n_jobs to cpu_count() for reliable parallelization (joblib's -1 can undercount on some systems)
+        # Default n_jobs to cpu_count()
         if n_jobs is None:
             n_jobs = os.cpu_count()
 
-        joblib_backend = None if not debug else 'sequential'
-        # for Google Colab NetCDF compatibility use threading backend
-        if joblib_backend is None and 'google.colab' in sys.modules:
-            joblib_backend = 'threading'
-        with self.progressbar_joblib(tqdm(desc='Transforming SLC...'.ljust(25), total=len(refreps))) as progress_bar:
-            joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(process_refrep)(refrep, target, tmpdir_base, debug=debug) for refrep in refreps)
+        # Auto-select sequential scheduler for single-worker mode (most memory-efficient)
+        if n_jobs == 1 and scheduler is None:
+            scheduler = 'sequential'
+            print(f'NOTE: n_jobs=1, auto-selecting scheduler="sequential" for lowest memory usage.')
+            print(f'      Use scheduler="loky" or "threads" to override if needed.')
 
-        # consolidate zarr metadata for the resolution directory
+        n_bursts = len(refreps)
+        # n_dates is total dates, n_rep_dates is repeat dates only (excluding reference)
+        n_dates = len(refreps[0][0]) + len(refreps[0][1]) if refreps else 1
+        n_rep_dates = n_dates - 1  # Only repeat dates matter for parallelization comparison
+
+        # Determine scheduler: 'sequential', 'threads', or 'loky' (default)
+        if scheduler == 'sequential' or debug:
+            # Sequential execution for debugging or explicit sequential scheduler
+            print(f'NOTE: Sequential execution ({n_bursts} bursts, {n_dates} dates).')
+            for bursts in tqdm(refreps, desc='Transforming SLC...'.ljust(25)):
+                process_burst_sequential(bursts, target, debug=debug)
+        elif n_bursts >= n_rep_dates:
+            # More bursts than repeat dates: parallelize across bursts
+            # e.g., 1000 bursts × 2 dates → burst-parallel
+            n_procs = min(n_jobs, n_bursts)
+            print(f'NOTE: Using {n_procs} workers for {n_bursts} bursts, {n_dates} dates each (burst-parallel, scheduler={scheduler}).')
+            with self.progressbar_joblib(tqdm(desc='Transforming SLC...'.ljust(25), total=len(refreps))) as progress_bar:
+                joblib.Parallel(n_jobs=n_procs, backend=scheduler)(
+                    joblib.delayed(process_burst_sequential)(bursts, target, debug) for bursts in refreps
+                )
+        else:
+            # More repeat dates than bursts: parallelize dates within each burst
+            # e.g., 1 burst × 100 dates → date-parallel
+            print(f'NOTE: Processing {n_bursts} bursts sequentially, {n_dates} dates each with {n_jobs} workers (date-parallel, scheduler={scheduler}).')
+            for bursts in tqdm(refreps, desc='Transforming SLC...'.ljust(25)):
+                process_burst_dates_parallel(bursts, target, n_jobs_inner=n_jobs, scheduler_inner=scheduler, debug=debug)
+
+        # Consolidate zarr metadata for the target directory
         self.consolidate_metadata(target, resolution=resolution)
 
     def transform_slc_int16(self,
                             outdir: str,
                             transform: xr.Dataset,
                             topo: xr.DataArray | None,
-                            burst_rep: str,
-                            burst_ref: str,
-                            basedir: str,
+                            prm_rep: "PRM",
+                            prm_ref: "PRM",
+                            slc_data: np.ndarray,
                             epsg: int,
-                            scale: float=2.5e-07
+                            scale: float=2.5e-07,
+                            baseline_params: dict=None,
+                            sc_height_params: dict=None
                             ):
         """
         Perform geocoding from radar to geographic coordinates.
 
         Parameters
         ----------
-        burst_rep : str
-            The repeat burst name.
-        burst_ref : str
-            The reference burst name.
-        resolution : tuple[int, int]
-            The resolution to use.
+        outdir : str
+            Output directory for zarr data.
+        transform : xr.Dataset
+            Transform dataset.
+        topo : xr.DataArray
+            Topographic phase.
+        prm_rep : PRM
+            Repeat burst PRM object.
+        prm_ref : PRM
+            Reference burst PRM object.
+        slc_data : np.ndarray
+            SLC data array.
+        epsg : int
+            EPSG code.
         scale : float, optional
             The scale to use. Default is 2.5e-07.
         """
@@ -246,56 +988,138 @@ class S1_transform(S1_topo):
         import numpy as np
         import xarray as xr
         import os
-        #print(f'transform_slc {burst} {date}')
+        import time
+
+        _t0 = time.perf_counter()
+        _timings = {}
+
+        # get burst name from PRM
+        # input_file contains the full path, extract just the burst name
+        if 'input_file' in prm_rep.df.index:
+            burst_rep = os.path.splitext(os.path.basename(prm_rep.get('input_file')))[0]
+        else:
+            burst_rep = 'burst'
+
         # get record
         df = self.get_record(burst_rep)
 
-        # get PRM parameters
-        prm_rep = self.PRM(burst_rep, basedir=basedir)
-        prm_ref = self.PRM(burst_ref, basedir=basedir)
+        # Convert SLC data to xarray
+        # SLC is stored as interleaved int16 real/imag
+        num_lines = prm_rep.get('num_lines')
+        num_rng_bins = prm_rep.get('num_rng_bins')
 
-        #print ('transform_slc', burst_rep, burst_ref, basedir, resolution, epsg, scale)
+        if slc_data.dtype == np.int16:
+            # Interleaved format: reshape and convert
+            slc_reshaped = slc_data.reshape(num_lines, -1)
+            re = slc_reshaped[:, 0::2].astype(np.float32)
+            im = slc_reshaped[:, 1::2].astype(np.float32)
+            del slc_reshaped
+            slc_complex = scale * (re + 1j * im)
+            del re, im
+        else:
+            # Already complex
+            slc_complex = scale * slc_data.astype(np.complex64)
 
-        # read SLC data
-        slc = prm_rep.read_SLC_int()
-        # scale as complex values
-        slc_complex = scale*(slc.re.astype(np.float32) + 1j*slc.im.astype(np.float32)).rename('data')
-        # mask empty borders
-        slc_complex = slc_complex\
-                .where((slc_complex!=0+0j).sum('a') > 0.8 * slc_complex.a.size)\
-                .where((slc_complex!=0+0j).sum('r') > 0.8 * slc_complex.r.size)
+        # Create xarray DataArray with numpy operations for masking (faster than xarray .where)
+        coords = {'a': np.arange(slc_complex.shape[0]) + 0.5, 'r': np.arange(slc_complex.shape[1]) + 0.5}
+
+        # Fast masking using numpy (avoid slow xarray .where chains)
+        nonzero_mask = slc_complex != 0
+        col_valid = nonzero_mask.sum(axis=0) > 0.8 * slc_complex.shape[0]
+        row_valid = nonzero_mask.sum(axis=1) > 0.8 * slc_complex.shape[1]
+        slc_complex = np.where(col_valid[np.newaxis, :] & row_valid[:, np.newaxis], slc_complex, np.nan + 0j)
+
+        slc_xa = xr.DataArray(slc_complex, coords=coords, dims=['a', 'r']).rename('data')
+        del slc_complex
+        _timings['slc_prep'] = time.perf_counter() - _t0
+
         # compute the topo phase
-        #print ('burst_rep, burst_ref', burst_rep, burst_ref)
-        phase = self.flat_earth_topo_phase(topo, burst_rep, burst_ref, basedir=basedir)
-        # reproject as a single complex variable
-        complex_proj = self.geocode(transform, slc_complex * np.exp(-1j * phase))
-        # unify the order of dimensions
-        complex_proj = complex_proj.transpose('y', 'x')
-        del phase, slc_complex
-        
-        # do not apply scale to complex_proj to preserve projection attributes
-        data_proj = xr.merge([
-                        (complex_proj.real / scale).round().astype(np.int16).where(np.isfinite(complex_proj.real), np.iinfo(np.int16).max).rename('re'),
-                        (complex_proj.imag / scale).round().astype(np.int16).where(np.isfinite(complex_proj.imag), np.iinfo(np.int16).max).rename('im')
-                        ])
+        _t0 = time.perf_counter()
+        phase = self.flat_earth_topo_phase(topo, prm_rep, prm_ref,
+                                            baseline_params=baseline_params,
+                                            sc_height_params=sc_height_params)
+        _timings['flat_earth_topo_phase'] = time.perf_counter() - _t0
+
+        # Apply phase correction and optionally geocode
+        # Use Euler's formula to avoid complex128: exp(-1j*phase) = cos(phase) - 1j*sin(phase)
+        # Note: phase and slc_xa may have different shapes, so align via xarray first
+        # reindex_like is 70x faster than interp_like for this use case
+        _t0 = time.perf_counter()
+        phase_aligned = phase.reindex_like(slc_xa, method='nearest').values
+        del phase
+        cos_phase = np.cos(phase_aligned)
+        sin_phase = np.sin(phase_aligned)
+        del phase_aligned
+        slc_vals = slc_xa.values
+        # (re + 1j*im) * (cos - 1j*sin) = (re*cos + im*sin) + 1j*(im*cos - re*sin)
+        corrected_real = slc_vals.real * cos_phase + slc_vals.imag * sin_phase
+        corrected_imag = slc_vals.imag * cos_phase - slc_vals.real * sin_phase
+        del cos_phase, sin_phase
+        slc_corrected = xr.DataArray(
+            (corrected_real + 1j * corrected_imag).astype(np.complex64),
+            coords=slc_xa.coords, dims=slc_xa.dims
+        )
+        del corrected_real, corrected_imag, slc_vals, slc_xa
+
+        if epsg == 0:
+            # Keep radar coordinates (no geocoding)
+            complex_proj = slc_corrected.rename({'a': 'y', 'r': 'x'})
+            _timings['phase_apply'] = time.perf_counter() - _t0
+        else:
+            # Geocode to geographic coordinates
+            complex_proj = self.geocode(transform, slc_corrected)
+            complex_proj = complex_proj.transpose('y', 'x')
+            _timings['geocode'] = time.perf_counter() - _t0
+        del slc_corrected
+
+        # Convert to int16 using numpy (faster than xarray operations)
+        _t0 = time.perf_counter()
+        fill_value = np.iinfo(np.int16).max
+        re_vals = complex_proj.values.real
+        im_vals = complex_proj.values.imag
+
+        with np.errstate(invalid='ignore'):
+            re_int16 = np.round(re_vals / scale).astype(np.int16)
+            im_int16 = np.round(im_vals / scale).astype(np.int16)
+
+        # Apply fill value for NaN
+        nan_mask = ~np.isfinite(re_vals)
+        del re_vals, im_vals
+        re_int16[nan_mask] = fill_value
+        im_int16[nan_mask] = fill_value
+        del nan_mask
+
+        # Get coords before deleting complex_proj (radar coordinates: y=azimuth, x=range)
+        y_coords = complex_proj.y.values
+        x_coords = complex_proj.x.values
         del complex_proj
+
+        data_proj = xr.Dataset({
+            're': xr.DataArray(re_int16, coords={'y': y_coords, 'x': x_coords}, dims=['y', 'x']),
+            'im': xr.DataArray(im_int16, coords={'y': y_coords, 'x': x_coords}, dims=['y', 'x'])
+        })
+        del re_int16, im_int16, y_coords, x_coords
+        _timings['int16_convert'] = time.perf_counter() - _t0
 
         # add PRM attributes
         for name, value in prm_rep.df.itertuples():
             if name not in ['input_file', 'SLC_file', 'led_file']:
                 data_proj.attrs[name] = value
 
-        # add TOPS-specific parameters for phase ramp computation (already read above)
+        # add TOPS-specific parameters for phase ramp computation
         for name, value in prm_rep.read_tops_params().items():
             data_proj.attrs[name] = value
 
-        # add calculated attributes
-        BPL, BPR = prm_ref.SAT_baseline(prm_rep).get('B_parallel', 'B_perpendicular')
+        # add calculated attributes - baseline from in-memory PRMs
+        # For reference burst (prm_rep is prm_ref), baseline is 0
+        if prm_rep is prm_ref:
+            BPR = 0.0
+        else:
+            baseline = prm_ref.SAT_baseline(prm_rep)
+            BPR = baseline.get('B_perpendicular')
         # prevent confusing -0.0
         data_proj.attrs['BPR'] = BPR + 0
-        # workaround for the hard-coded attribute
-        #data_proj.attrs['SLC_scale'] = scale
-        
+
         # add record attributes
         for _, row in df.reset_index().iterrows():
             # reverse the items order within each row
@@ -306,21 +1130,25 @@ class S1_transform(S1_topo):
                     value = value.wkt
                 data_proj.attrs[name] = value
 
-        # add georeference attributes
-        data_proj = self.spatial_ref(data_proj, epsg)
-        data_proj.attrs['spatial_ref'] = data_proj.spatial_ref.attrs['spatial_ref']
-        # remove spatial_ref variable to limit zarray files count
-        data_proj = data_proj.drop_vars('spatial_ref')
-
         # add storage specific attributes to variables only
         for varname in ['re', 'im']:
             data_proj[varname].attrs['scale_factor'] = scale
             data_proj[varname].attrs['add_offset'] = 0
             data_proj[varname].attrs['_FillValue'] = np.iinfo(np.int16).max
 
-        # use transfrom coordinates
-        data_proj = data_proj.drop_vars(['x','y'])
+        if epsg == 0:
+            # Keep radar coordinates (y=azimuth, x=range) - use engineering CRS
+            radar_crs_wkt = '''ENGCRS["Radar Coordinates",EDATUM["Radar datum"],CS[Cartesian,2],AXIS["azimuth",south,ORDER[1],LENGTHUNIT["pixel",1]],AXIS["range",east,ORDER[2],LENGTHUNIT["pixel",1]]]'''
+            data_proj.attrs['spatial_ref'] = radar_crs_wkt
+        else:
+            # Add georeference attributes for geographic coordinates
+            data_proj = self.spatial_ref(data_proj, epsg)
+            data_proj.attrs['spatial_ref'] = data_proj.spatial_ref.attrs['spatial_ref']
+            data_proj = data_proj.drop_vars('spatial_ref')
+            # Use transform coordinates (don't duplicate y,x in each burst)
+            data_proj = data_proj.drop_vars(['x', 'y'])
         # use a single chunk per burst for efficient storage
+        _t0 = time.perf_counter()
         shape = data_proj.re.shape
         encoding = {var: {'chunks': shape} for var in ['re', 'im']}
         data_proj.to_zarr(
@@ -330,8 +1158,209 @@ class S1_transform(S1_topo):
             consolidated=True,
             encoding=encoding
         )
-        slc.close()
-        del data_proj, slc
+        _timings['to_zarr'] = time.perf_counter() - _t0
 
-        for ext in ['SLC', 'LED', 'PRM']:
-            self.get_burstfile(burst_rep, basedir, ext=ext, clean=True)
+        # Print timing breakdown in debug mode
+        if os.environ.get('INSAR_DEBUG'):
+            total = sum(_timings.values())
+            print(f'PROFILE transform_slc_int16 {burst_rep[-20:]}: ' +
+                  ' | '.join(f'{k}={v:.2f}s' for k, v in sorted(_timings.items(), key=lambda x: -x[1])) +
+                  f' | total={total:.2f}s')
+        del data_proj
+
+    def flat_earth_topo_phase(self, topo: xr.DataArray | None, prm_rep: "PRM", prm_ref: "PRM",
+                               baseline_params: dict = None, sc_height_params: dict = None) -> xr.DataArray:
+        """
+        Compute the combined earth curvature and topographic phase correction.
+
+        Uses the full GMTSAR algorithm with time-varying baseline geometry.
+
+        Parameters
+        ----------
+        topo : xr.DataArray
+            Topographic elevation in radar coordinates (meters).
+        prm_rep : PRM
+            Repeat burst PRM object.
+        prm_ref : PRM
+            Reference burst PRM object.
+        baseline_params : dict, optional
+            Pre-computed baseline parameters (from SAT_baseline). If None, computed on the fly.
+        sc_height_params : dict, optional
+            Pre-computed SC_height parameters (from SAT_baseline). If None, computed on the fly.
+
+        Returns
+        -------
+        xr.DataArray
+            Combined flat earth and topo phase (radians).
+        """
+        import numpy as np
+        import xarray as xr
+        from scipy import constants
+        import warnings
+        import time
+        import os
+        warnings.filterwarnings('ignore')
+
+        _t0 = time.perf_counter()
+        _timings = {}
+
+        # For reference burst (same as itself), we still compute flat earth correction
+        # with baseline=0 to go through the same code path as repeat bursts
+        is_reference = (prm_rep is prm_ref)
+
+        # Create topo with zeros if None (flat-earth only correction)
+        if topo is None:
+            xdim = prm_ref.get('num_rng_bins')
+            ydim = prm_ref.get('num_patches') * prm_ref.get('num_valid_az')
+            azis = np.arange(0.5, ydim, 1)
+            rngs = np.arange(0.5, xdim, 1)
+            topo = xr.DataArray(np.zeros((len(azis), len(rngs)), dtype=np.float32),
+                                dims=['a', 'r'],
+                                coords={'a': azis, 'r': rngs}).rename('topo')
+
+        # Calculate the combined earth curvature and topography correction
+        def calc_drho(rho, topo_vals, earth_radius, height, b, alpha, Bx):
+            sina = np.sin(alpha)
+            cosa = np.cos(alpha)
+            c = earth_radius + height
+            ret = earth_radius + topo_vals
+            cost = ((rho**2 + c**2 - ret**2) / (2. * rho * c))
+            sint = np.sqrt(1. - cost**2)
+            term1 = rho**2 + b**2 - 2 * rho * b * (sint * cosa - cost * sina) - Bx**2
+            drho = -rho + np.sqrt(term1)
+            return drho
+
+        # Create copies to avoid modifying cached PRMs
+        # fix_aligned() modifies near_range, so calling it multiple times on cached PRMs causes drift
+        from .PRM import PRM
+        prm1 = PRM().set(prm_ref)  # copy of reference PRM
+        prm1.orbit_df = prm_ref.orbit_df  # copy orbit data reference
+        prm2 = PRM().set(prm_rep)  # copy of repeat PRM
+        prm2.orbit_df = prm_rep.orbit_df  # copy orbit data reference
+        _timings['prm_copy'] = time.perf_counter() - _t0
+
+        # Set baseline parameters on PRM copies
+        # Order follows GMTSAR: SAT_baseline first, then fix_aligned
+        _t0 = time.perf_counter()
+        if is_reference:
+            # For reference burst, baseline is 0 - set explicitly to avoid SAT_baseline issues
+            prm2.set(
+                baseline_start=0, baseline_center=0, baseline_end=0,
+                alpha_start=0, alpha_center=0, alpha_end=0,
+                B_offset_start=0, B_offset_center=0, B_offset_end=0
+            ).fix_aligned()
+        elif baseline_params is not None:
+            # Use cached baseline parameters (avoids expensive SAT_baseline call)
+            prm2.set(**baseline_params).fix_aligned()
+        else:
+            # Only set the 9 baseline geometry parameters on prm2 (equivalent to GMTSAR's tail=9)
+            # Do NOT set SC_height values on prm2 - those belong to prm1
+            prm2.set(prm1.SAT_baseline(prm2).sel(
+                'baseline_start', 'baseline_center', 'baseline_end',
+                'alpha_start', 'alpha_center', 'alpha_end',
+                'B_offset_start', 'B_offset_center', 'B_offset_end'
+            )).fix_aligned()
+        _timings['SAT_baseline_prm2'] = time.perf_counter() - _t0
+
+        _t0 = time.perf_counter()
+        if sc_height_params is not None:
+            # Use cached SC_height parameters (avoids expensive SAT_baseline call)
+            prm1.set(**sc_height_params).fix_aligned()
+        else:
+            prm1.set(prm1.SAT_baseline(prm1).sel('SC_height', 'SC_height_start', 'SC_height_end')).fix_aligned()
+        _timings['SAT_baseline_prm1'] = time.perf_counter() - _t0
+
+        # Fill NaNs by 0 (avoid np.where temp array)
+        topo_vals = topo.values.copy()
+        np.copyto(topo_vals, 0, where=np.isnan(topo_vals))
+        y_coords = topo.a.values
+        x_coords = topo.r.values
+
+        # Get full dimensions
+        xdim = prm1.get('num_rng_bins')
+        ydim = prm1.get('num_patches') * prm1.get('num_valid_az')
+
+        # Get heights (from prm1 = reference copy)
+        htc = prm1.get('SC_height')
+        ht0 = prm1.get('SC_height_start')
+        htf = prm1.get('SC_height_end')
+
+        # Compute the time span and the time spacing (from prm2 = repeat copy)
+        tspan = 86400 * abs(prm2.get('SC_clock_stop') - prm2.get('SC_clock_start'))
+        assert (tspan >= 0.01) and (prm2.get('PRF') >= 0.01), \
+            f"ERROR in sc_clock_start={prm2.get('SC_clock_start')}, sc_clock_stop={prm2.get('SC_clock_stop')}, or PRF={prm2.get('PRF')}"
+
+        # Setup the default parameters
+        drange = constants.speed_of_light / (2 * prm2.get('rng_samp_rate'))
+        alpha = prm2.get('alpha_start') * np.pi / 180
+        cnst = -4 * np.pi / prm2.get('radar_wavelength')
+
+        # Calculate initial baselines (from prm2 which has baseline params set)
+        Bh0 = prm2.get('baseline_start') * np.cos(prm2.get('alpha_start') * np.pi / 180)
+        Bv0 = prm2.get('baseline_start') * np.sin(prm2.get('alpha_start') * np.pi / 180)
+        Bhf = prm2.get('baseline_end') * np.cos(prm2.get('alpha_end') * np.pi / 180)
+        Bvf = prm2.get('baseline_end') * np.sin(prm2.get('alpha_end') * np.pi / 180)
+        Bx0 = prm2.get('B_offset_start')
+        Bxf = prm2.get('B_offset_end')
+
+        # First case is quadratic baseline model, second case is default linear model
+        if prm2.get('baseline_center') != 0 or prm2.get('alpha_center') != 0 or prm2.get('B_offset_center') != 0:
+            Bhc = prm2.get('baseline_center') * np.cos(prm2.get('alpha_center') * np.pi / 180)
+            Bvc = prm2.get('baseline_center') * np.sin(prm2.get('alpha_center') * np.pi / 180)
+            Bxc = prm2.get('B_offset_center')
+
+            dBh = (-3 * Bh0 + 4 * Bhc - Bhf) / tspan
+            dBv = (-3 * Bv0 + 4 * Bvc - Bvf) / tspan
+            ddBh = (2 * Bh0 - 4 * Bhc + 2 * Bhf) / (tspan * tspan)
+            ddBv = (2 * Bv0 - 4 * Bvc + 2 * Bvf) / (tspan * tspan)
+
+            dBx = (-3 * Bx0 + 4 * Bxc - Bxf) / tspan
+            ddBx = (2 * Bx0 - 4 * Bxc + 2 * Bxf) / (tspan * tspan)
+        else:
+            dBh = (Bhf - Bh0) / tspan
+            dBv = (Bvf - Bv0) / tspan
+            dBx = (Bxf - Bx0) / tspan
+            ddBh = ddBv = ddBx = 0
+
+        # Calculate height increment
+        dht = (-3 * ht0 + 4 * htc - htf) / tspan
+        ddht = (2 * ht0 - 4 * htc + 2 * htf) / (tspan * tspan)
+
+        # Ensure float64 precision for near_range calculation to avoid sqrt precision issues
+        # (float32 rho gives sqrt(rho**2) != rho due to precision loss)
+        x_coords_f64 = x_coords.astype(np.float64)
+        y_coords_f64 = y_coords.astype(np.float64)
+        near_range = (prm1.get('near_range') + \
+            x_coords_f64.reshape(1, -1) * (1 + prm1.get('stretch_r')) * drange) + \
+            y_coords_f64.reshape(-1, 1) * prm1.get('a_stretch_r') * drange
+
+        # Calculate the change in baseline and height along the frame
+        t_arr = y_coords_f64 * tspan / (ydim - 1)
+        Bh = Bh0 + dBh * t_arr + ddBh * t_arr**2
+        Bv = Bv0 + dBv * t_arr + ddBv * t_arr**2
+        Bx = Bx0 + dBx * t_arr + ddBx * t_arr**2
+        B = np.sqrt(Bh * Bh + Bv * Bv)
+        alpha = np.arctan2(Bv, Bh)
+        height = ht0 + dht * t_arr + ddht * t_arr**2
+
+        # Calculate the combined earth curvature and topography correction
+        _t0 = time.perf_counter()
+        drho = calc_drho(near_range, topo_vals, prm1.get('earth_radius'),
+                         height.reshape(-1, 1), B.reshape(-1, 1), alpha.reshape(-1, 1), Bx.reshape(-1, 1))
+
+        phase_shift = (cnst * drho).astype(np.float32)
+        _timings['calc_drho'] = time.perf_counter() - _t0
+
+        _t0 = time.perf_counter()
+        topo_phase = xr.DataArray(phase_shift, topo.coords)
+        topo_phase = topo_phase.where(np.isfinite(topo)).rename('phase')
+        _timings['xarray_wrap'] = time.perf_counter() - _t0
+
+        # Print timing breakdown in debug mode
+        if os.environ.get('INSAR_DEBUG'):
+            total = sum(_timings.values())
+            print(f'  PROFILE flat_earth_topo_phase: ' +
+                  ' | '.join(f'{k}={v:.2f}s' for k, v in sorted(_timings.items(), key=lambda x: -x[1])) +
+                  f' | total={total:.2f}s')
+
+        return topo_phase

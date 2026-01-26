@@ -9,109 +9,61 @@
 # ----------------------------------------------------------------------------
 from .S1_slc import S1_slc
 from .PRM import PRM
+from .utils_s1 import make_burst
+
 
 class S1_gmtsar(S1_slc):
 
-    def _ext_orb_s1a(self, burst: str, basedir: str, debug: bool=False):
+    def _make_burst(self, burst: str, mode: int = 0,
+                    rshift_grid=None, ashift_grid=None, debug: bool = False):
         """
-        Extracts orbital data for the Sentinel-1A satellite by running GMTSAR binary `ext_orb_s1a`.
+        Extract PRM and orbit data (and optionally SLC) for a burst.
+
+        Pure Python implementation - no GMTSAR binaries required.
+        All data is returned in-memory, no files are written.
 
         Parameters
         ----------
-        stem : str
-            Stem name used for file naming.
-        date : str, optional
-            Date for which to extract the orbital data. If not provided or if date is the reference, 
-            it will extract the orbital data for the reference. Defaults to None.
-        debug : bool, optional
-            If True, prints debug information. Defaults to False.
-
-        Examples
-        --------
-        _ext_orb_s1a(1, 'stem_name', '2023-05-24', True)
-        """
-        import os
-        import subprocess
-
-        df = self.get_record(burst)
-        #prefix = self.get_prefix(burst)
-
-        orbit = df['orbit'].iloc[0]
-        orbitfile = os.path.join(self.datadir, orbit)
-        orbitfile = os.path.abspath(orbitfile)
-
-        argv = ['ext_orb_s1a', f'{burst}.PRM', orbitfile, burst]
-        if debug:
-            print ('DEBUG: argv', argv)
-        p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf8', cwd=basedir)
-        stdout_data, stderr_data = p.communicate()
-        if len(stderr_data) > 0 and debug:
-            print ('DEBUG: ext_orb_s1a', stderr_data)
-        if len(stdout_data) > 0 and debug:
-            print ('DEBUG: ext_orb_s1a', stdout_data)
-
-        return
-
-    # produce LED and PRM
-    def _make_s1a_tops(self, burst: str, basedir: str, mode: int=0, rshift_fromfile: str|None=None, ashift_fromfile: str|None=None, debug: bool=False):
-        """
-        Produces LED and PRM in the base directory by executing GMTSAR binary `make_s1a_tops`.
-
-        Parameters
-        ----------
-        date : str, optional
-            Date for which to create the Sentinel-1A TOPS products. If not provided, 
-            it processes the reference image. Defaults to None.
+        burst : str
+            Burst identifier
         mode : int, optional
-            Mode for `make_s1a_tops` script: 
-            0 - no SLC; 
-            1 - center SLC; 
-            2 - high SLCH and low SLCL; 
-            3 - output ramp phase.
+            0 - PRM and orbit only (no SLC)
+            1 - PRM, orbit, and SLC data
             Defaults to 0.
-        rshift_fromfile : str, optional
-            Path to the file with range shift data. Defaults to None.
-        ashift_fromfile : str, optional
-            Path to the file with azimuth shift data. Defaults to None.
+        rshift_grid : np.ndarray, optional
+            Range shift grid for alignment (mode=1 only)
+        ashift_grid : np.ndarray, optional
+            Azimuth shift grid for alignment (mode=1 only)
         debug : bool, optional
-            If True, prints debug information. Defaults to False.
+            Enable debug output. Defaults to False.
 
-        Notes
-        -----
-        The function executes an external binary `make_s1a_tops`.
-        Also, this function calls the `ext_orb_s1a` method internally.
+        Returns
+        -------
+        tuple
+            (prm, orbit_df) for mode=0 where prm is a PRM object with orbit_df attached
+            (prm, orbit_df, slc_data) for mode=1
 
         Examples
         --------
-        _make_s1a_tops(1, '2023-05-24', 1, '/path/to/rshift.grd', '/path/to/ashift.grd', True)
+        >>> prm, orbit_df = s1._make_burst(burst, mode=0)
+        >>> prm, orbit_df, slc = s1._make_burst(burst, mode=1)
         """
         import os
-        import subprocess
 
         df = self.get_record(burst)
         prefix = self.fullBurstId(burst)
 
-        xmlfile = os.path.join(self.datadir, prefix, 'annotation', f'{burst}.xml')
-        xmlfile = os.path.abspath(xmlfile)
-        tiffile = os.path.join(self.datadir, prefix, 'measurement', f'{burst}.tiff')
-        tiffile = os.path.abspath(tiffile)
+        # File paths
+        xml_file = os.path.join(self.datadir, prefix, 'annotation', f'{burst}.xml')
+        tiff_file = os.path.join(self.datadir, prefix, 'measurement', f'{burst}.tiff')
+        orbit_file = os.path.join(self.datadir, df['orbit'].iloc[0])
 
-        #argv = ['make_s1a_tops', xmlfile, tiffile, f'{prefix}/{burst}', str(mode)]
-        argv = ['make_s1a_tops', xmlfile, tiffile, burst, str(mode)]
-        if rshift_fromfile is not None:
-            argv.append(rshift_fromfile)
-        if ashift_fromfile is not None:
-            argv.append(ashift_fromfile)
-        if debug:
-            print ('DEBUG: argv', argv)
-        p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf8', cwd=basedir)
-        stdout_data, stderr_data = p.communicate()
-        if len(stderr_data) > 0 and debug:
-            print ('DEBUG: make_s1a_tops', stderr_data)
-        if len(stdout_data) > 0 and debug:
-            print ('DEBUG: make_s1a_tops', stdout_data)
-
-        self._ext_orb_s1a(burst, basedir, debug=debug)
-
-        return
-
+        return make_burst(
+            xml_file=xml_file,
+            tiff_file=tiff_file,
+            orbit_file=orbit_file,
+            mode=mode,
+            rshift_grid=rshift_grid,
+            ashift_grid=ashift_grid,
+            debug=debug
+        )

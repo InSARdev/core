@@ -143,6 +143,7 @@ class PRM(datagrid, PRM_gmtsar):
         # Set the DataFrame for the PRM object
         self.df = _prm[['name', 'value']].drop_duplicates(keep='last').set_index('name')
         self.filename = None
+        self.orbit_df = None  # In-memory orbit data (replaces LED file)
 
     def __eq__(self, other: "PRM") -> bool:
         """
@@ -191,6 +192,9 @@ class PRM(datagrid, PRM_gmtsar):
     def set(self, prm: Union["PRM", None]=None, **kwargs) -> "PRM":
         """
         Set PRM values.
+
+        Note: This method only copies DataFrame values, not orbit_df.
+        To copy orbit_df, assign it separately: prm_copy.orbit_df = prm_orig.orbit_df
 
         Parameters
         ----------
@@ -457,57 +461,6 @@ class PRM(datagrid, PRM_gmtsar):
         re = xr.DataArray(re, coords=coords, dims=['a', 'r']).rename('re')
         im = xr.DataArray(im, coords=coords, dims=['a', 'r']).rename('im')
         return xr.merge([re, im])
-
-    def read_LED(self) -> tuple[dict, pd.DataFrame]:
-        """
-        Read an associated LED file and extract the metadata and data into a dictionary and a DataFrame.
-    
-        Parameters:
-        None
-    
-        Returns:
-        tuple: A tuple containing the metadata dictionary and the data DataFrame.
-    
-        Metadata Dictionary:
-        - 'nd' (str): Number of given points in the list.
-        - 'iy' (str): Year.
-        - 'id' (str): Julian day.
-        - 'isec' (str): Seconds of the day.
-        - 'idsec' (str): Delta seconds.
-    
-        Data DataFrame:
-        - 'iy' (int): Year.
-        - 'id' (int): Julian day.
-        - 'isec' (float): Seconds of the day.
-        - 'px' (float): X-coordinate.
-        - 'py' (float): Y-coordinate.
-        - 'pz' (float): Z-coordinate.
-        - 'vx' (float): X-velocity.
-        - 'vy' (float): Y-velocity.
-        - 'vz' (float): Z-velocity.
-        - 'time' (datetime): Combined datetime.
-        """
-        import pandas as pd
-        from datetime import datetime, timedelta
-    
-        led_file = self.get('led_file')
-        with open(led_file, 'r') as file:
-            first_line = file.readline()
-        columns = ['nd', 'iy', 'id', 'isec', 'idsec']
-        meta = dict(zip(columns, first_line.split()))
-    
-        # Define the column headers based on the structure in the code
-        headers = ['iy', 'id', 'isec', 'px', 'py', 'pz', 'vx', 'vy', 'vz']
-        # Read the file with pandas, specifying space as the delimiter and skipping the first row
-        df = pd.read_csv(led_file, delimiter=' ', header=None, skiprows=1, names=headers, index_col=False)
-        df.attrs = meta
-        
-        # add a time column
-        #df['time'] = df.apply(lambda row: datetime(int(row['iy']), 1, 1) + timedelta(days=int(row['id']), seconds=float(row['isec'])), axis=1)
-        # add seconds from Jan 1
-        df['clock'] = (24 * 60 * 60) * df['id'] + df['isec']
-
-        return df
 
     def read_tops_params(self) -> dict:
         """

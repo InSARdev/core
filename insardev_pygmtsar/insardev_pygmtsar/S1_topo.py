@@ -58,7 +58,8 @@ class S1_topo(S1_geocode):
         prm1, prm2 = prepare_prms(burst_rep, burst_ref)
 
         if prm1 is None or prm2 is None:
-            return xr.DataArray(np.ones_like(topo.values, dtype=np.float32), topo.coords).rename('phase')
+            # Reference burst: no phase correction needed (return zeros)
+            return xr.DataArray(np.zeros_like(topo.values, dtype=np.float32), topo.coords).rename('phase')
 
         # fill NaNs by 0
         topo_vals = np.where(np.isnan(topo.values), 0, topo.values)
@@ -115,12 +116,16 @@ class S1_topo(S1_geocode):
         dht = (-3 * ht0 + 4 * htc - htf) / tspan
         ddht = (2 * ht0 - 4 * htc + 2 * htf) / (tspan * tspan)
 
+        # Ensure float64 precision for near_range calculation to avoid sqrt precision issues
+        # (float32 rho gives sqrt(rho**2) != rho due to precision loss)
+        x_coords_f64 = x_coords.astype(np.float64)
+        y_coords_f64 = y_coords.astype(np.float64)
         near_range = (prm1.get('near_range') + \
-            x_coords.reshape(1,-1) * (1 + prm1.get('stretch_r')) * drange) + \
-            y_coords.reshape(-1,1) * prm1.get('a_stretch_r') * drange
+            x_coords_f64.reshape(1,-1) * (1 + prm1.get('stretch_r')) * drange) + \
+            y_coords_f64.reshape(-1,1) * prm1.get('a_stretch_r') * drange
 
         # calculate the change in baseline and height along the frame
-        time = y_coords * tspan / (ydim - 1)
+        time = y_coords_f64 * tspan / (ydim - 1)
         Bh = Bh0 + dBh * time + ddBh * time**2
         Bv = Bv0 + dBv * time + ddBv * time**2
         Bx = Bx0 + dBx * time + ddBx * time**2

@@ -59,7 +59,8 @@ class S1_dem(S1_tidal):
 
         Returns
         -------
-        None
+        xr.DataArray
+            Geoid heights in meters.
 
         Examples
         --------
@@ -69,18 +70,8 @@ class S1_dem(S1_tidal):
         -----
         See EGM96 geoid heights on http://icgem.gfz-potsdam.de/tom_longtime
         """
-        import numpy as np
-        import xarray as xr
-        import os
-        import importlib.resources as resources
-
-        with resources.as_file(resources.files('insardev_pygmtsar.data') / 'geoid_egm96_icgem.grd') as geoid_filename:
-            geoid = xr.open_dataarray(geoid_filename, engine=self.netcdf_engine_read, chunks=self.netcdf_chunksize)\
-                .rename({'y': 'lat', 'x': 'lon'})\
-                .astype(np.float32).transpose('lat','lon').rename('geoid')
-        if grid is not None:
-            return self._interp2d_like(geoid, grid)
-        return geoid
+        from .utils_satellite import get_geoid
+        return get_geoid(grid)
 
     def get_dem(self, geometry: gpd.GeoDataFrame=None, buffer_degrees: float=0):
         """
@@ -139,8 +130,8 @@ class S1_dem(S1_tidal):
         bounds = self.get_bounds(geometry.buffer(buffer_degrees))
         ortho = ortho.sel(lat=slice(bounds[1], bounds[3]), lon=slice(bounds[0], bounds[2]))
 
-        # suppose missed values are water surface
-        ds = ortho.fillna(0).astype(np.float32).transpose('lat','lon').rename("dem")
+        # preserve NaN for areas outside DEM coverage
+        ds = ortho.astype(np.float32).transpose('lat','lon').rename("dem")
         return self.spatial_ref(ds, 4326)
 
     # buffer required to get correct (binary) results from SAT_llt2rat tool

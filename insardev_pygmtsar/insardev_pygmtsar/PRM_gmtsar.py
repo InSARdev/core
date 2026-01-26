@@ -7,287 +7,297 @@
 #
 # See the LICENSE file in the insardev_pygmtsar directory for license terms.
 # ----------------------------------------------------------------------------
+"""
+PRM methods for satellite geometry computations.
+Pure Python implementations using functions from utils_s1.py and utils_satellite.py.
+All methods use in-memory orbit data (self.orbit_df) - no file I/O.
+"""
+
+
 class PRM_gmtsar:
     import numpy as np
 
-    def calc_dop_orb(self, earth_radius: float=0, doppler_centroid: float=0, inplace: bool=False, debug: bool=False) -> "PRM":
+    def calc_dop_orb(self, earth_radius: float = 0, doppler_centroid: float = 0,
+                     inplace: bool = False, debug: bool = False) -> "PRM":
         """
-        Calculate the Doppler orbit.
+        Calculate the Doppler orbit parameters.
+
+        Pure Python implementation using in-memory orbit data.
 
         Parameters
         ----------
         earth_radius : float, optional
             The Earth radius. If set to 0, the radius will be calculated. Default is 0.
         doppler_centroid : float, optional
-            The Doppler centroid. If set to 0, the Doppler will be calculated. Default is 0.
+            The Doppler centroid (currently not used, for API compatibility).
         inplace : bool, optional
-            If True, the calculated Doppler orbit will be set in the current PRM object. If False, a new PRM object
-            with the calculated Doppler orbit will be returned. Default is False.
+            If True, set results in current PRM object. Default is False.
         debug : bool, optional
-            If True, debug information will be printed. Default is False.
+            If True, print debug information. Default is False.
 
         Returns
         -------
-        PRM or None
-            If inplace is True, returns the current PRM object with the calculated Doppler orbit.
-            If inplace is False, returns a new PRM object with the calculated Doppler orbit.
+        PRM
+            PRM object with calculated Doppler orbit parameters.
         """
-        import subprocess
-        import os
+        import time
         from .PRM import PRM
-        
-        cwd = os.path.dirname(self.filename) if self.filename is not None else '.'
-        p = subprocess.Popen(['calc_dop_orb', '/dev/stdin', '/dev/stdout', str(earth_radius), str(doppler_centroid)],
-                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             cwd=cwd, encoding='utf8')
-        stdout_data, stderr_data = p.communicate(input=self.to_str())
-        #print ('stdout_data', stdout_data)
-        if len(stderr_data) > 0 and debug:
-            print ('DEBUG: calc_dop_orb', stderr_data)
-        prm = PRM.from_str(stdout_data)
+        from .utils_s1 import doppler_centroid as calc_doppler
+
+        if self.orbit_df is None:
+            raise ValueError("No orbit data attached to PRM. Use make_burst() to create PRM with orbit data.")
+
+        start_time = time.perf_counter()
+
+        # Get required PRM parameters
+        clock_start = self.get('clock_start')
+        prf = self.get('PRF')
+        near_range = self.get('near_range')
+        num_rng_bins = self.get('num_rng_bins')
+        num_valid_az = self.get('num_valid_az')
+        num_patches = self.get('num_patches')
+        nrows = self.get('nrows')
+        ra = self.get('equatorial_radius') if 'equatorial_radius' in self.df.index else 6378137.0
+        rc = self.get('polar_radius') if 'polar_radius' in self.df.index else 6356752.31424518
+
+        # Compute Doppler orbit parameters
+        params = calc_doppler(
+            orbit_df=self.orbit_df,
+            clock_start=clock_start,
+            prf=prf,
+            near_range=near_range,
+            num_rng_bins=num_rng_bins,
+            num_valid_az=num_valid_az,
+            num_patches=num_patches,
+            nrows=nrows,
+            ra=ra,
+            rc=rc
+        )
+
+        elapsed = time.perf_counter() - start_time
+        if debug:
+            print(f'PROFILE: calc_dop_orb {elapsed:.3f}s')
+
+        # If earth_radius was provided, use it
+        if earth_radius != 0:
+            params['earth_radius'] = earth_radius
+
+        # Create PRM with computed parameters
+        prm = PRM().set(
+            earth_radius=params['earth_radius'],
+            SC_height=params['SC_height'],
+            SC_height_start=params['SC_height_start'],
+            SC_height_end=params['SC_height_end'],
+            SC_vel=params['SC_vel'],
+            orbdir=params['orbdir']
+        )
+
         if inplace:
             return self.set(prm)
         else:
             return prm
 
-    def SAT_baseline(self, other: "PRM", tail: int|None=None, debug: bool=False) -> "PRM":
+    def SAT_llt2rat(self, coords: np.ndarray, precise: int = 1,
+                    debug: bool = False) -> np.ndarray:
         """
-        Compute the satellite baseline.
+        Convert geographic coordinates (LLT) to radar coordinates (RAT).
+
+        Pure Python implementation using in-memory orbit data.
+
+        Parameters
+        ----------
+        coords : array_like
+            LLT coordinates with shape (N, 3): [longitude, latitude, elevation].
+        precise : int, optional
+            Precision level (0=standard, 1=polynomial refinement). Default is 1.
+        debug : bool, optional
+            If True, print debug information. Default is False.
+
+        Returns
+        -------
+        numpy.ndarray
+            RAT coordinates with shape (N, 5):
+            [range_pix, azimuth_pix, range_m, azimuth_time, elevation].
+        """
+        import numpy as np
+        import time
+        from .utils_s1 import satellite_llt2rat
+
+        if self.orbit_df is None:
+            raise ValueError("No orbit data attached to PRM. Use make_burst() to create PRM with orbit data.")
+
+        llt_coords = np.atleast_2d(coords)
+        n_coords = len(llt_coords)
+
+        if debug:
+            print(f'DEBUG: SAT_llt2rat n={n_coords}')
+
+        start_time = time.perf_counter()
+
+        # Get required PRM parameters - all must be present
+        result = satellite_llt2rat(
+            lon=llt_coords[:, 0],
+            lat=llt_coords[:, 1],
+            elevation=llt_coords[:, 2],
+            orbit_df=self.orbit_df,
+            clock_start=self.get('clock_start'),
+            prf=self.get('PRF'),
+            near_range=self.get('near_range'),
+            rng_samp_rate=self.get('rng_samp_rate'),
+            num_valid_az=self.get('num_valid_az'),
+            num_patches=self.get('num_patches'),
+            nrows=self.get('nrows'),
+            earth_radius=self.get('earth_radius'),
+            ra=self.get('equatorial_radius'),
+            rc=self.get('polar_radius'),
+            precise=precise,
+            lookdir=self.get('lookdir'),
+            fd1=self.get('fd1'),
+            fdd1=self.get('fdd1'),
+            wavelength=self.get('radar_wavelength'),
+            vel=self.get('SC_vel'),
+            num_rng_bins=self.get('num_rng_bins'),
+            rshift=int(self.get('rshift')),
+            ashift=int(self.get('ashift')),
+            sub_int_r=self.get('sub_int_r'),
+            sub_int_a=self.get('sub_int_a'),
+            chirp_ext=int(self.get('chirp_ext'))
+        )
+
+        elapsed = time.perf_counter() - start_time
+        if debug:
+            print(f'PROFILE: SAT_llt2rat n={n_coords} {elapsed:.3f}s')
+
+        return result if result.shape[0] > 1 else result.ravel()
+
+    def SAT_look(self, coords: np.ndarray, debug: bool = False) -> np.ndarray:
+        """
+        Compute the satellite look vector.
+
+        Pure Python implementation using in-memory orbit data.
+
+        Parameters
+        ----------
+        coords : array_like
+            LLT coordinates with shape (N, 3): [longitude, latitude, elevation].
+        debug : bool, optional
+            If True, print debug information. Default is False.
+
+        Returns
+        -------
+        numpy.ndarray
+            Look vectors with shape (N, 6):
+            [longitude, latitude, elevation, look_E, look_N, look_U].
+        """
+        import numpy as np
+        import time
+        from .utils_s1 import satellite_look
+
+        if self.orbit_df is None:
+            raise ValueError("No orbit data attached to PRM. Use make_burst() to create PRM with orbit data.")
+
+        llt_coords = np.atleast_2d(coords)
+        n_coords = len(llt_coords)
+
+        if debug:
+            print(f'DEBUG: SAT_look n={n_coords}')
+
+        start_time = time.perf_counter()
+
+        # Compute look vectors
+        look_E, look_N, look_U = satellite_look(
+            lon=llt_coords[:, 0],
+            lat=llt_coords[:, 1],
+            elevation=llt_coords[:, 2],
+            orbit_df=self.orbit_df,
+            clock_start=self.get('clock_start'),
+            prf=self.get('PRF'),
+            num_valid_az=self.get('num_valid_az'),
+            num_patches=self.get('num_patches'),
+            nrows=self.get('nrows'),
+            earth_radius=self.get('earth_radius'),
+            ra=self.get('equatorial_radius') if 'equatorial_radius' in self.df.index else 6378137.0,
+            rc=self.get('polar_radius') if 'polar_radius' in self.df.index else 6356752.31424518
+        )
+
+        elapsed = time.perf_counter() - start_time
+        if debug:
+            print(f'PROFILE: SAT_look n={n_coords} {elapsed:.3f}s')
+
+        # Build result array: [lon, lat, elevation, look_E, look_N, look_U]
+        result = np.column_stack([
+            llt_coords[:, 0], llt_coords[:, 1], llt_coords[:, 2],
+            look_E, look_N, look_U
+        ])
+
+        return result if result.shape[0] > 1 else result.ravel()
+
+    def SAT_baseline(self, other: "PRM", debug: bool = False) -> "PRM":
+        """
+        Compute the satellite baseline between two acquisitions.
+
+        Pure Python implementation using in-memory orbit data.
+        Uses GMTSAR's exact algorithm for compatibility.
 
         Parameters
         ----------
         other : PRM
-            The PRM object for the other image.
-        tail : int, optional
-            The number of lines to keep from the computed baseline. Default is None, which keeps all lines.
+            PRM object for the secondary image.
         debug : bool, optional
-            If True, debug information will be printed. Default is False.
+            If True, print debug information. Default is False.
 
         Returns
         -------
         PRM
-            The PRM object with the computed satellite baseline.
-
-        Notes
-        -----
-        This method computes the satellite baseline between the current PRM object and the specified PRM object.
-        The resulting parameters are stored in the returned PRM object.
+            PRM object containing baseline parameters:
+            - B_parallel, B_perpendicular, baseline
+            - baseline_start, baseline_center, baseline_end
+            - alpha_start, alpha_center, alpha_end
+            - B_offset_start, B_offset_center, B_offset_end
+            - SC_height, SC_height_start, SC_height_end
         """
-        import os
-        import subprocess
+        import time
         from .PRM import PRM
+        from .utils_satellite import satellite_baseline
 
         if not isinstance(other, PRM):
-            raise Exception('Argument "other" should be PRM class instance')
+            raise ValueError('Argument "other" should be PRM class instance')
 
-        pipe1 = os.pipe()
-        os.write(pipe1[1], bytearray(self.to_str(), 'utf8'))
-        os.close(pipe1[1])
-        #print ('descriptor 1', str(pipe1[0]))
+        if self.orbit_df is None:
+            raise ValueError("No orbit data attached to reference PRM.")
+        if other.orbit_df is None:
+            raise ValueError("No orbit data attached to secondary PRM.")
 
-        pipe2 = os.pipe()
-        os.write(pipe2[1], bytearray(other.to_str(), 'utf8'))
-        os.close(pipe2[1])
-        #print ('descriptor 2', str(pipe2[0]))
+        start_time = time.perf_counter()
 
-        argv = ['SAT_baseline', f'/dev/fd/{pipe1[0]}', f'/dev/fd/{pipe2[0]}']
+        result = satellite_baseline(
+            orbit_df1=self.orbit_df,
+            orbit_df2=other.orbit_df,
+            clock_start=self.get('clock_start'),
+            prf=self.get('PRF'),
+            num_valid_az=int(self.get('num_valid_az')),
+            num_patches=int(self.get('num_patches')),
+            nrows=int(self.get('nrows')),
+            # Additional parameters for GMTSAR-style computation
+            earth_radius=self.get('earth_radius') if 'earth_radius' in self.df.index else None,
+            SC_height=self.get('SC_height') if 'SC_height' in self.df.index else None,
+            near_range=self.get('near_range') if 'near_range' in self.df.index else None,
+            num_rng_bins=int(self.get('num_rng_bins')) if 'num_rng_bins' in self.df.index else None,
+            rng_samp_rate=self.get('rng_samp_rate') if 'rng_samp_rate' in self.df.index else None,
+            # Repeat image parameters
+            clock_start_rep=other.get('clock_start') if 'clock_start' in other.df.index else None,
+            num_valid_az_rep=int(other.get('num_valid_az')) if 'num_valid_az' in other.df.index else None,
+            num_patches_rep=int(other.get('num_patches')) if 'num_patches' in other.df.index else None,
+            nrows_rep=int(other.get('nrows')) if 'nrows' in other.df.index else None,
+            prf_rep=other.get('PRF') if 'PRF' in other.df.index else None
+        )
+
+        elapsed = time.perf_counter() - start_time
         if debug:
-            print ('DEBUG: argv', argv)
-        cwd = os.path.dirname(self.filename) if self.filename is not None else '.'
-        p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE, pass_fds=[pipe1[0], pipe2[0]],
-                             cwd=cwd, encoding='utf8')
-        stdout_data, stderr_data = p.communicate()
-        os.close(pipe1[0])
-        os.close(pipe2[0])
-        #print ('stdout_data', stdout_data)
-        if len(stderr_data) > 0 and debug:
-            print ('DEBUG: SAT_baseline', stderr_data)
-        prm = PRM.from_str(stdout_data)
-        # replacement for SAT_baseline $1 $2 | tail -n9
-        if tail is not None:
-            prm.df = prm.df.tail(tail)
-        return prm
+            print(f'PROFILE: SAT_baseline {elapsed:.3f}s')
+            print(f"DEBUG: baseline={result['baseline']:.1f}m, "
+                  f"Bpar={result['B_parallel']:.1f}m, "
+                  f"Bperp={result['B_perpendicular']:.1f}m")
 
-    """
-    coords = prm.SAT_llt2rat([-115.588333, 32.758333, -42.441303], precise=1)
-    coords = prm.SAT_llt2rat([-115.588333, 32.758333, -42.441303], precise=1, binary=True)
-
-    coords = prm.SAT_llt2rat([-115.588333, 32.758333, -42.441303], tofile='out.dat', precise=1)
-    coords = prm.SAT_llt2rat([-115.588333, 32.758333, -42.441303], tofile='outd.dat', precise=1, binary=True)
-
-    coords = prm.SAT_llt2rat(dem_data[:10], precise=1)
-    [format(v, '.6f') for v in coords]
-    """
-    def SAT_llt2rat(self, coords: np.ndarray|None=None, fromfile: str|None=None, tofile: str|None=None, precise: int=1, binary: bool=False,
-                    debug: bool=False) -> np.ndarray|None:
-        """
-        Convert latitude, longitude, and elevation (LLT) coordinates to radar (RAT) coordinates.
-
-        Parameters
-        ----------
-        coords : array_like or None, optional
-            The LLT coordinates to convert. Should be a 2D array-like object with shape (N, 3), where N is the number of coordinates.
-            Each coordinate should be in the format [longitude, latitude, elevation].
-        fromfile : str or None, optional
-            The file path to read the LLT coordinates from. The file should contain a space-separated list of LLT coordinates in the
-            format "longitude latitude elevation". If provided, the 'coords' parameter will be ignored. Default is None.
-        tofile : str or None, optional
-            The file path to save the converted RAT coordinates to. If not provided, the converted RAT coordinates will be returned as a numpy array.
-        precise : int, optional
-            The precision level of the conversion. Set to 0 for standard back geocoding or 1 for polynomial refinement (slower). Default is 1.
-        binary : bool, optional
-            If True, the output coordinates will be saved in binary format. Default is False.
-        debug : bool, optional
-            If True, debug information will be printed. Default is False.
-
-        Returns
-        -------
-        numpy.ndarray or None
-            If 'tofile' is None, returns a numpy array of the converted RAT coordinates with shape (N, 5), where N is the number of coordinates.
-            Each coordinate is in the format [longitude, latitude, elevation, range, azimuth]. If 'tofile' is provided, returns None.
-
-        Notes
-        -----
-        This method converts LLT coordinates to RAT coordinates using the current PRM object. The converted RAT coordinates can be saved
-        to a file or returned as a numpy array.
-        """
-        import numpy as np
-        from io import StringIO, BytesIO
-        import os
-        import subprocess
-
-        if coords is not None and fromfile is None:
-            #lon, lat, elevation = coords
-            #data=f'{lon} {lat} {elevation}'
-            buffer = BytesIO()
-            # to produce the same result as original command returns
-            # gmt grd2xyz --FORMAT_FLOAT_OUT=%lf topo/dem.grd -s
-            np.savetxt(buffer, coords, delimiter=' ', fmt='%.6f')
-            stdin_data = buffer.getvalue()
-        elif coords is None and fromfile is not None:
-            with open(fromfile, 'rb') as f:
-                stdin_data = f.read()
-        else:
-            raise Exception('Should be defined data source as coordinates triplet (coords) or as file (fromfile)')
-
-        # TBD: use np.array_split() and [x for x in a if x.size > 0] for chunking processing
-        pipe = os.pipe()
-        # for unicode file paths
-        os.write(pipe[1], bytearray(self.to_str(), 'utf8'))
-        os.close(pipe[1])
-        #print ('descriptor', str(pipe[0]))
-
-        argv = ['SAT_llt2rat', f'/dev/fd/{pipe[0]}', str(precise)]
-        # set binary format mode
-        if binary:
-            argv.append('-bod')
-        if debug:
-            print ('DEBUG: argv', argv)
-        if debug and not binary and coords is not None:
-            print ('DEBUG: coords', coords)    
-        cwd = os.path.dirname(self.filename) if self.filename is not None else '.'
-        p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE, pass_fds=[pipe[0]],
-                             cwd=cwd, bufsize=10*1000*1000)
-        stdout_data, stderr_data = p.communicate(input=stdin_data)
-        os.close(pipe[0])
-
-        stderr_data = stderr_data.decode('utf8', errors='ignore')
-        if stderr_data.startswith('interpolation point outside of data constraints'):
-            print ('Error: SAT_llt2rat processing stopped due to invalid coordinates for one of input points')
-            return None
-        if stderr_data is not None and len(stderr_data) and debug:
-            print ('DEBUG: SAT_llt2rat', stderr_data)
-
-        if tofile is not None:
-            with open(tofile, 'wb') as f:
-                f.write(stdout_data)
-        else:
-            if binary:
-                out = (np.frombuffer(stdout_data, dtype=np.dtype(np.float64)))
-            else:
-                out = np.fromstring(stdout_data, dtype=float, sep=' ')
-            return out if out.size==5 else out.reshape(-1,5)
-
-    def SAT_look(self, coords: np.ndarray|None=None, fromfile: str|None=None, tofile: str|None=None, binary: bool=False,
-                 debug: bool=False) -> np.ndarray|None:
-        """
-        Compute the satellite look vector.
-
-        Parameters
-        ----------
-        coords : array_like or None, optional
-            The LLT coordinates to compute the look vector for. Should be a 2D array-like object with shape (N, 3),
-            where N is the number of coordinates. Each coordinate should be in the format [longitude, latitude, elevation].
-        fromfile : str or None, optional
-            The file path to read the LLT coordinates from. The file should contain a space-separated list of LLT coordinates
-            in the format "longitude latitude elevation". If provided, the 'coords' parameter will be ignored. Default is None.
-        tofile : str or None, optional
-            The file path to save the computed look vectors to. If not provided, the computed look vectors will be returned as a numpy array.
-        binary : bool, optional
-            If True, the output look vectors will be saved in binary format. Default is False.
-        debug : bool, optional
-            If True, debug information will be printed. Default is False.
-
-        Returns
-        -------
-        numpy.ndarray or None
-            If 'tofile' is None, returns a numpy array of the computed look vectors with shape (N, 6), where N is the number of coordinates.
-            Each look vector is in the format [longitude, latitude, elevation, look_E, look_N, look_U].
-            If 'tofile' is provided, returns None.
-
-        Notes
-        -----
-        This method computes the look vectors for LLT coordinates using the current PRM object. The computed look vectors can be saved
-        to a file or returned as a numpy array.
-        """
-        import numpy as np
-        from io import StringIO, BytesIO
-        import os
-        import subprocess
-
-        if coords is not None and fromfile is None:
-            #lon, lat, elevation = coords
-            #data=f'{lon} {lat} {elevation}'
-            buffer = BytesIO()
-            np.savetxt(buffer, coords, delimiter=' ', fmt='%.6f')
-            stdin_data = buffer.getvalue()
-        elif coords is None and fromfile is not None:
-            with open(fromfile, 'rb') as f:
-                stdin_data = f.read()
-        else:
-            raise Exception('Should be defined data source as coordinates triplet (coords) or as file (fromfile)')
-
-        pipe = os.pipe()
-        os.write(pipe[1], bytearray(self.to_str(), 'utf8'))
-        os.close(pipe[1])
-        #print ('descriptor', str(pipe[0]))
-
-        argv = ['SAT_look', f'/dev/fd/{pipe[0]}']
-        # set binary format mode
-        if binary:
-            argv.append('-bod')
-        if debug:
-            print ('DEBUG: argv', argv)
-        cwd = os.path.dirname(self.filename) if self.filename is not None else '.'
-        p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE, pass_fds=[pipe[0]],
-                             cwd=cwd, bufsize=10*1000*1000)
-        stdout_data, stderr_data = p.communicate(input=stdin_data)
-        os.close(pipe[0])
-
-        stderr_data = stderr_data.decode('utf8')
-        if stderr_data is not None and len(stderr_data) and debug:
-            print ('DEBUG: SAT_look', stderr_data)
-            return None
-
-        if tofile is not None:
-            with open(tofile, 'wb') as f:
-                f.write(stdout_data)
-        else:
-            if binary:
-                out = (np.frombuffer(stdout_data, dtype=np.dtype(np.float64)))
-            else:
-                out = np.fromstring(stdout_data, dtype=float, sep=' ')
-            return out if out.size==6 else out.reshape(-1,6)
+        # Return as PRM object for compatibility with prm.set()
+        return PRM().set(**result)

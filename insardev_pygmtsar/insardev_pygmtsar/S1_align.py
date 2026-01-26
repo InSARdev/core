@@ -10,19 +10,21 @@
 from .S1_dem import S1_dem
 from .PRM import PRM
 
+
 class S1_align(S1_dem):
     import numpy as np
     import xarray as xr
     import pandas as pd
+
     @staticmethod
-    def _offset2shift(xyz: np.ndarray, rmax: int, amax: int, method: str='linear') -> xr.DataArray:
+    def _offset2shift(xyz: np.ndarray, rmax: int, amax: int, method: str = 'linear') -> xr.DataArray:
         """
         Convert offset coordinates to shift values on a grid.
 
         Parameters
         ----------
         xyz : numpy.ndarray
-            Array containing the offset coordinates (x, y, z).
+            Array containing the offset coordinates (x, y, z) = (range, azimuth, shift).
         rmax : int
             Maximum range bin.
         amax : int
@@ -44,19 +46,70 @@ class S1_align(S1_dem):
         azis = np.arange(4/2, amax+4/2, 4)
         grid_r, grid_a = np.meshgrid(rngs, azis)
 
-        # crashes in Docker containers on Türkiye Earthquakes for scipy=1.12.0
-        grid = griddata((xyz[:,0], xyz[:,1]), xyz[:,2], (grid_r, grid_a), method=method)
-        da = xr.DataArray(np.flipud(grid), coords={'y': azis, 'x': rngs}, name='z')
+        grid = griddata((xyz[:, 0], xyz[:, 1]), xyz[:, 2], (grid_r, grid_a), method=method)
+        # No flipud needed - grid row index directly corresponds to azimuth index
+        da = xr.DataArray(grid, coords={'y': azis, 'x': rngs}, name='z')
         return da
 
-    # replacement for gmt grdfilter ../topo/dem.grd -D2 -Fg2 -I12s -Gflt.grd
-    # use median decimation instead of average
-    def _get_topo_llt(self, burst: str, degrees: float, debug: bool=False) -> np.ndarray:
+    @staticmethod
+    def _offset2shift_combined(offset_dat: np.ndarray, rmax: int, amax: int) -> tuple:
+        """
+        Convert offset coordinates to r and a shift grids in one interpolation.
+
+        Uses LinearNDInterpolator to build triangulation once and interpolate
+        both r_shift and a_shift values together, which is ~2x faster than
+        calling griddata separately for each.
+
+        Parameters
+        ----------
+        offset_dat : numpy.ndarray
+            Array with columns [r, dr, a, da, snr] from offset computation.
+        rmax : int
+            Maximum range bin.
+        amax : int
+            Maximum azimuth line.
+
+        Returns
+        -------
+        tuple
+            (r_grd, a_grd) - xarray.DataArrays with shift grids.
+        """
+        import xarray as xr
+        import numpy as np
+        from scipy.interpolate import LinearNDInterpolator
+
+        # use center pixel GMT registration mode
+        rngs = np.arange(8/2, rmax+8/2, 8)
+        azis = np.arange(4/2, amax+4/2, 4)
+        grid_r, grid_a = np.meshgrid(rngs, azis)
+        grid_points = np.column_stack([grid_r.ravel(), grid_a.ravel()])
+
+        # Input points: (range, azimuth) coordinates
+        points = np.column_stack([offset_dat[:, 0], offset_dat[:, 2]])  # [r, a]
+        # Shift values: (dr, da)
+        shifts = np.column_stack([offset_dat[:, 1], offset_dat[:, 3]])  # [dr, da]
+
+        # Build triangulation once, interpolate both shifts
+        interp = LinearNDInterpolator(points, shifts, fill_value=np.nan)
+        result = interp(grid_points)  # Shape: (n_points, 2)
+
+        # Reshape to grid
+        r_grid = result[:, 0].reshape(grid_r.shape)
+        a_grid = result[:, 1].reshape(grid_r.shape)
+
+        r_grd = xr.DataArray(r_grid, coords={'y': azis, 'x': rngs}, name='z')
+        a_grd = xr.DataArray(a_grid, coords={'y': azis, 'x': rngs}, name='z')
+
+        return r_grd, a_grd
+
+    def _get_topo_llt(self, burst: str, degrees: float, debug: bool = False) -> tuple:
         """
         Get the topography coordinates (lon, lat, z) for decimated DEM.
 
         Parameters
         ----------
+        burst : str
+            Burst identifier.
         degrees : float
             Number of degrees for decimation.
         debug : bool, optional
@@ -65,9 +118,8 @@ class S1_align(S1_dem):
         Returns
         -------
         numpy.ndarray
-            Array containing the topography coordinates (lon, lat, z).
+            Array containing the topography coordinates (lon, lat, z), NaN filtered.
         """
-        import xarray as xr
         import numpy as np
         import warnings
         warnings.filterwarnings('ignore')
@@ -75,53 +127,91 @@ class S1_align(S1_dem):
         # add buffer around the cropped area for borders interpolation
         record = self.get_record(burst)
         dem_area = self.get_dem_wgs84ellipsoid(geometry=record.geometry)
-        
+
         ny = int(np.round(degrees/dem_area.lat.diff('lat')[0]))
         nx = int(np.round(degrees/dem_area.lon.diff('lon')[0]))
         if debug:
-            print ('DEBUG: DEM decimation','ny', ny, 'nx', nx)
+            print('DEBUG: DEM decimation', 'ny', ny, 'nx', nx)
         dem_area = dem_area.coarsen({'lat': ny, 'lon': nx}, boundary='pad').mean()
 
-        lats, lons, z = xr.broadcast(dem_area.lat, dem_area.lon, dem_area)
-        topo_llt = np.column_stack([lons.values.ravel(), lats.values.ravel(), z.values.ravel()])
-        # filter out records where the third column (index 2) is NaN
-        return topo_llt[~np.isnan(topo_llt[:, 2])]
+        # Extract values directly using meshgrid instead of xr.broadcast
+        lat_vals = dem_area.lat.values
+        lon_vals = dem_area.lon.values
+        z_vals = dem_area.values
 
-    # aligning for reference image
-    def align_ref(self, burst: str, basedir: str=None, debug: bool=False):
+        # Create coordinate arrays using meshgrid (keep float64 for lon/lat precision)
+        lon_grid, lat_grid = np.meshgrid(lon_vals, lat_vals)
+        topo_llt = np.column_stack([
+            lon_grid.ravel(),
+            lat_grid.ravel(),
+            z_vals.ravel()
+        ])
+        del lon_grid, lat_grid, dem_area, lat_vals, lon_vals, z_vals
+
+        # Filter out records where the elevation (third column) is NaN
+        valid_mask = ~np.isnan(topo_llt[:, 2])
+        result = topo_llt[valid_mask]
+        del topo_llt, valid_mask
+        return result
+
+    def align_ref(self, burst: str, debug: bool = False, return_slc: bool = True) -> tuple:
         """
-        Align and stack the reference scene.
+        Process reference burst - extract PRM, orbit, and optionally SLC data.
+
+        All data is returned in-memory, no files are written.
 
         Parameters
         ----------
+        burst : str
+            Burst identifier.
         debug : bool, optional
             Enable debug mode. Default is False.
+        return_slc : bool, optional
+            If True, load and return SLC data. If False, only return PRM.
+            Default is True for backward compatibility.
 
         Returns
         -------
-        None
+        tuple
+            (prm, slc_data) where:
+            - prm: PRM object with orbit_df attached and Doppler parameters computed
+            - slc_data: Complex SLC data as numpy array, or None if return_slc=False
 
         Examples
         --------
-        stack.stack_ref(debug=True)
+        >>> prm, slc = stack.align_ref(burst, debug=True)
+        >>> prm, _ = stack.align_ref(burst, debug=True, return_slc=False)
         """
-        import xarray as xr
         import numpy as np
-        import os
 
-        # generate PRM, LED, SLC
-        self._make_s1a_tops(burst, basedir, mode=1, debug=debug)
+        if return_slc:
+            # Extract PRM, orbit, and SLC data
+            prm, orbit_df, slc_data = self._make_burst(burst, mode=1, debug=debug)
+        else:
+            # Extract PRM and orbit only (no SLC - saves ~130MB memory)
+            prm, orbit_df = self._make_burst(burst, mode=0, debug=debug)
+            slc_data = None
 
-        PRM.from_file(os.path.join(basedir, f'{burst}.PRM'))\
-            .calc_dop_orb(inplace=True).update()
+        # Compute Doppler orbit parameters
+        prm.calc_dop_orb(inplace=True, debug=debug)
 
-    # aligning for secondary image
-    def align_rep(self, burst_rep: str, burst_ref: str, basedir: str, degrees: float=12.0/3600, debug: bool=False):
+        return prm, slc_data
+
+    def align_rep(self, burst_rep: str, burst_ref: str, prm_ref: "PRM",
+                  degrees: float = 12.0/3600, debug: bool = False) -> tuple:
         """
-        Align and stack secondary images.
+        Process and align secondary burst to reference.
+
+        All data is returned in-memory, no files are written.
 
         Parameters
         ----------
+        burst_rep : str
+            Secondary burst identifier.
+        burst_ref : str
+            Reference burst identifier (used for DEM geometry).
+        prm_ref : PRM
+            Reference PRM object (from align_ref) with Doppler parameters.
         degrees : float, optional
             Degrees per pixel resolution for the coarse DEM. Default is 12.0/3600.
         debug : bool, optional
@@ -129,93 +219,86 @@ class S1_align(S1_dem):
 
         Returns
         -------
-        None
+        tuple
+            (prm, slc_data) where:
+            - prm: PRM object with orbit_df attached, alignment, and Doppler parameters
+            - slc_data: Aligned complex SLC data as numpy array
 
         Examples
         --------
-        stack.stack_rep(degrees=15.0/3600, debug=True)
+        >>> prm_ref, slc_ref = stack.align_ref(burst_ref)
+        >>> prm_rep, slc_rep = stack.align_rep(burst_rep, burst_ref, prm_ref, debug=True)
         """
-        import xarray as xr
         import numpy as np
-        import os
-        
-        # temporary filenames to be removed
-        cleanup = []
 
-        # define reference image parameters
-        earth_radius = self.PRM(burst_ref, basedir).get('earth_radius')
+        # Get reference earth_radius
+        earth_radius = prm_ref.get('earth_radius')
 
-        # prepare coarse DEM for alignment
-        # 12 arc seconds resolution is enough, for SRTM 90m decimation is 4x4
+        # Prepare coarse DEM for alignment using REFERENCE burst geometry
+        # (12 arc seconds is enough for SRTM 90m)
         topo_llt = self._get_topo_llt(burst_ref, degrees=degrees)
 
-        # define relative filenames for PRM
-        rep_prm  = os.path.join(basedir, f'{burst_rep}.PRM')
-        ref_prm  = os.path.join(basedir, f'{burst_ref}.PRM')
+        # Extract PRM and orbit for secondary burst (mode=0, no SLC yet)
+        prm_rep, orbit_df = self._make_burst(burst_rep, mode=0, debug=debug)
 
-        # generate PRM, LED
-        self._make_s1a_tops(burst_rep, basedir, debug=debug)
+        # Compute time difference between frames
+        t1, prf = prm_rep.get('clock_start', 'PRF')
+        t2 = prm_rep.get('clock_start')
+        nl = int((t2 - t1) * prf * 86400.0 + 0.2)
 
-        # compute the time difference between first frame and the rest frames
-        t1, prf = PRM.from_file(rep_prm).get('clock_start', 'PRF')
-        t2      = PRM.from_file(rep_prm).get('clock_start')
-        nl = int((t2 - t1)*prf*86400.0+0.2)
-        #echo "Shifting the reference PRM by $nl lines..."
+        # Create shifted reference PRM for SAT_llt2rat
+        # Shift the reference PRM based on nl so SAT_llt2rat gives precise estimate
+        prm_ref_shifted = PRM(prm_ref)  # Copy
+        prm_ref_shifted.orbit_df = prm_ref.orbit_df  # Attach orbit
+        prm_ref_shifted.set(
+            prm_ref.sel('clock_start', 'clock_stop', 'SC_clock_start', 'SC_clock_stop')
+            + nl / prf / 86400.0
+        )
+        prm_ref_shifted.calc_dop_orb(earth_radius, inplace=True, debug=debug)
 
-        # Shifting the reference PRM by $nl lines...
-        # shift the super-references PRM based on $nl so SAT_llt2rat gives precise estimate
-        prm1 = PRM.from_file(ref_prm)
-        prm1.set(prm1.sel('clock_start' ,'clock_stop', 'SC_clock_start', 'SC_clock_stop') + nl/prf/86400.0)
-        tmp_prm = prm1
+        # Compute offset from reference to secondary
+        tmpm_dat = prm_ref_shifted.SAT_llt2rat(coords=topo_llt, precise=1, debug=debug)
 
-        # tmp.PRM defined above from {reference}.PRM
-        prm1 = tmp_prm.calc_dop_orb(earth_radius, inplace=True, debug=debug)
-        tmpm_dat = prm1.SAT_llt2rat(coords=topo_llt, precise=1, debug=debug)
-        prm2 = PRM.from_file(rep_prm).calc_dop_orb(earth_radius, inplace=True, debug=debug)
-        tmp1_dat = prm2.SAT_llt2rat(coords=topo_llt, precise=1, debug=debug)
+        prm_rep.calc_dop_orb(earth_radius, inplace=True, debug=debug)
+        tmp1_dat = prm_rep.SAT_llt2rat(coords=topo_llt, precise=1, debug=debug)
 
-        # get r, dr, a, da, SNR table to be used by fitoffset.csh
+        # Compute r, dr, a, da, SNR table for fitoffset
         offset_dat0 = np.hstack([tmpm_dat, tmp1_dat])
-        func = lambda row: [row[0],row[5]-row[0],row[1],row[6]-row[1],100]
+        func = lambda row: [row[0], row[5] - row[0], row[1], row[6] - row[1], 100]
         offset_dat = np.apply_along_axis(func, 1, offset_dat0)
 
-        # define radar coordinates extent
-        rmax, amax = PRM.from_file(rep_prm).get('num_rng_bins','num_lines')
+        # Get radar coordinates extent
+        rmax = prm_rep.get('num_rng_bins')
+        amax = prm_rep.get('num_lines')
 
-        # prepare the offset parameters for the stitched image
-        # set the exact borders in radar coordinates
-        par_tmp = offset_dat[(offset_dat[:,0]>0) & (offset_dat[:,0]<rmax) & (offset_dat[:,2]>0) & (offset_dat[:,2]<amax)]
-        par_tmp[:,2] += nl
+        # Filter to points inside valid radar extent (reduces Delaunay triangulation cost)
+        valid_mask = (
+            (offset_dat[:, 0] > 0) & (offset_dat[:, 0] < rmax) &
+            (offset_dat[:, 2] > 0) & (offset_dat[:, 2] < amax)
+        )
+        offset_dat_valid = offset_dat[valid_mask]
 
-        # prepare the rshift and ashift look up table to be used by make_s1a_tops
-        r_xyz = offset_dat[:,[0,2,1]]
-        a_xyz = offset_dat[:,[0,2,3]]
+        # Prepare offset parameters for fitoffset
+        par_tmp = offset_dat_valid.copy()
+        par_tmp[:, 2] += nl
 
-        r_grd = self._offset2shift(r_xyz, rmax, amax)
-        r_grd_filename = rep_prm[:-4]+'_r.grd'
-        r_grd.to_netcdf(r_grd_filename, engine=self.netcdf_engine_write)
-        # drop the temporary file at the end of the function
-        cleanup.append(r_grd_filename)
+        # Prepare the rshift and ashift look up tables using combined interpolation
+        # (builds triangulation once, interpolates both shifts together - ~2x faster)
+        r_grd, a_grd = self._offset2shift_combined(offset_dat_valid, rmax, amax)
 
-        a_grd = self._offset2shift(a_xyz, rmax, amax)
-        a_grd_filename = rep_prm[:-4]+'_a.grd'
-        a_grd.to_netcdf(a_grd_filename, engine=self.netcdf_engine_write)
-        # drop the temporary file at the end of the function
-        cleanup.append(a_grd_filename)
+        # Extract aligned SLC with shift grids (pure Python)
+        prm_rep, orbit_df, slc_data = self._make_burst(
+            burst_rep,
+            mode=1,
+            rshift_grid=r_grd.values,
+            ashift_grid=a_grd.values,
+            debug=debug
+        )
 
-        # generate the image with point-by-point shifts
-        # note: it removes calc_dop_orb parameters from PRM file
-        # generate PRM, LED
-        self._make_s1a_tops(burst_rep, basedir,
-                            mode=1,
-                            rshift_fromfile=f'{burst_rep}_r.grd',
-                            ashift_fromfile=f'{burst_rep}_a.grd',
-                            debug=debug)
+        # Apply fitoffset parameters
+        prm_rep.set(PRM.fitoffset(3, 3, par_tmp))
 
-        PRM.from_file(rep_prm).set(PRM.fitoffset(3, 3, par_tmp)).update()
+        # Recompute Doppler with earth_radius
+        prm_rep.calc_dop_orb(earth_radius, inplace=True, debug=debug)
 
-        PRM.from_file(rep_prm).calc_dop_orb(earth_radius, 0, inplace=True, debug=debug).update()
-
-        # cleanup
-        for filename in cleanup:
-            os.remove(filename)
+        return prm_rep, slc_data
