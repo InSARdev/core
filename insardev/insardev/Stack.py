@@ -816,14 +816,76 @@ class Stack(Stack_plot, BatchCore):
         return df
 
     @staticmethod
-    def _load_complex_from_zarr(zarr_path, burst_path, storage_options=None):
+    def _load_zarr_array(zarr_path, group_path, name, storage_options=None):
         """
-        Load complex64 data from zarr re/im arrays.
+        Load a single zarr array as numpy with direct file reading.
 
-        Uses direct file reading with numcodecs for zstd decompression,
-        bypassing zarr library overhead. Uses np.multiply with out= to
-        convert int16->float32 directly into complex array views without
-        intermediate arrays. Masks fill_value (32767) as NaN.
+        Reads one array from a zarr group, applies scale_factor and fill_value
+        decoding. File handles are opened and closed within this call —
+        no persistent descriptors.
+
+        Uses fsspec for unified local/remote access and numcodecs for
+        zstd decompression, bypassing zarr library overhead.
+
+        Parameters
+        ----------
+        zarr_path : str
+            Path to zarr store. Supports local and remote (fsspec) paths:
+            - Local: /path/to/data.zarr
+            - S3: s3://bucket/path/data.zarr
+            - GCS: gs://bucket/path/data.zarr (requires gcsfs)
+            - Azure: az://container/path/data.zarr (requires adlfs)
+        group_path : str
+            Relative path to group within zarr store. Empty string for root.
+        name : str
+            Array name within the group.
+        storage_options : dict, optional
+            Options passed to fsspec filesystem.
+
+        Returns
+        -------
+        np.ndarray
+            Float32 2D array with NaN for masked values.
+        """
+        import numpy as np
+        import json
+        from numcodecs import Zstd
+        import fsspec
+
+        fs, root = fsspec.core.url_to_fs(zarr_path, **(storage_options or {}))
+        base_path = f"{root}/{group_path}".rstrip('/') if group_path else root
+
+        arr_meta_path = f"{base_path}/{name}/zarr.json"
+        with fs.open(arr_meta_path, 'r') as f:
+            meta = json.load(f)
+        shape = tuple(meta['shape'])
+        assert len(shape) >= 2, f"_load_zarr_array is for 2D+ delayed vars only, got {name} with shape {shape}"
+        dtype = meta['data_type']
+        attrs = meta.get('attributes', {})
+        scale_factor = np.float32(attrs.get('scale_factor', 1.0))
+        fill_value = attrs.get('_FillValue')
+
+        chunk_suffix = '/'.join(['0'] * len(shape))
+        chunk_path = f"{base_path}/{name}/c/{chunk_suffix}"
+        codec = Zstd()
+        with fs.open(chunk_path, 'rb') as f:
+            raw = codec.decode(f.read())
+        arr_int = np.frombuffer(raw, dtype=dtype).reshape(shape)
+
+        arr_f32 = np.empty(shape, dtype=np.float32)
+        np.multiply(arr_int, scale_factor, out=arr_f32, casting='unsafe')
+        if fill_value is not None:
+            np.putmask(arr_f32, arr_int == fill_value, np.nan)
+        return arr_f32
+
+    @staticmethod
+    def _load_zarr_complex(zarr_path, group_path, storage_options=None):
+        """
+        Load complex64 array from zarr re/im pair with direct file reading.
+
+        Reads 're' and 'im' int16 arrays and combines into complex64 using
+        np.multiply with out= to write directly into real/imag views
+        without intermediate arrays. Masks fill_value as NaN.
 
         Performance vs naive loading (3711x32766 burst, 973 MB):
         - Time: 0.64s vs 0.77s (1.2x faster)
@@ -836,18 +898,11 @@ class Stack(Stack_plot, BatchCore):
         Parameters
         ----------
         zarr_path : str
-            Path to zarr store. Supports local and remote (fsspec) paths:
-            - Local: /path/to/data.zarr
-            - S3: s3://bucket/path/data.zarr
-            - GCS: gs://bucket/path/data.zarr (requires gcsfs)
-            - Azure: az://container/path/data.zarr (requires adlfs)
-        burst_path : str
-            Relative path to burst within zarr store.
+            Path to zarr store (local or remote via fsspec).
+        group_path : str
+            Relative path to burst group within zarr store.
         storage_options : dict, optional
-            Options passed to fsspec filesystem. Examples:
-            - S3 public: {'anon': True}
-            - S3 with profile: {'profile': 'myprofile'}
-            - GCS with key: {'token': '/path/to/key.json'}
+            Options passed to fsspec filesystem.
 
         Returns
         -------
@@ -859,13 +914,9 @@ class Stack(Stack_plot, BatchCore):
         from numcodecs import Zstd
         import fsspec
 
-        # Use fsspec for both local and remote paths
         fs, root = fsspec.core.url_to_fs(zarr_path, **(storage_options or {}))
+        base_path = f"{root}/{group_path}".rstrip('/') if group_path else root
 
-        # Build paths using forward slash (works for both local and remote)
-        base_path = f"{root}/{burst_path}" if root else burst_path
-
-        # Read metadata from zarr.json
         meta_path = f"{base_path}/re/zarr.json"
         with fs.open(meta_path, 'r') as f:
             meta = json.load(f)
@@ -876,31 +927,26 @@ class Stack(Stack_plot, BatchCore):
         codec = Zstd()
         data = np.empty(shape, dtype=np.complex64)
 
-        # Process re: decompress, build mask, multiply directly into data.real
         re_chunk_path = f"{base_path}/re/c/0/0"
         with fs.open(re_chunk_path, 'rb') as f:
             re_bytes = codec.decode(f.read())
         re_int16 = np.frombuffer(re_bytes, dtype=np.int16).reshape(shape)
         del re_bytes
-        # Build mask from fill_value
         if fill_value is not None:
             mask = (re_int16 == fill_value)
         np.multiply(re_int16, scale, out=data.real, casting='unsafe')
         del re_int16
 
-        # Process im: decompress, update mask, multiply directly into data.imag
         im_chunk_path = f"{base_path}/im/c/0/0"
         with fs.open(im_chunk_path, 'rb') as f:
             im_bytes = codec.decode(f.read())
         im_int16 = np.frombuffer(im_bytes, dtype=np.int16).reshape(shape)
         del im_bytes
-        # Update mask (either re or im has fill_value)
         if fill_value is not None:
             mask |= (im_int16 == fill_value)
         np.multiply(im_int16, scale, out=data.imag, casting='unsafe')
         del im_int16
 
-        # Apply NaN mask (putmask is faster than fancy indexing)
         if fill_value is not None:
             np.putmask(data, mask, np.nan + 0j)
             del mask
@@ -939,62 +985,6 @@ class Stack(Stack_plot, BatchCore):
                 )
         client = get_client()
         client.register_plugin(IgnoreDaskDivide(), name='ignore_divide')
-
-        def burst_preprocess_metadata(ds):
-            """Extract metadata and 1D arrays from burst dataset (materialized)."""
-            # Convert all attrs to vars (except xarray/CRS metadata)
-            for key in list(ds.attrs.keys()):
-                if key in ['Conventions', 'spatial_ref']:
-                    continue
-                val = ds.attrs[key]
-                if isinstance(val, (list, tuple)):
-                    val = np.array(val)
-                val_arr = np.asarray(val)
-                if val_arr.ndim == 0:
-                    ds[key] = xr.DataArray(val_arr, dims=[])
-                else:
-                    ds[key] = xr.DataArray(val_arr, dims=['coef'])
-                del ds.attrs[key]
-
-            # Remove attributes for repeat bursts
-            BPR = ds['BPR'].values.item(0)
-            if BPR != 0:
-                ds.attrs = {}
-
-            return ds
-
-        def create_delayed_complex(zarr_path, burst_path, shape, storage_options=None):
-            """Create a dask array backed by delayed zarr loading."""
-            delayed_load = dask.delayed(Stack._load_complex_from_zarr)(zarr_path, burst_path, storage_options)
-            return da.from_delayed(delayed_load, shape=shape, dtype=np.complex64)
-
-        def _bursts_transform_preprocess(bursts, transform):
-            #print ('_bursts_transform_preprocess')
-            
-            # in case of multiple polarizations, merge them into a single dataset
-            polarizations = np.unique(bursts.polarization)
-            if len(polarizations) > 1:
-                datas = []
-                for polarization in polarizations:
-                    data = bursts.isel(date=bursts.polarization == polarization)\
-                                .rename({'data': polarization})
-                    # cannot combine in a single value VV and VH polarizations and corresponding burst names
-                    data.burst.values = [
-                        v.replace(polarization, 'XX') for v in data.burst.values
-                    ]
-                    del data['polarization']
-                    datas.append(data.chunk(-1))
-                ds = xr.merge(datas)
-                del datas
-            else:
-                ds = bursts.rename({'data': polarizations[0]})
-
-            for var in transform.data_vars:
-                #if var not in ['re', 'im']:
-                ds[var] = transform[var].chunk(-1)
-
-            ds.rio.write_crs(bursts.attrs['spatial_ref'], inplace=True)
-            return ds
 
         def store_open_group_delayed(zarr_path, group):
             """
@@ -1071,7 +1061,7 @@ class Stack(Stack_plot, BatchCore):
                 # Create delayed dask arrays for each date
                 delayed_arrays = []
                 for info in pol_infos:
-                    delayed_load = dask.delayed(Stack._load_complex_from_zarr)(
+                    delayed_load = dask.delayed(Stack._load_zarr_complex)(
                         zarr_path, info['burst_path'], storage_options
                     )
                     arr = da.from_delayed(delayed_load, shape=info['shape'], dtype=np.complex64)
@@ -1130,14 +1120,25 @@ class Stack(Stack_plot, BatchCore):
             ds = xr.merge(datas, combine_attrs='override')
             del datas
 
-            # Load transform (small 2D arrays - keep lazy for now)
+            # Load transform: zarr handles metadata/coords, custom reader for 2D chunks
             grp_transform = grp['transform']
             transform = xr.open_zarr(grp_transform.store, group=grp_transform.path,
                                      consolidated=True, zarr_format=3)
-            # Update coordinates from transform (has geographic coords, not pixel indices)
+
+            # Coords eagerly (small 1D arrays)
             ds = ds.assign_coords(x=transform.x.values, y=transform.y.values)
+
+            # 2D vars as lazy dask arrays via custom reader (no persistent file descriptors)
+            transform_path = f"{group}/transform"
             for var in transform.data_vars:
-                ds[var] = transform[var].astype(np.float32)
+                shape = transform[var].shape
+                delayed_load = dask.delayed(Stack._load_zarr_array)(
+                    zarr_path, transform_path, var, storage_options
+                )
+                ds[var] = xr.DataArray(
+                    da.from_delayed(delayed_load, shape=shape, dtype=np.float32),
+                    dims=['y', 'x']
+                )
 
             # Set spatial_ref
             if spatial_ref is None:
@@ -1147,7 +1148,7 @@ class Stack(Stack_plot, BatchCore):
             ds.attrs['spatial_ref'] = spatial_ref
             ds.rio.write_crs(spatial_ref, inplace=True)
 
-            # Close zarr resources
+            # Close zarr resources (metadata only, no lazy data references)
             transform.close()
             root.store.close()
 
@@ -1193,29 +1194,127 @@ class Stack(Stack_plot, BatchCore):
 
             dss = {}
             for fullBurstID in tqdm(urls.index.get_level_values(0).unique(), desc='Loading Datasets...'.ljust(25)):
-                #print ('fullBurstID', fullBurstID)
                 df = urls[urls.index.get_level_values(0) == fullBurstID]
-                bases = df[df.index.get_level_values(1) != 'transform'].iloc[:,0].values
-                #print ('fullBurstID', fullBurstID, '=>', bases)
-                base = df[df.index.get_level_values(1) == 'transform'].iloc[:,0].values[0]
-                #print ('fullBurstID', fullBurstID, '=>', base)
-                bursts = xr.open_mfdataset(
-                    bases,
-                    engine='zarr',
-                    zarr_format=3,
-                    consolidated=True,
-                    parallel=True,
-                    concat_dim='date',
-                    combine='nested',
-                    preprocess=burst_preprocess,
-                    storage_options=storage_options,
-                )
-                # some variables are stored as int32 with scale factor, convert to float32 instead of default float64
-                transform = xr.open_dataset(base, engine='zarr', zarr_format=3, consolidated=True, storage_options=storage_options).astype('float32')
+                burst_urls = df[df.index.get_level_values(1) != 'transform'].iloc[:,0].values
+                transform_url = df[df.index.get_level_values(1) == 'transform'].iloc[:,0].values[0]
 
-                ds = _bursts_transform_preprocess(bursts, transform)
+                # Read burst metadata eagerly from each URL (attrs, shape, coords)
+                burst_infos = []
+                spatial_ref = None
+                for burst_url in burst_urls:
+                    bds = xr.open_zarr(burst_url, consolidated=True, zarr_format=3,
+                                       storage_options=storage_options)
+                    shape = (bds.dims['y'], bds.dims['x'])
+                    date = np.datetime64(bds.attrs['startTime'], 's')
+                    polarization = bds.attrs['polarization']
+                    burst_name = bds.attrs['burst']
+
+                    if spatial_ref is None and bds.attrs.get('BPR', 1) == 0:
+                        spatial_ref = bds.attrs.get('spatial_ref')
+
+                    scalar_attrs = {}
+                    array_attrs = {}
+                    for k, v in bds.attrs.items():
+                        if k in {'Conventions', 'spatial_ref'}:
+                            continue
+                        if isinstance(v, (list, tuple)):
+                            array_attrs[k] = np.array(v)
+                        elif isinstance(v, str):
+                            scalar_attrs[k] = v
+                        else:
+                            scalar_attrs[k] = float(v) if isinstance(v, (int, float)) else v
+
+                    burst_infos.append({
+                        'url': burst_url,
+                        'polarization': polarization,
+                        'burst_name': burst_name.replace(polarization, 'XX'),
+                        'shape': shape,
+                        'date': date,
+                        'y': bds.y.values,
+                        'x': bds.x.values,
+                        'scalar_attrs': scalar_attrs,
+                        'array_attrs': array_attrs,
+                    })
+                    bds.close()
+
+                # Build dataset same as primary path: delayed complex arrays
+                polarizations = np.unique([info['polarization'] for info in burst_infos])
+                datas = []
+                for polarization in polarizations:
+                    pol_infos = sorted(
+                        [info for info in burst_infos if info['polarization'] == polarization],
+                        key=lambda x: x['date']
+                    )
+
+                    delayed_arrays = []
+                    for info in pol_infos:
+                        delayed_load = dask.delayed(Stack._load_zarr_complex)(
+                            info['url'], '', storage_options
+                        )
+                        arr = da.from_delayed(delayed_load, shape=info['shape'], dtype=np.complex64)
+                        arr = arr[np.newaxis, :, :]
+                        delayed_arrays.append(arr)
+
+                    stacked = da.concatenate(delayed_arrays, axis=0)
+                    dates = [info['date'] for info in pol_infos]
+                    data_arr = xr.DataArray(
+                        stacked,
+                        dims=['date', 'y', 'x'],
+                        coords={
+                            'date': np.array(dates),
+                            'y': pol_infos[0]['y'],
+                            'x': pol_infos[0]['x'],
+                        },
+                    )
+                    data_ds = xr.Dataset({polarization: data_arr})
+                    data_ds['burst'] = xr.DataArray([info['burst_name'] for info in pol_infos], dims=['date'])
+
+                    all_scalar_keys = list(pol_infos[0]['scalar_attrs'].keys())
+                    for info in pol_infos[1:]:
+                        for k in info['scalar_attrs'].keys():
+                            if k not in all_scalar_keys:
+                                all_scalar_keys.append(k)
+                    for key in all_scalar_keys:
+                        vals = [info['scalar_attrs'].get(key, np.nan) for info in pol_infos]
+                        if all(isinstance(v, (int, float, np.number)) for v in vals):
+                            data_ds[key] = xr.DataArray(np.array(vals, dtype=np.float64), dims=['date'])
+                        else:
+                            data_ds[key] = xr.DataArray(vals, dims=['date'])
+
+                    first_info = pol_infos[0]
+                    for key, arr in first_info['array_attrs'].items():
+                        if arr.ndim == 1:
+                            stacked_arr = np.stack([info['array_attrs'].get(key, arr) for info in pol_infos])
+                            data_ds[key] = xr.DataArray(stacked_arr, dims=['date', 'coef'])
+
+                    datas.append(data_ds)
+
+                ds = xr.merge(datas, combine_attrs='override')
+                del datas
+
+                # Load transform: zarr for metadata/coords, custom reader for 2D
+                transform = xr.open_zarr(transform_url, consolidated=True, zarr_format=3,
+                                         storage_options=storage_options)
+                ds = ds.assign_coords(x=transform.x.values, y=transform.y.values)
+                for var in transform.data_vars:
+                    shape = transform[var].shape
+                    delayed_load = dask.delayed(Stack._load_zarr_array)(
+                        transform_url, '', var, storage_options
+                    )
+                    ds[var] = xr.DataArray(
+                        da.from_delayed(delayed_load, shape=shape, dtype=np.float32),
+                        dims=['y', 'x']
+                    )
+
+                if spatial_ref is None:
+                    spatial_ref = transform.attrs.get('spatial_ref')
+                if spatial_ref is None:
+                    raise KeyError('spatial_ref')
+                ds.attrs['spatial_ref'] = spatial_ref
+                ds.rio.write_crs(spatial_ref, inplace=True)
+                transform.close()
+
                 dss[fullBurstID] = ds
-                del ds, bursts, transform
 
             #assert len(np.unique([ds.rio.crs.to_epsg() for ds in dss])) == 1, 'All datasets must have the same coordinate reference system'
             self.update(dss)
