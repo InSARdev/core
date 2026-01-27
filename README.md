@@ -8,14 +8,21 @@
 | Package | Description | License |
 |---------|-------------|---------|
 | [insardev](./insardev/) | Core interferometric processing and analysis | InSARdev-SAL-1.0 |
-| [insardev_pygmtsar](./insardev_pygmtsar/) | GMTSAR-based Sentinel-1 SLC preprocessing | BSD 3-Clause |
+| [insardev_pygmtsar](./insardev_pygmtsar/) | Sentinel-1 SLC preprocessing | BSD 3-Clause |
 | [insardev_toolkit](./insardev_toolkit/) | Utility functions and helper tools | BSD 3-Clause |
 
 ## Features
 
-- Sentinel-1 SLC bursts processing pipeline
-- Interferogram generation, filtering, detrending, unwrapping
-- Time series analysis (SBAS, PSI)
+- **Per-burst processing** — each Sentinel-1 TOPS burst processed independently on a geocoded grid, no frame stitching required
+- **Geometric coregistration** — bursts aligned to a reference via radar-to-geographic transforms with differential topo phase correction between reference and repeat geometries
+- **Cloud-native storage** — Zarr v3 with chunked arrays, works with local disk or GCS/S3 via fsspec
+- **GPU-accelerated** — interferogram generation, filtering, detrending, phase unwrapping (1D and 2D) on Apple MPS and NVIDIA CUDA
+- **Time series analysis** — SBAS and PSI with least-squares and STL decomposition
+- **Dual-polarization support** — all polarization channels (VV+VH or HH+HV) processed together for PolSAR analysis
+- **Ascending and descending on the same grid** — both orbit directions processed in common geocoded coordinates for straightforward vertical and east-west displacement decomposition
+- **Per-pixel incidence geometry** — elevation-corrected incidence from spherical Earth model, no central-point approximation
+- **Integrated data access** — download Sentinel-1 bursts, precise orbits, DEM, land mask, and map tiles
+- **Runs anywhere** — Colab, GitHub runners, Docker containers, and even Raspberry Pi 4 & 5
 
 ## Examples
 
@@ -23,18 +30,16 @@
 
 <img src="assets/Türkiye_Earthquakes_2023_intf.jpg" />
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1YnXVOpEW8lOkCQ-SV6ki5FN4-YEfKWUL?usp=sharing) **Imperial Valley Subsidence, CA USA (2015).**  This example is provided in the [GMTSAR project](https://topex.ucsd.edu/gmtsar/downloads/) in the archive file [S1A_Stack_CPGF_T173.tar.gz](http://topex.ucsd.edu/gmtsar/tar/S1A_Stack_CPGF_T173.tar.gz), titled 'Sentinel-1 TOPS Time Series'.
-
-The resulting InSAR velocity map is available as a self-contained web page at: [Imperial_Valley_2015.html](https://insar.dev/ui/Imperial_Valley_2015_ipyleaflet.html)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1YnXVOpEW8lOkCQ-SV6ki5FN4-YEfKWUL?usp=sharing) **Imperial Valley Subsidence, CA USA (2015).** SBAS velocity map from a Sentinel-1 time series stack. Interactive result: [Imperial_Valley_2015.html](https://insar.dev/ui/Imperial_Valley_2015_ipyleaflet.html). Uses the same bursts as the GMTSAR ['Sentinel-1 TOPS Time Series' example](http://topex.ucsd.edu/gmtsar/tar/S1A_Stack_CPGF_T173.tar.gz) .
 
 <img src="assets/Imperial_Valley_Subsidence.jpg" />
 
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1KJgX69LyKLfGUkiRLiStR-SMnJOy-eDs?usp=sharing) **Golden Valley Subsidence, CA USA (2021).** This example demonstrates the case study 'Antelope Valley Freeway in Santa Clarita, CA,' as detailed in [SAR Technical Series Part 4 Sentinel-1 global velocity layer: Using global InSAR at scale](https://blog.descarteslabs.com/using-global-insar-at-scale) and [Sentinel-1 Technical Series Part 5 Targeted Analysis](https://blog.descarteslabs.com/sentinel-1-targeted-analysis) with a significant subsidence rate 'exceeding 5cm/year in places'.
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1KJgX69LyKLfGUkiRLiStR-SMnJOy-eDs?usp=sharing) **Golden Valley Subsidence, CA USA (2021).** SBAS velocity map detecting subsidence exceeding 5 cm/year near Antelope Valley Freeway in Santa Clarita, CA. Reproduces results from the EarthDaily [Sentinel-1 Technical Series](https://earthdaily.com/blog/sentinel-1-targeted-analysis).
 
 <img src="assets/Golden_Valley_Subsidence.jpg" />
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/12oss994Pabq_8JDv4Dj-R6iqfGEalHCe?usp=sharing) **Erzincan Elevation, Türkiye (2019).** This example reproduces 29-page ESA document [DEM generation with Sentinel-1 IW](https://step.esa.int/docs/tutorials/S1TBX%20DEM%20generation%20with%20Sentinel-1%20IW%20Tutorial.pdf).
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/12oss994Pabq_8JDv4Dj-R6iqfGEalHCe?usp=sharing) **Erzincan Elevation, Türkiye (2019).** DEM generation from a single Sentinel-1 interferometric pair. Reproduces the ESA tutorial [DEM generation with Sentinel-1 IW](https://step.esa.int/docs/tutorials/S1TBX%20DEM%20generation%20with%20Sentinel-1%20IW%20Tutorial.pdf).
 
 <img src="assets/Türkiye_Elevation_2019_ele.jpg" />
 

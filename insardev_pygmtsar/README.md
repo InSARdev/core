@@ -1,16 +1,16 @@
 # InSAR.dev PyGMTSAR
 
-GMTSAR-based Sentinel-1 SLC preprocessing library for Python.
+Sentinel-1 SLC preprocessing library for Python.
 
 ## Features
 
-- Sentinel-1 SLC burst processing
-- Precise orbit file integration
-- DEM preparation and coregistration
-- Burst alignment and coregistration
-- Topographic phase computation
-- Geocoding and coordinate transformations
-- GMTSAR wrapper
+- **Per-burst Sentinel-1 TOPS SLC preprocessing** — independent processing of each burst, no frame stitching
+- **Geometric coregistration** — bursts aligned to a reference via radar-to-geographic transforms with differential topo phase correction between reference and repeat geometries
+- **Dual-polarization support** — all polarization channels (VV+VH or HH+HV) processed together
+- **Precise orbit integration** — automatic application of restituted and precise orbit files
+- **DEM preparation** — geocoding and coordinate transformations to a common geographic grid
+- **User-defined coordinate system and resolution** — output in any EPSG projection at any resolution, from small large-area overviews to precise local analysis grids
+- **Geocoded Zarr output** — burst stacks stored as Zarr v3 with per-pixel azi, rng, and elevation
 
 ## License
 
