@@ -1381,6 +1381,8 @@ def save_transform(transform, outdir, scale_factor=2.0):
 
     fill_value = np.iinfo(np.int32).max
     trans_int = xr.Dataset(attrs=transform.attrs)
+
+    # Scale coordinate variables (rng, azi, ele)
     for varname in ['rng', 'azi', 'ele']:
         scaled = (scale_factor * transform[varname]).round()
         finite_mask = np.isfinite(scaled)
@@ -1390,8 +1392,22 @@ def save_transform(transform, outdir, scale_factor=2.0):
         trans_int[varname].attrs['scale_factor'] = 1/scale_factor
         trans_int[varname].attrs['add_offset'] = 0
 
+    # Scale look vector components (unit vectors, range -1 to 1)
+    # Use higher scale factor for precision (1e6 gives ~1e-6 precision)
+    look_scale = 1e6
+    for varname in ['look_E', 'look_N', 'look_U']:
+        if varname in transform:
+            scaled = (look_scale * transform[varname]).round()
+            finite_mask = np.isfinite(scaled)
+            int_data = scaled.fillna(0).astype(np.int32)
+            int_data = int_data.where(finite_mask, fill_value)
+            trans_int[varname] = int_data
+            trans_int[varname].attrs['scale_factor'] = 1/look_scale
+            trans_int[varname].attrs['add_offset'] = 0
+
     shape = (transform.y.size, transform.x.size)
-    encoding = {var: {'chunks': shape, '_FillValue': fill_value} for var in ['rng', 'azi', 'ele']}
+    all_vars = ['rng', 'azi', 'ele'] + [v for v in ['look_E', 'look_N', 'look_U'] if v in trans_int]
+    encoding = {var: {'chunks': shape, '_FillValue': fill_value} for var in all_vars}
     trans_int.to_zarr(
         store=os.path.join(outdir, 'transform'),
         mode='w',
@@ -1975,31 +1991,95 @@ def compute_transform_inverse(prm, dem,
         _timings['inverse_transform'] = time.perf_counter() - t0
         print(f'  Inverse transform ({n_valid:,} pixels): {_timings["inverse_transform"]:.2f}s')
 
-    # Step 7: Compute ele_gmtsar for valid output pixels
+    # Step 7: Compute ele_gmtsar and look angles for valid output pixels
+    # Process in chunks to limit working memory to ~250 MB (20× more chunks than n_chunks)
     t0 = time.perf_counter()
-    lon_rad = np.radians(valid_lon)
-    lat_rad = np.radians(valid_lat)
-    sin_lat = np.sin(lat_rad).astype(np.float32)
-    cos_lat = np.cos(lat_rad).astype(np.float32)
-    N = (np.float32(ra) / np.sqrt(1 - e2 * sin_lat**2)).astype(np.float32)
-    cos_lon = np.cos(lon_rad).astype(np.float32)
-    sin_lon = np.sin(lon_rad).astype(np.float32)
-    xp = ((N + valid_ele) * cos_lat * cos_lon).astype(np.float32)
-    yp = ((N + valid_ele) * cos_lat * sin_lon).astype(np.float32)
-    zp = ((N * (1 - e2) + valid_ele) * sin_lat).astype(np.float32)
-    inv_ele_valid = (np.sqrt(xp**2 + yp**2 + zp**2) - earth_radius).astype(np.float32)
-    del lon_rad, lat_rad, sin_lat, cos_lat, N, cos_lon, sin_lon, xp, yp, zp
+    n_valid_pts = len(valid_lon)
+    chunk_size = max(1, n_valid_pts // (20 * n_chunks))  # ~160 chunks for default n_chunks=8
+
+    # Pre-allocate output arrays
+    inv_ele_valid = np.empty(n_valid_pts, dtype=np.float32)
+    # NOTE: look_E/N/U calculation commented out - incidence is computed from azi/rng in Batch.incidence()
+    # Keeping this GMTSAR-compatible code for reference
+    # look_E_valid = np.empty(n_valid_pts, dtype=np.float32)
+    # look_N_valid = np.empty(n_valid_pts, dtype=np.float32)
+    # look_U_valid = np.empty(n_valid_pts, dtype=np.float32)
+
+    for i in range(0, n_valid_pts, chunk_size):
+        j = min(i + chunk_size, n_valid_pts)
+
+        # Chunk inputs
+        lon_c = valid_lon[i:j]
+        lat_c = valid_lat[i:j]
+        ele_c = valid_ele[i:j]
+        azi_c = inv_azi_valid[i:j]
+
+        # Trig functions
+        lon_rad = np.float32(np.pi / 180) * lon_c
+        lat_rad = np.float32(np.pi / 180) * lat_c
+        sin_lat = np.sin(lat_rad, dtype=np.float32)
+        cos_lat = np.cos(lat_rad, dtype=np.float32)
+        sin_lon = np.sin(lon_rad, dtype=np.float32)
+        cos_lon = np.cos(lon_rad, dtype=np.float32)
+
+        # Ground point ECEF
+        N = np.float32(ra) / np.sqrt(1 - np.float32(e2) * sin_lat**2)
+        Nh = N + ele_c
+        xp = Nh * cos_lat * cos_lon
+        yp = Nh * cos_lat * sin_lon
+        zp = (N * np.float32(1 - e2) + ele_c) * sin_lat
+
+        # ele_gmtsar = distance from earth center - earth_radius
+        inv_ele_valid[i:j] = np.sqrt(xp**2 + yp**2 + zp**2, dtype=np.float32) - np.float32(earth_radius)
+
+        # NOTE: Look vector calculation commented out - incidence is computed from azi/rng in Batch.incidence()
+        # Keeping this GMTSAR-compatible code for reference
+        # # Satellite ECEF at azimuth time
+        # sat_time = np.float32(clock_start) + azi_c / np.float32(prf)
+        # sat_x = _hermite_interp(orbit_time, orbit_pos[:, 0], orbit_vel[:, 0], sat_time).astype(np.float32)
+        # sat_y = _hermite_interp(orbit_time, orbit_pos[:, 1], orbit_vel[:, 1], sat_time).astype(np.float32)
+        # sat_z = _hermite_interp(orbit_time, orbit_pos[:, 2], orbit_vel[:, 2], sat_time).astype(np.float32)
+        #
+        # # Look vector (ground to satellite), normalize to unit
+        # sat_x -= xp; sat_y -= yp; sat_z -= zp
+        # dist = np.sqrt(sat_x**2 + sat_y**2 + sat_z**2, dtype=np.float32)
+        # sat_x /= dist; sat_y /= dist; sat_z /= dist
+        #
+        # # Transform ECEF look vector to local ENU
+        # lat_rad -= np.float32(np.pi / 2)  # b = lat - 90°
+        # lon_rad += np.float32(np.pi / 2)  # g = lon + 90°
+        # cos_b = np.cos(lat_rad, dtype=np.float32)
+        # sin_b = np.sin(lat_rad, dtype=np.float32)
+        # cos_g = np.cos(lon_rad, dtype=np.float32)
+        # sin_g = np.sin(lon_rad, dtype=np.float32)
+        #
+        # look_E_valid[i:j] = cos_g * sat_x + sin_g * sat_y
+        # look_N_valid[i:j] = -sin_g * cos_b * sat_x + cos_g * cos_b * sat_y - sin_b * sat_z
+        # look_U_valid[i:j] = -sin_g * sin_b * sat_x + cos_g * sin_b * sat_y + cos_b * sat_z
+
     del valid_lon, valid_lat, valid_ele
 
+    if _timings is not None:
+        _timings['ele_computation'] = time.perf_counter() - t0
+        print(f'  Elevation computation: {_timings["ele_computation"]:.2f}s')
+
     # Step 8: Scatter valid pixels to full output grid
+    t0 = time.perf_counter()
     inv_azi = np.full((n_y, n_x), np.nan, dtype=np.float32)
     inv_rng = np.full((n_y, n_x), np.nan, dtype=np.float32)
     inv_ele = np.full((n_y, n_x), np.nan, dtype=np.float32)
+    # NOTE: look_E/N/U arrays commented out - incidence is computed from azi/rng in Batch.incidence()
+    # look_E = np.full((n_y, n_x), np.nan, dtype=np.float32)
+    # look_N = np.full((n_y, n_x), np.nan, dtype=np.float32)
+    # look_U = np.full((n_y, n_x), np.nan, dtype=np.float32)
 
     inv_azi[valid_mask] = inv_azi_valid
     inv_rng[valid_mask] = inv_rng_valid
     inv_ele[valid_mask] = inv_ele_valid
-    del inv_azi_valid, inv_rng_valid, inv_ele_valid
+    # look_E[valid_mask] = look_E_valid
+    # look_N[valid_mask] = look_N_valid
+    # look_U[valid_mask] = look_U_valid
+    del inv_azi_valid, inv_rng_valid, inv_ele_valid  # , look_E_valid, look_N_valid, look_U_valid
 
     if _timings is not None:
         _timings['scatter'] = time.perf_counter() - t0
@@ -2051,10 +2131,14 @@ def compute_transform_inverse(prm, dem,
         ele_gmtsar_full = None
 
     # Build dataset
+    # NOTE: look_E/N/U removed - incidence is computed from azi/rng in Batch.incidence()
     trans = xr.Dataset({
         'rng': xr.DataArray(inv_rng, coords={'y': out_y, 'x': out_x}, dims=['y', 'x']),
         'azi': xr.DataArray(inv_azi, coords={'y': out_y, 'x': out_x}, dims=['y', 'x']),
         'ele': xr.DataArray(inv_ele, coords={'y': out_y, 'x': out_x}, dims=['y', 'x']),
+        # 'look_E': xr.DataArray(look_E, coords={'y': out_y, 'x': out_x}, dims=['y', 'x']),
+        # 'look_N': xr.DataArray(look_N, coords={'y': out_y, 'x': out_x}, dims=['y', 'x']),
+        # 'look_U': xr.DataArray(look_U, coords={'y': out_y, 'x': out_x}, dims=['y', 'x']),
     })
 
     # Add georeference

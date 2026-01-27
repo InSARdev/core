@@ -170,68 +170,6 @@ class PRM_gmtsar:
 
         return result if result.shape[0] > 1 else result.ravel()
 
-    def SAT_look(self, coords: np.ndarray, debug: bool = False) -> np.ndarray:
-        """
-        Compute the satellite look vector.
-
-        Pure Python implementation using in-memory orbit data.
-
-        Parameters
-        ----------
-        coords : array_like
-            LLT coordinates with shape (N, 3): [longitude, latitude, elevation].
-        debug : bool, optional
-            If True, print debug information. Default is False.
-
-        Returns
-        -------
-        numpy.ndarray
-            Look vectors with shape (N, 6):
-            [longitude, latitude, elevation, look_E, look_N, look_U].
-        """
-        import numpy as np
-        import time
-        from .utils_s1 import satellite_look
-
-        if self.orbit_df is None:
-            raise ValueError("No orbit data attached to PRM. Use make_burst() to create PRM with orbit data.")
-
-        llt_coords = np.atleast_2d(coords)
-        n_coords = len(llt_coords)
-
-        if debug:
-            print(f'DEBUG: SAT_look n={n_coords}')
-
-        start_time = time.perf_counter()
-
-        # Compute look vectors
-        look_E, look_N, look_U = satellite_look(
-            lon=llt_coords[:, 0],
-            lat=llt_coords[:, 1],
-            elevation=llt_coords[:, 2],
-            orbit_df=self.orbit_df,
-            clock_start=self.get('clock_start'),
-            prf=self.get('PRF'),
-            num_valid_az=self.get('num_valid_az'),
-            num_patches=self.get('num_patches'),
-            nrows=self.get('nrows'),
-            earth_radius=self.get('earth_radius'),
-            ra=self.get('equatorial_radius') if 'equatorial_radius' in self.df.index else 6378137.0,
-            rc=self.get('polar_radius') if 'polar_radius' in self.df.index else 6356752.31424518
-        )
-
-        elapsed = time.perf_counter() - start_time
-        if debug:
-            print(f'PROFILE: SAT_look n={n_coords} {elapsed:.3f}s')
-
-        # Build result array: [lon, lat, elevation, look_E, look_N, look_U]
-        result = np.column_stack([
-            llt_coords[:, 0], llt_coords[:, 1], llt_coords[:, 2],
-            look_E, look_N, look_U
-        ])
-
-        return result if result.shape[0] > 1 else result.ravel()
-
     def SAT_baseline(self, other: "PRM", debug: bool = False) -> "PRM":
         """
         Compute the satellite baseline between two acquisitions.

@@ -262,7 +262,71 @@ class Batch(BatchCore):
         return Batch(vel_results), Batch(int_results)
 
     def incidence(self) -> "Batch":
-        """Compute incidence angle from look vector components."""
+        """Compute incidence angle from azi, rng, ele, and radar geometry parameters.
+
+        Uses spherical Earth geometry with per-pixel satellite height interpolation
+        and terrain elevation correction. Matches GMTSAR look vector results within ~0.07%.
+
+        Required vars: azi, rng, ele, near_range, SC_height_start, SC_height_end,
+                       earth_radius, rng_samp_rate, num_lines
+        """
+        import numpy as np
+        import rioxarray  # for .rio accessor
+
+        c = 299792458.0  # speed of light
+
+        # Get CRS from input batch
+        crs = self.crs
+
+        out: dict[str, xr.Dataset] = {}
+        for key, tfm in self.items():
+            # Get scalar parameters (mean if per-date)
+            near_range = float(tfm['near_range'].mean().item())
+            SC_height_start = float(tfm['SC_height_start'].mean().item())
+            SC_height_end = float(tfm['SC_height_end'].mean().item())
+            earth_radius = float(tfm['earth_radius'].mean().item())
+            rng_samp_rate = float(tfm['rng_samp_rate'].mean().item())
+            num_lines = float(tfm['num_lines'].mean().item())
+
+            # Get per-pixel coordinates
+            azi = tfm['azi']
+            rng = tfm['rng']
+            ele = tfm['ele']
+
+            # Compute slant range to the actual elevated ground point
+            range_pixel_size = c / (2 * rng_samp_rate)
+            slant_range = near_range + rng * range_pixel_size
+
+            # Interpolate satellite height based on azimuth position
+            SC_height = SC_height_start + (SC_height_end - SC_height_start) * azi / (num_lines - 1)
+
+            # Ground at earth_radius + ele from Earth center
+            ground_dist = earth_radius + ele
+
+            # Satellite at earth_radius + SC_height from Earth center
+            sat_dist = earth_radius + SC_height
+
+            # Spherical Earth geometry: law of cosines + law of sines
+            cos_earth = (ground_dist**2 + sat_dist**2 - slant_range**2) / (2 * ground_dist * sat_dist)
+            cos_earth = xr.where(cos_earth > 1, 1, xr.where(cos_earth < -1, -1, cos_earth))
+            earth_angle = xr.ufuncs.arccos(cos_earth)
+            sin_inc = sat_dist * xr.ufuncs.sin(earth_angle) / slant_range
+            sin_inc = xr.where(sin_inc > 1, 1, xr.where(sin_inc < -1, -1, sin_inc))
+            incidence = xr.ufuncs.arcsin(sin_inc).astype('float32')
+
+            result_ds = xr.Dataset({"incidence": incidence})
+            result_ds.attrs = tfm.attrs
+            # Preserve CRS
+            if crs is not None:
+                result_ds = result_ds.rio.write_crs(crs)
+            out[key] = result_ds
+        return Batch(out)
+
+    def incidence_look(self) -> "Batch":
+        """Compute incidence angle from look vector components (legacy method).
+
+        Required vars: look_E, look_N, look_U
+        """
         import rioxarray  # for .rio accessor
 
         # Get CRS from input batch
