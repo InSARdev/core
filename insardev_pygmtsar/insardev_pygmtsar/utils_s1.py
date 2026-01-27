@@ -590,6 +590,194 @@ def satellite_slc(tiff_path: str) -> "xr.DataArray":
     )
 
 
+def deramped_burst(xml_path: str, tiff_path: str, eof_path: str) -> tuple:
+    """
+    Extract deramped burst SLC data without alignment shift or reramp.
+
+    Returns the deramped SLC (azimuth phase ramp removed) and the parameters
+    needed to compute the reramp phase analytically at any coordinates.
+    This enables merging the alignment and geocoding interpolations into one.
+
+    Parameters
+    ----------
+    xml_path : str
+        Path to burst annotation XML file
+    tiff_path : str
+        Path to burst GeoTIFF file
+    eof_path : str
+        Path to precise orbit EOF file
+
+    Returns
+    -------
+    prm_dict : dict
+        Dictionary of PRM parameters
+    orbit_df : pd.DataFrame
+        Orbit state vectors from EOF file
+    slc_data : np.ndarray
+        Deramped SLC as int16 array with shape (n_valid, num_rng_bins*2).
+        Format: [re0, im0, re1, im1, ...] matching GMTSAR SLC format.
+    reramp_params : dict
+        Parameters for analytical reramp phase computation:
+        fka, fnc, ks, dta, dts, ts0, tau0, lpb, k_start, n_valid
+    """
+    import numpy as np
+    from scipy import constants
+    import xml.etree.ElementTree as ET
+    from datetime import datetime
+
+    SOL = constants.speed_of_light
+
+    # Get PRM parameters and orbit
+    prm_dict, orbit_df = reference_burst(xml_path, tiff_path, eof_path)
+
+    # Read SLC data
+    slc_da = satellite_slc(tiff_path)
+    data_complex = slc_da.values
+
+    # Get valid line range
+    n_lines, n_cols = data_complex.shape
+    lpb = n_lines
+    width = prm_dict['num_rng_bins']
+
+    # Parse firstValidSample from XML for valid region
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    burst = root.find('.//swathTiming/burstList/burst')
+    fvs_text = burst.find('firstValidSample').text
+    fvs = [int(x) for x in fvs_text.split()]
+
+    # Find valid line range
+    k_start = None
+    k_end = None
+    for j, flag in enumerate(fvs):
+        if flag >= 0:
+            if k_start is None:
+                k_start = j
+            k_end = j
+
+    if k_start is None:
+        k_start = 0
+        k_end = lpb - 1
+
+    n_valid = k_end - k_start
+    n_valid = n_valid - (n_valid % 4)
+
+    # Get parameters for deramp/reramp computation
+    prf = prm_dict['PRF']
+    radar_freq = SOL / prm_dict['radar_wavelength']
+    azi_steering_rate = float(root.find('.//productInformation/azimuthSteeringRate').text)
+    kpsi = np.pi * azi_steering_rate / 180.0
+
+    dta = 1.0 / prf
+    dts = 1.0 / prm_dict['rng_samp_rate']
+    ts0 = prm_dict['near_range'] * 2.0 / SOL + 1.0 / prm_dict['rng_samp_rate']
+    tau0 = float(root.find('.//azimuthFmRateList/azimuthFmRate/t0').text)
+
+    # Compute burst center time for finding nearest Doppler/FM rate estimates
+    t_brst_str = root.find('.//swathTiming/burstList/burst/azimuthTime').text
+    dt_brst = datetime.strptime(t_brst_str, '%Y-%m-%dT%H:%M:%S.%f')
+    sec_brst = dt_brst.hour * 3600 + dt_brst.minute * 60 + dt_brst.second + dt_brst.microsecond / 1e6
+    t_brst = sec_brst + dta * lpb / 2.0
+
+    def parse_aztime(aztime_str):
+        dt = datetime.strptime(aztime_str, '%Y-%m-%dT%H:%M:%S.%f')
+        return dt.hour * 3600 + dt.minute * 60 + dt.second + dt.microsecond / 1e6
+
+    # Get Doppler centroid polynomial
+    dc_estimates = root.findall('.//dopplerCentroid/dcEstimateList/dcEstimate')
+    best_dc = None
+    best_dc_dist = float('inf')
+    for dc in dc_estimates:
+        dc_time = parse_aztime(dc.find('azimuthTime').text)
+        dist = abs(dc_time - t_brst)
+        if dist < best_dc_dist:
+            best_dc_dist = dist
+            best_dc = dc
+    fnc = [float(x) for x in best_dc.find('dataDcPolynomial').text.split()[:3]]
+
+    # Get FM rate polynomial
+    fm_rates = root.findall('.//generalAnnotation/azimuthFmRateList/azimuthFmRate')
+    best_fm = None
+    best_fm_dist = float('inf')
+    for fm in fm_rates:
+        fm_time = parse_aztime(fm.find('azimuthTime').text)
+        dist = abs(fm_time - t_brst)
+        if dist < best_fm_dist:
+            best_fm_dist = dist
+            best_fm = fm
+    if best_fm.find('azimuthFmRatePolynomial') is not None:
+        fka = [float(x) for x in best_fm.find('azimuthFmRatePolynomial').text.split()[:3]]
+    else:
+        fka = [float(best_fm.find('c0').text),
+               float(best_fm.find('c1').text),
+               float(best_fm.find('c2').text)]
+
+    # Find velocity at burst center
+    orbit_time = orbit_df['clock'].values
+    vx = np.interp(t_brst, orbit_time % 86400, orbit_df['vx'].values)
+    vy = np.interp(t_brst, orbit_time % 86400, orbit_df['vy'].values)
+    vz = np.interp(t_brst, orbit_time % 86400, orbit_df['vz'].values)
+    vtot = np.sqrt(vx**2 + vy**2 + vz**2)
+    ks = 2.0 * vtot * radar_freq * kpsi / SOL
+
+    # Compute deramp phase and apply (chunked, memory-efficient)
+    eta = (np.arange(lpb) - lpb / 2.0 + 0.5) * dta
+    jj = np.arange(width)
+    taus = ts0 + jj * dts - tau0
+
+    ka = fka[0] + fka[1] * taus + fka[2] * taus**2
+    kt = ka * ks / (ka - ks)
+    fnct_arr = fnc[0] + fnc[1] * taus + fnc[2] * taus**2
+    etaref = -fnct_arr / ka + fnc[0] / fka[0]
+
+    n_chunks = 8
+    chunk_size = (lpb + n_chunks - 1) // n_chunks
+    slc_deramped = np.empty((lpb, width), dtype=np.complex64)
+
+    for chunk_idx in range(n_chunks):
+        azi_start = chunk_idx * chunk_size
+        azi_end = min((chunk_idx + 1) * chunk_size, lpb)
+        if azi_start >= lpb:
+            break
+        eta_chunk = eta[azi_start:azi_end, np.newaxis]
+        pramp = -np.pi * kt * (eta_chunk - etaref)**2
+        pmod = -2.0 * np.pi * fnct_arr * eta_chunk
+        phase_chunk = pramp + pmod
+        del pramp, pmod
+        deramp = np.exp(1j * phase_chunk)
+        del phase_chunk
+        slc_deramped[azi_start:azi_end] = (data_complex[azi_start:azi_end, :width] * deramp).astype(np.complex64)
+        del deramp
+
+    del data_complex, eta, jj, taus, ka, kt, fnct_arr, etaref
+
+    # Extract valid region
+    slc_valid = slc_deramped[k_start:k_start + n_valid, :width]
+    del slc_deramped
+
+    # Convert to int16 format
+    slc_out = np.zeros((n_valid, width * 2), dtype=np.int16)
+    with np.errstate(invalid='ignore'):
+        slc_out[:, 0::2] = np.clip(slc_valid.real * 2, -32768, 32767).astype(np.int16)
+        slc_out[:, 1::2] = np.clip(slc_valid.imag * 2, -32768, 32767).astype(np.int16)
+    del slc_valid
+
+    reramp_params = {
+        'fka': fka,
+        'fnc': fnc,
+        'ks': ks,
+        'dta': dta,
+        'dts': dts,
+        'ts0': ts0,
+        'tau0': tau0,
+        'lpb': lpb,
+        'k_start': k_start,
+        'n_valid': n_valid,
+    }
+
+    return prm_dict, orbit_df, slc_out, reramp_params
+
+
 def repeat_burst(xml_path: str, tiff_path: str, eof_path: str,
                  rshift_grid: "np.ndarray | None" = None,
                  ashift_grid: "np.ndarray | None" = None,

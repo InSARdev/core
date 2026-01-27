@@ -29,6 +29,7 @@ class S1_gmtsar(S1_slc):
         mode : int, optional
             0 - PRM and orbit only (no SLC)
             1 - PRM, orbit, and SLC data
+            2 - PRM, orbit, deramped SLC, and reramp params
             Defaults to 0.
         rshift_grid : np.ndarray, optional
             Range shift grid for alignment (mode=1 only)
@@ -57,6 +58,10 @@ class S1_gmtsar(S1_slc):
         xml_file = os.path.join(self.datadir, prefix, 'annotation', f'{burst}.xml')
         tiff_file = os.path.join(self.datadir, prefix, 'measurement', f'{burst}.tiff')
         orbit_file = os.path.join(self.datadir, df['orbit'].iloc[0])
+
+        if mode == 2:
+            from .utils_s1 import deramped_burst
+            return deramped_burst(xml_file, tiff_file, orbit_file)
 
         return make_burst(
             xml_file=xml_file,

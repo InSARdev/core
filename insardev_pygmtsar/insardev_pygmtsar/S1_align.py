@@ -156,7 +156,7 @@ class S1_align(S1_dem):
 
     def align_ref(self, burst: str, debug: bool = False, return_slc: bool = True) -> tuple:
         """
-        Process reference burst - extract PRM, orbit, and optionally SLC data.
+        Process reference burst - extract PRM, orbit, and optionally deramped SLC.
 
         All data is returned in-memory, no files are written.
 
@@ -167,40 +167,36 @@ class S1_align(S1_dem):
         debug : bool, optional
             Enable debug mode. Default is False.
         return_slc : bool, optional
-            If True, load and return SLC data. If False, only return PRM.
-            Default is True for backward compatibility.
+            If True, load and return deramped SLC data. If False, only return PRM.
+            Default is True.
 
         Returns
         -------
         tuple
-            (prm, slc_data) where:
-            - prm: PRM object with orbit_df attached and Doppler parameters computed
-            - slc_data: Complex SLC data as numpy array, or None if return_slc=False
-
-        Examples
-        --------
-        >>> prm, slc = stack.align_ref(burst, debug=True)
-        >>> prm, _ = stack.align_ref(burst, debug=True, return_slc=False)
+            (prm, slc_deramped, reramp_params) or (prm, None) if return_slc=False
         """
-        import numpy as np
-
         if return_slc:
-            # Extract PRM, orbit, and SLC data
-            prm, orbit_df, slc_data = self._make_burst(burst, mode=1, debug=debug)
-        else:
-            # Extract PRM and orbit only (no SLC - saves ~130MB memory)
-            prm, orbit_df = self._make_burst(burst, mode=0, debug=debug)
-            slc_data = None
+            from .PRM import PRM
+            prm_dict, orbit_df, slc_data, reramp_params = self._make_burst(burst, mode=2)
+            prm = PRM()
+            prm.set(**prm_dict)
+            prm.orbit_df = orbit_df
+            prm.calc_dop_orb(inplace=True, debug=debug)
+            return prm, slc_data, reramp_params
 
-        # Compute Doppler orbit parameters
+        prm, orbit_df = self._make_burst(burst, mode=0, debug=debug)
         prm.calc_dop_orb(inplace=True, debug=debug)
-
-        return prm, slc_data
+        return prm, None
 
     def align_rep(self, burst_rep: str, burst_ref: str, prm_ref: "PRM",
                   degrees: float = 12.0/3600, debug: bool = False) -> tuple:
         """
         Process and align secondary burst to reference.
+
+        Returns deramped SLC (no alignment shift, no reramp) with alignment
+        offsets stored in the PRM. The alignment and geocoding interpolations
+        are merged into a single remap step during the transform phase,
+        avoiding double interpolation.
 
         All data is returned in-memory, no files are written.
 
@@ -220,14 +216,15 @@ class S1_align(S1_dem):
         Returns
         -------
         tuple
-            (prm, slc_data) where:
+            (prm, slc_data, reramp_params) where:
             - prm: PRM object with orbit_df attached, alignment, and Doppler parameters
-            - slc_data: Aligned complex SLC data as numpy array
+            - slc_data: Deramped SLC data as int16 numpy array (no shift, no reramp)
+            - reramp_params: dict with parameters for analytical reramp phase computation
 
         Examples
         --------
-        >>> prm_ref, slc_ref = stack.align_ref(burst_ref)
-        >>> prm_rep, slc_rep = stack.align_rep(burst_rep, burst_ref, prm_ref, debug=True)
+        >>> prm_ref, slc_ref, _ = stack.align_ref(burst_ref)
+        >>> prm_rep, slc_rep, reramp_params = stack.align_rep(burst_rep, burst_ref, prm_ref)
         """
         import numpy as np
 
@@ -247,9 +244,8 @@ class S1_align(S1_dem):
         nl = int((t2 - t1) * prf * 86400.0 + 0.2)
 
         # Create shifted reference PRM for SAT_llt2rat
-        # Shift the reference PRM based on nl so SAT_llt2rat gives precise estimate
-        prm_ref_shifted = PRM(prm_ref)  # Copy
-        prm_ref_shifted.orbit_df = prm_ref.orbit_df  # Attach orbit
+        prm_ref_shifted = PRM(prm_ref)
+        prm_ref_shifted.orbit_df = prm_ref.orbit_df
         prm_ref_shifted.set(
             prm_ref.sel('clock_start', 'clock_stop', 'SC_clock_start', 'SC_clock_stop')
             + nl / prf / 86400.0
@@ -271,7 +267,7 @@ class S1_align(S1_dem):
         rmax = prm_rep.get('num_rng_bins')
         amax = prm_rep.get('num_lines')
 
-        # Filter to points inside valid radar extent (reduces Delaunay triangulation cost)
+        # Filter to points inside valid radar extent
         valid_mask = (
             (offset_dat[:, 0] > 0) & (offset_dat[:, 0] < rmax) &
             (offset_dat[:, 2] > 0) & (offset_dat[:, 2] < amax)
@@ -282,23 +278,18 @@ class S1_align(S1_dem):
         par_tmp = offset_dat_valid.copy()
         par_tmp[:, 2] += nl
 
-        # Prepare the rshift and ashift look up tables using combined interpolation
-        # (builds triangulation once, interpolates both shifts together - ~2x faster)
-        r_grd, a_grd = self._offset2shift_combined(offset_dat_valid, rmax, amax)
+        # Extract deramped SLC (no shift, no reramp)
+        prm_dict, orbit_df_new, slc_data, reramp_params = self._make_burst(burst_rep, mode=2)
 
-        # Extract aligned SLC with shift grids (pure Python)
-        prm_rep, orbit_df, slc_data = self._make_burst(
-            burst_rep,
-            mode=1,
-            rshift_grid=r_grd.values,
-            ashift_grid=a_grd.values,
-            debug=debug
-        )
+        # Build PRM from dict (same as _make_burst does)
+        prm_rep = PRM()
+        prm_rep.set(**prm_dict)
+        prm_rep.orbit_df = orbit_df_new
 
-        # Apply fitoffset parameters
+        # Apply fitoffset parameters (bilinear offset model stored in PRM)
         prm_rep.set(PRM.fitoffset(3, 3, par_tmp))
 
         # Recompute Doppler with earth_radius
         prm_rep.calc_dop_orb(earth_radius, inplace=True, debug=debug)
 
-        return prm_rep, slc_data
+        return prm_rep, slc_data, reramp_params

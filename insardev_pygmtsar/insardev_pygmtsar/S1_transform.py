@@ -54,8 +54,8 @@ def _compute_transform_inverse_worker(prm_ref_df, prm_ref_orbit_df, dem_path, ge
     })
 
 
-def _offset2shift_standalone(xyz, rmax, amax, method='linear'):
-    """Convert offset coordinates to shift grid - standalone version."""
+def _offset2shift(xyz, rmax, amax, method='linear'):
+    """Convert offset coordinates to shift grid."""
     import numpy as np
     import xarray as xr
     from scipy.interpolate import griddata
@@ -73,7 +73,7 @@ def _process_date_worker(args):
     Must be at module level for multiprocessing spawn to pickle it.
     Each worker processes one date then exits (max_tasks_per_child=1), releasing memory.
 
-    This worker does NOT create S1 instance - uses standalone functions only.
+    This worker does NOT create S1 instance - uses module-level functions only.
     Computes alignment shifts for repeat dates internally (not passed from main).
     """
     (outdir, burst_item, burst_refs, is_reference,
@@ -98,21 +98,23 @@ def _process_date_worker(args):
         prm_ref.set(**{name: row['value']})
     prm_ref.orbit_df = prm_ref_orbit_df
 
-    # Load burst data using standalone make_burst (no S1 needed)
+    # Load burst data
     if is_reference:
-        # Reference: no alignment needed - just get SLC data
-        _, _, slc = make_burst(xml_file, tiff_file, orbit_file, mode=1, debug=debug)
-        # Use prm_ref as prm_rep (same object identity needed in transform_slc)
+        # Reference: deramped SLC for symmetric geocoding (no alignment offsets)
+        from insardev_pygmtsar.utils_s1 import deramped_burst as deramped_burst_func
+        _, _, slc, reramp_params = deramped_burst_func(xml_file, tiff_file, orbit_file)
         prm = prm_ref
         baseline_params = None
     else:
-        # Repeat: compute alignment shifts inside worker
-        # First get PRM without SLC to compute shifts
-        prm_rep_temp, orbit_df_temp = make_burst(xml_file, tiff_file, orbit_file, mode=0, debug=debug)
-        prm_rep_temp.orbit_df = orbit_df_temp
+        # Repeat: compute alignment offsets + load deramped SLC
+        from insardev_pygmtsar.utils_s1 import deramped_burst
         earth_radius = prm_ref.get('earth_radius')
 
-        # Compute time offset within burst (nl=0 for burst processing, same as align_rep)
+        # First get PRM without SLC to compute offsets
+        prm_rep_temp, orbit_df_temp = make_burst(xml_file, tiff_file, orbit_file, mode=0, debug=debug)
+        prm_rep_temp.orbit_df = orbit_df_temp
+
+        # Compute time offset
         t1, prf = prm_rep_temp.get('clock_start', 'PRF')
         t2 = prm_rep_temp.get('clock_start')
         nl = int((t2 - t1) * prf * 86400.0 + 0.2)
@@ -136,7 +138,7 @@ def _process_date_worker(args):
         func = lambda row: [row[0], row[5] - row[0], row[1], row[6] - row[1], 100]
         offset_dat = np.apply_along_axis(func, 1, offset_dat0)
 
-        # Prepare offset parameters for fitoffset (filter valid points)
+        # Filter valid points for fitoffset
         rmax = prm_rep_temp.get('num_rng_bins')
         amax = prm_rep_temp.get('num_lines')
         par_tmp = offset_dat[
@@ -145,21 +147,16 @@ def _process_date_worker(args):
         ].copy()
         par_tmp[:, 2] += nl
 
-        # Compute shift grids
-        r_xyz = offset_dat[:, [0, 2, 1]]
-        a_xyz = offset_dat[:, [0, 2, 3]]
-        rshift_grid = _offset2shift_standalone(r_xyz, rmax, amax).values
-        ashift_grid = _offset2shift_standalone(a_xyz, rmax, amax).values
-
-        # Now load SLC with computed shifts
-        prm, orbit_df, slc = make_burst(xml_file, tiff_file, orbit_file, mode=1,
-                                        rshift_grid=rshift_grid, ashift_grid=ashift_grid, debug=debug)
+        # Load deramped SLC (no shift, no reramp)
+        prm_dict, orbit_df, slc, reramp_params = deramped_burst(
+            xml_file, tiff_file, orbit_file
+        )
+        prm = PRM()
+        prm.set(**prm_dict)
         prm.orbit_df = orbit_df
 
-        # Apply fitoffset parameters (same as align_rep)
+        # Apply fitoffset parameters (bilinear offset model)
         prm.set(PRM.fitoffset(3, 3, par_tmp))
-
-        # Recompute Doppler with earth_radius
         prm.calc_dop_orb(earth_radius, inplace=True, debug=debug)
 
         baseline_result = prm_ref.SAT_baseline(prm)
@@ -175,24 +172,127 @@ def _process_date_worker(args):
             'B_offset_end': baseline_result.get('B_offset_end')
         }
 
-    # Call standalone transform function
-    _transform_slc_standalone(
+    # Transform and save
+    _transform_slc_int16(
         outdir=outdir, transform=transform, topo=topo,
         prm_rep=prm, prm_ref=prm_ref, slc_data=slc,
         burst_name=burst_name, record_dict=record_dict,
         epsg=epsg, baseline_params=baseline_params, sc_height_params=sc_height,
-        debug=debug
+        reramp_params=reramp_params, debug=debug
     )
     return burst_name
 
 
-def _transform_slc_standalone(outdir, transform, topo, prm_rep, prm_ref, slc_data,
-                               burst_name, record_dict, epsg, scale=2.5e-07,
-                               baseline_params=None, sc_height_params=None, debug=False):
-    """Standalone SLC transform function - no S1 instance needed.
+def _compute_reramp_phase(azi_rep, rng_rep, reramp_params):
+    """Compute TOPS reramp phase analytically at arbitrary radar coordinates.
 
-    This is a refactored version of S1_transform.transform_slc_int16 that
-    works without self, using standalone functions for geocode/spatial_ref.
+    Each date's burst has slightly different FM rate and Doppler centroid
+    parameters, so the reramp must use each burst's own parameters to restore
+    the original TOPS ramp. The ramp does NOT cancel between dates.
+
+    Parameters
+    ----------
+    azi_rep : np.ndarray
+        Azimuth pixel coordinates (float32, 2D). Uses 0.5-based pixel centers.
+    rng_rep : np.ndarray
+        Range pixel coordinates (float32, 2D). Uses 0.5-based pixel centers.
+    reramp_params : dict
+        Parameters from deramped_burst(): fka, fnc, ks, dta, dts, ts0, tau0, lpb, k_start.
+
+    Returns
+    -------
+    phase : np.ndarray
+        Reramp phase in radians (float32, same shape as input).
+        Apply as: reramped = deramped * exp(-1j * phase)
+    """
+    import numpy as np
+
+    fka = reramp_params['fka']
+    fnc = reramp_params['fnc']
+    ks = reramp_params['ks']
+    dta = reramp_params['dta']
+    dts = reramp_params['dts']
+    ts0 = reramp_params['ts0']
+    tau0 = reramp_params['tau0']
+    lpb = reramp_params['lpb']
+    k_start = reramp_params['k_start']
+
+    # Convert pixel coordinates to time coordinates
+    # azi_rep/rng_rep use 0.5-based pixel centers (first pixel at 0.5)
+    # Subtract 0.5 to get 0-based integer indices matching deramped_burst convention
+    azi_full = (azi_rep - 0.5) + k_start
+    eta = (azi_full - lpb / 2.0 + 0.5) * dta
+    tau = ts0 + (rng_rep - 0.5) * dts - tau0
+
+    # FM rate polynomial at each range
+    ka = fka[0] + fka[1] * tau + fka[2] * tau**2
+    kt = ka * ks / (ka - ks)
+
+    # Doppler centroid at each range
+    fnct = fnc[0] + fnc[1] * tau + fnc[2] * tau**2
+    del tau
+
+    # Reference azimuth time
+    etaref = -fnct / ka + fnc[0] / fka[0]
+    del ka
+
+    # Reramp phase (same formula as deramp but applied as exp(-1j * phase))
+    phase = (-np.pi * kt * (eta - etaref)**2 - 2.0 * np.pi * fnct * eta).astype(np.float32)
+    del kt, eta, etaref, fnct
+
+    return phase
+
+
+def _compute_merged_transform(transform, prm_rep):
+    """Compute merged transform by adding PRM bilinear offsets to ref transform.
+
+    Parameters
+    ----------
+    transform : xr.Dataset
+        Reference burst transform with azi, rng variables.
+    prm_rep : PRM
+        Repeat burst PRM with fitoffset parameters (rshift, stretch_r, etc.).
+
+    Returns
+    -------
+    azi_rep, rng_rep : np.ndarray
+        Repeat burst radar coordinates for each output pixel (float32, 2D).
+    """
+    import numpy as np
+
+    azi_ref = transform.azi.values
+    rng_ref = transform.rng.values
+
+    # Bilinear offset model from fitoffset:
+    # dr(a, r) = (rshift + sub_int_r) + stretch_r * r + a_stretch_r * a
+    # da(a, r) = (ashift + sub_int_a) + stretch_a * r + a_stretch_a * a
+    rshift = prm_rep.get('rshift') + prm_rep.get('sub_int_r')
+    ashift = prm_rep.get('ashift') + prm_rep.get('sub_int_a')
+    stretch_r = prm_rep.get('stretch_r')
+    a_stretch_r = prm_rep.get('a_stretch_r')
+    stretch_a = prm_rep.get('stretch_a')
+    a_stretch_a = prm_rep.get('a_stretch_a')
+
+    rng_rep = (rng_ref + rshift + stretch_r * rng_ref + a_stretch_r * azi_ref).astype(np.float32)
+    azi_rep = (azi_ref + ashift + stretch_a * rng_ref + a_stretch_a * azi_ref).astype(np.float32)
+
+    return azi_rep, rng_rep
+
+
+def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
+                               burst_name, record_dict, epsg, scale=2.5e-07,
+                               baseline_params=None, sc_height_params=None,
+                               reramp_params=None, debug=False):
+    """Transform SLC to geocoded int16 zarr.
+
+    Module-level function usable from both class methods and joblib workers.
+
+    All SLCs (ref and rep) are deramped before geocoding. For rep bursts,
+    the alignment offsets are merged into the geocoding transform (single
+    interpolation). After geocoding, each date's TOPS reramp phase is restored
+    analytically (using that date's own burst parameters) along with topo phase.
+    The reramp is required because FM rate and Doppler centroid parameters differ
+    between acquisitions — the ramp does NOT cancel in interferograms.
     """
     import os
     import time
@@ -230,42 +330,101 @@ def _transform_slc_standalone(outdir, transform, topo, prm_rep, prm_ref, slc_dat
     del slc_complex
     _timings['slc_prep'] = time.perf_counter() - _t0
 
-    # Compute topo phase using standalone function (imported from S1_transform class but doesn't use self)
-    _t0 = time.perf_counter()
-    phase = _flat_earth_topo_phase_standalone(topo, prm_rep, prm_ref,
-                                               baseline_params=baseline_params,
-                                               sc_height_params=sc_height_params)
-    _timings['flat_earth_topo_phase'] = time.perf_counter() - _t0
+    if reramp_params is not None and epsg != 0:
+        # ====================================================================
+        # Merged alignment + geocoding path (projected output)
+        # Single interpolation: deramped SLC → projected grid
+        # Then analytical reramp + topo phase correction
+        # ====================================================================
 
-    # Apply phase correction and optionally geocode
-    # Use Euler's formula to avoid complex128: exp(-1j*phase) = cos(phase) - 1j*sin(phase)
-    # Note: phase and slc_xa may have different shapes, so align via xarray first
-    # reindex_like is 70x faster than interp_like for this use case
-    _t0 = time.perf_counter()
-    phase_aligned = phase.reindex_like(slc_xa, method='nearest').values
-    del phase
-    cos_phase = np.cos(phase_aligned)
-    sin_phase = np.sin(phase_aligned)
-    del phase_aligned
-    slc_vals = slc_xa.values
-    # (re + 1j*im) * (cos - 1j*sin) = (re*cos + im*sin) + 1j*(im*cos - re*sin)
-    corrected_real = slc_vals.real * cos_phase + slc_vals.imag * sin_phase
-    corrected_imag = slc_vals.imag * cos_phase - slc_vals.real * sin_phase
-    del cos_phase, sin_phase
-    slc_corrected = xr.DataArray(
-        (corrected_real + 1j * corrected_imag).astype(np.complex64),
-        coords=slc_xa.coords, dims=slc_xa.dims
-    )
-    del corrected_real, corrected_imag, slc_vals, slc_xa
+        # Step 1: Compute transform and geocode SLC (single remap)
+        _t0 = time.perf_counter()
+        try:
+            prm_rep.get('rshift')
+            # Rep burst: merged transform with alignment offsets
+            azi_map, rng_map = _compute_merged_transform(transform, prm_rep)
+        except:
+            # Ref burst: no alignment offsets, use ref transform directly
+            azi_map = transform.azi.values.astype(np.float32)
+            rng_map = transform.rng.values.astype(np.float32)
+        complex_proj = _geocode_with_maps(slc_xa, azi_map, rng_map,
+                                          transform.y.values, transform.x.values)
+        complex_proj = complex_proj.transpose('y', 'x')
+        del slc_xa
+        _timings['merged_geocode'] = time.perf_counter() - _t0
 
-    if epsg == 0:
-        complex_proj = slc_corrected.rename({'a': 'y', 'r': 'x'})
+        # Step 2: Compute reramp phase at geocoded radar coordinates
+        _t0 = time.perf_counter()
+        phase_reramp = _compute_reramp_phase(azi_map, rng_map, reramp_params)
+        del azi_map, rng_map
+
+        # Step 3: Compute topo phase and geocode to projected coordinates
+        topo_phase = _flat_earth_topo_phase(topo, prm_rep, prm_ref,
+                                            baseline_params=baseline_params,
+                                            sc_height_params=sc_height_params)
+        topo_phase_xa = xr.DataArray(topo_phase.values, coords=topo_phase.coords,
+                                     dims=topo_phase.dims).rename('data')
+        topo_phase_proj = _geocode(transform, topo_phase_xa).transpose('y', 'x').values
+        del topo_phase, topo_phase_xa
+
+        # Combine reramp + topo into total phase correction
+        phase_reramp += topo_phase_proj
+        del topo_phase_proj
+        _timings['phase_compute'] = time.perf_counter() - _t0
+
+        # Step 4: Apply combined phase correction exp(-1j * phase)
+        _t0 = time.perf_counter()
+        cos_phase = np.cos(phase_reramp)
+        sin_phase = np.sin(phase_reramp)
+        del phase_reramp
+        proj_re = complex_proj.values.real.copy()
+        proj_im = complex_proj.values.imag
+        corrected_re = (proj_re * cos_phase + proj_im * sin_phase)
+        corrected_im = (proj_im * cos_phase - proj_re * sin_phase)
+        del cos_phase, sin_phase, proj_re, proj_im
+        complex_proj = xr.DataArray(
+            (corrected_re + 1j * corrected_im).astype(np.complex64),
+            coords=complex_proj.coords, dims=complex_proj.dims
+        )
+        del corrected_re, corrected_im
         _timings['phase_apply'] = time.perf_counter() - _t0
     else:
-        complex_proj = _geocode_standalone(transform, slc_corrected)
-        complex_proj = complex_proj.transpose('y', 'x')
-        _timings['geocode'] = time.perf_counter() - _t0
-    del slc_corrected
+        # ====================================================================
+        # Original path: ref bursts, or rep bursts with epsg=0 (radar coords)
+        # ====================================================================
+
+        # Compute topo phase
+        _t0 = time.perf_counter()
+        phase = _flat_earth_topo_phase(topo, prm_rep, prm_ref,
+                                                   baseline_params=baseline_params,
+                                                   sc_height_params=sc_height_params)
+        _timings['flat_earth_topo_phase'] = time.perf_counter() - _t0
+
+        # Apply phase correction and optionally geocode
+        _t0 = time.perf_counter()
+        phase_aligned = phase.reindex_like(slc_xa, method='nearest').values
+        del phase
+        cos_phase = np.cos(phase_aligned)
+        sin_phase = np.sin(phase_aligned)
+        del phase_aligned
+        slc_vals = slc_xa.values
+        corrected_real = slc_vals.real * cos_phase + slc_vals.imag * sin_phase
+        corrected_imag = slc_vals.imag * cos_phase - slc_vals.real * sin_phase
+        del cos_phase, sin_phase
+        slc_corrected = xr.DataArray(
+            (corrected_real + 1j * corrected_imag).astype(np.complex64),
+            coords=slc_xa.coords, dims=slc_xa.dims
+        )
+        del corrected_real, corrected_imag, slc_vals, slc_xa
+
+        if epsg == 0:
+            complex_proj = slc_corrected.rename({'a': 'y', 'r': 'x'})
+            _timings['phase_apply'] = time.perf_counter() - _t0
+        else:
+            complex_proj = _geocode(transform, slc_corrected)
+            complex_proj = complex_proj.transpose('y', 'x')
+            _timings['geocode'] = time.perf_counter() - _t0
+        del slc_corrected
 
     # Convert to int16
     _t0 = time.perf_counter()
@@ -350,8 +509,91 @@ def _transform_slc_standalone(outdir, transform, topo, prm_rep, prm_ref, slc_dat
     del data_proj
 
 
-def _geocode_standalone(transform, data):
-    """Standalone geocode function - copied from S1_geocode.geocode."""
+def _geocode_with_maps(data, azi_map, rng_map, out_y, out_x):
+    """Geocode using pre-computed azimuth/range coordinate maps.
+
+    Like _geocode but takes explicit azi/rng maps instead of a
+    transform dataset. Used for merged alignment+geocoding where the maps
+    include alignment offsets.
+
+    Parameters
+    ----------
+    data : xr.DataArray
+        Input data in radar coordinates with dims ['a', 'r'].
+    azi_map : np.ndarray
+        Azimuth pixel coordinates for each output pixel (float32, 2D).
+    rng_map : np.ndarray
+        Range pixel coordinates for each output pixel (float32, 2D).
+    out_y, out_x : np.ndarray
+        Output grid coordinates (1D).
+
+    Returns
+    -------
+    xr.DataArray
+        Geocoded data with dims ['y', 'x'].
+    """
+    import cv2
+    import numpy as np
+    import xarray as xr
+
+    data_vals = data.values
+    coord_a = data.a.values
+    coord_r = data.r.values
+
+    inv_map_a = ((azi_map - coord_a[0]) / (coord_a[1] - coord_a[0])).astype(np.float32)
+    inv_map_r = ((rng_map - coord_r[0]) / (coord_r[1] - coord_r[0])).astype(np.float32)
+
+    n_y, n_x = inv_map_a.shape
+    OPENCV_MAX = 32766
+
+    if n_x <= OPENCV_MAX:
+        if np.iscomplexobj(data_vals):
+            grid_proj_re = cv2.remap(data_vals.real.astype(np.float32), inv_map_r, inv_map_a,
+                                     interpolation=cv2.INTER_LANCZOS4,
+                                     borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
+            grid_proj_im = cv2.remap(data_vals.imag.astype(np.float32), inv_map_r, inv_map_a,
+                                     interpolation=cv2.INTER_LANCZOS4,
+                                     borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
+            grid_proj = (grid_proj_re + 1j * grid_proj_im).astype(data.dtype)
+        else:
+            grid_proj = cv2.remap(data_vals.astype(np.float32), inv_map_r, inv_map_a,
+                                  interpolation=cv2.INTER_LANCZOS4,
+                                  borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
+    else:
+        n_chunks = (n_x + OPENCV_MAX - 1) // OPENCV_MAX
+        x_indices = np.arange(n_x)
+        chunk_indices = np.array_split(x_indices, n_chunks)
+
+        if np.iscomplexobj(data_vals):
+            grid_proj = np.empty((n_y, n_x), dtype=data.dtype)
+            data_re = data_vals.real.astype(np.float32)
+            data_im = data_vals.imag.astype(np.float32)
+            for idx in chunk_indices:
+                x_slice = slice(idx[0], idx[-1] + 1)
+                re_chunk = cv2.remap(data_re, inv_map_r[:, x_slice], inv_map_a[:, x_slice],
+                                     interpolation=cv2.INTER_LANCZOS4,
+                                     borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
+                im_chunk = cv2.remap(data_im, inv_map_r[:, x_slice], inv_map_a[:, x_slice],
+                                     interpolation=cv2.INTER_LANCZOS4,
+                                     borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
+                grid_proj[:, x_slice] = (re_chunk + 1j * im_chunk).astype(data.dtype)
+            del data_re, data_im
+        else:
+            grid_proj = np.empty((n_y, n_x), dtype=np.float32)
+            data_f32 = data_vals.astype(np.float32)
+            for idx in chunk_indices:
+                x_slice = slice(idx[0], idx[-1] + 1)
+                grid_proj[:, x_slice] = cv2.remap(data_f32, inv_map_r[:, x_slice], inv_map_a[:, x_slice],
+                                                  interpolation=cv2.INTER_LANCZOS4,
+                                                  borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
+            del data_f32
+
+    coords = {'y': out_y, 'x': out_x}
+    return xr.DataArray(grid_proj, coords=coords, dims=['y', 'x']).rename(data.name)
+
+
+def _geocode(transform, data):
+    """Geocode data from radar to geographic coordinates using transform."""
     import cv2
     import numpy as np
     import xarray as xr
@@ -419,8 +661,8 @@ def _geocode_standalone(transform, data):
     return xr.DataArray(grid_proj, coords=coords, dims=['y', 'x']).rename(data.name)
 
 
-def _flat_earth_topo_phase_standalone(topo, prm_rep, prm_ref, baseline_params=None, sc_height_params=None):
-    """Standalone flat earth topo phase - copied from S1_transform.flat_earth_topo_phase."""
+def _flat_earth_topo_phase(topo, prm_rep, prm_ref, baseline_params=None, sc_height_params=None):
+    """Compute flat earth and topographic phase correction."""
     import numpy as np
     import xarray as xr
     from scipy import constants
@@ -747,12 +989,13 @@ class S1_transform(S1_topo):
                 prm_ref = prm_cache[burst_ref_name]
 
                 if is_reference:
-                    _, slc = self.align_ref(burst_name, debug=debug, return_slc=True)
-                    prm = prm_ref
+                    # Deramped SLC for symmetric geocoding (same as rep path)
+                    _, slc, reramp_params = self.align_ref(burst_name, debug=debug)
+                    prm = prm_ref  # use cached PRM (ensures is_reference identity check works)
                     baseline_params = None
                 else:
-                    prm, slc = self.align_rep(burst_name, burst_ref_name, prm_ref,
-                                              degrees=alignment_spacing, debug=debug)
+                    prm, slc, reramp_params = self.align_rep(burst_name, burst_ref_name, prm_ref,
+                                                              degrees=alignment_spacing, debug=debug)
                     baseline_result = prm_ref.SAT_baseline(prm)
                     baseline_params = {
                         'baseline_start': baseline_result.get('baseline_start'),
@@ -768,7 +1011,8 @@ class S1_transform(S1_topo):
 
                 self.transform_slc_int16(outdir, transform, topo, prm, prm_ref, slc, epsg=epsg,
                                         baseline_params=baseline_params,
-                                        sc_height_params=sc_height_cache[burst_ref_name])
+                                        sc_height_params=sc_height_cache[burst_ref_name],
+                                        reramp_params=reramp_params)
                 del slc
 
             # Cleanup and consolidate
@@ -960,213 +1204,41 @@ class S1_transform(S1_topo):
                             epsg: int,
                             scale: float=2.5e-07,
                             baseline_params: dict=None,
-                            sc_height_params: dict=None
+                            sc_height_params: dict=None,
+                            reramp_params: dict=None
                             ):
         """
         Perform geocoding from radar to geographic coordinates.
-
-        Parameters
-        ----------
-        outdir : str
-            Output directory for zarr data.
-        transform : xr.Dataset
-            Transform dataset.
-        topo : xr.DataArray
-            Topographic phase.
-        prm_rep : PRM
-            Repeat burst PRM object.
-        prm_ref : PRM
-            Reference burst PRM object.
-        slc_data : np.ndarray
-            SLC data array.
-        epsg : int
-            EPSG code.
-        scale : float, optional
-            The scale to use. Default is 2.5e-07.
+        Delegates to the module-level _transform_slc_int16 function.
         """
+        import os
         import pandas as pd
         import numpy as np
-        import xarray as xr
-        import os
-        import time
 
-        _t0 = time.perf_counter()
-        _timings = {}
-
-        # get burst name from PRM
-        # input_file contains the full path, extract just the burst name
+        # Extract burst name and record dict from self
         if 'input_file' in prm_rep.df.index:
-            burst_rep = os.path.splitext(os.path.basename(prm_rep.get('input_file')))[0]
+            burst_name = os.path.splitext(os.path.basename(prm_rep.get('input_file')))[0]
         else:
-            burst_rep = 'burst'
+            burst_name = 'burst'
 
-        # get record
-        df = self.get_record(burst_rep)
-
-        # Convert SLC data to xarray
-        # SLC is stored as interleaved int16 real/imag
-        num_lines = prm_rep.get('num_lines')
-        num_rng_bins = prm_rep.get('num_rng_bins')
-
-        if slc_data.dtype == np.int16:
-            # Interleaved format: reshape and convert
-            slc_reshaped = slc_data.reshape(num_lines, -1)
-            re = slc_reshaped[:, 0::2].astype(np.float32)
-            im = slc_reshaped[:, 1::2].astype(np.float32)
-            del slc_reshaped
-            slc_complex = scale * (re + 1j * im)
-            del re, im
-        else:
-            # Already complex
-            slc_complex = scale * slc_data.astype(np.complex64)
-
-        # Create xarray DataArray with numpy operations for masking (faster than xarray .where)
-        coords = {'a': np.arange(slc_complex.shape[0]) + 0.5, 'r': np.arange(slc_complex.shape[1]) + 0.5}
-
-        # Fast masking using numpy (avoid slow xarray .where chains)
-        nonzero_mask = slc_complex != 0
-        col_valid = nonzero_mask.sum(axis=0) > 0.8 * slc_complex.shape[0]
-        row_valid = nonzero_mask.sum(axis=1) > 0.8 * slc_complex.shape[1]
-        slc_complex = np.where(col_valid[np.newaxis, :] & row_valid[:, np.newaxis], slc_complex, np.nan + 0j)
-
-        slc_xa = xr.DataArray(slc_complex, coords=coords, dims=['a', 'r']).rename('data')
-        del slc_complex
-        _timings['slc_prep'] = time.perf_counter() - _t0
-
-        # compute the topo phase
-        _t0 = time.perf_counter()
-        phase = self.flat_earth_topo_phase(topo, prm_rep, prm_ref,
-                                            baseline_params=baseline_params,
-                                            sc_height_params=sc_height_params)
-        _timings['flat_earth_topo_phase'] = time.perf_counter() - _t0
-
-        # Apply phase correction and optionally geocode
-        # Use Euler's formula to avoid complex128: exp(-1j*phase) = cos(phase) - 1j*sin(phase)
-        # Note: phase and slc_xa may have different shapes, so align via xarray first
-        # reindex_like is 70x faster than interp_like for this use case
-        _t0 = time.perf_counter()
-        phase_aligned = phase.reindex_like(slc_xa, method='nearest').values
-        del phase
-        cos_phase = np.cos(phase_aligned)
-        sin_phase = np.sin(phase_aligned)
-        del phase_aligned
-        slc_vals = slc_xa.values
-        # (re + 1j*im) * (cos - 1j*sin) = (re*cos + im*sin) + 1j*(im*cos - re*sin)
-        corrected_real = slc_vals.real * cos_phase + slc_vals.imag * sin_phase
-        corrected_imag = slc_vals.imag * cos_phase - slc_vals.real * sin_phase
-        del cos_phase, sin_phase
-        slc_corrected = xr.DataArray(
-            (corrected_real + 1j * corrected_imag).astype(np.complex64),
-            coords=slc_xa.coords, dims=slc_xa.dims
-        )
-        del corrected_real, corrected_imag, slc_vals, slc_xa
-
-        if epsg == 0:
-            # Keep radar coordinates (no geocoding)
-            complex_proj = slc_corrected.rename({'a': 'y', 'r': 'x'})
-            _timings['phase_apply'] = time.perf_counter() - _t0
-        else:
-            # Geocode to geographic coordinates
-            complex_proj = self.geocode(transform, slc_corrected)
-            complex_proj = complex_proj.transpose('y', 'x')
-            _timings['geocode'] = time.perf_counter() - _t0
-        del slc_corrected
-
-        # Convert to int16 using numpy (faster than xarray operations)
-        _t0 = time.perf_counter()
-        fill_value = np.iinfo(np.int16).max
-        re_vals = complex_proj.values.real
-        im_vals = complex_proj.values.imag
-
-        with np.errstate(invalid='ignore'):
-            re_int16 = np.round(re_vals / scale).astype(np.int16)
-            im_int16 = np.round(im_vals / scale).astype(np.int16)
-
-        # Apply fill value for NaN
-        nan_mask = ~np.isfinite(re_vals)
-        del re_vals, im_vals
-        re_int16[nan_mask] = fill_value
-        im_int16[nan_mask] = fill_value
-        del nan_mask
-
-        # Get coords before deleting complex_proj (radar coordinates: y=azimuth, x=range)
-        y_coords = complex_proj.y.values
-        x_coords = complex_proj.x.values
-        del complex_proj
-
-        data_proj = xr.Dataset({
-            're': xr.DataArray(re_int16, coords={'y': y_coords, 'x': x_coords}, dims=['y', 'x']),
-            'im': xr.DataArray(im_int16, coords={'y': y_coords, 'x': x_coords}, dims=['y', 'x'])
-        })
-        del re_int16, im_int16, y_coords, x_coords
-        _timings['int16_convert'] = time.perf_counter() - _t0
-
-        # add PRM attributes
-        for name, value in prm_rep.df.itertuples():
-            if name not in ['input_file', 'SLC_file', 'led_file']:
-                data_proj.attrs[name] = value
-
-        # add TOPS-specific parameters for phase ramp computation
-        for name, value in prm_rep.read_tops_params().items():
-            data_proj.attrs[name] = value
-
-        # add calculated attributes - baseline from in-memory PRMs
-        # For reference burst (prm_rep is prm_ref), baseline is 0
-        if prm_rep is prm_ref:
-            BPR = 0.0
-        else:
-            baseline = prm_ref.SAT_baseline(prm_rep)
-            BPR = baseline.get('B_perpendicular')
-        # prevent confusing -0.0
-        data_proj.attrs['BPR'] = BPR + 0
-
-        # add record attributes
+        df = self.get_record(burst_name)
+        record_dict = {}
         for _, row in df.reset_index().iterrows():
-            # reverse the items order within each row
-            for name, value in ((n, v) for n, v in list(row.items())[::-1] if n not in ['orbit', 'path']):
+            for name, value in row.items():
                 if isinstance(value, (pd.Timestamp, np.datetime64)):
                     value = pd.Timestamp(value).strftime('%Y-%m-%d %H:%M:%S')
-                if name == 'geometry':
+                elif hasattr(value, 'wkt'):
                     value = value.wkt
-                data_proj.attrs[name] = value
+                record_dict[name] = value
 
-        # add storage specific attributes to variables only
-        for varname in ['re', 'im']:
-            data_proj[varname].attrs['scale_factor'] = scale
-            data_proj[varname].attrs['add_offset'] = 0
-            data_proj[varname].attrs['_FillValue'] = np.iinfo(np.int16).max
-
-        if epsg == 0:
-            # Keep radar coordinates (y=azimuth, x=range) - use engineering CRS
-            radar_crs_wkt = '''ENGCRS["Radar Coordinates",EDATUM["Radar datum"],CS[Cartesian,2],AXIS["azimuth",south,ORDER[1],LENGTHUNIT["pixel",1]],AXIS["range",east,ORDER[2],LENGTHUNIT["pixel",1]]]'''
-            data_proj.attrs['spatial_ref'] = radar_crs_wkt
-        else:
-            # Add georeference attributes for geographic coordinates
-            data_proj = self.spatial_ref(data_proj, epsg)
-            data_proj.attrs['spatial_ref'] = data_proj.spatial_ref.attrs['spatial_ref']
-            data_proj = data_proj.drop_vars('spatial_ref')
-            # Use transform coordinates (don't duplicate y,x in each burst)
-            data_proj = data_proj.drop_vars(['x', 'y'])
-        # use a single chunk per burst for efficient storage
-        _t0 = time.perf_counter()
-        shape = data_proj.re.shape
-        encoding = {var: {'chunks': shape} for var in ['re', 'im']}
-        data_proj.to_zarr(
-            store=os.path.join(outdir, burst_rep),
-            mode='w',
-            zarr_format=3,
-            consolidated=True,
-            encoding=encoding
+        _transform_slc_int16(
+            outdir=outdir, transform=transform, topo=topo,
+            prm_rep=prm_rep, prm_ref=prm_ref, slc_data=slc_data,
+            burst_name=burst_name, record_dict=record_dict,
+            epsg=epsg, scale=scale,
+            baseline_params=baseline_params, sc_height_params=sc_height_params,
+            reramp_params=reramp_params, debug=bool(os.environ.get('INSAR_DEBUG'))
         )
-        _timings['to_zarr'] = time.perf_counter() - _t0
-
-        # Print timing breakdown in debug mode
-        if os.environ.get('INSAR_DEBUG'):
-            total = sum(_timings.values())
-            print(f'PROFILE transform_slc_int16 {burst_rep[-20:]}: ' +
-                  ' | '.join(f'{k}={v:.2f}s' for k, v in sorted(_timings.items(), key=lambda x: -x[1])) +
-                  f' | total={total:.2f}s')
-        del data_proj
 
     def flat_earth_topo_phase(self, topo: xr.DataArray | None, prm_rep: "PRM", prm_ref: "PRM",
                                baseline_params: dict = None, sc_height_params: dict = None) -> xr.DataArray:
