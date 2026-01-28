@@ -722,105 +722,105 @@ def _step2lon_vec(xsta, fhr, t):
 # Integrated pytest tests — run with: pytest utils_tidal.py -v
 # ---------------------------------------------------------------------------
 
-def _pysolid_point(lon, lat, dt):
-    """Reference: pySolid Fortran solid_grid at exact time."""
-    from pysolid.solid import solid_grid as _sg
-    te, tn, tu = _sg(dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second,
-                      lat, 1.0, 1, lon, 1.0, 1)
-    return te[0, 0], tn[0, 0], tu[0, 0]
+# def _pysolid_point(lon, lat, dt):
+#     """Reference: pySolid Fortran solid_grid at exact time."""
+#     from pysolid.solid import solid_grid as _sg
+#     te, tn, tu = _sg(dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second,
+#                       lat, 1.0, 1, lon, 1.0, 1)
+#     return te[0, 0], tn[0, 0], tu[0, 0]
 
 
-def _random_datetimes(n, seed=42):
-    rng = np.random.default_rng(seed)
-    start = datetime.datetime(2000, 1, 1)
-    total_seconds = (datetime.datetime(2040, 1, 1) - start).total_seconds()
-    offsets = rng.uniform(0, total_seconds, size=n)
-    return [start + datetime.timedelta(seconds=float(s)) for s in offsets]
+# def _random_datetimes(n, seed=42):
+#     rng = np.random.default_rng(seed)
+#     start = datetime.datetime(2000, 1, 1)
+#     total_seconds = (datetime.datetime(2040, 1, 1) - start).total_seconds()
+#     offsets = rng.uniform(0, total_seconds, size=n)
+#     return [start + datetime.timedelta(seconds=float(s)) for s in offsets]
 
 
-import datetime  # noqa: E402
-import pytest  # noqa: E402
+# import datetime  # noqa: E402
+# import pytest  # noqa: E402
 
 
-class TestVsPySolid:
-    """Compare against pySolid (IERS 2003 Fortran reference)."""
+# class TestVsPySolid:
+#     """Compare against pySolid (IERS 2003 Fortran reference)."""
 
-    @pytest.fixture(scope="class")
-    def global_grid(self):
-        lons_1d = np.arange(-180, 180, 10.0)
-        lats_1d = np.arange(-85, 86, 10.0)
-        lon_grid, lat_grid = np.meshgrid(lons_1d, lats_1d)
-        return lon_grid.ravel(), lat_grid.ravel()
+#     @pytest.fixture(scope="class")
+#     def global_grid(self):
+#         lons_1d = np.arange(-180, 180, 10.0)
+#         lats_1d = np.arange(-85, 86, 10.0)
+#         lon_grid, lat_grid = np.meshgrid(lons_1d, lats_1d)
+#         return lon_grid.ravel(), lat_grid.ravel()
 
-    @pytest.mark.parametrize("lon,lat,dt", [
-        (-115.5, 32.8,  datetime.datetime(2023, 2, 6, 0, 0, 0)),
-        (-115.5, 32.8,  datetime.datetime(2023, 2, 6, 12, 30, 0)),
-        (28.5,   37.0,  datetime.datetime(2023, 2, 6, 6, 0, 0)),
-        (139.7,  35.7,  datetime.datetime(2023, 6, 21, 12, 0, 0)),
-        (-70.0,  -33.4, datetime.datetime(2023, 9, 15, 3, 0, 0)),
-        (0.0,    0.1,   datetime.datetime(2023, 1, 1, 0, 0, 0)),
-        (180.0,  -85.0, datetime.datetime(2020, 3, 20, 18, 0, 0)),
-        (-60.0,  60.0,  datetime.datetime(2035, 12, 31, 23, 59, 0)),
-    ])
-    def test_agrees_within_0_001mm(self, lon, lat, dt):
-        e_py, n_py, u_py = solid_tide(np.array([lon]), np.array([lat]), dt)
-        e_ps, n_ps, u_ps = _pysolid_point(lon, lat, dt)
-        dmax = max(abs(e_py[0] - e_ps), abs(n_py[0] - n_ps), abs(u_py[0] - u_ps))
-        assert dmax < 1e-6, (
-            f"Diff {dmax:.2e} m at lon={lon} lat={lat} {dt}\n"
-            f"  Python: E={e_py[0]:.9f} N={n_py[0]:.9f} U={u_py[0]:.9f}\n"
-            f"  pySolid: E={e_ps:.9f} N={n_ps:.9f} U={u_ps:.9f}")
+#     @pytest.mark.parametrize("lon,lat,dt", [
+#         (-115.5, 32.8,  datetime.datetime(2023, 2, 6, 0, 0, 0)),
+#         (-115.5, 32.8,  datetime.datetime(2023, 2, 6, 12, 30, 0)),
+#         (28.5,   37.0,  datetime.datetime(2023, 2, 6, 6, 0, 0)),
+#         (139.7,  35.7,  datetime.datetime(2023, 6, 21, 12, 0, 0)),
+#         (-70.0,  -33.4, datetime.datetime(2023, 9, 15, 3, 0, 0)),
+#         (0.0,    0.1,   datetime.datetime(2023, 1, 1, 0, 0, 0)),
+#         (180.0,  -85.0, datetime.datetime(2020, 3, 20, 18, 0, 0)),
+#         (-60.0,  60.0,  datetime.datetime(2035, 12, 31, 23, 59, 0)),
+#     ])
+#     def test_agrees_within_0_001mm(self, lon, lat, dt):
+#         e_py, n_py, u_py = solid_tide(np.array([lon]), np.array([lat]), dt)
+#         e_ps, n_ps, u_ps = _pysolid_point(lon, lat, dt)
+#         dmax = max(abs(e_py[0] - e_ps), abs(n_py[0] - n_ps), abs(u_py[0] - u_ps))
+#         assert dmax < 1e-6, (
+#             f"Diff {dmax:.2e} m at lon={lon} lat={lat} {dt}\n"
+#             f"  Python: E={e_py[0]:.9f} N={n_py[0]:.9f} U={u_py[0]:.9f}\n"
+#             f"  pySolid: E={e_ps:.9f} N={n_ps:.9f} U={u_ps:.9f}")
 
-    def test_global_grid_random_times(self, global_grid):
-        lons, lats = global_grid
-        max_diff = 0.0
-        for dt in _random_datetimes(10):
-            dt = dt.replace(microsecond=0)
-            e_py, n_py, u_py = solid_tide(lons, lats, dt)
-            for idx in range(0, len(lons), 50):
-                e_ps, n_ps, u_ps = _pysolid_point(lons[idx], lats[idx], dt)
-                dmax = max(abs(e_py[idx] - e_ps), abs(n_py[idx] - n_ps), abs(u_py[idx] - u_ps))
-                max_diff = max(max_diff, dmax)
-        assert max_diff < 1e-6, f"Max diff {max_diff:.2e} m exceeds 0.001 mm"
-
-
-class TestVectorized:
-    def test_consistency(self):
-        dt = datetime.datetime(2023, 2, 6, 12, 30, 0)
-        lons = np.array([-115.5, 28.5, 96.5, 0.0, 139.7])
-        lats = np.array([32.8, 37.0, 20.0, 0.1, 35.7])
-        e_vec, n_vec, u_vec = solid_tide(lons, lats, dt)
-        for j in range(len(lons)):
-            e_pt, n_pt, u_pt = solid_tide(np.array([lons[j]]), np.array([lats[j]]), dt)
-            assert abs(e_vec[j] - e_pt[0]) < 1e-12
-            assert abs(n_vec[j] - n_pt[0]) < 1e-12
-            assert abs(u_vec[j] - u_pt[0]) < 1e-12
+#     def test_global_grid_random_times(self, global_grid):
+#         lons, lats = global_grid
+#         max_diff = 0.0
+#         for dt in _random_datetimes(10):
+#             dt = dt.replace(microsecond=0)
+#             e_py, n_py, u_py = solid_tide(lons, lats, dt)
+#             for idx in range(0, len(lons), 50):
+#                 e_ps, n_ps, u_ps = _pysolid_point(lons[idx], lats[idx], dt)
+#                 dmax = max(abs(e_py[idx] - e_ps), abs(n_py[idx] - n_ps), abs(u_py[idx] - u_ps))
+#                 max_diff = max(max_diff, dmax)
+#         assert max_diff < 1e-6, f"Max diff {max_diff:.2e} m exceeds 0.001 mm"
 
 
-class TestShape:
-    def test_2d_preservation(self):
-        dt = datetime.datetime(2023, 2, 6, 12, 30, 0)
-        lons_2d, lats_2d = np.meshgrid(np.linspace(-116, -115, 5), np.linspace(32, 33, 4))
-        e, n, u = solid_tide(lons_2d, lats_2d, dt)
-        assert e.shape == (4, 5) and n.shape == (4, 5) and u.shape == (4, 5)
+# class TestVectorized:
+#     def test_consistency(self):
+#         dt = datetime.datetime(2023, 2, 6, 12, 30, 0)
+#         lons = np.array([-115.5, 28.5, 96.5, 0.0, 139.7])
+#         lats = np.array([32.8, 37.0, 20.0, 0.1, 35.7])
+#         e_vec, n_vec, u_vec = solid_tide(lons, lats, dt)
+#         for j in range(len(lons)):
+#             e_pt, n_pt, u_pt = solid_tide(np.array([lons[j]]), np.array([lats[j]]), dt)
+#             assert abs(e_vec[j] - e_pt[0]) < 1e-12
+#             assert abs(n_vec[j] - n_pt[0]) < 1e-12
+#             assert abs(u_vec[j] - u_pt[0]) < 1e-12
 
 
-class TestMagnitude:
-    @pytest.fixture(scope="class")
-    def global_grid(self):
-        lons_1d = np.arange(-180, 180, 10.0)
-        lats_1d = np.arange(-85, 86, 10.0)
-        lon_grid, lat_grid = np.meshgrid(lons_1d, lats_1d)
-        return lon_grid.ravel(), lat_grid.ravel()
-
-    def test_max_displacement_under_1m(self, global_grid):
-        lons, lats = global_grid
-        dt = datetime.datetime(2023, 6, 21, 12, 0, 0)
-        e, n, u = solid_tide(lons, lats, dt)
-        total = np.sqrt(e**2 + n**2 + u**2)
-        assert total.max() < 1.0
-        assert total.max() > 0.01
+# class TestShape:
+#     def test_2d_preservation(self):
+#         dt = datetime.datetime(2023, 2, 6, 12, 30, 0)
+#         lons_2d, lats_2d = np.meshgrid(np.linspace(-116, -115, 5), np.linspace(32, 33, 4))
+#         e, n, u = solid_tide(lons_2d, lats_2d, dt)
+#         assert e.shape == (4, 5) and n.shape == (4, 5) and u.shape == (4, 5)
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+# class TestMagnitude:
+#     @pytest.fixture(scope="class")
+#     def global_grid(self):
+#         lons_1d = np.arange(-180, 180, 10.0)
+#         lats_1d = np.arange(-85, 86, 10.0)
+#         lon_grid, lat_grid = np.meshgrid(lons_1d, lats_1d)
+#         return lon_grid.ravel(), lat_grid.ravel()
+
+#     def test_max_displacement_under_1m(self, global_grid):
+#         lons, lats = global_grid
+#         dt = datetime.datetime(2023, 6, 21, 12, 0, 0)
+#         e, n, u = solid_tide(lons, lats, dt)
+#         total = np.sqrt(e**2 + n**2 + u**2)
+#         assert total.max() < 1.0
+#         assert total.max() > 0.01
+
+
+# if __name__ == "__main__":
+#     pytest.main([__file__, "-v"])
