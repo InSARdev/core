@@ -80,7 +80,7 @@ def _process_date_worker(args):
      xml_file, tiff_file, orbit_file, record_dict,
      topo, transform,
      prm_ref_df, prm_ref_orbit_df, sc_height,
-     topo_llt, epsg, debug) = args
+     topo_llt, epsg, remove_tidal_phase, debug) = args
 
     import warnings
     import numpy as np
@@ -178,7 +178,7 @@ def _process_date_worker(args):
         prm_rep=prm, prm_ref=prm_ref, slc_data=slc,
         burst_name=burst_name, record_dict=record_dict,
         epsg=epsg, baseline_params=baseline_params, sc_height_params=sc_height,
-        reramp_params=reramp_params, debug=debug
+        reramp_params=reramp_params, remove_tidal_phase=remove_tidal_phase, debug=debug
     )
     return burst_name
 
@@ -282,7 +282,7 @@ def _compute_merged_transform(transform, prm_rep):
 def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
                                burst_name, record_dict, epsg, scale=2.5e-07,
                                baseline_params=None, sc_height_params=None,
-                               reramp_params=None, debug=False):
+                               reramp_params=None, remove_tidal_phase=True, debug=False):
     """Transform SLC to geocoded int16 zarr.
 
     Module-level function usable from both class methods and joblib workers.
@@ -330,6 +330,17 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
     del slc_complex
     _timings['slc_prep'] = time.perf_counter() - _t0
 
+    # Compute tidal datetime from PRM if tidal correction is enabled
+    tidal_dt = None
+    if remove_tidal_phase and topo is not None:
+        import datetime as _dt
+        sc_clock = prm_rep.get('SC_clock_start')
+        sc_clock_stop = prm_rep.get('SC_clock_stop')
+        sc_mid = (sc_clock + sc_clock_stop) / 2.0
+        year = int(sc_mid // 1000)
+        doy_frac = sc_mid % 1000
+        tidal_dt = _dt.datetime(year, 1, 1) + _dt.timedelta(days=doy_frac - 1)
+
     if reramp_params is not None and epsg != 0:
         # ====================================================================
         # Merged alignment + geocoding path (projected output)
@@ -358,10 +369,13 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
         phase_reramp = _compute_reramp_phase(azi_map, rng_map, reramp_params)
         del azi_map, rng_map
 
-        # Step 3: Compute topo phase and geocode to projected coordinates
+        # Step 3: Compute topo phase (+ tidal) and geocode to projected coordinates
         topo_phase = _flat_earth_topo_phase(topo, prm_rep, prm_ref,
                                             baseline_params=baseline_params,
                                             sc_height_params=sc_height_params)
+        if tidal_dt is not None:
+            topo_phase.values += _tidal_phase_radar(topo, prm_ref, tidal_dt).values
+
         topo_phase_xa = xr.DataArray(topo_phase.values, coords=topo_phase.coords,
                                      dims=topo_phase.dims).rename('data')
         topo_phase_proj = _geocode(transform, topo_phase_xa).transpose('y', 'x').values
@@ -370,6 +384,7 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
         # Combine reramp + topo into total phase correction
         phase_reramp += topo_phase_proj
         del topo_phase_proj
+
         _timings['phase_compute'] = time.perf_counter() - _t0
 
         # Step 4: Apply combined phase correction exp(-1j * phase)
@@ -399,6 +414,10 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
                                                    baseline_params=baseline_params,
                                                    sc_height_params=sc_height_params)
         _timings['flat_earth_topo_phase'] = time.perf_counter() - _t0
+
+        # Tidal phase correction
+        if tidal_dt is not None:
+            phase.values += _tidal_phase_radar(topo, prm_ref, tidal_dt).values
 
         # Apply phase correction and optionally geocode
         _t0 = time.perf_counter()
@@ -661,6 +680,122 @@ def _geocode(transform, data):
     return xr.DataArray(grid_proj, coords=coords, dims=['y', 'x']).rename(data.name)
 
 
+def _tidal_phase_radar(topo, prm_ref, dt):
+    """Compute solid Earth tidal phase correction on the radar coordinate grid.
+
+    Uses 2×2 radar-grid corners: computes tidal E,N,U and look vectors at the
+    4 corner points, bilinearly interpolates each component separately onto the
+    full topo grid, then dot-products to LOS and converts to phase.
+
+    Parameters
+    ----------
+    topo : xr.DataArray
+        Topographic elevation with radar coordinates (a, r).
+    prm_ref : PRM
+        Reference burst PRM (has orbit_df, clock_start, PRF, etc.).
+    dt : datetime.datetime
+        Acquisition UTC time.
+
+    Returns
+    -------
+    xr.DataArray
+        Tidal phase correction in radians, same coords as topo.
+    """
+    import numpy as np
+    import xarray as xr
+    import cv2
+    from insardev_pygmtsar.utils_satellite import satellite_rat2llt, _hermite_interp
+    from insardev_pygmtsar.utils_tidal import solid_tide
+
+    n_azi = len(topo.a)
+    n_rng = len(topo.r)
+
+    # --- (a) 4 radar corner coordinates ---
+    azi_corners = np.array([topo.a.values[0], topo.a.values[0],
+                            topo.a.values[-1], topo.a.values[-1]])
+    rng_corners = np.array([topo.r.values[0], topo.r.values[-1],
+                            topo.r.values[0], topo.r.values[-1]])
+
+    # --- (b) Geocode 4 corners → lat/lon ---
+    orbit_df = prm_ref.orbit_df
+    orbit_time = orbit_df['isec'].values
+    orbit_pos = orbit_df[['px', 'py', 'pz']].values
+    orbit_vel = orbit_df[['vx', 'vy', 'vz']].values
+
+    clock_start = (prm_ref.get('clock_start') % 1.0) * 86400
+    prf = prm_ref.get('PRF')
+    near_range = prm_ref.get('near_range')
+    rng_samp_rate = prm_ref.get('rng_samp_rate')
+    earth_radius = prm_ref.get('earth_radius')
+
+    lon_corners, lat_corners, _ = satellite_rat2llt(
+        azi_corners, rng_corners,
+        orbit_time, orbit_pos, orbit_vel,
+        clock_start, prf, near_range, rng_samp_rate, earth_radius)
+
+    # --- (c) Compute tidal E, N, U at 4 corners ---
+    tide_e, tide_n, tide_u = solid_tide(lon_corners, lat_corners, dt)
+
+    # --- (d) Compute look vectors at 4 corners from orbit ---
+    # Satellite ECEF at corner azimuth times
+    sat_time = np.float64(clock_start) + azi_corners / np.float64(prf)
+    sat_x = _hermite_interp(orbit_time, orbit_pos[:, 0], orbit_vel[:, 0], sat_time)
+    sat_y = _hermite_interp(orbit_time, orbit_pos[:, 1], orbit_vel[:, 1], sat_time)
+    sat_z = _hermite_interp(orbit_time, orbit_pos[:, 2], orbit_vel[:, 2], sat_time)
+
+    # Ground ECEF from corner lat/lon (WGS84 ellipsoid, height=0)
+    ra = 6378137.0
+    e2 = 6.69437999014e-3
+    lat_rad = np.deg2rad(lat_corners)
+    lon_rad = np.deg2rad(lon_corners)
+    sin_lat = np.sin(lat_rad)
+    cos_lat = np.cos(lat_rad)
+    N_wgs = ra / np.sqrt(1 - e2 * sin_lat**2)
+    gx = N_wgs * cos_lat * np.cos(lon_rad)
+    gy = N_wgs * cos_lat * np.sin(lon_rad)
+    gz = N_wgs * (1 - e2) * sin_lat
+
+    # Look vector (ground → satellite), normalized
+    lx = sat_x - gx
+    ly = sat_y - gy
+    lz = sat_z - gz
+    dist = np.sqrt(lx**2 + ly**2 + lz**2)
+    lx /= dist;  ly /= dist;  lz /= dist
+
+    # ECEF look → ENU
+    # Rotation: b = lat - 90°, g = lon + 90°
+    b = lat_rad - np.pi / 2
+    g = lon_rad + np.pi / 2
+    cos_b = np.cos(b);  sin_b = np.sin(b)
+    cos_g = np.cos(g);  sin_g = np.sin(g)
+    look_E = cos_g * lx + sin_g * ly
+    look_N = -sin_g * cos_b * lx + cos_g * cos_b * ly - sin_b * lz
+    look_U = -sin_g * sin_b * lx + cos_g * sin_b * ly + cos_b * lz
+
+    # --- (e) Bilinear interpolation + LOS (memory-efficient) ---
+    # Reshape 4-element arrays to 2×2: rows=azimuth (near/far azi), cols=range (near/far rng)
+    def _to_2x2(arr):
+        return np.array([[arr[0], arr[1]], [arr[2], arr[3]]], dtype=np.float32)
+
+    W, H = n_rng, n_azi  # cv2.resize takes (width, height)
+    los = cv2.resize(_to_2x2(tide_e), (W, H), interpolation=cv2.INTER_LINEAR) \
+        * cv2.resize(_to_2x2(look_E), (W, H), interpolation=cv2.INTER_LINEAR)
+    tmp = cv2.resize(_to_2x2(tide_n), (W, H), interpolation=cv2.INTER_LINEAR)
+    tmp *= cv2.resize(_to_2x2(look_N), (W, H), interpolation=cv2.INTER_LINEAR)
+    los += tmp
+    tmp = cv2.resize(_to_2x2(tide_u), (W, H), interpolation=cv2.INTER_LINEAR)
+    tmp *= cv2.resize(_to_2x2(look_U), (W, H), interpolation=cv2.INTER_LINEAR)
+    los += tmp
+    del tmp
+
+    # --- (f) Convert to phase ---
+    wavelength = prm_ref.get('radar_wavelength')
+    cnst = -4.0 * np.pi / wavelength
+    tidal_phase = (cnst * los).astype(np.float32)
+
+    return xr.DataArray(tidal_phase, coords=topo.coords, dims=topo.dims).rename('tidal_phase')
+
+
 def _flat_earth_topo_phase(topo, prm_rep, prm_ref, baseline_params=None, sc_height_params=None):
     """Compute flat earth and topographic phase correction."""
     import numpy as np
@@ -817,6 +952,7 @@ class S1_transform(S1_topo):
                   epsg: str|int|None='auto',
                   resolution: tuple[int, int]=(20, 5),
                   remove_topo_phase: bool = True,
+                  remove_tidal_phase: bool = True,
                   dem_vertical_accuracy: float=0.5,
                   alignment_spacing: float=12.0/3600,
                   overwrite: bool=False,
@@ -1012,7 +1148,8 @@ class S1_transform(S1_topo):
                 self.transform_slc_int16(outdir, transform, topo, prm, prm_ref, slc, epsg=epsg,
                                         baseline_params=baseline_params,
                                         sc_height_params=sc_height_cache[burst_ref_name],
-                                        reramp_params=reramp_params)
+                                        reramp_params=reramp_params,
+                                        remove_tidal_phase=remove_tidal_phase)
                 del slc
 
             # Cleanup and consolidate
@@ -1131,7 +1268,7 @@ class S1_transform(S1_topo):
                     xml_file, tiff_file, orbit_file, record_dict,
                     topo, transform,
                     prm_ref_df, prm_ref_orbit_df, sc_height,
-                    topo_llt, epsg, debug
+                    topo_llt, epsg, remove_tidal_phase, debug
                 ))
 
             # Use ProcessPoolExecutor or ThreadPoolExecutor based on scheduler
@@ -1205,7 +1342,8 @@ class S1_transform(S1_topo):
                             scale: float=2.5e-07,
                             baseline_params: dict=None,
                             sc_height_params: dict=None,
-                            reramp_params: dict=None
+                            reramp_params: dict=None,
+                            remove_tidal_phase: bool=True
                             ):
         """
         Perform geocoding from radar to geographic coordinates.
@@ -1237,7 +1375,8 @@ class S1_transform(S1_topo):
             burst_name=burst_name, record_dict=record_dict,
             epsg=epsg, scale=scale,
             baseline_params=baseline_params, sc_height_params=sc_height_params,
-            reramp_params=reramp_params, debug=bool(os.environ.get('INSAR_DEBUG'))
+            reramp_params=reramp_params, remove_tidal_phase=remove_tidal_phase,
+            debug=bool(os.environ.get('INSAR_DEBUG'))
         )
 
     def flat_earth_topo_phase(self, topo: xr.DataArray | None, prm_rep: "PRM", prm_ref: "PRM",

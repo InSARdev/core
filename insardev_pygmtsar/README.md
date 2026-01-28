@@ -10,6 +10,7 @@ Sentinel-1 SLC preprocessing library for Python.
 - **Precise orbit integration** — automatic application of restituted and precise orbit files
 - **DEM preparation** — geocoding and coordinate transformations to a common geographic grid
 - **User-defined coordinate system and resolution** — output in any EPSG projection at any resolution, from small large-area overviews to precise local analysis grids
+- **Solid Earth tidal phase correction** — per-date tidal displacement projected onto the radar line-of-sight using IERS 2003 solid Earth tide model and satellite look vectors, computed efficiently via 2×2 radar-grid corner interpolation
 - **Geocoded Zarr output** — burst stacks stored as Zarr v3 with per-pixel azi, rng, and elevation
 
 ## License
