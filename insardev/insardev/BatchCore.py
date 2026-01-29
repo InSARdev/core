@@ -517,6 +517,15 @@ class BatchCore(dict):
     def sqrt(self, **kwargs):
         return self.map_da(lambda da: xr.ufuncs.sqrt(da), **kwargs)
 
+    def log10(self, **kwargs):
+        return self.map_da(lambda da: xr.ufuncs.log10(da), **kwargs)
+
+    def multiply(self, value, **kwargs):
+        return self.map_da(lambda da: da * value, **kwargs)
+
+    def divide(self, value, **kwargs):
+        return self.map_da(lambda da: da / value, **kwargs)
+
     def clip(self, min=None, max=None, **kwargs):
         return self.map_da(lambda da: da.clip(min=min, max=max), **kwargs)
 
