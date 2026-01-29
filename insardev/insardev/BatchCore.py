@@ -66,6 +66,86 @@ def _merge_tiles_for_dask(tiles, offsets, out_shape, fill_dtype):
     return out
 
 
+def _dissolve_pol_for_dask(da_current, das_others, wrap, extend, weight):
+    """
+    Module-level function for dissolving one polarization in dissolve().
+
+    Defined at module level to avoid dask serialization issues with nested functions.
+    When using dask distributed, closures with nested functions may not serialize correctly,
+    causing random/incorrect behavior on workers.
+
+    Args:
+        da_current: xarray DataArray of current burst
+        das_others: list of xarray DataArrays from overlapping bursts
+        wrap: bool, True for wrapped phase (circular mean)
+        extend: bool, True to fill NaN areas from overlapping bursts
+        weight: float or None, weight of current burst
+
+    Returns:
+        numpy array with dissolved values
+    """
+    import warnings
+
+    # Use exact coordinates from da_current - do NOT modify them
+    ys = da_current.y.values
+    xs = da_current.x.values
+    n_others = len(das_others)
+
+    if weight is None:
+        w_current, w_other = 1.0, 1.0
+    else:
+        w_current = weight
+        w_other = (1.0 - weight) / n_others if n_others > 0 else 0.0
+
+    # Reindex das_others to match da_current coordinates
+    # Use interp for floating point coordinate matching instead of reindex
+    das_reindexed = []
+    for d in das_others:
+        # Use interp with nearest to avoid issues with floating point coordinate matching
+        das_reindexed.append(d.interp(y=ys, x=xs, method='nearest', kwargs={'fill_value': np.nan}))
+
+    current_vals = da_current.values
+    current_valid = np.isfinite(current_vals)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+
+        if wrap:
+            weighted_sum = np.where(current_valid, np.exp(1j * current_vals) * w_current, 0.0)
+            weight_sum = np.where(current_valid, w_current, 0.0)
+            for d in das_reindexed:
+                vals = d.values
+                valid = np.isfinite(vals)
+                weighted_sum += np.where(valid, np.exp(1j * vals) * w_other, 0.0)
+                weight_sum += np.where(valid, w_other, 0.0)
+            valid_weights = weight_sum > 0
+            normalized = np.divide(weighted_sum, weight_sum, out=np.zeros_like(weighted_sum), where=valid_weights)
+            out = np.where(valid_weights, np.arctan2(normalized.imag, normalized.real), np.nan)
+        else:
+            weighted_sum = np.where(current_valid, current_vals * w_current, 0.0)
+            weight_sum = np.where(current_valid, w_current, 0.0)
+            for d in das_reindexed:
+                vals = d.values
+                valid = np.isfinite(vals)
+                weighted_sum += np.where(valid, vals * w_other, 0.0)
+                weight_sum += np.where(valid, w_other, 0.0)
+            out = np.divide(weighted_sum, weight_sum, out=np.full_like(weighted_sum, np.nan), where=weight_sum > 0)
+
+        if not extend:
+            out = np.where(current_valid, out, np.nan)
+
+    return out.astype(da_current.dtype)
+
+
+def _dissolve_pol_3d_for_dask(da_slice, das_others_slice, wrap, extend, weight):
+    """
+    Module-level wrapper for 3D dissolve returning shape (1, y, x).
+
+    Defined at module level to avoid dask serialization issues with nested functions.
+    """
+    return _dissolve_pol_for_dask(da_slice, das_others_slice, wrap, extend, weight)[np.newaxis, ...]
+
+
 class BatchCore(dict):
     """
     This class has 'pair' stack variable for the datasets in the dict and stores real values (correlation and unwrapped phase).
@@ -2119,9 +2199,12 @@ class BatchCore(dict):
                                 # Tiles arrive as 3D (1, ny, nx), squeeze to 2D in merge
                                 # IMPORTANT: Use standalone function instead of lambda with closure
                                 # to avoid serialization issues with nested functions in dask distributed
+                                # IMPORTANT: Convert to tuples (immutable) before passing to delayed
+                                # This ensures proper serialization in distributed environments
+                                # and prevents any race conditions with list mutations
                                 block = da.from_delayed(
-                                    dask.delayed(_merge_tiles_for_dask)(
-                                        tiles_delayed, offsets, out_shape, fill_dtype
+                                    dask.delayed(_merge_tiles_for_dask, pure=True)(
+                                        tuple(tiles_delayed), tuple(offsets), out_shape, fill_dtype
                                     ),
                                     shape=out_shape,
                                     dtype=fill_dtype
@@ -3626,59 +3709,9 @@ class BatchCore(dict):
             total_overlaps = sum(len(v) for v in overlapping_map.values())
             print(f'dissolve: STRtree found {total_overlaps} burst overlaps', flush=True)
 
-        def dissolve_pol(da_current, das_others, wrap, extend, weight):
-            """Dissolve one polarization - returns numpy array."""
-            # Use exact coordinates from da_current - do NOT modify them
-            ys = da_current.y.values
-            xs = da_current.x.values
-            n_others = len(das_others)
-
-            if weight is None:
-                w_current, w_other = 1.0, 1.0
-            else:
-                w_current = weight
-                w_other = (1.0 - weight) / n_others if n_others > 0 else 0.0
-
-            # Reindex das_others to match da_current coordinates
-            # Use interp for floating point coordinate matching instead of reindex
-            das_reindexed = []
-            for d in das_others:
-                # Use interp with nearest to avoid issues with floating point coordinate matching
-                das_reindexed.append(d.interp(y=ys, x=xs, method='nearest', kwargs={'fill_value': np.nan}))
-
-            current_vals = da_current.values
-            current_valid = np.isfinite(current_vals)
-
-            with warnings.catch_warnings():
-                warnings.simplefilter('ignore', RuntimeWarning)
-
-                if wrap:
-                    weighted_sum = np.where(current_valid, np.exp(1j * current_vals) * w_current, 0.0)
-                    weight_sum = np.where(current_valid, w_current, 0.0)
-                    for d in das_reindexed:
-                        vals = d.values
-                        valid = np.isfinite(vals)
-                        weighted_sum += np.where(valid, np.exp(1j * vals) * w_other, 0.0)
-                        weight_sum += np.where(valid, w_other, 0.0)
-                    valid_weights = weight_sum > 0
-                    normalized = np.divide(weighted_sum, weight_sum, out=np.zeros_like(weighted_sum), where=valid_weights)
-                    out = np.where(valid_weights, np.arctan2(normalized.imag, normalized.real), np.nan)
-                else:
-                    weighted_sum = np.where(current_valid, current_vals * w_current, 0.0)
-                    weight_sum = np.where(current_valid, w_current, 0.0)
-                    for d in das_reindexed:
-                        vals = d.values
-                        valid = np.isfinite(vals)
-                        weighted_sum += np.where(valid, vals * w_other, 0.0)
-                        weight_sum += np.where(valid, w_other, 0.0)
-                    out = np.divide(weighted_sum, weight_sum, out=np.full_like(weighted_sum, np.nan), where=weight_sum > 0)
-
-                if not extend:
-                    out = np.where(current_valid, out, np.nan)
-
-            return out.astype(da_current.dtype)
-
         # Build output - per burst, replace pol variables with lazy arrays
+        # Note: dissolve functions are defined at module level (_dissolve_pol_for_dask, _dissolve_pol_3d_for_dask)
+        # to avoid dask serialization issues with nested function closures in distributed environments
         output = {}
         for burst_idx, bid in enumerate(burst_ids):
             overlapping_indices = overlapping_map[burst_idx]
@@ -3702,18 +3735,18 @@ class BatchCore(dict):
                     n_stack = da_current.sizes[stackvar]
                     shape_2d = da_current.shape[1:]
 
-                    def dissolve_pol_3d(da_slice, das_others_slice, wrap, extend, weight):
-                        """Wrapper to return 3D array with shape (1, y, x)."""
-                        return dissolve_pol(da_slice, das_others_slice, wrap, extend, weight)[np.newaxis, ...]
-
                     # Create separate delayed array for each stack element for parallelization
+                    # Use module-level function to avoid dask serialization issues
                     delayed_slices = []
                     for i in range(n_stack):
                         da_slice = da_current.isel({stackvar: i})
-                        das_others_slice = [d.isel({stackvar: i}) for d in das_others]
+                        das_others_slice = tuple(d.isel({stackvar: i}) for d in das_others)
                         # Create 3D delayed array with shape (1, y, x) and chunks (1, -1, -1)
+                        # Use pure=True for deterministic behavior in distributed environments
                         delayed_slice = da.from_delayed(
-                            dask.delayed(dissolve_pol_3d)(da_slice, das_others_slice, wrap, extend, weight),
+                            dask.delayed(_dissolve_pol_3d_for_dask, pure=True)(
+                                da_slice, das_others_slice, wrap, extend, weight
+                            ),
                             shape=(1,) + shape_2d,
                             dtype=da_current.dtype
                         )
@@ -3724,8 +3757,12 @@ class BatchCore(dict):
                     delayed_array = da.concatenate(delayed_slices, axis=0).rechunk({0: 1, 1: -1, 2: -1})
                 else:
                     # 2D case - single delayed array
+                    # Use module-level function to avoid dask serialization issues
+                    # Use pure=True for deterministic behavior in distributed environments
                     delayed_array = da.from_delayed(
-                        dask.delayed(dissolve_pol)(da_current, das_others, wrap, extend, weight),
+                        dask.delayed(_dissolve_pol_for_dask, pure=True)(
+                            da_current, tuple(das_others), wrap, extend, weight
+                        ),
                         shape=da_current.shape,
                         dtype=da_current.dtype
                     )
