@@ -2024,18 +2024,22 @@ class BatchCore(dict):
                             tiles_delayed = []
                             offsets = []
 
-                            # Output chunk coordinate bounds (with tolerance for edge matching)
-                            out_y0, out_y1 = out_ys[0] - dy/2, out_ys[-1] + dy/2
-                            out_x0, out_x1 = out_xs[0] - dx/2, out_xs[-1] + dx/2
+                            # Output chunk coordinate bounds (with small tolerance for floating point)
+                            # Use tiny tolerance (1e-6 * spacing) to handle floating point precision
+                            # Apply tolerance to expand bounds (not shrink), regardless of coord direction
+                            tol_y = abs(dy) * 1e-6
+                            tol_x = abs(dx) * 1e-6
+                            y_lo = min(out_ys[0], out_ys[-1]) - tol_y
+                            y_hi = max(out_ys[0], out_ys[-1]) + tol_y
+                            x_lo = min(out_xs[0], out_xs[-1]) - tol_x
+                            x_hi = max(out_xs[0], out_xs[-1]) + tol_x
 
                             for burst_idx, _ in overlapping:
                                 info = burst_info[burst_idx]
                                 burst_ys = info['y_coords']
                                 burst_xs = info['x_coords']
 
-                                # Find burst indices that fall within output chunk
-                                y_lo, y_hi = min(out_y0, out_y1), max(out_y0, out_y1)
-                                x_lo, x_hi = min(out_x0, out_x1), max(out_x0, out_x1)
+                                # Find burst indices that fall within output chunk bounds
                                 mask_y = (burst_ys >= y_lo) & (burst_ys <= y_hi)
                                 mask_x = (burst_xs >= x_lo) & (burst_xs <= x_hi)
                                 idx_y = np.where(mask_y)[0]
@@ -2044,13 +2048,6 @@ class BatchCore(dict):
                                 if len(idx_y) > 0 and len(idx_x) > 0:
                                     by0, by1 = idx_y[0], idx_y[-1] + 1
                                     bx0, bx1 = idx_x[0], idx_x[-1] + 1
-
-                                    # Slice the dask array to get this tile
-                                    # Input is single-chunked, so this just creates a slice view
-                                    tile_slice = datas_rechunked[burst_idx][s_idx:s_idx+1, by0:by1, bx0:bx1]
-                                    # Convert to delayed - dask will auto-compute when merge is called
-                                    tile_delayed = tile_slice.to_delayed().ravel()[0]
-                                    tiles_delayed.append(tile_delayed)
 
                                     # Compute tile offset within this output chunk
                                     # Tile's first coord -> global array index -> offset in chunk
@@ -2062,6 +2059,21 @@ class BatchCore(dict):
                                     # Offset within this chunk (yb0, xb0 is chunk start in global)
                                     y_off = tile_global_yi - yb0
                                     x_off = tile_global_xi - xb0
+
+                                    # Validate offset is within reasonable bounds
+                                    # (should be within chunk ± 1 for floating point tolerance)
+                                    tile_h, tile_w = by1 - by0, bx1 - bx0
+                                    if y_off < -1 or y_off + tile_h > out_shape[0] + 1:
+                                        continue  # Skip misaligned tiles
+                                    if x_off < -1 or x_off + tile_w > out_shape[1] + 1:
+                                        continue  # Skip misaligned tiles
+
+                                    # Slice the dask array to get this tile
+                                    # Input is single-chunked, so this just creates a slice view
+                                    tile_slice = datas_rechunked[burst_idx][s_idx:s_idx+1, by0:by1, bx0:bx1]
+                                    # Convert to delayed - dask will auto-compute when merge is called
+                                    tile_delayed = tile_slice.to_delayed().ravel()[0]
+                                    tiles_delayed.append(tile_delayed)
                                     offsets.append((y_off, x_off))
 
                             if len(tiles_delayed) == 0:
