@@ -1694,13 +1694,13 @@ class BatchCore(dict):
             self.save(store=store, storage_options=storage_options, caption=caption, n_jobs=n_jobs, debug=debug)
         return utils_io.open(store=store, storage_options=storage_options, compat=False, n_jobs=n_jobs, debug=debug)
 
-    def to_dataset(self, polarization=None, compute: bool = False):
+    def to_dataset(self, polarization=None, chunks='auto', compute: bool = False, debug: bool = False):
         """
         Merge multiple burst DataArrays into a single unified grid.
 
-        This function efficiently combines bursts using dask.array.blockwise for lazy
-        evaluation. For each output chunk, it selects the minimal set of input bursts
-        needed and combines their data using forward-fill.
+        This function efficiently combines bursts using dask delayed operations
+        for lazy evaluation. For each output chunk, it selects the minimal set
+        of input bursts needed and combines their data using forward-fill.
 
         For best results with overlapping bursts, call .dissolve() first to average
         values in overlap regions, then call .to_dataset() to merge into a single grid.
@@ -1709,8 +1709,17 @@ class BatchCore(dict):
         ----------
         polarization : str, optional
             Specific polarization to process. If None, processes all polarizations.
+        chunks : str, int, or tuple, optional
+            Spatial chunk size for processing. Options:
+            - 'auto' (default): automatically determine chunk size based on memory
+            - int: use same chunk size for both y and x dimensions
+            - tuple (y_chunk, x_chunk): explicit chunk sizes for each dimension
+            Note: Only 2D spatial chunks are supported. The stack dimension
+            (date/pair) is always processed one slice at a time.
         compute : bool, optional
             Whether to compute the result immediately. Default is False (lazy).
+        debug : bool, optional
+            Print debugging/profiling information. Default is False.
 
         Returns
         -------
@@ -1722,8 +1731,17 @@ class BatchCore(dict):
         >>> # Merge bursts into single grid (fast, uses ffill for overlaps)
         >>> merged = batch.to_dataset()
         >>>
+        >>> # With explicit chunk size for memory-constrained environments
+        >>> merged = batch.to_dataset(chunks=1024)
+        >>>
+        >>> # With different y/x chunk sizes
+        >>> merged = batch.to_dataset(chunks=(512, 2048))
+        >>>
         >>> # For smooth overlaps, dissolve first then merge
         >>> merged = batch.dissolve().to_dataset()
+        >>>
+        >>> # Debug mode to see chunk sizes and burst distribution
+        >>> merged = batch.to_dataset(debug=True)
         """
         import xarray as xr
         import numpy as np
@@ -1736,6 +1754,15 @@ class BatchCore(dict):
 
         sample = next(iter(self.values()))
         if len(self) == 1:
+            if debug:
+                print(f"=== to_dataset() debug ===")
+                print(f"Single burst - returning directly (no merge needed)")
+                print(f"Burst key: {next(iter(self.keys()))}")
+                # Get spatial vars
+                spatial_vars = [v for v in sample.data_vars if 'y' in sample[v].dims and 'x' in sample[v].dims]
+                for var in spatial_vars[:3]:  # Show first 3 spatial vars
+                    da = sample[var]
+                    print(f"  {var}: shape={da.shape}, dtype={da.dtype}")
             if compute:
                 progressbar(sample := sample.persist(), desc=f'Compute Dataset'.ljust(25))
                 return sample
@@ -1784,99 +1811,235 @@ class BatchCore(dict):
 
         fill_dtype = first_datas[0].dtype
 
-        # Extract extents of all datasets once (same for all polarizations)
-        extents = [(float(d.y.min()), float(d.y.max()),
-                    float(d.x.min()), float(d.x.max())) for d in first_datas]
+        # Determine chunk sizes for spatial dimensions
+        # Stack dimension is always processed one slice at a time (chunked to 1)
+        if chunks == 'auto':
+            # Use complex128 (16 bytes) to account for memory overhead:
+            # output chunk + 2-4 overlapping input bursts to load and merge
+            auto_chunks = dask.array.core.normalize_chunks('auto', (ys.size, xs.size), dtype=np.complex128)
+            y_chunk_size = auto_chunks[0][0] if auto_chunks[0] else ys.size
+            x_chunk_size = auto_chunks[1][0] if auto_chunks[1] else xs.size
+        elif isinstance(chunks, (int, np.integer)):
+            # Single int: use same size for both dimensions
+            y_chunk_size = min(int(chunks), ys.size)
+            x_chunk_size = min(int(chunks), xs.size)
+        elif isinstance(chunks, (tuple, list)) and len(chunks) == 2:
+            # Tuple/list of (y_chunk, x_chunk)
+            y_chunk_size = min(int(chunks[0]), ys.size)
+            x_chunk_size = min(int(chunks[1]), xs.size)
+        else:
+            raise ValueError(
+                f"chunks must be 'auto', int, or 2-tuple (y, x), got {type(chunks).__name__}: {chunks}. "
+                "Note: 3D chunks are not supported; stack dimension is always processed per-slice."
+            )
 
-        # Precompute burst coverage areas for fast lookup
-        burst_coords = [(d.y.values, d.x.values) for d in first_datas]
+        # Number of chunks in each dimension
+        n_y_chunks = (ys.size + y_chunk_size - 1) // y_chunk_size
+        n_x_chunks = (xs.size + x_chunk_size - 1) // x_chunk_size
 
-        def process_chunk(ys_block, xs_block, pol, datas):
-            """Process a single output chunk for one polarization.
+        # Extract extents and build spatial index for O(1) chunk lookup
+        burst_info = []
+        # chunk_index[(yi, xi)] = list of (burst_idx, coverage) sorted by coverage desc
+        from collections import defaultdict
+        chunk_index = defaultdict(list)
+
+        for burst_idx, d in enumerate(first_datas):
+            info = {
+                'y_min': float(d.y.min()),
+                'y_max': float(d.y.max()),
+                'x_min': float(d.x.min()),
+                'x_max': float(d.x.max()),
+                'y_coords': d.y.values,
+                'x_coords': d.x.values,
+            }
+            burst_info.append(info)
+
+            # Which output chunks does this burst overlap?
+            # Convert burst extent to chunk indices
+            y_chunk_start = max(0, int((info['y_min'] - y_min) / (dy * y_chunk_size)))
+            y_chunk_end = min(n_y_chunks, int((info['y_max'] - y_min) / (dy * y_chunk_size)) + 1)
+            x_chunk_start = max(0, int((info['x_min'] - x_min) / (dx * x_chunk_size)))
+            x_chunk_end = min(n_x_chunks, int((info['x_max'] - x_min) / (dx * x_chunk_size)) + 1)
+
+            # Register this burst for all overlapping chunks
+            for yi in range(y_chunk_start, y_chunk_end):
+                for xi in range(x_chunk_start, x_chunk_end):
+                    # Compute coverage for this chunk
+                    yb0 = yi * y_chunk_size
+                    yb1 = min(yb0 + y_chunk_size, ys.size)
+                    xb0 = xi * x_chunk_size
+                    xb1 = min(xb0 + x_chunk_size, xs.size)
+                    y0, y1 = ys[yb0], ys[yb1-1]
+                    x0, x1 = xs[xb0], xs[xb1-1]
+                    y_overlap = min(y1, info['y_max']) - max(y0, info['y_min'])
+                    x_overlap = min(x1, info['x_max']) - max(x0, info['x_min'])
+                    coverage = max(0, y_overlap / dy) * max(0, x_overlap / dx)
+                    chunk_index[(yi, xi)].append((burst_idx, coverage))
+
+        # Sort each chunk's burst list by coverage (descending)
+        for key in chunk_index:
+            chunk_index[key].sort(key=lambda x: -x[1])
+
+        # Debug output
+        if debug:
+            print(f"=== to_dataset() debug ===")
+            print(f"Number of bursts: {len(first_datas)}")
+            print(f"Output grid: y={ys.size}, x={xs.size} (total {ys.size * xs.size:,} pixels)")
+            print(f"Chunk size: y={y_chunk_size}, x={x_chunk_size} ({y_chunk_size * x_chunk_size:,} pixels/chunk)")
+            print(f"Number of chunks: {n_y_chunks} y × {n_x_chunks} x = {n_y_chunks * n_x_chunks} total")
+            print(f"Stack dimension: {stackvar}={n_stack} slices")
+            print(f"Data type: {fill_dtype} ({np.dtype(fill_dtype).itemsize} bytes/pixel)")
+
+            # Memory estimate per chunk
+            chunk_mem_mb = y_chunk_size * x_chunk_size * np.dtype(fill_dtype).itemsize / 1024 / 1024
+            print(f"Memory per chunk: ~{chunk_mem_mb:.1f} MB")
+
+            # Burst distribution across chunks
+            bursts_per_chunk = [len(chunk_index.get((yi, xi), []))
+                               for yi in range(n_y_chunks) for xi in range(n_x_chunks)]
+            if bursts_per_chunk:
+                # Show distribution histogram
+                from collections import Counter
+                dist = Counter(bursts_per_chunk)
+                dist_str = ", ".join(f"{k} bursts: {v}" for k, v in sorted(dist.items()))
+                print(f"Chunk distribution: {dist_str}")
+
+            # Burst extents
+            print(f"Burst extents:")
+            for idx, info in enumerate(burst_info):
+                ny = len(info['y_coords'])
+                nx = len(info['x_coords'])
+                print(f"  [{idx}] y=[{info['y_min']:.1f}, {info['y_max']:.1f}] "
+                      f"x=[{info['x_min']:.1f}, {info['x_max']:.1f}] ({ny}×{nx} pixels)")
+
+        def merge_tiles_numpy(tiles_with_offsets, out_shape, fill_dtype):
+            """Merge overlapping tiles using forward-fill (NaN-aware).
 
             Args:
-                ys_block, xs_block: coordinate arrays for this chunk
-                pol: polarization name (for naming)
-                datas: list of DataArrays for this polarization
+                tiles_with_offsets: list of (tile_data, y_offset, x_offset)
+                    where offsets are positions in output array
+                out_shape: (out_ny, out_nx) output shape
+                fill_dtype: output dtype
+
+            Returns:
+                merged (out_ny, out_nx) array
             """
-            import warnings
-            fill_nan = np.nan * np.ones((), dtype=fill_dtype)
-
-            ymin0, ymax0 = float(ys_block.min()), float(ys_block.max())
-            xmin0, xmax0 = float(xs_block.min()), float(xs_block.max())
-
-            # Find all bursts overlapping with this chunk
-            overlapping = []
-            for idx, (ymin, ymax, xmin, xmax) in enumerate(extents):
-                if ymin0 < ymax and ymax0 > ymin and xmin0 < xmax and xmax0 > xmin:
-                    burst_y, burst_x = burst_coords[idx]
-                    y_covered = np.sum((ys_block >= burst_y.min()) & (ys_block <= burst_y.max()))
-                    x_covered = np.sum((xs_block >= burst_x.min()) & (xs_block <= burst_x.max()))
-                    coverage = y_covered * x_covered
-                    overlapping.append((idx, coverage))
-
-            if len(overlapping) == 0:
-                return np.full((n_stack, ys_block.size, xs_block.size), fill_nan, dtype=fill_dtype)
-
-            # Sort by coverage (descending)
-            overlapping.sort(key=lambda x: -x[1])
-
-            # Process each stack element
-            result_slices = []
-            for s_idx in range(n_stack):
-                if len(overlapping) == 1:
-                    best_idx = overlapping[0][0]
-                    da_block = datas[best_idx].isel({stackvar: s_idx})\
-                        .sel(y=slice(ymin0, ymax0), x=slice(xmin0, xmax0))
-                    if hasattr(da_block.data, 'compute'):
-                        da_block = da_block.compute(n_workers=1)
-                    da_block = da_block.reindex(y=ys_block, x=xs_block, fill_value=fill_nan, copy=False)
-                    result_slices.append(da_block.values)
-                else:
-                    selected_indices = [idx for idx, _ in overlapping]
-                    das_block = [datas[idx].isel({stackvar: s_idx}).sel(y=slice(ymin0, ymax0), x=slice(xmin0, xmax0))
-                                for idx in selected_indices]
-                    das_block = [d.compute(n_workers=1) if hasattr(d.data, 'compute') else d for d in das_block]
-                    das_block = [d.reindex(y=ys_block, x=xs_block, fill_value=fill_nan, copy=False) for d in das_block]
-
-                    if len(das_block) == 1:
-                        result_slices.append(das_block[0].values)
-                    else:
-                        das_block_concat = np.stack([d.values for d in das_block], axis=0)
-                        with warnings.catch_warnings():
-                            warnings.simplefilter('ignore', RuntimeWarning)
-                            result_slices.append(np.nanmin(das_block_concat, axis=0))
-
-            return np.stack(result_slices, axis=0)
-
-        # Use complex128 (16 bytes) to account for total memory per chunk:
-        # output + 2-4 overlapping input bursts to load, crop, and merge
-        chunks = dask.array.core.normalize_chunks('auto', (ys.size, xs.size), dtype=np.complex128)
-        ys_blocks = np.array_split(ys, np.cumsum(chunks[0])[:-1])
-        xs_blocks = np.array_split(xs, np.cumsum(chunks[1])[:-1])
+            out = np.full(out_shape, np.nan, dtype=fill_dtype)
+            for tile, y_off, x_off in tiles_with_offsets:
+                # Compute valid region considering both tile size and output bounds
+                ny, nx = tile.shape
+                y_end = min(y_off + ny, out_shape[0])
+                x_end = min(x_off + nx, out_shape[1])
+                tile_y_end = y_end - y_off
+                tile_x_end = x_end - x_off
+                # Forward-fill: only write to NaN positions
+                view = out[y_off:y_end, x_off:x_end]
+                tile_view = tile[:tile_y_end, :tile_x_end]
+                mask = np.isnan(view)
+                view[mask] = tile_view[mask]
+            return out
 
         # Build result for each polarization
         results = {}
         for pol in polarizations:
             datas = datas_by_pol[pol]
 
-            # Build blocks using da.from_delayed
-            blocks_total = []
-            for ys_block in ys_blocks:
-                blocks_row = []
-                for xs_block in xs_blocks:
-                    block = da.from_delayed(
-                        dask.delayed(process_chunk)(ys_block, xs_block, pol, datas),
-                        shape=(n_stack, ys_block.size, xs_block.size),
-                        dtype=fill_dtype
-                    )
-                    blocks_row.append(block)
-                blocks_total.append(blocks_row)
+            # Rechunk all bursts to consistent spatial chunks for efficient block access
+            # Stack dimension chunked to 1 for per-date processing
+            rechunked_datas = []
+            for d in datas:
+                # xarray .chunk() works for both numpy and dask backed arrays
+                rechunked = d.chunk({d.dims[0]: 1, 'y': y_chunk_size, 'x': x_chunk_size}).data
+                rechunked_datas.append(rechunked)
 
-            data = da.block(blocks_total)
-            # Rechunk stack dimension to 1 (one pair/date per chunk)
-            if n_stack > 1:
-                data = data.rechunk({0: 1})
+            # Build output blocks for each stack slice separately
+            stack_mosaics = []
+            for s_idx in range(n_stack):
+                # Extract this stack slice from all bursts
+                slice_arrays = [rd[s_idx] for rd in rechunked_datas]
+
+                # Build 2D mosaic for this stack slice
+                blocks_rows = []
+                for yi in range(n_y_chunks):
+                    yb0 = yi * y_chunk_size
+                    yb1 = min(yb0 + y_chunk_size, ys.size)
+                    blocks_row = []
+                    for xi in range(n_x_chunks):
+                        xb0 = xi * x_chunk_size
+                        xb1 = min(xb0 + x_chunk_size, xs.size)
+
+                        # O(1) lookup of overlapping bursts via spatial index
+                        overlapping = chunk_index.get((yi, xi), [])
+
+                        out_shape = (yb1 - yb0, xb1 - xb0)
+
+                        if len(overlapping) == 0:
+                            # No data - create NaN block
+                            block = da.full(out_shape, np.nan, dtype=fill_dtype)
+                        else:
+                            # Collect delayed tiles with their offsets in output chunk
+                            tiles_info = []  # list of (delayed_tile, y_offset, x_offset)
+
+                            # Output chunk coordinate bounds
+                            out_y0, out_y1 = ys[yb0], ys[yb1-1]
+                            out_x0, out_x1 = xs[xb0], xs[xb1-1]
+
+                            for burst_idx, _ in overlapping:
+                                info = burst_info[burst_idx]
+                                arr = slice_arrays[burst_idx]
+                                burst_ys = info['y_coords']
+                                burst_xs = info['x_coords']
+
+                                # Find burst indices that fall within output chunk
+                                # Use searchsorted for robust coordinate matching
+                                burst_y0 = np.searchsorted(burst_ys, out_y0 - dy/2)
+                                burst_y1 = np.searchsorted(burst_ys, out_y1 + dy/2)
+                                burst_x0 = np.searchsorted(burst_xs, out_x0 - dx/2)
+                                burst_x1 = np.searchsorted(burst_xs, out_x1 + dx/2)
+
+                                if burst_y1 > burst_y0 and burst_x1 > burst_x0:
+                                    # Compute offset: where in output chunk does this tile start?
+                                    # Find where burst_ys[burst_y0] falls in output coordinates
+                                    tile_y_in_out = np.searchsorted(ys[yb0:yb1], burst_ys[burst_y0] - dy/2)
+                                    tile_x_in_out = np.searchsorted(xs[xb0:xb1], burst_xs[burst_x0] - dx/2)
+
+                                    # Slice the burst array
+                                    tile = arr[burst_y0:burst_y1, burst_x0:burst_x1]
+                                    # Rechunk to single chunk to ensure to_delayed() returns one object
+                                    # (slice may span multiple input chunks)
+                                    if tile.npartitions > 1:
+                                        tile = tile.rechunk(-1)
+                                    tiles_info.append((tile.to_delayed().ravel()[0],
+                                                      tile_y_in_out, tile_x_in_out))
+
+                            if len(tiles_info) == 0:
+                                block = da.full(out_shape, np.nan, dtype=fill_dtype)
+                            elif len(tiles_info) == 1 and tiles_info[0][1] == 0 and tiles_info[0][2] == 0:
+                                # Single tile at origin - check if it covers the whole chunk
+                                tile_delayed, _, _ = tiles_info[0]
+                                # Use merge even for single tile to handle size mismatches
+                                block = da.from_delayed(
+                                    dask.delayed(merge_tiles_numpy)(tiles_info, out_shape, fill_dtype),
+                                    shape=out_shape,
+                                    dtype=fill_dtype
+                                )
+                            else:
+                                # Multiple tiles or offset - merge with forward-fill
+                                block = da.from_delayed(
+                                    dask.delayed(merge_tiles_numpy)(tiles_info, out_shape, fill_dtype),
+                                    shape=out_shape,
+                                    dtype=fill_dtype
+                                )
+
+                        blocks_row.append(block)
+                    blocks_rows.append(blocks_row)
+
+                # Assemble 2D mosaic for this stack slice
+                mosaic_2d = da.block(blocks_rows)
+                stack_mosaics.append(mosaic_2d[np.newaxis, :, :])
+
+            # Stack all slices along axis 0
+            data = da.concatenate(stack_mosaics, axis=0)
 
             result = xr.DataArray(data, coords={stackvar: stackval, 'y': ys, 'x': xs})\
                 .rename(pol)\
