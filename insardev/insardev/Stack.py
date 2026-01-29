@@ -1590,7 +1590,8 @@ class Stack(Stack_plot, BatchCore):
         Parameters
         ----------
         debug : bool, optional
-            Print debug information including elevation corrections.
+            Print debug information including elevation corrections and
+            alignment quality metrics.
 
         Returns
         -------
@@ -1602,51 +1603,63 @@ class Stack(Stack_plot, BatchCore):
         The satellite height varies along the orbit (30-60m between adjacent
         bursts). This causes an apparent elevation offset between bursts
         when they are processed independently. This function computes and
-        applies cumulative elevation corrections to align the bursts.
+        applies optimal elevation corrections to align all bursts.
 
-        The elevation correction is computed from the satellite height
-        difference using radar geometry (incidence angle, Earth radius,
-        slant range).
+        Uses least-squares optimization over all overlapping burst pairs
+        (both within-subswath and cross-subswath) to find globally optimal
+        corrections. The elevation correction for each pair is computed
+        analytically from satellite height difference using radar geometry.
+
+        For improved accuracy, uses a single reference range per orbital path
+        (IW2's near_range or average if IW2 not available) instead of
+        per-subswath near_range, reducing systematic biases across subswaths.
         """
         import numpy as np
-        import xarray as xr
+        from scipy import sparse
+        from scipy.sparse.linalg import lsqr
+        from collections import defaultdict
 
         if not self:
             return type(self)({})
 
-        # Group bursts by (pathNumber, subswath) and sort by burst number
-        # NOTE: Extract pathNumber and subswath from burst ID string, not from
-        # per-date data variables which may vary (e.g., S1A vs S1B satellites).
-        # Burst ID format: "{pathNumber}_{burstNumber}_{subswath}"
         ids = sorted(self.keys())
-        groups = {}
+        n_bursts = len(ids)
+        id_to_idx = {bid: i for i, bid in enumerate(ids)}
+
+        if debug:
+            print(f"align_elevation(): {n_bursts} bursts")
+
+        # Compute reference near_range per orbital path
+        # Using IW2 (middle subswath) provides best accuracy across all subswaths
+        path_ref_range = {}
+        path_all_ranges = defaultdict(list)
+
         for bid in ids:
             parts = bid.split('_')
             if len(parts) >= 3:
-                path_num = int(parts[0])
-                burst_num = int(parts[1])
-                subswath = parts[2]
-            else:
-                # Fallback to data variable if burst ID format is unexpected
-                ds = self[bid]
-                path_num = int(ds['pathNumber'].values[0])
-                subswath = str(ds['subswath'].values[0])
-                burst_num = int(parts[1]) if len(parts) >= 2 else 0
-            key = (path_num, subswath)
-            if key not in groups:
-                groups[key] = []
-            groups[key].append((bid, burst_num))
+                path = parts[0]
+                sw = parts[2]
+                nr = float(self[bid]['near_range'].isel(date=0).values)
+                path_all_ranges[path].append(nr)
+                if sw == 'IW2':
+                    path_ref_range[path] = nr
 
-        for key in groups:
-            groups[key].sort(key=lambda x: x[1])
+        # For paths without IW2, use average of available subswaths
+        for path, ranges in path_all_ranges.items():
+            if path not in path_ref_range:
+                path_ref_range[path] = np.mean(ranges)
 
         if debug:
-            print(f"align_tops(): {len(ids)} bursts")
+            print(f"Reference range per path:")
+            for path in sorted(path_ref_range.keys()):
+                print(f"  Path {path}: {path_ref_range[path]/1000:.1f} km")
 
-        def compute_elevation_correction(ds_prev, ds_curr):
+        def compute_elevation_correction(ds_prev, ds_curr, ref_range):
             """Compute elevation correction from satellite height difference.
 
-            Returns the apparent elevation offset (meters) to add to current burst.
+            Returns (dh_elevation, has_overlap) where dh_elevation is the
+            apparent elevation offset (meters) to add to curr relative to prev,
+            and has_overlap indicates if the bursts have valid azimuth overlap.
             """
             prf = float(ds_prev['PRF'].isel(date=0).values)
             lpb = int(ds_prev['linesPerBurst'].isel(date=0).values)
@@ -1665,6 +1678,10 @@ class Stack(Stack_plot, BatchCore):
             valid_overlap_start = max(ksr_prev, nl + ksr_curr)
             valid_overlap_end = min(ker_prev, nl + ker_curr)
 
+            # Check if there's valid overlap
+            if valid_overlap_end <= valid_overlap_start:
+                return 0.0, False
+
             # Stitch at middle of valid overlap
             azi_prev = round((valid_overlap_start + valid_overlap_end) / 2)
             azi_curr = azi_prev - nl
@@ -1681,50 +1698,146 @@ class Stack(Stack_plot, BatchCore):
 
             # Compute apparent elevation difference from satellite height change
             # Using radar geometry: range, Earth radius, incidence angle
+            # Use path-specific reference range for consistent accuracy across subswaths
             earth_radius = float(ds_prev['earth_radius'].isel(date=0).values)
-            near_range = float(ds_prev['near_range'].isel(date=0).values)
             H_avg = (H_prev + H_curr) / 2
             c = earth_radius + H_avg
             ret = earth_radius
-            cos_theta = (c**2 + ret**2 - near_range**2) / (2 * c * ret)
-            drho_dH = (c - ret * cos_theta) / near_range
-            drho_dh = (ret - c * cos_theta) / near_range
+            cos_theta = (c**2 + ret**2 - ref_range**2) / (2 * c * ret)
+            drho_dH = (c - ret * cos_theta) / ref_range
+            drho_dh = (ret - c * cos_theta) / ref_range
             dh_elevation = -dH_satellite * drho_dH / drho_dh
 
-            return dh_elevation
+            return dh_elevation, True
 
-        # Compute cumulative elevation corrections per burst
-        burst_ele_corrections = {}
+        # Find all overlapping burst pairs and compute analytical corrections
+        # - Within-subswath (same IW): compute from satellite height variation along track
+        # - Cross-subswath at same burst number: dh=0 (same satellite position, elevations match)
+        overlap_pairs = []  # (id1, id2, dh_elevation)
 
-        for (path_num, subswath), burst_list in groups.items():
+        for i, id1 in enumerate(ids):
+            ds1 = self[id1]
+            # Extract path, burst number and subswath from burst ID
+            parts1 = id1.split('_')
+            path1 = parts1[0] if len(parts1) >= 3 else ''
+            bn1 = parts1[1] if len(parts1) >= 3 else ''
+            sw1 = parts1[2] if len(parts1) >= 3 else ''
+
+            for j, id2 in enumerate(ids):
+                if i >= j:
+                    continue
+                ds2 = self[id2]
+                parts2 = id2.split('_')
+                path2 = parts2[0] if len(parts2) >= 3 else ''
+                bn2 = parts2[1] if len(parts2) >= 3 else ''
+                sw2 = parts2[2] if len(parts2) >= 3 else ''
+
+                if sw1 == sw2:
+                    # Within-subswath: check azimuth overlap and compute analytical correction
+                    ref_range = path_ref_range.get(path1, float(ds1['near_range'].isel(date=0).values))
+                    dh, has_overlap = compute_elevation_correction(ds1, ds2, ref_range)
+                    if has_overlap:
+                        overlap_pairs.append((id1, id2, dh))
+                elif bn1 == bn2:
+                    # Cross-subswath at SAME burst number: same satellite position, dh=0
+                    # These bursts have spatial overlap and same acquisition time
+                    overlap_pairs.append((id1, id2, 0.0))
+
+        # Count within-subswath vs cross-subswath
+        within_sw = 0
+        cross_sw = 0
+        for id1, id2, _ in overlap_pairs:
+            sw1 = id1.split('_')[2] if len(id1.split('_')) >= 3 else ''
+            sw2 = id2.split('_')[2] if len(id2.split('_')) >= 3 else ''
+            if sw1 == sw2:
+                within_sw += 1
+            else:
+                cross_sw += 1
+
+        if debug:
+            print(f"Overlapping pairs: {len(overlap_pairs)} "
+                  f"({within_sw} within-subswath, {cross_sw} cross-subswath)")
+
+        if len(overlap_pairs) == 0:
             if debug:
-                print(f"\n=== Path {path_num}, Subswath {subswath} ===")
+                print("No overlapping pairs found, returning unchanged")
+            return type(self)(dict(self))
 
-            ref_bid = burst_list[0][0]
-            burst_ele_corrections[ref_bid] = 0.0
+        # Build least-squares system: A @ corrections = b
+        # For each pair (id1, id2, dh): corr[id2] - corr[id1] = dh
+        n_constraints = len(overlap_pairs)
+        rows = []
+        cols = []
+        data = []
+        b = []
 
-            if debug:
-                print(f"{ref_bid}: reference burst (ele_corr=0)")
+        for constraint_idx, (id1, id2, dh) in enumerate(overlap_pairs):
+            idx1 = id_to_idx[id1]
+            idx2 = id_to_idx[id2]
+            # corr[id2] - corr[id1] = dh
+            rows.extend([constraint_idx, constraint_idx])
+            cols.extend([idx1, idx2])
+            data.extend([-1.0, 1.0])
+            b.append(dh)
 
-            cumulative_ele = 0.0
+        A = sparse.csr_matrix((data, (rows, cols)), shape=(n_constraints, n_bursts))
+        b = np.array(b)
 
-            for i in range(1, len(burst_list)):
-                prev_bid = burst_list[i - 1][0]
-                curr_bid = burst_list[i][0]
-                ds_prev = self[prev_bid]
-                ds_curr = self[curr_bid]
+        # Solve least-squares (with implicit reference: mean correction = 0)
+        result = lsqr(A, b)
+        corrections = result[0]
 
-                dh_elevation = compute_elevation_correction(ds_prev, ds_curr)
-                cumulative_ele += dh_elevation
-                burst_ele_corrections[curr_bid] = cumulative_ele
+        # Center corrections (mean = 0) to avoid drift
+        corrections = corrections - np.mean(corrections)
 
-                if debug:
-                    print(f"{curr_bid}: dh={dh_elevation:.2f}m, cumulative={cumulative_ele:.2f}m")
+        if debug:
+            # Compute residuals for quality assessment
+            residuals = A @ corrections - b
+
+            # Separate within-subswath and cross-subswath residuals
+            within_sw_residuals = []
+            cross_sw_residuals = []
+            sw_residuals = defaultdict(list)
+
+            for idx, (id1, id2, dh) in enumerate(overlap_pairs):
+                sw1 = id1.split('_')[2] if len(id1.split('_')) >= 3 else ''
+                sw2 = id2.split('_')[2] if len(id2.split('_')) >= 3 else ''
+                if sw1 == sw2:
+                    within_sw_residuals.append(residuals[idx])
+                    sw_residuals[sw1].append(residuals[idx])
+                else:
+                    cross_sw_residuals.append(residuals[idx])
+
+            within_arr = np.array(within_sw_residuals) if within_sw_residuals else np.array([0.0])
+            cross_arr = np.array(cross_sw_residuals) if cross_sw_residuals else np.array([0.0])
+
+            # Print quality summary
+            print(f"\nAlignment quality:")
+            print(f"  Overall RMS: {np.sqrt(np.mean(residuals**2)):.3f} m")
+            print(f"  Within-subswath ({len(within_arr)} pairs): "
+                  f"RMS={np.sqrt(np.mean(within_arr**2)):.3f} m, "
+                  f"max={np.max(np.abs(within_arr)):.3f} m")
+            print(f"  Cross-subswath ({len(cross_arr)} pairs): "
+                  f"RMS={np.sqrt(np.mean(cross_arr**2)):.3f} m, "
+                  f"max={np.max(np.abs(cross_arr)):.3f} m")
+
+            # Per-subswath breakdown
+            print(f"\n  Per-subswath RMS:")
+            for sw in sorted(sw_residuals.keys()):
+                sw_arr = np.array(sw_residuals[sw])
+                print(f"    {sw} ({len(sw_arr)} pairs): "
+                      f"RMS={np.sqrt(np.mean(sw_arr**2)):.3f} m, "
+                      f"bias={np.mean(sw_arr):.3f} m")
+
+            # Correction range
+            print(f"\nCorrections range: {corrections.min():.2f} to {corrections.max():.2f} m")
+            print(f"Mean correction between adjacent bursts: "
+                  f"{np.mean(np.abs(np.array([dh for _, _, dh in overlap_pairs if dh != 0]))):.2f} m")
 
         # Apply elevation corrections
         output = {}
         for bid, ds in self.items():
-            ele_corr = burst_ele_corrections.get(bid, 0.0)
+            ele_corr = corrections[id_to_idx[bid]]
 
             # Skip if no correction needed
             if abs(ele_corr) < 1e-6:
