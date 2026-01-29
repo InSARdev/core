@@ -614,12 +614,16 @@ class Stack_unwrap1d(Stack_phasediff):
         n_dates = len(dates)
         n_pairs = len(pair_dates)
 
-        # Use dask auto-chunking for y,x based on memory
-        # Multiplier accounts for lstsq internal memory (matrices, solutions)
+        # Use dask auto-chunking for y,x based on actual memory usage
+        # WA tensor is (n_pixels, n_pairs, n_intervals) - dominant memory consumer
+        # Memory per pixel = n_pairs * n_intervals * 4 bytes
+        # Use 2D auto-chunks with memory-equivalent dtype
+        n_intervals = n_dates - 1
+        mem_per_pixel = n_pairs * n_intervals * 4
         auto_chunks = dask.array.core.normalize_chunks(
-            'auto', (4 * n_pairs, data.y.size, data.x.size), dtype=np.complex128
+            'auto', (data.y.size, data.x.size), dtype=np.dtype(f'V{mem_per_pixel}')
         )
-        chunks_y, chunks_x = auto_chunks[1][0], auto_chunks[2][0]
+        chunks_y, chunks_x = auto_chunks[0][0], auto_chunks[1][0]
 
         # Rechunk: all pairs together (-1), auto-chunked y,x
         first_dim = data.dims[0]
