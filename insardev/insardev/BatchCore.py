@@ -22,6 +22,50 @@ if TYPE_CHECKING:
     import pandas as pd
     import matplotlib
 
+
+def _merge_tiles_for_dask(tiles, offsets, out_shape, fill_dtype):
+    """
+    Module-level function for merging tiles in to_dataset().
+
+    Defined at module level to avoid dask serialization issues with nested functions.
+    When using dask distributed, closures with nested functions may not serialize correctly,
+    causing random/incorrect behavior on workers.
+
+    Args:
+        tiles: list of dask delayed objects that will compute to 3D arrays (1, ny, nx)
+        offsets: list of (y_offset, x_offset) tuples for each tile
+        out_shape: (ny, nx) output shape
+        fill_dtype: output dtype
+
+    Returns:
+        merged 2D numpy array
+    """
+    out = np.full(out_shape, np.nan, dtype=fill_dtype)
+
+    for tile_3d, (y_off, x_off) in zip(tiles, offsets):
+        # Tiles arrive as 3D (1, ny, nx), squeeze to 2D
+        tile = tile_3d[0]
+
+        # Tile position in output chunk
+        y0, x0 = y_off, x_off
+        y1, x1 = y0 + tile.shape[0], x0 + tile.shape[1]
+
+        # Clip to output bounds
+        y0c, x0c = max(0, y0), max(0, x0)
+        y1c, x1c = min(out_shape[0], y1), min(out_shape[1], x1)
+
+        if y1c > y0c and x1c > x0c:
+            # Tile slice corresponding to clipped output region
+            ty0, tx0 = y0c - y0, x0c - x0
+            ty1, tx1 = ty0 + (y1c - y0c), tx0 + (x1c - x0c)
+
+            # In-place fmin: min of existing and new, NaN treated as missing
+            view = out[y0c:y1c, x0c:x1c]
+            np.fmin(view, tile[ty0:ty1, tx0:tx1], out=view)
+
+    return out
+
+
 class BatchCore(dict):
     """
     This class has 'pair' stack variable for the datasets in the dict and stores real values (correlation and unwrapped phase).
@@ -1505,10 +1549,33 @@ class BatchCore(dict):
             result[key] = {var: ds[var].values for var in ds.data_vars}
         return result
 
-    def compute(self):
+    def compute(self, load: bool = False):
+        """
+        Compute lazy data in the batch.
+
+        Parameters
+        ----------
+        load : bool, optional
+            If False (default), uses dask.persist() which keeps data as dask arrays
+            but triggers computation and caches results in distributed memory.
+            If True, fully loads data into numpy arrays (uses more memory but
+            ensures data is fully materialized for subsequent operations).
+
+        Returns
+        -------
+        BatchCore
+            New batch with computed data.
+        """
         import dask
         from insardev_toolkit.progressbar import progressbar
-        progressbar(result := dask.persist(dict(self))[0], desc=f'Computing Batch...'.ljust(25))
+
+        if load:
+            # Fully load data to numpy arrays
+            progressbar(result := dask.compute(dict(self))[0], desc=f'Loading Batch...'.ljust(25))
+        else:
+            # Persist data (keep as dask arrays but computed/cached)
+            progressbar(result := dask.persist(dict(self))[0], desc=f'Computing Batch...'.ljust(25))
+
         # Ensure coordinates are also computed (not lazy dask arrays)
         computed = {}
         for key, ds in result.items():
@@ -1809,14 +1876,16 @@ class BatchCore(dict):
             first_datas = datas_by_pol[first_pol]
 
         n_stack = len(stackval)
-        dy = first_datas[0].y.diff('y').item(0)  # Signed spacing
-        dx = first_datas[0].x.diff('x').item(0)
+        # Ensure coordinates are concrete values (important for data from delayed computations)
+        dy = float(first_datas[0].y.diff('y').values[0])  # Signed spacing
+        dx = float(first_datas[0].x.diff('x').values[0])
 
         # Find global min/max across all bursts
-        y_min = min(ds.y.min().item() for ds in first_datas)
-        y_max = max(ds.y.max().item() for ds in first_datas)
-        x_min = min(ds.x.min().item() for ds in first_datas)
-        x_max = max(ds.x.max().item() for ds in first_datas)
+        # Use explicit float conversion to handle any lazy coordinate types
+        y_min = min(float(np.asarray(ds.y.values).min()) for ds in first_datas)
+        y_max = max(float(np.asarray(ds.y.values).max()) for ds in first_datas)
+        x_min = min(float(np.asarray(ds.x.values).min()) for ds in first_datas)
+        x_max = max(float(np.asarray(ds.x.values).max()) for ds in first_datas)
 
         # Determine first/last based on sign of spacing
         # If dy > 0 (increasing): first = min, last = max
@@ -1868,8 +1937,10 @@ class BatchCore(dict):
         # Index formula: idx = (coord - y_first) / dy
         # Works for both increasing (dy > 0) and decreasing (dy < 0) coords
         for burst_idx, d in enumerate(first_datas):
-            burst_ys = d.y.values
-            burst_xs = d.x.values
+            # Ensure coordinates are concrete numpy arrays (not dask or other lazy types)
+            # This is important when data comes from delayed computations like dissolve()
+            burst_ys = np.asarray(d.y.values, dtype=np.float64)
+            burst_xs = np.asarray(d.x.values, dtype=np.float64)
             info = {
                 'y_coords': burst_ys,
                 'x_coords': burst_xs,
@@ -1943,44 +2014,9 @@ class BatchCore(dict):
                 print(f"  [{idx}] y=[{by.min():.1f}, {by.max():.1f}] "
                       f"x=[{bx.min():.1f}, {bx.max():.1f}] ({len(by)}×{len(bx)} pixels)")
 
-        def merge_tiles_numpy(tiles, offsets, out_shape, fill_dtype):
-            """Merge overlapping numpy tiles using direct index placement and in-place fmin.
-
-            Each tile is placed at its offset position. Uses np.fmin for nanmin semantics.
-            All grids are identical by design, so simple index arithmetic works.
-
-            Args:
-                tiles: list of numpy arrays (2D) - pre-computed by dask
-                offsets: list of (y_offset, x_offset) tuples for each tile
-                out_shape: (ny, nx) output shape
-                fill_dtype: output dtype
-
-            Returns:
-                merged 2D array
-            """
-            out = np.full(out_shape, np.nan, dtype=fill_dtype)
-
-            for tile, (y_off, x_off) in zip(tiles, offsets):
-                # Tile position in output chunk
-                y0, x0 = y_off, x_off
-                y1, x1 = y0 + tile.shape[0], x0 + tile.shape[1]
-
-                # Clip to output bounds
-                y0c, x0c = max(0, y0), max(0, x0)
-                y1c, x1c = min(out_shape[0], y1), min(out_shape[1], x1)
-
-                if y1c > y0c and x1c > x0c:
-                    # Tile slice corresponding to clipped output region
-                    ty0, tx0 = y0c - y0, x0c - x0
-                    ty1, tx1 = ty0 + (y1c - y0c), tx0 + (x1c - x0c)
-
-                    # In-place fmin: min of existing and new, NaN treated as missing
-                    view = out[y0c:y1c, x0c:x1c]
-                    np.fmin(view, tile[ty0:ty1, tx0:tx1], out=view)
-
-            return out
-
         # Build result for each polarization
+        # Note: merge function is defined at module level (_merge_tiles_for_dask)
+        # to avoid dask serialization issues with nested function closures
         results = {}
         for pol in polarizations:
             datas = datas_by_pol[pol]
@@ -2081,10 +2117,12 @@ class BatchCore(dict):
                             else:
                                 # Merge tiles - dask auto-computes delayed tiles before calling
                                 # Tiles arrive as 3D (1, ny, nx), squeeze to 2D in merge
+                                # IMPORTANT: Use standalone function instead of lambda with closure
+                                # to avoid serialization issues with nested functions in dask distributed
                                 block = da.from_delayed(
-                                    dask.delayed(lambda tiles, offs, shape, dtype: merge_tiles_numpy(
-                                        [t[0] for t in tiles], offs, shape, dtype
-                                    ))(tiles_delayed, offsets, out_shape, fill_dtype),
+                                    dask.delayed(_merge_tiles_for_dask)(
+                                        tiles_delayed, offsets, out_shape, fill_dtype
+                                    ),
                                     shape=out_shape,
                                     dtype=fill_dtype
                                 )
