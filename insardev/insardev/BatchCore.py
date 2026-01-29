@@ -1793,11 +1793,7 @@ class BatchCore(dict):
         first_pol = polarizations[0]
         first_datas = datas_by_pol[first_pol]
 
-        # Define unified grid from all burst extents
-        y_min = min(ds.y.min().item() for ds in first_datas)
-        y_max = max(ds.y.max().item() for ds in first_datas)
-        x_min = min(ds.x.min().item() for ds in first_datas)
-        x_max = max(ds.x.max().item() for ds in first_datas)
+        # Get signed spacing from first burst
         dims = first_datas[0].dims
         stackvar = list(dims)[0] if len(dims) > 2 else None
 
@@ -1813,10 +1809,27 @@ class BatchCore(dict):
             first_datas = datas_by_pol[first_pol]
 
         n_stack = len(stackval)
-        dy = first_datas[0].y.diff('y').item(0)
+        dy = first_datas[0].y.diff('y').item(0)  # Signed spacing
         dx = first_datas[0].x.diff('x').item(0)
-        ys = np.arange(y_min, y_max + dy/2, dy)
-        xs = np.arange(x_min, x_max + dx/2, dx)
+
+        # Find global min/max across all bursts
+        y_min = min(ds.y.min().item() for ds in first_datas)
+        y_max = max(ds.y.max().item() for ds in first_datas)
+        x_min = min(ds.x.min().item() for ds in first_datas)
+        x_max = max(ds.x.max().item() for ds in first_datas)
+
+        # Determine first/last based on sign of spacing
+        # If dy > 0 (increasing): first = min, last = max
+        # If dy < 0 (decreasing): first = max, last = min
+        y_first = y_min if dy > 0 else y_max
+        y_last = y_max if dy > 0 else y_min
+        x_first = x_min if dx > 0 else x_max
+        x_last = x_max if dx > 0 else x_min
+
+        # Build output grid using arange with signed spacing
+        # Add dy/2 to last to ensure it's included (arange excludes endpoint)
+        ys = np.arange(y_first, y_last + dy/2, dy)
+        xs = np.arange(x_first, x_last + dx/2, dx)
 
         fill_dtype = first_datas[0].dtype
 
@@ -1852,38 +1865,47 @@ class BatchCore(dict):
         from collections import defaultdict
         chunk_index = defaultdict(list)
 
+        # Index formula: idx = (coord - y_first) / dy
+        # Works for both increasing (dy > 0) and decreasing (dy < 0) coords
         for burst_idx, d in enumerate(first_datas):
+            burst_ys = d.y.values
+            burst_xs = d.x.values
             info = {
-                'y_min': float(d.y.min()),
-                'y_max': float(d.y.max()),
-                'x_min': float(d.x.min()),
-                'x_max': float(d.x.max()),
-                'y_coords': d.y.values,
-                'x_coords': d.x.values,
+                'y_coords': burst_ys,
+                'x_coords': burst_xs,
             }
             burst_info.append(info)
 
-            # Which output chunks does this burst overlap?
-            # Convert burst extent to chunk indices
-            y_chunk_start = max(0, int((info['y_min'] - y_min) / (dy * y_chunk_size)))
-            y_chunk_end = min(n_y_chunks, int((info['y_max'] - y_min) / (dy * y_chunk_size)) + 1)
-            x_chunk_start = max(0, int((info['x_min'] - x_min) / (dx * x_chunk_size)))
-            x_chunk_end = min(n_x_chunks, int((info['x_max'] - x_min) / (dx * x_chunk_size)) + 1)
+            # Convert burst first/last coordinates to global array indices
+            burst_y_start_idx = int(round((burst_ys[0] - y_first) / dy))
+            burst_y_end_idx = int(round((burst_ys[-1] - y_first) / dy)) + 1
+            burst_x_start_idx = int(round((burst_xs[0] - x_first) / dx))
+            burst_x_end_idx = int(round((burst_xs[-1] - x_first) / dx)) + 1
+
+            # Which output chunks does this burst overlap? (using array indices)
+            y_chunk_start = max(0, burst_y_start_idx // y_chunk_size)
+            y_chunk_end = min(n_y_chunks, (burst_y_end_idx + y_chunk_size - 1) // y_chunk_size)
+            x_chunk_start = max(0, burst_x_start_idx // x_chunk_size)
+            x_chunk_end = min(n_x_chunks, (burst_x_end_idx + x_chunk_size - 1) // x_chunk_size)
 
             # Register this burst for all overlapping chunks
             for yi in range(y_chunk_start, y_chunk_end):
                 for xi in range(x_chunk_start, x_chunk_end):
-                    # Compute coverage for this chunk
-                    yb0 = yi * y_chunk_size
-                    yb1 = min(yb0 + y_chunk_size, ys.size)
-                    xb0 = xi * x_chunk_size
-                    xb1 = min(xb0 + x_chunk_size, xs.size)
-                    y0, y1 = ys[yb0], ys[yb1-1]
-                    x0, x1 = xs[xb0], xs[xb1-1]
-                    y_overlap = min(y1, info['y_max']) - max(y0, info['y_min'])
-                    x_overlap = min(x1, info['x_max']) - max(x0, info['x_min'])
-                    coverage = max(0, y_overlap / dy) * max(0, x_overlap / dx)
-                    chunk_index[(yi, xi)].append((burst_idx, coverage))
+                    # Compute coverage (number of pixels in overlap)
+                    chunk_y0 = yi * y_chunk_size
+                    chunk_y1 = min(chunk_y0 + y_chunk_size, ys.size)
+                    chunk_x0 = xi * x_chunk_size
+                    chunk_x1 = min(chunk_x0 + x_chunk_size, xs.size)
+
+                    # Overlap in array index space
+                    ov_y0 = max(chunk_y0, burst_y_start_idx)
+                    ov_y1 = min(chunk_y1, burst_y_end_idx)
+                    ov_x0 = max(chunk_x0, burst_x_start_idx)
+                    ov_x1 = min(chunk_x1, burst_x_end_idx)
+
+                    coverage = max(0, ov_y1 - ov_y0) * max(0, ov_x1 - ov_x0)
+                    if coverage > 0:
+                        chunk_index[(yi, xi)].append((burst_idx, coverage))
 
         # Sort each chunk's burst list by coverage (descending)
         for key in chunk_index:
@@ -1916,36 +1938,46 @@ class BatchCore(dict):
             # Burst extents
             print(f"Burst extents:")
             for idx, info in enumerate(burst_info):
-                ny = len(info['y_coords'])
-                nx = len(info['x_coords'])
-                print(f"  [{idx}] y=[{info['y_min']:.1f}, {info['y_max']:.1f}] "
-                      f"x=[{info['x_min']:.1f}, {info['x_max']:.1f}] ({ny}×{nx} pixels)")
+                by = info['y_coords']
+                bx = info['x_coords']
+                print(f"  [{idx}] y=[{by.min():.1f}, {by.max():.1f}] "
+                      f"x=[{bx.min():.1f}, {bx.max():.1f}] ({len(by)}×{len(bx)} pixels)")
 
-        def merge_tiles_numpy(tiles_with_offsets, out_shape, fill_dtype):
-            """Merge overlapping tiles using forward-fill (NaN-aware).
+        def merge_tiles_numpy(tiles, offsets, out_shape, fill_dtype):
+            """Merge overlapping numpy tiles using direct index placement and in-place fmin.
+
+            Each tile is placed at its offset position. Uses np.fmin for nanmin semantics.
+            All grids are identical by design, so simple index arithmetic works.
 
             Args:
-                tiles_with_offsets: list of (tile_data, y_offset, x_offset)
-                    where offsets are positions in output array
-                out_shape: (out_ny, out_nx) output shape
+                tiles: list of numpy arrays (2D) - pre-computed by dask
+                offsets: list of (y_offset, x_offset) tuples for each tile
+                out_shape: (ny, nx) output shape
                 fill_dtype: output dtype
 
             Returns:
-                merged (out_ny, out_nx) array
+                merged 2D array
             """
             out = np.full(out_shape, np.nan, dtype=fill_dtype)
-            for tile, y_off, x_off in tiles_with_offsets:
-                # Compute valid region considering both tile size and output bounds
-                ny, nx = tile.shape
-                y_end = min(y_off + ny, out_shape[0])
-                x_end = min(x_off + nx, out_shape[1])
-                tile_y_end = y_end - y_off
-                tile_x_end = x_end - x_off
-                # Forward-fill: only write to NaN positions
-                view = out[y_off:y_end, x_off:x_end]
-                tile_view = tile[:tile_y_end, :tile_x_end]
-                mask = np.isnan(view)
-                view[mask] = tile_view[mask]
+
+            for tile, (y_off, x_off) in zip(tiles, offsets):
+                # Tile position in output chunk
+                y0, x0 = y_off, x_off
+                y1, x1 = y0 + tile.shape[0], x0 + tile.shape[1]
+
+                # Clip to output bounds
+                y0c, x0c = max(0, y0), max(0, x0)
+                y1c, x1c = min(out_shape[0], y1), min(out_shape[1], x1)
+
+                if y1c > y0c and x1c > x0c:
+                    # Tile slice corresponding to clipped output region
+                    ty0, tx0 = y0c - y0, x0c - x0
+                    ty1, tx1 = ty0 + (y1c - y0c), tx0 + (x1c - x0c)
+
+                    # In-place fmin: min of existing and new, NaN treated as missing
+                    view = out[y0c:y1c, x0c:x1c]
+                    np.fmin(view, tile[ty0:ty1, tx0:tx1], out=view)
+
             return out
 
         # Build result for each polarization
@@ -1953,20 +1985,18 @@ class BatchCore(dict):
         for pol in polarizations:
             datas = datas_by_pol[pol]
 
-            # Rechunk all bursts to consistent spatial chunks for efficient block access
-            # Stack dimension chunked to 1 for per-date processing
-            rechunked_datas = []
-            for d in datas:
-                # xarray .chunk() works for both numpy and dask backed arrays
-                rechunked = d.chunk({d.dims[0]: 1, 'y': y_chunk_size, 'x': x_chunk_size}).data
-                rechunked_datas.append(rechunked)
+            # Ensure data is dask and rechunk: stack dim = 1, spatial = single chunk
+            def ensure_dask_rechunked(d):
+                arr = d.data
+                if not isinstance(arr, da.Array):
+                    arr = da.from_array(arr, chunks=arr.shape)
+                return arr.rechunk({0: 1, 1: -1, 2: -1})
+
+            datas_rechunked = [ensure_dask_rechunked(d) for d in datas]
 
             # Build output blocks for each stack slice separately
             stack_mosaics = []
             for s_idx in range(n_stack):
-                # Extract this stack slice from all bursts
-                slice_arrays = [rd[s_idx] for rd in rechunked_datas]
-
                 # Build 2D mosaic for this stack slice
                 blocks_rows = []
                 for yi in range(n_y_chunks):
@@ -1982,60 +2012,67 @@ class BatchCore(dict):
 
                         out_shape = (yb1 - yb0, xb1 - xb0)
 
+                        # Output chunk coordinates
+                        out_ys = ys[yb0:yb1]
+                        out_xs = xs[xb0:xb1]
+
                         if len(overlapping) == 0:
                             # No data - create NaN block
                             block = da.full(out_shape, np.nan, dtype=fill_dtype)
                         else:
-                            # Collect delayed tiles with their offsets in output chunk
-                            tiles_info = []  # list of (delayed_tile, y_offset, x_offset)
+                            # Collect delayed tile references and their offsets within this chunk
+                            tiles_delayed = []
+                            offsets = []
 
-                            # Output chunk coordinate bounds
-                            out_y0, out_y1 = ys[yb0], ys[yb1-1]
-                            out_x0, out_x1 = xs[xb0], xs[xb1-1]
+                            # Output chunk coordinate bounds (with tolerance for edge matching)
+                            out_y0, out_y1 = out_ys[0] - dy/2, out_ys[-1] + dy/2
+                            out_x0, out_x1 = out_xs[0] - dx/2, out_xs[-1] + dx/2
 
                             for burst_idx, _ in overlapping:
                                 info = burst_info[burst_idx]
-                                arr = slice_arrays[burst_idx]
                                 burst_ys = info['y_coords']
                                 burst_xs = info['x_coords']
 
                                 # Find burst indices that fall within output chunk
-                                # Use searchsorted for robust coordinate matching
-                                burst_y0 = np.searchsorted(burst_ys, out_y0 - dy/2)
-                                burst_y1 = np.searchsorted(burst_ys, out_y1 + dy/2)
-                                burst_x0 = np.searchsorted(burst_xs, out_x0 - dx/2)
-                                burst_x1 = np.searchsorted(burst_xs, out_x1 + dx/2)
+                                y_lo, y_hi = min(out_y0, out_y1), max(out_y0, out_y1)
+                                x_lo, x_hi = min(out_x0, out_x1), max(out_x0, out_x1)
+                                mask_y = (burst_ys >= y_lo) & (burst_ys <= y_hi)
+                                mask_x = (burst_xs >= x_lo) & (burst_xs <= x_hi)
+                                idx_y = np.where(mask_y)[0]
+                                idx_x = np.where(mask_x)[0]
 
-                                if burst_y1 > burst_y0 and burst_x1 > burst_x0:
-                                    # Compute offset: where in output chunk does this tile start?
-                                    # Find where burst_ys[burst_y0] falls in output coordinates
-                                    tile_y_in_out = np.searchsorted(ys[yb0:yb1], burst_ys[burst_y0] - dy/2)
-                                    tile_x_in_out = np.searchsorted(xs[xb0:xb1], burst_xs[burst_x0] - dx/2)
+                                if len(idx_y) > 0 and len(idx_x) > 0:
+                                    by0, by1 = idx_y[0], idx_y[-1] + 1
+                                    bx0, bx1 = idx_x[0], idx_x[-1] + 1
 
-                                    # Slice the burst array
-                                    tile = arr[burst_y0:burst_y1, burst_x0:burst_x1]
-                                    # Rechunk to single chunk to ensure to_delayed() returns one object
-                                    # (slice may span multiple input chunks)
-                                    if tile.npartitions > 1:
-                                        tile = tile.rechunk(-1)
-                                    tiles_info.append((tile.to_delayed().ravel()[0],
-                                                      tile_y_in_out, tile_x_in_out))
+                                    # Slice the dask array to get this tile
+                                    # Input is single-chunked, so this just creates a slice view
+                                    tile_slice = datas_rechunked[burst_idx][s_idx:s_idx+1, by0:by1, bx0:bx1]
+                                    # Convert to delayed - dask will auto-compute when merge is called
+                                    tile_delayed = tile_slice.to_delayed().ravel()[0]
+                                    tiles_delayed.append(tile_delayed)
 
-                            if len(tiles_info) == 0:
+                                    # Compute tile offset within this output chunk
+                                    # Tile's first coord -> global array index -> offset in chunk
+                                    tile_y0_coord = burst_ys[by0]
+                                    tile_x0_coord = burst_xs[bx0]
+                                    # Global array index of tile start
+                                    tile_global_yi = int(round((tile_y0_coord - y_first) / dy))
+                                    tile_global_xi = int(round((tile_x0_coord - x_first) / dx))
+                                    # Offset within this chunk (yb0, xb0 is chunk start in global)
+                                    y_off = tile_global_yi - yb0
+                                    x_off = tile_global_xi - xb0
+                                    offsets.append((y_off, x_off))
+
+                            if len(tiles_delayed) == 0:
                                 block = da.full(out_shape, np.nan, dtype=fill_dtype)
-                            elif len(tiles_info) == 1 and tiles_info[0][1] == 0 and tiles_info[0][2] == 0:
-                                # Single tile at origin - check if it covers the whole chunk
-                                tile_delayed, _, _ = tiles_info[0]
-                                # Use merge even for single tile to handle size mismatches
-                                block = da.from_delayed(
-                                    dask.delayed(merge_tiles_numpy)(tiles_info, out_shape, fill_dtype),
-                                    shape=out_shape,
-                                    dtype=fill_dtype
-                                )
                             else:
-                                # Multiple tiles or offset - merge with forward-fill
+                                # Merge tiles - dask auto-computes delayed tiles before calling
+                                # Tiles arrive as 3D (1, ny, nx), squeeze to 2D in merge
                                 block = da.from_delayed(
-                                    dask.delayed(merge_tiles_numpy)(tiles_info, out_shape, fill_dtype),
+                                    dask.delayed(lambda tiles, offs, shape, dtype: merge_tiles_numpy(
+                                        [t[0] for t in tiles], offs, shape, dtype
+                                    ))(tiles_delayed, offsets, out_shape, fill_dtype),
                                     shape=out_shape,
                                     dtype=fill_dtype
                                 )
