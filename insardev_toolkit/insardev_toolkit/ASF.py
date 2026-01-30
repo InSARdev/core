@@ -13,10 +13,6 @@ class ASF(progressbar_joblib):
     import pandas as pd
     from datetime import timedelta
 
-    # check for downloaded burst files
-    # like S1_370328_IW1_20150121T134421_VV_DBBE-BURST
-    template_burst = '{burstId}/*/{burst}.*'
-
     def __init__(self, username=None, password=None):
         import asf_search
         import getpass
@@ -30,6 +26,61 @@ class ASF(progressbar_joblib):
     def _get_asf_session(self):
         import asf_search
         return asf_search.ASFSession().auth_with_creds(self.username, self.password)
+
+    @staticmethod
+    def _burst_exists(basedir, burst):
+        """
+        Check if a burst is completely downloaded with all required files.
+
+        Parameters
+        ----------
+        basedir : str
+            Base directory containing burst data.
+        burst : str
+            Burst name like 'S1_370328_IW1_20150121T134421_VV_DBBE-BURST'.
+
+        Returns
+        -------
+        bool
+            True if all 4 files exist, are regular files, and have non-zero size.
+        """
+        import os
+        from glob import glob
+
+        # Extract burstId pattern from burst name (orbital path unknown, use wildcard)
+        # burst: S1_370328_IW1_20150121T134421_VV_DBBE-BURST
+        # burstId: 071_370328_IW1 (path number varies)
+        parts = burst.split('_')
+        burstid_pattern = f'*_{parts[1]}_{parts[2]}'
+
+        # Find matching burstId directory
+        matching_dirs = glob(burstid_pattern, root_dir=basedir)
+        if not matching_dirs:
+            return False
+        if len(matching_dirs) > 1:
+            raise ValueError(f'ERROR: Multiple burstId directories found for {burst}: {matching_dirs}. '
+                           f'This indicates inconsistent data that cannot be processed.')
+
+        burst_dir = os.path.join(basedir, matching_dirs[0])
+
+        # Define expected file paths
+        files = [
+            os.path.join(burst_dir, 'measurement', f'{burst}.tiff'),
+            os.path.join(burst_dir, 'annotation', f'{burst}.xml'),
+            os.path.join(burst_dir, 'calibration', f'{burst}.xml'),
+            os.path.join(burst_dir, 'noise', f'{burst}.xml'),
+        ]
+
+        # Check all files: exist, regular file, non-zero size
+        for filepath in files:
+            if not os.path.exists(filepath):
+                return False
+            if not os.path.isfile(filepath):
+                return False
+            if os.path.getsize(filepath) == 0:
+                return False
+
+        return True
 
     # https://asf.alaska.edu/datasets/data-sets/derived-data-sets/sentinel-1-bursts/
     def download(self, basedir, bursts, session=None, n_jobs=8, joblib_backend='loky', skip_exist=True,
@@ -68,7 +119,6 @@ class ASF(progressbar_joblib):
         import joblib
         from tqdm.auto import tqdm
         import os
-        import glob
         from datetime import datetime, timedelta
         import time
         import warnings
@@ -86,28 +136,11 @@ class ASF(progressbar_joblib):
         # create the directory if needed
         os.makedirs(basedir, exist_ok=True)
 
-        # skip existing bursts
+        # skip existing bursts (check all 4 files: tiff + 3 xml, regular files, non-zero size)
         if skip_exist:
-            bursts_missed = []
-            for burst in bursts:
-                #print (burst)
-                # orbital path is not included into burst
-                fakeBurstId = '_'.join(['*'] + burst.split('_')[1:3])
-                template = self.template_burst.format(burstId=fakeBurstId, burst=burst)
-                #print ('template', template)
-                files = glob.glob(template, root_dir=basedir)
-                #print ('files', files)
-                exts =[ os.path.splitext(file)[-1] for file in files]
-                #print ('exts', exts)
-                if '.tiff' in exts and '.xml' in exts and len(exts)==4:
-                    #print ('pass')
-                    pass
-                else:
-                    bursts_missed.append(burst)
+            bursts_missed = [burst for burst in bursts if not self._burst_exists(basedir, burst)]
         else:
-            # process all the defined scenes
             bursts_missed = bursts
-        #print ('bursts_missed', len(bursts_missed))
         # do not use internet connection, work offline when all the scenes already available
         if len(bursts_missed) == 0:
             return
@@ -369,6 +402,24 @@ class ASF(progressbar_joblib):
         with tqdm(desc=f'Downloading ASF Catalog'.ljust(25), total=1) as pbar:
             results = asf_search.granule_search(bursts_missed)
             pbar.update(1)
+
+        # Check for conflicting bursts from different paths with same burstNum_subswath pattern
+        # Such data cannot be stored in the same basedir without conflicts
+        pattern_to_fullburstid = {}
+        for result in results:
+            props = result.geojson()['properties']
+            full_burst_id = props['burst']['fullBurstID']  # e.g., '071_151226_IW3'
+            # Extract pattern without path: '151226_IW3'
+            parts = full_burst_id.split('_')
+            pattern = f'{parts[1]}_{parts[2]}'
+            if pattern in pattern_to_fullburstid:
+                if pattern_to_fullburstid[pattern] != full_burst_id:
+                    raise ValueError(f'ERROR: Conflicting bursts from different paths: '
+                                   f'{pattern_to_fullburstid[pattern]} and {full_burst_id} '
+                                   f'both match pattern *_{pattern}. '
+                                   f'Download bursts from different paths into separate directories.')
+            else:
+                pattern_to_fullburstid[pattern] = full_burst_id
 
         if n_jobs is None or debug == True:
             print ('Note: sequential joblib processing is applied when "n_jobs" is None or "debug" is True.')
