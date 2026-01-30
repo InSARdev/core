@@ -751,16 +751,9 @@ def deramped_burst(xml_path: str, tiff_path: str, eof_path: str) -> tuple:
 
     del data_complex, eta, jj, taus, ka, kt, fnct_arr, etaref
 
-    # Extract valid region
-    slc_valid = slc_deramped[k_start:k_start + n_valid, :width]
+    # Extract valid region and return as complex64 (raw DN values)
+    slc_valid = slc_deramped[k_start:k_start + n_valid, :width].astype(np.complex64)
     del slc_deramped
-
-    # Convert to int16 format
-    slc_out = np.zeros((n_valid, width * 2), dtype=np.int16)
-    with np.errstate(invalid='ignore'):
-        slc_out[:, 0::2] = np.clip(slc_valid.real * 2, -32768, 32767).astype(np.int16)
-        slc_out[:, 1::2] = np.clip(slc_valid.imag * 2, -32768, 32767).astype(np.int16)
-    del slc_valid
 
     reramp_params = {
         'fka': fka,
@@ -775,7 +768,7 @@ def deramped_burst(xml_path: str, tiff_path: str, eof_path: str) -> tuple:
         'n_valid': n_valid,
     }
 
-    return prm_dict, orbit_df, slc_out, reramp_params
+    return prm_dict, orbit_df, slc_valid, reramp_params
 
 
 def repeat_burst(xml_path: str, tiff_path: str, eof_path: str,
@@ -1071,18 +1064,11 @@ def repeat_burst(xml_path: str, tiff_path: str, eof_path: str,
 
     del slc_shifted, ashift_full, rshift_full, eta, jj, taus, ka, kt, fnct, etaref
 
-    # Extract valid region
-    slc_valid = slc_final[k_start:k_start + n_valid, :width]
+    # Extract valid region and return as complex64 (raw DN values)
+    slc_valid = slc_final[k_start:k_start + n_valid, :width].astype(np.complex64)
     del slc_final
 
-    # Convert to int16 format (real, imag interleaved) with factor of 2
-    slc_out = np.zeros((n_valid, width * 2), dtype=np.int16)
-    with np.errstate(invalid='ignore'):
-        slc_out[:, 0::2] = np.clip(slc_valid.real * 2, -32768, 32767).astype(np.int16)
-        slc_out[:, 1::2] = np.clip(slc_valid.imag * 2, -32768, 32767).astype(np.int16)
-    del slc_valid
-
-    return prm_dict, orbit_df, slc_out
+    return prm_dict, orbit_df, slc_valid
 
 
 # Re-export satellite_llt2rat from utils_satellite for backwards compatibility

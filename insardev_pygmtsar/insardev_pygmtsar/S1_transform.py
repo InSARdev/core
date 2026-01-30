@@ -280,7 +280,7 @@ def _compute_merged_transform(transform, prm_rep):
 
 
 def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
-                               burst_name, record_dict, epsg, scale=2.5e-07,
+                               burst_name, record_dict, epsg, scale=0.5,
                                baseline_params=None, sc_height_params=None,
                                reramp_params=None, remove_tidal_phase=True, debug=False):
     """Transform SLC to geocoded int16 zarr.
@@ -309,15 +309,8 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
     num_lines = prm_rep.get('num_lines')
     num_rng_bins = prm_rep.get('num_rng_bins')
 
-    if slc_data.dtype == np.int16:
-        slc_reshaped = slc_data.reshape(num_lines, -1)
-        re = slc_reshaped[:, 0::2].astype(np.float32)
-        im = slc_reshaped[:, 1::2].astype(np.float32)
-        del slc_reshaped
-        slc_complex = scale * (re + 1j * im)
-        del re, im
-    else:
-        slc_complex = scale * slc_data.astype(np.complex64)
+    # Input is complex64 (raw DN values)
+    slc_complex = slc_data.astype(np.complex64)
 
     coords = {'a': np.arange(slc_complex.shape[0]) + 0.5, 'r': np.arange(slc_complex.shape[1]) + 0.5}
 
