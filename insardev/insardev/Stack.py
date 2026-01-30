@@ -1119,7 +1119,7 @@ class Stack(Stack_plot, BatchCore):
                 datas.append(data_ds)
 
             # Merge polarizations
-            ds = xr.merge(datas, combine_attrs='override')
+            ds = xr.merge(datas, compat='no_conflicts', combine_attrs='override')
             del datas
 
             # Load transform: zarr handles metadata/coords, custom reader for 2D chunks
@@ -1294,7 +1294,7 @@ class Stack(Stack_plot, BatchCore):
                     datas.append(data_ds)
 
                 # Merge polarizations
-                ds = xr.merge(datas, combine_attrs='override')
+                ds = xr.merge(datas, compat='no_conflicts', combine_attrs='override')
                 del datas
 
                 # Load transform: zarr for metadata/coords, custom reader for 2D
