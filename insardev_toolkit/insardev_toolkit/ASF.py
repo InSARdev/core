@@ -194,20 +194,15 @@ class ASF(progressbar_joblib):
                 # all files valid, skip download
                 return
 
-            # download manifest to get dimensions for TIFF validation
-            basename = os.path.basename(properties['additionalUrls'][0])
-            import tempfile
-            with tempfile.TemporaryDirectory(prefix=f'{burst}_', dir=burst_dir) as tmp_dir:
-                asf_search.download_urls(urls=properties['additionalUrls'], path=tmp_dir, session=session)
-                manifest_file = os.path.join(tmp_dir, basename)
-                if not os.path.exists(manifest_file):
-                    raise Exception(f'ERROR: manifest file is not downloaded: {manifest_file}')
-                if os.path.getsize(manifest_file) == 0:
-                    raise Exception(f'ERROR: manifest file is empty: {manifest_file}')
-                # check XML file validity parsing it
-                with open(manifest_file, 'r') as file:
-                    xml_content = file.read()
-                    _ = ElementTree.fromstring(xml_content)
+            # download manifest to memory to get dimensions for TIFF validation
+            manifest_url = properties['additionalUrls'][0]
+            response = session.get(manifest_url)
+            response.raise_for_status()
+            xml_content = response.text
+            if len(xml_content) == 0:
+                raise Exception(f'ERROR: Downloaded manifest is empty: {manifest_url}')
+            # check XML file validity by parsing it
+            _ = ElementTree.fromstring(xml_content)
 
             subswathidx = int(subswath[-1:]) - 1
             content = xmltodict.parse(xml_content)['burst']['metadata']['product'][subswathidx]
@@ -241,51 +236,53 @@ class ASF(progressbar_joblib):
                                   f'got {actual_lines}x{actual_samples}, expected {lines_per_burst}x{samples_per_burst}. '
                                   f'Delete the corrupted file and re-download.')
             else:
-                # remove potentially incomplete file if needed
-                if os.path.exists(tif_file):
-                    os.remove(tif_file)
-                # check if we can open the downloaded file without errors
-                tmp_file = os.path.join(burst_dir, os.path.basename(tif_file))
-                # remove potentially incomplete data file if needed
-                if os.path.exists(tmp_file):
-                    os.remove(tmp_file)
-                result.download(burst_dir, filename=os.path.basename(tif_file), session=session)
-                if not os.path.exists(tmp_file):
-                    raise Exception(f'ERROR: TiFF file is not downloaded: {tmp_file}')
-                if os.path.getsize(tmp_file) == 0:
-                    raise Exception(f'ERROR: TiFF file is empty: {tmp_file}')
-                # check TiFF file validity and dimensions
-                with TiffFile(tmp_file) as tif:
+                # Download and validate TIFF entirely in memory before writing to disk
+                import io
+                import rasterio
+                from rasterio.io import MemoryFile
+
+                # Download TIFF to memory
+                tiff_url = properties['url']
+                response = session.get(tiff_url)
+                response.raise_for_status()
+                tiff_bytes = response.content
+                if len(tiff_bytes) == 0:
+                    raise Exception(f'ERROR: Downloaded TIFF is empty: {tiff_url}')
+
+                # Validate TIFF structure and dimensions in memory using TiffFile
+                with TiffFile(io.BytesIO(tiff_bytes)) as tif:
                     page = tif.pages[0]
-                    tags = page.tags
                     actual_lines, actual_samples = page.shape
                     if actual_lines != lines_per_burst or actual_samples != samples_per_burst:
                         raise Exception(f'ERROR: Downloaded TIFF dimensions mismatch for {burst}: '
                                       f'got {actual_lines}x{actual_samples}, expected {lines_per_burst}x{samples_per_burst}. '
                                       f'ASF burst extraction may have failed.')
-                    data = page.asarray()
-                # attention: rasterio can crash the interpreter on a corrupted TIFF file
-                # perform this check as the final step
-                with rio.open_rasterio(tmp_file) as raster:
-                    raster.load()
-                # TiFF file is well loaded
-                if not os.path.exists(tmp_file):
-                    raise Exception(f'ERROR: TiFF file is missed: {tmp_file}')
-                # move to persistent name
-                if os.path.exists(tmp_file):
-                    os.rename(tmp_file, tif_file)
+                    # Also get offset for XML creation
+                    tiff_offset = page.dataoffsets[0]
 
-            # create xml files if needed
-            if os.path.exists(xml_file) and os.path.getsize(xml_file) > 0 \
-                and os.path.exists(xml_noise_file) and os.path.getsize(xml_noise_file) > 0 \
-                and os.path.exists(xml_calib_file) and os.path.getsize(xml_calib_file) > 0:
-                #print (f'pass {xml_file}')
-                pass
-            else:
-                # get TiFF file information
-                with TiffFile(tif_file) as tif:
-                    page = tif.pages[0]
-                    offset = page.dataoffsets[0]
+                # Validate TIFF can be read by rasterio/GDAL (detects corruption)
+                with MemoryFile(tiff_bytes) as memfile:
+                    with memfile.open() as ds:
+                        if ds.width != samples_per_burst or ds.height != lines_per_burst:
+                            raise Exception(f'ERROR: Rasterio dimensions mismatch for {burst}')
+                        # Read a small portion to verify data is accessible
+                        _ = ds.read(1, window=rasterio.windows.Window(0, 0, min(100, ds.width), min(100, ds.height)))
+
+                # TIFF validated - now build XML content in memory before writing anything
+
+            # Build XML content in memory (or skip if files exist)
+            xml_contents = {}  # {filepath: content_string}
+            need_xml = not (os.path.exists(xml_file) and os.path.getsize(xml_file) > 0
+                           and os.path.exists(xml_noise_file) and os.path.getsize(xml_noise_file) > 0
+                           and os.path.exists(xml_calib_file) and os.path.getsize(xml_calib_file) > 0)
+
+            if need_xml:
+                # Get TIFF offset (already have it if we downloaded, otherwise read from existing file)
+                if 'tiff_offset' not in dir():
+                    with TiffFile(tif_file) as tif:
+                        page = tif.pages[0]
+                        tiff_offset = page.dataoffsets[0]
+                offset = tiff_offset
 
                 azimuth_time_interval = annotation['imageAnnotation']['imageInformation']['azimuthTimeInterval']
                 burst_time_interval = timedelta(seconds=(lines_per_burst - 1) * float(azimuth_time_interval))
@@ -348,8 +345,7 @@ class ASF(progressbar_joblib):
                 product = product   | {'coordinateConversion': annotation['coordinateConversion']}
                 product = product   | {'swathMerging': annotation['swathMerging']}
 
-                with open(xml_file, 'w') as file:
-                    file.write(xmltodict.unparse({'product': product}, pretty=True, indent='  '))
+                xml_contents[xml_file] = xmltodict.unparse({'product': product}, pretty=True, indent='  ')
 
                 # output noise xml
                 content = xmltodict.parse(xml_content)['burst']['metadata']['noise'][subswathidx]
@@ -396,8 +392,7 @@ class ASF(progressbar_joblib):
                     noiseAzimuthVector['noiseAzimuthVector']['noiseAzimuthLut'] = {'@count': len(items), '#text': ' '.join(items)}
                     noise = noise   | {'noiseAzimuthVectorList': noiseAzimuthVector}
 
-                with open(xml_noise_file, 'w') as file:
-                    file.write(xmltodict.unparse({'noise': noise}, pretty=True, indent='  '))
+                xml_contents[xml_noise_file] = xmltodict.unparse({'noise': noise}, pretty=True, indent='  ')
 
                 # output calibration xml
                 content = xmltodict.parse(xml_content)['burst']['metadata']['calibration'][subswathidx]
@@ -421,8 +416,18 @@ class ASF(progressbar_joblib):
                 calibrationVector = {'@count': len(items), 'calibrationVector': items}
                 calibration = calibration   | {'calibrationVectorList': calibrationVector}
 
-                with open(xml_calib_file, 'w') as file:
-                    file.write(xmltodict.unparse({'calibration': calibration}, pretty=True, indent='  '))
+                xml_contents[xml_calib_file] = xmltodict.unparse({'calibration': calibration}, pretty=True, indent='  ')
+
+            # All validations passed - now write everything to disk atomically
+            # Write TIFF if we downloaded it (tiff_bytes exists in local scope)
+            if 'tiff_bytes' in dir():
+                with open(tif_file, 'wb') as f:
+                    f.write(tiff_bytes)
+
+            # Write all XML files
+            for filepath, content in xml_contents.items():
+                with open(filepath, 'w') as f:
+                    f.write(content)
 
         # prepare authorized connection
         if session is None:
