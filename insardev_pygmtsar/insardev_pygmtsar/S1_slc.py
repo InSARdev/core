@@ -55,16 +55,16 @@ class S1_slc(S1_base):
         orbits = glob(self.pattern_orbit, root_dir=self.datadir)
         #print ('orbits', orbits)
         orbits_dict = {}
+        # Extract validity dates from filename (no file I/O needed)
+        # Pattern: S1A_OPER_AUX_POEORB_OPOD_20210207T122351_V20210117T225942_20210119T005942.EOF
+        import re
+        filename_pattern = re.compile(r'_V(\d{8})T\d{6}_(\d{8})T\d{6}\.EOF$')
         for orbit in orbits:
-            #print(orbit)
-            annotation = self.read_xml(os.path.join(self.datadir, orbit))
-            validity = annotation['Earth_Explorer_File']['Earth_Explorer_Header']['Fixed_Header']['Validity_Period']
-            #print('validity', validity)
-            validity_start = datetime.strptime(validity['Validity_Start'], 'UTC=%Y-%m-%dT%H:%M:%S').date()
-            validity_stop = datetime.strptime(validity['Validity_Stop'], 'UTC=%Y-%m-%dT%H:%M:%S').date()
-            #print('validity_start', validity_start)
-            #print('validity_stop', validity_stop)
-            orbits_dict[(validity_start, validity_stop)] = orbit
+            match = filename_pattern.search(orbit)
+            if match:
+                validity_start = datetime.strptime(match.group(1), '%Y%m%d').date()
+                validity_stop = datetime.strptime(match.group(2), '%Y%m%d').date()
+                orbits_dict[(validity_start, validity_stop)] = orbit
         #print('orbits_dict', orbits_dict)
         
         # scan directories with patterns
