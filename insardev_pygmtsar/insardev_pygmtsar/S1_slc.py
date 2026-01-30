@@ -10,10 +10,8 @@
 from .S1_base import S1_base
 
 class S1_slc(S1_base):
-    import geopandas as gpd
-    from shapely.geometry import MultiPolygon
     import xarray as xr
-    
+
     pattern_prefix: str = '[0-9]*_[0-9]*_IW?'
     pattern_burst: str = 'S1_[0-9]*_IW?_[0-9]*T[0-9]*_[HV][HV]_*-BURST'
     pattern_orbit: str = 'S1?_OPER_AUX_???ORB_OPOD_[0-9]*_V[0-9]*_[0-9]*.EOF'
@@ -41,10 +39,9 @@ class S1_slc(S1_base):
         """
         import os
         from glob import glob
+        import re
         import pandas as pd
         import geopandas as gpd
-        import shapely
-        import numpy as np
         from datetime import datetime
         from dateutil.relativedelta import relativedelta
         oneday = relativedelta(days=1)
@@ -57,7 +54,6 @@ class S1_slc(S1_base):
         orbits_dict = {}
         # Extract validity dates from filename (no file I/O needed)
         # Pattern: S1A_OPER_AUX_POEORB_OPOD_20210207T122351_V20210117T225942_20210119T005942.EOF
-        import re
         filename_pattern = re.compile(r'_V(\d{8})T\d{6}_(\d{8})T\d{6}\.EOF$')
         for orbit in orbits:
             match = filename_pattern.search(orbit)
@@ -77,9 +73,8 @@ class S1_slc(S1_base):
             #print('metas', metas)
             for meta in metas:
                 #print('meta', meta)
-                annotation = self.read_xml(os.path.join(meta_dir, meta))
-                start_time = annotation['product']['adsHeader']['startTime']
-                start_time = datetime.strptime(start_time, '%Y-%m-%dT%H:%M:%S.%f')
+                ann = self.parse_annotation(os.path.join(meta_dir, meta))
+                start_time = datetime.strptime(ann['startTime'], '%Y-%m-%dT%H:%M:%S.%f')
                 # validate startTime matches burst name date (detect corrupted XML from parallel download race condition)
                 burst_name = os.path.splitext(meta)[0]
                 burst_date_str = burst_name.split('_')[3]  # e.g., '20210211T135237'
@@ -92,24 +87,23 @@ class S1_slc(S1_base):
                 # match orbit file
                 date = start_time.date()
                 orbit= (orbits_dict.get((date-oneday, date+oneday)) or
-                                     orbits_dict.get((date-oneday, date)) or 
+                                     orbits_dict.get((date-oneday, date)) or
                                      orbits_dict.get((date, date)))
-                # Extract all required fields from annotation
+                # Build record from parsed annotation
                 record = {
                     'fullBurstID': prefix,
-                    'burst': os.path.splitext(meta)[0],
+                    'burst': burst_name,
                     'startTime': start_time,
-                    'polarization': annotation['product']['adsHeader']['polarisation'],
-                    'flightDirection': annotation['product']['generalAnnotation']['productInformation']['pass'],
-                    'pathNumber': ((int(annotation['product']['adsHeader']['absoluteOrbitNumber']) - 73) % 175) + 1,
-                    'subswath': annotation['product']['adsHeader']['swath'],
-                    'mission': annotation['product']['adsHeader']['missionId'],
-                    'beamModeType': annotation['product']['adsHeader']['mode'],
+                    'polarization': ann['polarisation'],
+                    'flightDirection': ann['flightDirection'],
+                    'pathNumber': ((int(ann['absoluteOrbitNumber']) - 73) % 175) + 1,
+                    'subswath': ann['swath'],
+                    'mission': ann['missionId'],
+                    'beamModeType': ann['mode'],
                     'orbit': orbit,
-                    'geometry': self.geoloc2geometry(annotation)
+                    'geometry': ann['geometry']
                 }
                 records.append(record)
-                #print(record)
         
         df = pd.DataFrame(records)
         assert len(df), f'Bursts not found'
@@ -125,32 +119,9 @@ class S1_slc(S1_base):
         print (f'NOTE: Loaded {len(df)} bursts.')
         self.df = df
 
-    def geoloc2geometry(self, annotation: dict) -> MultiPolygon:
+    def parse_annotation(self, filename: str) -> dict:
         """
-        Read approximate bursts locations from annotation
-        """
-        from shapely.geometry import LineString, Polygon, MultiPolygon
-        df = self.get_geoloc(annotation)
-        # this code line works for a single scene
-        #lines = df.groupby('line')['geometry'].apply(lambda x: LineString(x.tolist()))
-        # more complex code is required for stitched scenes processing with repeating 'line' series
-        df['line_change'] = df['line'].diff().ne(0).cumsum()
-        # single-point lines possible for stitched scenes
-        grouped_lines = df.groupby('line_change')['geometry'].apply(lambda x: LineString(x.tolist()) if len(x) > 1 else None)
-        lines = grouped_lines.reset_index(drop=True)
-        #bursts = [Polygon([*line1.coords, *line2.coords[::-1]]) for line1, line2 in zip(lines[:-1], lines[1:])]
-        # to ignore None for single-point lines
-        bursts = []
-        prev_line = None
-        for line in lines:
-            if line is not None and prev_line is not None:
-                bursts.append(Polygon([*prev_line.coords, *line.coords[::-1]]))
-            prev_line = line
-        return MultiPolygon(bursts)
-
-    def read_xml(self, filename: str) -> dict:
-        """
-        Return the XML scene annotation as a dictionary.
+        Parse XML annotation using ElementTree (fast, extracts only required fields).
 
         Parameters
         ----------
@@ -160,52 +131,45 @@ class S1_slc(S1_base):
         Returns
         -------
         dict
-            The XML scene annotation as a dictionary.
+            Flat dict with metadata fields and geometry.
         """
-        import xmltodict
+        import xml.etree.ElementTree as ET
+        from shapely.geometry import LineString, Polygon, MultiPolygon
 
-        with open(filename) as fd:
-            # fix wrong XML tags to process cropped scenes
-            # GMTSAR assemble_tops.c produces malformed xml
-            # https://github.com/gmtsar/gmtsar/issues/354
-            #doc = xmltodict.parse(fd.read().replace('/></','></'))
-            try:
-                doc = xmltodict.parse(fd.read())
-            except Exception as e:
-                print(f'Error parsing XML file {filename}: {e}')
-                raise e
-        return doc
+        tree = ET.parse(filename)
+        root = tree.getroot()
 
-    def get_geoloc(self, annotation: dict) -> gpd.GeoDataFrame:
-        """
-        Build approximate scene polygons using Ground Control Points (GCPs) from XML scene annotation.
+        # Extract adsHeader fields
+        header = root.find('.//adsHeader')
+        result = {
+            'startTime': header.find('startTime').text,
+            'polarisation': header.find('polarisation').text,
+            'absoluteOrbitNumber': header.find('absoluteOrbitNumber').text,
+            'swath': header.find('swath').text,
+            'missionId': header.find('missionId').text,
+            'mode': header.find('mode').text,
+            'flightDirection': root.find('.//productInformation/pass').text,
+        }
 
-        Parameters
-        ----------
-        filename : str, optional
-            The filename of the XML scene annotation. If None, print a note and return an empty DataFrame. Default is None.
+        # Extract geolocation grid points and build geometry
+        geoloc_list = root.find('.//geolocationGridPointList')
+        lines_dict = {}  # line_num -> [(lon, lat), ...]
+        for gcp in geoloc_list.findall('geolocationGridPoint'):
+            line = int(gcp.find('line').text)
+            lon = float(gcp.find('longitude').text)
+            lat = float(gcp.find('latitude').text)
+            if line not in lines_dict:
+                lines_dict[line] = []
+            lines_dict[line].append((lon, lat))
 
-        Returns
-        -------
-        geopandas.GeoDataFrame
-            A GeoDataFrame containing the approximate scene polygons.
+        # Build polygons from consecutive lines
+        bursts = []
+        prev_coords = None
+        for line_num in sorted(lines_dict.keys()):
+            coords = lines_dict[line_num]
+            if len(coords) > 1 and prev_coords is not None and len(prev_coords) > 1:
+                bursts.append(Polygon([*prev_coords, *coords[::-1]]))
+            prev_coords = coords
 
-        annotation = S1.read_annotation(filename)
-        S1.get_geoloc(annotation)
-        """
-        import numpy as np
-        import pandas as pd
-        import geopandas as gpd
-        import os
-
-        geoloc = annotation['product']['geolocationGrid']['geolocationGridPointList']
-        # check data consistency
-        assert int(geoloc['@count']) == len(geoloc['geolocationGridPoint'])
-    
-        gcps = pd.DataFrame(geoloc['geolocationGridPoint'])
-        # convert to numeric values excluding azimuthTime & slantRangeTime
-        for column in gcps.columns[2:]:
-            gcps[column] = pd.to_numeric(gcps[column])
-
-        # return approximate location as set of GCP
-        return gpd.GeoDataFrame(gcps, geometry=gpd.points_from_xy(x=gcps.longitude, y=gcps.latitude))
+        result['geometry'] = MultiPolygon(bursts)
+        return result
