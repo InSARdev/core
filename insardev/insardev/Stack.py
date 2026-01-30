@@ -1091,11 +1091,13 @@ class Stack(Stack_plot, BatchCore):
 
                 # Add all scalar attrs as variables (replicated per date)
                 # Preserve original order from first burst (to_dataframe expects specific order)
-                all_scalar_keys = list(pol_infos[0]['scalar_attrs'].keys())
+                # Exclude 'burst' (handled above with XX replacement) and 'polarization' (per-pol)
+                excluded_keys = {'burst', 'polarization'}
+                all_scalar_keys = [k for k in pol_infos[0]['scalar_attrs'].keys() if k not in excluded_keys]
                 # Add any keys from other dates that might be missing
                 for info in pol_infos[1:]:
                     for k in info['scalar_attrs'].keys():
-                        if k not in all_scalar_keys:
+                        if k not in all_scalar_keys and k not in excluded_keys:
                             all_scalar_keys.append(k)
                 for key in all_scalar_keys:
                     vals = [info['scalar_attrs'].get(key, np.nan) for info in pol_infos]
@@ -1269,10 +1271,12 @@ class Stack(Stack_plot, BatchCore):
                     data_ds = xr.Dataset({polarization: data_arr})
                     data_ds['burst'] = xr.DataArray([info['burst_name'] for info in pol_infos], dims=['date'])
 
-                    all_scalar_keys = list(pol_infos[0]['scalar_attrs'].keys())
+                    # Exclude 'burst' (handled above with XX replacement) and 'polarization' (per-pol)
+                    excluded_keys = {'burst', 'polarization'}
+                    all_scalar_keys = [k for k in pol_infos[0]['scalar_attrs'].keys() if k not in excluded_keys]
                     for info in pol_infos[1:]:
                         for k in info['scalar_attrs'].keys():
-                            if k not in all_scalar_keys:
+                            if k not in all_scalar_keys and k not in excluded_keys:
                                 all_scalar_keys.append(k)
                     for key in all_scalar_keys:
                         vals = [info['scalar_attrs'].get(key, np.nan) for info in pol_infos]
@@ -1289,6 +1293,7 @@ class Stack(Stack_plot, BatchCore):
 
                     datas.append(data_ds)
 
+                # Merge polarizations
                 ds = xr.merge(datas, combine_attrs='override')
                 del datas
 
