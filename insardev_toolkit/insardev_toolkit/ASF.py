@@ -172,13 +172,75 @@ class ASF(progressbar_joblib):
             for dirname in [burst_dir, tif_dir, xml_annot_dir, xml_noise_dir, xml_calib_dir]:
                 os.makedirs(dirname, exist_ok=True)
 
-            # download tif
-            # properties['bytes'] is not an accurate file size but it looks about 40 kB smaller
+            # check if all files already exist
+            all_exist = (os.path.exists(tif_file) and os.path.getsize(tif_file) >= int(properties['bytes'])
+                        and os.path.exists(xml_file) and os.path.getsize(xml_file) > 0
+                        and os.path.exists(xml_noise_file) and os.path.getsize(xml_noise_file) > 0
+                        and os.path.exists(xml_calib_file) and os.path.getsize(xml_calib_file) > 0)
+
+            if all_exist:
+                # validate existing TIFF dimensions using local annotation XML
+                with open(xml_file, 'r') as f:
+                    local_annotation = xmltodict.parse(f.read())['product']
+                lines_per_burst = int(local_annotation['swathTiming']['linesPerBurst'])
+                samples_per_burst = int(local_annotation['imageAnnotation']['imageInformation']['numberOfSamples'])
+                with TiffFile(tif_file) as tif:
+                    page = tif.pages[0]
+                    actual_lines, actual_samples = page.shape
+                if actual_lines != lines_per_burst or actual_samples != samples_per_burst:
+                    raise Exception(f'ERROR: Existing TIFF dimensions mismatch for {burst}: '
+                                  f'got {actual_lines}x{actual_samples}, expected {lines_per_burst}x{samples_per_burst}. '
+                                  f'Delete the corrupted file and re-download.')
+                # all files valid, skip download
+                return
+
+            # download manifest to get dimensions for TIFF validation
+            basename = os.path.basename(properties['additionalUrls'][0])
+            import tempfile
+            with tempfile.TemporaryDirectory(prefix=f'{burst}_', dir=burst_dir) as tmp_dir:
+                asf_search.download_urls(urls=properties['additionalUrls'], path=tmp_dir, session=session)
+                manifest_file = os.path.join(tmp_dir, basename)
+                if not os.path.exists(manifest_file):
+                    raise Exception(f'ERROR: manifest file is not downloaded: {manifest_file}')
+                if os.path.getsize(manifest_file) == 0:
+                    raise Exception(f'ERROR: manifest file is empty: {manifest_file}')
+                # check XML file validity parsing it
+                with open(manifest_file, 'r') as file:
+                    xml_content = file.read()
+                    _ = ElementTree.fromstring(xml_content)
+
+            subswathidx = int(subswath[-1:]) - 1
+            content = xmltodict.parse(xml_content)['burst']['metadata']['product'][subswathidx]
+            assert polarization == content['polarisation'], 'ERROR: XML polarization differs from burst polarization'
+            annotation = content['content']
+
+            # get dimensions from manifest
+            lines_per_burst = int(annotation['swathTiming']['linesPerBurst'])
+            samples_per_burst = int(annotation['swathTiming']['samplesPerBurst'])
+
+            annotation_burst = annotation['swathTiming']['burstList']['burst'][burstIndex]
+            start_utc = annotation_burst['azimuthTime']
+            start_utc_dt = datetime.strptime(start_utc, '%Y-%m-%dT%H:%M:%S.%f')
+
+            # validate startTime matches burst name date (detect manifest mix-up)
+            burst_date_str = burst.split('_')[3]  # e.g., '20210211T135237'
+            expected_date = datetime.strptime(burst_date_str, '%Y%m%dT%H%M%S').date()
+            if start_utc_dt.date() != expected_date:
+                raise Exception(f'ERROR: Manifest data mismatch for burst {burst}: '
+                              f'parsed startTime {start_utc_dt.date()} does not match expected date {expected_date}. '
+                              f'This indicates corrupted manifest data.')
+
+            # download tif if needed
             if os.path.exists(tif_file) and os.path.getsize(tif_file) >= int(properties['bytes']):
-                #print (f'pass {tif_file}')
-                pass
+                # validate existing file dimensions
+                with TiffFile(tif_file) as tif:
+                    page = tif.pages[0]
+                    actual_lines, actual_samples = page.shape
+                if actual_lines != lines_per_burst or actual_samples != samples_per_burst:
+                    raise Exception(f'ERROR: Existing TIFF dimensions mismatch for {burst}: '
+                                  f'got {actual_lines}x{actual_samples}, expected {lines_per_burst}x{samples_per_burst}. '
+                                  f'Delete the corrupted file and re-download.')
             else:
-                #print ('YYY', os.path.getsize(tif_file), properties['bytes'])
                 # remove potentially incomplete file if needed
                 if os.path.exists(tif_file):
                     os.remove(tif_file)
@@ -192,11 +254,15 @@ class ASF(progressbar_joblib):
                     raise Exception(f'ERROR: TiFF file is not downloaded: {tmp_file}')
                 if os.path.getsize(tmp_file) == 0:
                     raise Exception(f'ERROR: TiFF file is empty: {tmp_file}')
-                # check TiFF file validity opening it
+                # check TiFF file validity and dimensions
                 with TiffFile(tmp_file) as tif:
-                    # get TiFF file information
                     page = tif.pages[0]
                     tags = page.tags
+                    actual_lines, actual_samples = page.shape
+                    if actual_lines != lines_per_burst or actual_samples != samples_per_burst:
+                        raise Exception(f'ERROR: Downloaded TIFF dimensions mismatch for {burst}: '
+                                      f'got {actual_lines}x{actual_samples}, expected {lines_per_burst}x{samples_per_burst}. '
+                                      f'ASF burst extraction may have failed.')
                     data = page.asarray()
                 # attention: rasterio can crash the interpreter on a corrupted TIFF file
                 # perform this check as the final step
@@ -209,7 +275,7 @@ class ASF(progressbar_joblib):
                 if os.path.exists(tmp_file):
                     os.rename(tmp_file, tif_file)
 
-            # download xml
+            # create xml files if needed
             if os.path.exists(xml_file) and os.path.getsize(xml_file) > 0 \
                 and os.path.exists(xml_noise_file) and os.path.getsize(xml_noise_file) > 0 \
                 and os.path.exists(xml_calib_file) and os.path.getsize(xml_calib_file) > 0:
@@ -220,46 +286,9 @@ class ASF(progressbar_joblib):
                 with TiffFile(tif_file) as tif:
                     page = tif.pages[0]
                     offset = page.dataoffsets[0]
-                #print ('offset', offset)
-                # get the file name - download to burst-specific temp directory to avoid race condition
-                basename = os.path.basename(properties['additionalUrls'][0])
-                #print ('basename', '=>', basename)
-                # use burst-specific temp directory to avoid race condition in parallel downloads
-                import tempfile
-                with tempfile.TemporaryDirectory(prefix=f'{burst}_', dir=burst_dir) as tmp_dir:
-                    asf_search.download_urls(urls=properties['additionalUrls'], path=tmp_dir, session=session)
-                    manifest_file = os.path.join(tmp_dir, basename)
-                    if not os.path.exists(manifest_file):
-                        raise Exception(f'ERROR: manifest file is not downloaded: {manifest_file}')
-                    if os.path.getsize(manifest_file) == 0:
-                        raise Exception(f'ERROR: manifest file is empty: {manifest_file}')
-                    # check XML file validity parsing it
-                    with open(manifest_file, 'r') as file:
-                        xml_content = file.read()
-                        _ = ElementTree.fromstring(xml_content)
 
-                subswathidx = int(subswath[-1:]) - 1
-                content = xmltodict.parse(xml_content)['burst']['metadata']['product'][subswathidx]
-                assert polarization == content['polarisation'], 'ERROR: XML polarization differs from burst polarization'
-                annotation = content['content']
-
-                annotation_burst = annotation['swathTiming']['burstList']['burst'][burstIndex]
-                start_utc = annotation_burst['azimuthTime']
-                start_utc_dt = datetime.strptime(start_utc, '%Y-%m-%dT%H:%M:%S.%f')
-                #print ('start_utc', start_utc, start_utc_dt)
-
-                # validate startTime matches burst name date (detect manifest mix-up from race condition)
-                burst_date_str = burst.split('_')[3]  # e.g., '20210211T135237'
-                expected_date = datetime.strptime(burst_date_str, '%Y%m%dT%H%M%S').date()
-                if start_utc_dt.date() != expected_date:
-                    raise Exception(f'ERROR: Manifest data mismatch for burst {burst}: '
-                                  f'parsed startTime {start_utc_dt.date()} does not match expected date {expected_date}. '
-                                  f'This indicates corrupted manifest data.')
-
-                length = int(annotation['swathTiming']['linesPerBurst'])
-                #print (f'length={length}, burstIndex={burstIndex}')
                 azimuth_time_interval = annotation['imageAnnotation']['imageInformation']['azimuthTimeInterval']
-                burst_time_interval = timedelta(seconds=(length - 1) * float(azimuth_time_interval))
+                burst_time_interval = timedelta(seconds=(lines_per_burst - 1) * float(azimuth_time_interval))
                 stop_utc_dt = start_utc_dt + burst_time_interval
                 stop_utc = stop_utc_dt.strftime('%Y-%m-%dT%H:%M:%S.%f')
                 #print ('stop_utc', stop_utc, stop_utc_dt)
@@ -287,7 +316,7 @@ class ASF(progressbar_joblib):
                 imageAnnotation['imageInformation']['productComposition'] = 'Assembled'
                 imageAnnotation['imageInformation']['sliceNumber'] = '0'
                 imageAnnotation['imageInformation']['sliceList'] = {'@count': '0'}
-                imageAnnotation['imageInformation']['numberOfLines'] = str(length)
+                imageAnnotation['imageInformation']['numberOfLines'] = str(lines_per_burst)
                 # imageStatistics and inputDimensionsList are not updated
                 product = product   | {'imageAnnotation': imageAnnotation}
 
@@ -312,7 +341,7 @@ class ASF(progressbar_joblib):
                 geolocationGrid = annotation['geolocationGrid']
                 items = filter_azimuth_time(geolocationGrid['geolocationGridPointList']['geolocationGridPoint'], start_utc_dt, stop_utc_dt, 1)
                 # re-numerate line numbers for the burst
-                for item in items: item['line'] = str(int(item['line']) - (length * burstIndex))
+                for item in items: item['line'] = str(int(item['line']) - (lines_per_burst * burstIndex))
                 geolocationGrid['geolocationGridPointList'] = {'@count': len(items), 'geolocationGridPoint': items}
                 product = product   | {'geolocationGrid': geolocationGrid}
 
@@ -339,7 +368,7 @@ class ASF(progressbar_joblib):
                     noiseRangeVector = annotation['noiseVectorList']
                     items = filter_azimuth_time(noiseRangeVector['noiseVector'], start_utc_dt, stop_utc_dt)
                     # re-numerate line numbers for the burst
-                    for item in items: item['line'] = str(int(item['line']) - (length * burstIndex))
+                    for item in items: item['line'] = str(int(item['line']) - (lines_per_burst * burstIndex))
                     noiseRangeVector = {'@count': len(items), 'noiseVector': items}
                     noise = noise   | {'noiseVectorList': noiseRangeVector}
 
@@ -347,7 +376,7 @@ class ASF(progressbar_joblib):
                     noiseRangeVector = annotation['noiseRangeVectorList']
                     items = filter_azimuth_time(noiseRangeVector['noiseRangeVector'], start_utc_dt, stop_utc_dt)
                     # re-numerate line numbers for the burst
-                    for item in items: item['line'] = str(int(item['line']) - (length * burstIndex))
+                    for item in items: item['line'] = str(int(item['line']) - (lines_per_burst * burstIndex))
                     noiseRangeVector = {'@count': len(items), 'noiseRangeVector': items}
                     noise = noise   | {'noiseRangeVectorList': noiseRangeVector}
 
@@ -355,12 +384,12 @@ class ASF(progressbar_joblib):
                     noiseAzimuthVector = annotation['noiseAzimuthVectorList']
                     items = noiseAzimuthVector['noiseAzimuthVector']['line']['#text'].split(' ')
                     items = [int(item) for item in items]
-                    lowers = [item for item in items if item <= burstIndex * length] or items[0]
-                    uppers = [item for item in items if item >= (burstIndex + 1) * length - 1] or items[-1]
+                    lowers = [item for item in items if item <= burstIndex * lines_per_burst] or items[0]
+                    uppers = [item for item in items if item >= (burstIndex + 1) * lines_per_burst - 1] or items[-1]
                     mask = [True if item>=lowers[-1] and item<=uppers[0] else False for item in items]
-                    items = [item - burstIndex * length for item, m in zip(items, mask) if m]
-                    noiseAzimuthVector['noiseAzimuthVector']['firstAzimuthLine'] = lowers[-1] - burstIndex * length
-                    noiseAzimuthVector['noiseAzimuthVector']['lastAzimuthLine'] = uppers[0] - burstIndex * length
+                    items = [item - burstIndex * lines_per_burst for item, m in zip(items, mask) if m]
+                    noiseAzimuthVector['noiseAzimuthVector']['firstAzimuthLine'] = lowers[-1] - burstIndex * lines_per_burst
+                    noiseAzimuthVector['noiseAzimuthVector']['lastAzimuthLine'] = uppers[0] - burstIndex * lines_per_burst
                     noiseAzimuthVector['noiseAzimuthVector']['line'] = {'@count': len(items), '#text': ' '.join([str(item) for item in items])}
                     items = noiseAzimuthVector['noiseAzimuthVector']['noiseAzimuthLut']['#text'].split(' ')
                     items = [item for item, m in zip(items, mask) if m]
@@ -388,7 +417,7 @@ class ASF(progressbar_joblib):
                 calibrationVector = annotation['calibrationVectorList']
                 items = filter_azimuth_time(calibrationVector['calibrationVector'], start_utc_dt, stop_utc_dt)
                 # re-numerate line numbers for the burst
-                for item in items: item['line'] = str(int(item['line']) - (length * burstIndex))
+                for item in items: item['line'] = str(int(item['line']) - (lines_per_burst * burstIndex))
                 calibrationVector = {'@count': len(items), 'calibrationVector': items}
                 calibration = calibration   | {'calibrationVectorList': calibrationVector}
 
