@@ -1004,6 +1004,8 @@ class S1_transform(S1_topo):
         import shutil
         import sys
         import warnings
+        import pandas as pd
+        import numpy as np
 
         # Suppress zarr v3 consolidated metadata warnings
         warnings.filterwarnings('ignore', message='.*Consolidated metadata.*', category=UserWarning)
@@ -1138,11 +1140,24 @@ class S1_transform(S1_topo):
                         'B_offset_end': baseline_result.get('B_offset_end')
                     }
 
-                self.transform_slc_int16(outdir, transform, topo, prm, prm_ref, slc, epsg=epsg,
-                                        baseline_params=baseline_params,
-                                        sc_height_params=sc_height_cache[burst_ref_name],
-                                        reramp_params=reramp_params,
-                                        remove_tidal_phase=remove_tidal_phase)
+                # Build record_dict for zarr metadata
+                record = self.get_record(burst_name)
+                record_dict = {}
+                for _, row in record.reset_index().iterrows():
+                    for name, value in row.items():
+                        if isinstance(value, (pd.Timestamp, np.datetime64)):
+                            value = pd.Timestamp(value).strftime('%Y-%m-%d %H:%M:%S')
+                        elif hasattr(value, 'wkt'):
+                            value = value.wkt
+                        record_dict[name] = value
+
+                # Call module-level function directly (same as _process_date_worker)
+                _transform_slc_int16(outdir, transform, topo, prm, prm_ref, slc,
+                                     burst_name=burst_name, record_dict=record_dict, epsg=epsg,
+                                     baseline_params=baseline_params,
+                                     sc_height_params=sc_height_cache[burst_ref_name],
+                                     reramp_params=reramp_params,
+                                     remove_tidal_phase=remove_tidal_phase, debug=debug)
                 del slc
 
             # Cleanup and consolidate
@@ -1323,248 +1338,3 @@ class S1_transform(S1_topo):
 
         # Consolidate zarr metadata for the target directory
         self.consolidate_metadata(target, resolution=resolution)
-
-    def transform_slc_int16(self,
-                            outdir: str,
-                            transform: xr.Dataset,
-                            topo: xr.DataArray | None,
-                            prm_rep: "PRM",
-                            prm_ref: "PRM",
-                            slc_data: np.ndarray,
-                            epsg: int,
-                            scale: float=2.5e-07,
-                            baseline_params: dict=None,
-                            sc_height_params: dict=None,
-                            reramp_params: dict=None,
-                            remove_tidal_phase: bool=True
-                            ):
-        """
-        Perform geocoding from radar to geographic coordinates.
-        Delegates to the module-level _transform_slc_int16 function.
-        """
-        import os
-        import pandas as pd
-        import numpy as np
-
-        # Extract burst name and record dict from self
-        if 'input_file' in prm_rep.df.index:
-            burst_name = os.path.splitext(os.path.basename(prm_rep.get('input_file')))[0]
-        else:
-            burst_name = 'burst'
-
-        df = self.get_record(burst_name)
-        record_dict = {}
-        for _, row in df.reset_index().iterrows():
-            for name, value in row.items():
-                if isinstance(value, (pd.Timestamp, np.datetime64)):
-                    value = pd.Timestamp(value).strftime('%Y-%m-%d %H:%M:%S')
-                elif hasattr(value, 'wkt'):
-                    value = value.wkt
-                record_dict[name] = value
-
-        _transform_slc_int16(
-            outdir=outdir, transform=transform, topo=topo,
-            prm_rep=prm_rep, prm_ref=prm_ref, slc_data=slc_data,
-            burst_name=burst_name, record_dict=record_dict,
-            epsg=epsg, scale=scale,
-            baseline_params=baseline_params, sc_height_params=sc_height_params,
-            reramp_params=reramp_params, remove_tidal_phase=remove_tidal_phase,
-            debug=bool(os.environ.get('INSAR_DEBUG'))
-        )
-
-    def flat_earth_topo_phase(self, topo: xr.DataArray | None, prm_rep: "PRM", prm_ref: "PRM",
-                               baseline_params: dict = None, sc_height_params: dict = None) -> xr.DataArray:
-        """
-        Compute the combined earth curvature and topographic phase correction.
-
-        Uses the full GMTSAR algorithm with time-varying baseline geometry.
-
-        Parameters
-        ----------
-        topo : xr.DataArray
-            Topographic elevation in radar coordinates (meters).
-        prm_rep : PRM
-            Repeat burst PRM object.
-        prm_ref : PRM
-            Reference burst PRM object.
-        baseline_params : dict, optional
-            Pre-computed baseline parameters (from SAT_baseline). If None, computed on the fly.
-        sc_height_params : dict, optional
-            Pre-computed SC_height parameters (from SAT_baseline). If None, computed on the fly.
-
-        Returns
-        -------
-        xr.DataArray
-            Combined flat earth and topo phase (radians).
-        """
-        import numpy as np
-        import xarray as xr
-        from scipy import constants
-        import warnings
-        import time
-        import os
-        warnings.filterwarnings('ignore')
-
-        _t0 = time.perf_counter()
-        _timings = {}
-
-        # For reference burst (same as itself), we still compute flat earth correction
-        # with baseline=0 to go through the same code path as repeat bursts
-        is_reference = (prm_rep is prm_ref)
-
-        # Create topo with zeros if None (flat-earth only correction)
-        if topo is None:
-            xdim = prm_ref.get('num_rng_bins')
-            ydim = prm_ref.get('num_patches') * prm_ref.get('num_valid_az')
-            azis = np.arange(0.5, ydim, 1)
-            rngs = np.arange(0.5, xdim, 1)
-            topo = xr.DataArray(np.zeros((len(azis), len(rngs)), dtype=np.float32),
-                                dims=['a', 'r'],
-                                coords={'a': azis, 'r': rngs}).rename('topo')
-
-        # Calculate the combined earth curvature and topography correction
-        def calc_drho(rho, topo_vals, earth_radius, height, b, alpha, Bx):
-            sina = np.sin(alpha)
-            cosa = np.cos(alpha)
-            c = earth_radius + height
-            ret = earth_radius + topo_vals
-            cost = ((rho**2 + c**2 - ret**2) / (2. * rho * c))
-            sint = np.sqrt(1. - cost**2)
-            term1 = rho**2 + b**2 - 2 * rho * b * (sint * cosa - cost * sina) - Bx**2
-            drho = -rho + np.sqrt(term1)
-            return drho
-
-        # Create copies to avoid modifying cached PRMs
-        # fix_aligned() modifies near_range, so calling it multiple times on cached PRMs causes drift
-        from .PRM import PRM
-        prm1 = PRM().set(prm_ref)  # copy of reference PRM
-        prm1.orbit_df = prm_ref.orbit_df  # copy orbit data reference
-        prm2 = PRM().set(prm_rep)  # copy of repeat PRM
-        prm2.orbit_df = prm_rep.orbit_df  # copy orbit data reference
-        _timings['prm_copy'] = time.perf_counter() - _t0
-
-        # Set baseline parameters on PRM copies
-        # Order follows GMTSAR: SAT_baseline first, then fix_aligned
-        _t0 = time.perf_counter()
-        if is_reference:
-            # For reference burst, baseline is 0 - set explicitly to avoid SAT_baseline issues
-            prm2.set(
-                baseline_start=0, baseline_center=0, baseline_end=0,
-                alpha_start=0, alpha_center=0, alpha_end=0,
-                B_offset_start=0, B_offset_center=0, B_offset_end=0
-            ).fix_aligned()
-        elif baseline_params is not None:
-            # Use cached baseline parameters (avoids expensive SAT_baseline call)
-            prm2.set(**baseline_params).fix_aligned()
-        else:
-            # Only set the 9 baseline geometry parameters on prm2 (equivalent to GMTSAR's tail=9)
-            # Do NOT set SC_height values on prm2 - those belong to prm1
-            prm2.set(prm1.SAT_baseline(prm2).sel(
-                'baseline_start', 'baseline_center', 'baseline_end',
-                'alpha_start', 'alpha_center', 'alpha_end',
-                'B_offset_start', 'B_offset_center', 'B_offset_end'
-            )).fix_aligned()
-        _timings['SAT_baseline_prm2'] = time.perf_counter() - _t0
-
-        _t0 = time.perf_counter()
-        if sc_height_params is not None:
-            # Use cached SC_height parameters (avoids expensive SAT_baseline call)
-            prm1.set(**sc_height_params).fix_aligned()
-        else:
-            prm1.set(prm1.SAT_baseline(prm1).sel('SC_height', 'SC_height_start', 'SC_height_end')).fix_aligned()
-        _timings['SAT_baseline_prm1'] = time.perf_counter() - _t0
-
-        # Fill NaNs by 0 (avoid np.where temp array)
-        topo_vals = topo.values.copy()
-        np.copyto(topo_vals, 0, where=np.isnan(topo_vals))
-        y_coords = topo.a.values
-        x_coords = topo.r.values
-
-        # Get full dimensions
-        xdim = prm1.get('num_rng_bins')
-        ydim = prm1.get('num_patches') * prm1.get('num_valid_az')
-
-        # Get heights (from prm1 = reference copy)
-        htc = prm1.get('SC_height')
-        ht0 = prm1.get('SC_height_start')
-        htf = prm1.get('SC_height_end')
-
-        # Compute the time span and the time spacing (from prm2 = repeat copy)
-        tspan = 86400 * abs(prm2.get('SC_clock_stop') - prm2.get('SC_clock_start'))
-        assert (tspan >= 0.01) and (prm2.get('PRF') >= 0.01), \
-            f"ERROR in sc_clock_start={prm2.get('SC_clock_start')}, sc_clock_stop={prm2.get('SC_clock_stop')}, or PRF={prm2.get('PRF')}"
-
-        # Setup the default parameters
-        drange = constants.speed_of_light / (2 * prm2.get('rng_samp_rate'))
-        alpha = prm2.get('alpha_start') * np.pi / 180
-        cnst = -4 * np.pi / prm2.get('radar_wavelength')
-
-        # Calculate initial baselines (from prm2 which has baseline params set)
-        Bh0 = prm2.get('baseline_start') * np.cos(prm2.get('alpha_start') * np.pi / 180)
-        Bv0 = prm2.get('baseline_start') * np.sin(prm2.get('alpha_start') * np.pi / 180)
-        Bhf = prm2.get('baseline_end') * np.cos(prm2.get('alpha_end') * np.pi / 180)
-        Bvf = prm2.get('baseline_end') * np.sin(prm2.get('alpha_end') * np.pi / 180)
-        Bx0 = prm2.get('B_offset_start')
-        Bxf = prm2.get('B_offset_end')
-
-        # First case is quadratic baseline model, second case is default linear model
-        if prm2.get('baseline_center') != 0 or prm2.get('alpha_center') != 0 or prm2.get('B_offset_center') != 0:
-            Bhc = prm2.get('baseline_center') * np.cos(prm2.get('alpha_center') * np.pi / 180)
-            Bvc = prm2.get('baseline_center') * np.sin(prm2.get('alpha_center') * np.pi / 180)
-            Bxc = prm2.get('B_offset_center')
-
-            dBh = (-3 * Bh0 + 4 * Bhc - Bhf) / tspan
-            dBv = (-3 * Bv0 + 4 * Bvc - Bvf) / tspan
-            ddBh = (2 * Bh0 - 4 * Bhc + 2 * Bhf) / (tspan * tspan)
-            ddBv = (2 * Bv0 - 4 * Bvc + 2 * Bvf) / (tspan * tspan)
-
-            dBx = (-3 * Bx0 + 4 * Bxc - Bxf) / tspan
-            ddBx = (2 * Bx0 - 4 * Bxc + 2 * Bxf) / (tspan * tspan)
-        else:
-            dBh = (Bhf - Bh0) / tspan
-            dBv = (Bvf - Bv0) / tspan
-            dBx = (Bxf - Bx0) / tspan
-            ddBh = ddBv = ddBx = 0
-
-        # Calculate height increment
-        dht = (-3 * ht0 + 4 * htc - htf) / tspan
-        ddht = (2 * ht0 - 4 * htc + 2 * htf) / (tspan * tspan)
-
-        # Ensure float64 precision for near_range calculation to avoid sqrt precision issues
-        # (float32 rho gives sqrt(rho**2) != rho due to precision loss)
-        x_coords_f64 = x_coords.astype(np.float64)
-        y_coords_f64 = y_coords.astype(np.float64)
-        near_range = (prm1.get('near_range') + \
-            x_coords_f64.reshape(1, -1) * (1 + prm1.get('stretch_r')) * drange) + \
-            y_coords_f64.reshape(-1, 1) * prm1.get('a_stretch_r') * drange
-
-        # Calculate the change in baseline and height along the frame
-        t_arr = y_coords_f64 * tspan / (ydim - 1)
-        Bh = Bh0 + dBh * t_arr + ddBh * t_arr**2
-        Bv = Bv0 + dBv * t_arr + ddBv * t_arr**2
-        Bx = Bx0 + dBx * t_arr + ddBx * t_arr**2
-        B = np.sqrt(Bh * Bh + Bv * Bv)
-        alpha = np.arctan2(Bv, Bh)
-        height = ht0 + dht * t_arr + ddht * t_arr**2
-
-        # Calculate the combined earth curvature and topography correction
-        _t0 = time.perf_counter()
-        drho = calc_drho(near_range, topo_vals, prm1.get('earth_radius'),
-                         height.reshape(-1, 1), B.reshape(-1, 1), alpha.reshape(-1, 1), Bx.reshape(-1, 1))
-
-        phase_shift = (cnst * drho).astype(np.float32)
-        _timings['calc_drho'] = time.perf_counter() - _t0
-
-        _t0 = time.perf_counter()
-        topo_phase = xr.DataArray(phase_shift, topo.coords)
-        topo_phase = topo_phase.where(np.isfinite(topo)).rename('phase')
-        _timings['xarray_wrap'] = time.perf_counter() - _t0
-
-        # Print timing breakdown in debug mode
-        if os.environ.get('INSAR_DEBUG'):
-            total = sum(_timings.values())
-            print(f'  PROFILE flat_earth_topo_phase: ' +
-                  ' | '.join(f'{k}={v:.2f}s' for k, v in sorted(_timings.items(), key=lambda x: -x[1])) +
-                  f' | total={total:.2f}s')
-
-        return topo_phase
