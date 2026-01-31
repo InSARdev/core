@@ -61,6 +61,16 @@ class Batch(BatchCore):
         kwargs["caption"] = caption
         return super().plot(*args, **kwargs)
 
+    def lee(self, *args, **kwargs):
+        """
+        Apply Enhanced Lee speckle filter to reduce noise while preserving edges.
+
+        This method requires the insardev_backscatter extension package.
+        """
+        raise ImportError(
+            "lee() requires insardev_backscatter extension"
+        )
+
     @staticmethod
     def _velocity_torch(data, times_years, min_valid=3, device='auto', debug=False):
         """
@@ -724,6 +734,16 @@ class BatchComplex(BatchCore):
         # Optimized: avoid sqrt in abs() by computing real² + imag² directly
         return Batch(self.map_da(lambda da: da.real**2 + da.imag**2, **kwargs))
 
+    def backscatter(self, *args, **kwargs):
+        """
+        Compute backscatter intensity (sigma0) from radiometrically calibrated SLC data.
+
+        This method requires the insardev_backscatter extension package.
+        """
+        raise ImportError(
+            "backscatter() requires insardev_backscatter extension"
+        )
+
     def conj(self, **kwargs):
         """intfs.iexp().conj() for np.exp(-1j * intfs)"""
         return self.map_da(lambda da: xr.ufuncs.conj(da), **kwargs)
@@ -775,7 +795,7 @@ class BatchComplex(BatchCore):
         )
 
     @staticmethod
-    def _goldstein(phase_np, corr_np, psize=32, device='auto', batch_size=None):
+    def _goldstein(phase_np, corr_np, psize=32, threshold=0.5, device='auto'):
         """
         Apply Goldstein adaptive filter.
 
@@ -790,10 +810,11 @@ class BatchComplex(BatchCore):
             2D real numpy array of correlation values.
         psize : int or dict
             Patch size for the filter. Default is 32.
+        threshold : float
+            Minimum fraction of valid (non-NaN) pixels required to process a patch.
+            Default 0.5 means at least 50% of pixels must be valid.
         device : str, optional
             PyTorch device: 'auto', 'cuda', 'mps', or 'cpu'.
-        batch_size : int, optional
-            Ignored (kept for API compatibility).
 
         Returns
         -------
@@ -819,9 +840,6 @@ class BatchComplex(BatchCore):
         else:
             psize_y, psize_x = int(psize), int(psize)
 
-        # Save NaN mask
-        nan_mask = ~np.isfinite(phase_np)
-
         # Ensure correct dtypes (goldstein functions require complex64/float32)
         if phase_np.dtype != np.complex64:
             phase_np = phase_np.astype(np.complex64)
@@ -832,18 +850,16 @@ class BatchComplex(BatchCore):
         dev = BatchCore._get_torch_device(device)
 
         if dev.type == 'cpu':
-            result = goldstein_numpy(phase_np, corr_np, psize_y, psize_x)
+            result = goldstein_numpy(phase_np, corr_np, psize_y, psize_x, threshold=threshold)
         else:
-            result = goldstein_pytorch(phase_np, corr_np, psize_y, psize_x, dev)
-
-        # Mask where original was NaN
-        result[nan_mask] = np.nan + 1j * np.nan
+            result = goldstein_pytorch(phase_np, corr_np, psize_y, psize_x, dev, threshold=threshold)
 
         if squeeze:
             result = result[np.newaxis, ...]
         return result
 
-    def goldstein(self, corr: BatchUnit, psize: int | dict[str, int] = 32, device: str = 'auto', debug: bool = False):
+    def goldstein(self, corr: BatchUnit, window: int | dict[str, int] = 32, threshold: float = 0.5,
+                  device: str = 'auto', debug: bool = False):
         """
         Apply Goldstein adaptive filter to each dataset in the batch.
 
@@ -851,9 +867,12 @@ class BatchComplex(BatchCore):
         ----------
         corr : BatchUnit
             Batch of correlation values to use for filtering.
-        psize : int or dict[str, int], optional
+        window : int or dict[str, int], optional
             Patch size for the filter. If int, same size used for both dimensions.
             If dict, specify {'y': size_y, 'x': size_x}. Default is 32.
+        threshold : float, optional
+            Minimum fraction of valid (non-NaN) pixels required to process a patch.
+            Default 0.5 means at least 50% of pixels must be valid.
         device : str, optional
             PyTorch device: 'auto' (default), 'cuda', 'mps', or 'cpu'.
             'auto' uses GPU if Dask client has resources={'gpu': 1}.
@@ -872,7 +891,7 @@ class BatchComplex(BatchCore):
         if debug:
             print('DEBUG: goldstein')
 
-        if psize is None:
+        if window is None:
             return self
 
         # Check if correlation is a BatchUnit by checking its class name
@@ -882,8 +901,8 @@ class BatchComplex(BatchCore):
         if set(corr.keys()) != set(self.keys()):
             raise ValueError("corr must have the same keys as self")
 
-        if isinstance(psize, int):
-            psize = {'y': psize, 'x': psize}
+        if isinstance(window, int):
+            window = {'y': window, 'x': window}
 
         # Determine if GPU resource annotation is needed
         use_gpu = device in ('cuda', 'mps')
@@ -904,7 +923,8 @@ class BatchComplex(BatchCore):
 
                     # Wrapper for _goldstein
                     def goldstein_block(phase_block, corr_block):
-                        return BatchComplex._goldstein(phase_block, corr_block, psize=psize, device=device)
+                        return BatchComplex._goldstein(phase_block, corr_block, psize=window,
+                                                       threshold=threshold, device=device)
 
                     # Build dimension string based on ndim (e.g., 'yx' for 2D, 'pyx' for 3D)
                     dim_str = ''.join(chr(ord('a') + i) for i in range(phase_dask.ndim))
@@ -1096,6 +1116,151 @@ class BatchList(tuple):
     def isel(self, *args, **kwargs):
         """Apply isel to all batches."""
         return BatchList([b.isel(*args, **kwargs) for b in self])
+
+    def angle(self):
+        """Apply angle() to BatchComplex batches, return others unchanged.
+
+        Returns
+        -------
+        BatchList
+            BatchList with BatchComplex converted to BatchWrap (phase angles),
+            other batch types unchanged.
+
+        Examples
+        --------
+        >>> phase, corr = stack.phasediff2(pairs).angle()
+        >>> # phase is now BatchWrap with angles, corr is unchanged BatchUnit
+        """
+        results = []
+        for b in self:
+            if isinstance(b, BatchComplex):
+                results.append(b.angle())
+            else:
+                results.append(b)
+        return BatchList(results)
+
+    def goldstein(self, window: int | list[int, int] = 32, threshold: float = 0.5, device: str = 'auto'):
+        """Apply Goldstein filter to phase using correlation as weight.
+
+        Expects BatchList with [BatchComplex (phase), BatchUnit (correlation)].
+
+        Parameters
+        ----------
+        window : int or list[int, int]
+            Goldstein filter patch size, default 32.
+        threshold : float
+            Minimum fraction of valid (non-NaN) pixels required to process a patch.
+            Default 0.5 means at least 50% of pixels must be valid.
+        device : str
+            PyTorch device: 'auto', 'cuda', 'mps', or 'cpu'.
+
+        Returns
+        -------
+        BatchList
+            BatchList with Goldstein-filtered phase and unchanged correlation.
+
+        Examples
+        --------
+        >>> phase, corr = stack.phasediff(pairs, wavelength=30).goldstein(32).angle()
+        """
+        if len(self) < 2:
+            raise ValueError("goldstein() requires BatchList with at least 2 elements: [phase, correlation]")
+
+        phase, corr = self[0], self[1]
+
+        if not isinstance(phase, BatchComplex):
+            raise TypeError(f"First element must be BatchComplex, got {type(phase).__name__}")
+        if not isinstance(corr, BatchUnit):
+            raise TypeError(f"Second element must be BatchUnit, got {type(corr).__name__}")
+
+        filtered_phase = phase.goldstein(corr, window, threshold=threshold, device=device)
+        return BatchList([filtered_phase, corr] + list(self[2:]))
+
+    def phasediff(self,
+                  weight: 'BatchUnit | None' = None,
+                  phase: 'BatchComplex | None' = None,
+                  wavelength: float | None = None,
+                  gaussian_threshold: float = 0.5,
+                  device: str = 'auto') -> 'BatchList':
+        """
+        Compute phase difference from paired SLC data.
+
+        Expects BatchList from pairs() with [ref, rep] BatchComplex objects.
+
+        Parameters
+        ----------
+        weight : BatchUnit or None
+            Per-burst weights for Gaussian filtering and masking.
+        phase : BatchComplex or None
+            Optional phase to subtract (e.g., topographic phase).
+        wavelength : float or None
+            Gaussian filter wavelength for multilooking.
+        gaussian_threshold : float
+            Threshold for Gaussian filter (default 0.5).
+        device : str
+            PyTorch device: 'auto', 'cuda', 'mps', or 'cpu'.
+
+        Returns
+        -------
+        BatchList
+            BatchList with [phase, correlation].
+
+        Examples
+        --------
+        >>> ref, rep = stack.pairs(baseline.tolist())
+        >>> phase, corr = ref.phasediff(rep, wavelength=30)
+        >>> # Or chained:
+        >>> phase, corr = stack.pairs(baseline.tolist()).phasediff(wavelength=30)
+        """
+        if len(self) != 2:
+            raise ValueError("phasediff() requires BatchList with exactly 2 elements: [ref, rep]")
+
+        ref, rep = self[0], self[1]
+
+        if not isinstance(ref, BatchComplex) or not isinstance(rep, BatchComplex):
+            raise TypeError("Both elements must be BatchComplex")
+
+        if weight is not None and not isinstance(weight, BatchUnit):
+            raise TypeError(
+                f'weight must be a BatchUnit, got {type(weight).__name__}. '
+                'Use BatchUnit(stack.from_dataset(data)) to convert a single DataArray.'
+            )
+
+        phasediff = ref * rep.conj()
+        if phase is not None:
+            if isinstance(phase, BatchComplex):
+                phasediff = phasediff * phase
+            else:
+                phasediff = phasediff * phase.iexp(-1)
+
+        corr_look = BatchUnit()
+        if wavelength is not None:
+            phasediff_look = phasediff.gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold, device=device)
+            intensity_ref = ref.power().gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold, device=device)
+            intensity_rep = rep.power().gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold, device=device)
+            del ref, rep
+            corr_look = (phasediff_look.abs() / (intensity_ref * intensity_rep).sqrt()).clip(0, 1)
+            del intensity_ref, intensity_rep
+        else:
+            phasediff_look = phasediff
+            del ref, rep
+        del phasediff
+
+        if weight is not None:
+            phasediff_look = phasediff_look.where(weight.isfinite())
+            corr_look = corr_look.where(weight.isfinite()) if corr_look else None
+
+        return BatchList([phasediff_look, corr_look])
+
+    def phasediff2(self, *args, **kwargs):
+        """
+        Compute optimized interferogram using dual-polarization coherence optimization.
+
+        This method requires the insardev_polsar extension package.
+        """
+        raise ImportError(
+            "phasediff2() requires insardev_polsar extension"
+        )
 
     def compute(self):
         """Compute all batches together efficiently and return as tuple for unpacking.

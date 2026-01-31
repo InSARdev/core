@@ -87,14 +87,9 @@ def save(*args, store, storage_options: dict[str, str] | None = None, compat: bo
     import xarray as xr
     import dask
     import zarr
-    import os
-    import shutil
-    import joblib
-    from tqdm.auto import tqdm
     import gc
     from dask.distributed import get_client
-
-    joblib_backend = 'sequential' if debug else 'threading'
+    from insardev_toolkit.progressbar import progressbar
 
     interleave = len(args) > 1
 
@@ -126,33 +121,6 @@ def save(*args, store, storage_options: dict[str, str] | None = None, compat: bo
     # Check if store is a string path or a store object
     is_store_object = not isinstance(store, str)
 
-    def _save_grp(grp, ds):
-        # silently drop problematic attributes
-        ds_clean = ds.copy()
-        for v in ds_clean.data_vars:
-            ds_clean[v].attrs.pop('grid_mapping', None)
-        # prevent chunks mismatch between variables and coordinates
-        for coord in ds_clean.coords:
-            ds_clean[coord].encoding.pop('chunks', None)
-        # save to subdirectory/subgroup
-        if is_store_object:
-            # Use group parameter for store objects (e.g., ZipStore)
-            ds_clean.to_zarr(
-                store=store,
-                group=grp,
-                mode='a',  # append mode for store objects
-                consolidated=True,
-                zarr_format=3
-            )
-        else:
-            ds_clean.to_zarr(
-                store=f'{store}/{grp}',
-                mode='w',
-                consolidated=True,
-                zarr_format=3
-            )
-        del ds_clean
-
     # open to drop existing store (for string paths) or initialize (for store objects)
     root = zarr.group(store=store, zarr_format=3, overwrite=True)
     root.attrs['__class__'] = [
@@ -160,8 +128,26 @@ def save(*args, store, storage_options: dict[str, str] | None = None, compat: bo
         for cls in (type(arg) for arg in args)
     ]
 
-    with progressbar_joblib.progressbar_joblib(tqdm(desc=caption.ljust(25), total=len(datas))) as progress_bar:
-        joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(_save_grp) (grp, ds) for grp, ds in datas.items())
+    # Create lazy write tasks for all datasets, then compute together
+    # This allows Dask to share intermediate results while streaming to disk
+    write_tasks = []
+    for grp, ds in datas.items():
+        ds_clean = ds.copy()
+        # drop problematic attributes
+        for v in ds_clean.data_vars:
+            ds_clean[v].attrs.pop('grid_mapping', None)
+        # prevent chunks mismatch between variables and coordinates
+        for coord in ds_clean.coords:
+            ds_clean[coord].encoding.pop('chunks', None)
+        if is_store_object:
+            task = ds_clean.to_zarr(store=store, group=grp, mode='a', consolidated=True, zarr_format=3, compute=False)
+        else:
+            task = ds_clean.to_zarr(store=f'{store}/{grp}', mode='w', consolidated=True, zarr_format=3, compute=False)
+        write_tasks.append(task)
+
+    # Compute all writes together - Dask shares intermediate results across bursts
+    progressbar(persisted := dask.persist(*write_tasks), desc=caption.ljust(25))
+    dask.compute(*persisted)  # Wait for completion
 
     # consolidate metadata for the groups in the store
     zarr.consolidate_metadata(store, zarr_format=3)

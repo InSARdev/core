@@ -80,7 +80,9 @@ def _process_date_worker(args):
      xml_file, tiff_file, orbit_file, record_dict,
      topo, transform,
      prm_ref_df, prm_ref_orbit_df, sc_height,
-     topo_llt, epsg, remove_tidal_phase, debug) = args
+     topo_llt, epsg, remove_tidal_phase,
+     remove_thermal_noise, radiometric_calibration,
+     calibration_xml, noise_xml, debug) = args
 
     import warnings
     import numpy as np
@@ -178,7 +180,11 @@ def _process_date_worker(args):
         prm_rep=prm, prm_ref=prm_ref, slc_data=slc,
         burst_name=burst_name, record_dict=record_dict,
         epsg=epsg, baseline_params=baseline_params, sc_height_params=sc_height,
-        reramp_params=reramp_params, remove_tidal_phase=remove_tidal_phase, debug=debug
+        reramp_params=reramp_params, remove_tidal_phase=remove_tidal_phase,
+        remove_thermal_noise=remove_thermal_noise,
+        radiometric_calibration=radiometric_calibration,
+        calibration_xml=calibration_xml, noise_xml=noise_xml,
+        debug=debug
     )
     return burst_name
 
@@ -280,19 +286,23 @@ def _compute_merged_transform(transform, prm_rep):
 
 
 def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
-                               burst_name, record_dict, epsg, scale=0.5,
+                               burst_name, record_dict, epsg,
                                baseline_params=None, sc_height_params=None,
-                               reramp_params=None, remove_tidal_phase=True, debug=False):
+                               reramp_params=None, remove_tidal_phase=True,
+                               remove_thermal_noise=False,
+                               radiometric_calibration=None,
+                               calibration_xml=None, noise_xml=None,
+                               debug=False):
     """Transform SLC to geocoded int16 zarr.
 
     Module-level function usable from both class methods and joblib workers.
 
-    All SLCs (ref and rep) are deramped before geocoding. For rep bursts,
-    the alignment offsets are merged into the geocoding transform (single
-    interpolation). After geocoding, each date's TOPS reramp phase is restored
-    analytically (using that date's own burst parameters) along with topo phase.
-    The reramp is required because FM rate and Doppler centroid parameters differ
-    between acquisitions — the ramp does NOT cancel in interferograms.
+    Input: complex64 SLC data from deramped_burst() (raw DN values, no scaling).
+    Output: int16 zarr with scale determined by calibration mode.
+
+    Scale factors (determined automatically):
+    - Raw data (no calibration): scale=5e-07 for typical DN ~50-5000
+    - Calibrated data: scale=1e-03 for sqrt(σ₀) covering -60 to +30 dB
     """
     import os
     import time
@@ -305,12 +315,50 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
     _t0 = time.perf_counter()
     _timings = {}
 
-    # Convert SLC data to xarray
+    # Input: complex64 SLC data (raw DN values from deramped_burst, no scaling)
     num_lines = prm_rep.get('num_lines')
     num_rng_bins = prm_rep.get('num_rng_bins')
 
-    # Input is complex64 (raw DN values)
-    slc_complex = slc_data.astype(np.complex64)
+    # Ensure complex64 format
+    slc_complex = slc_data.astype(np.complex64) if slc_data.dtype != np.complex64 else slc_data
+
+    # Apply radiometric calibration and/or thermal noise removal
+    # Works directly on raw DN values - no scaling needed!
+    if remove_thermal_noise or radiometric_calibration:
+        try:
+            from insardev_backscatter.utils_s1 import apply_radiometric_correction
+        except ImportError:
+            raise ImportError(
+                "Radiometric calibration requires insardev_backscatter extension"
+            )
+        slc_complex = apply_radiometric_correction(
+            slc_complex,
+            calibration_xml=calibration_xml,
+            noise_xml=noise_xml,
+            calibration_type=radiometric_calibration,
+            remove_noise=remove_thermal_noise
+        )
+
+    # Set output scale based on whether calibration was applied
+    # int16 conversion: int16 = value / scale, so value = int16 * scale
+    # Scale must be chosen so values fit in int16 range [-32767, 32767]
+    if radiometric_calibration:
+        # Output is sqrt(σ₀), typical range 0.01-1.0 (-40 to 0 dB), max ~3.16 (+10 dB)
+        # With scale=1e-04: int16 = 100-10000 (typical), max 31600 (+10 dB)
+        scale = 1e-04
+        # Clip amplitude to max +10 dB while preserving phase
+        amp_max = 32767 * scale  # sqrt(σ₀_max) ≈ 3.27
+        amplitude = np.abs(slc_complex)
+        clip_mask = amplitude > amp_max
+        if clip_mask.any():
+            # Preserve phase, clip amplitude
+            phase = np.angle(slc_complex[clip_mask])
+            slc_complex[clip_mask] = amp_max * np.exp(1j * phase)
+    else:
+        # Raw DN amplitude, typical range 50-5000
+        # For backward compatibility: int16 = 2*DN (same as old deramped_burst output)
+        # DN / scale = 2*DN → scale = 0.5
+        scale = 0.5
 
     coords = {'a': np.arange(slc_complex.shape[0]) + 0.5, 'r': np.arange(slc_complex.shape[1]) + 0.5}
 
@@ -946,6 +994,8 @@ class S1_transform(S1_topo):
                   resolution: tuple[int, int]=(20, 5),
                   remove_topo_phase: bool = True,
                   remove_tidal_phase: bool = True,
+                  remove_thermal_noise: bool = False,
+                  radiometric_calibration: str|None = None,
                   dem_vertical_accuracy: float=0.5,
                   alignment_spacing: float=12.0/3600,
                   overwrite: bool=False,
@@ -973,6 +1023,16 @@ class S1_transform(S1_topo):
         remove_topo_phase : bool, optional
             Remove the topographic phase from SLC data for interferometric processing. Set to False
             when creating a DEM from interferograms so the topo phase remains.
+        remove_tidal_phase : bool, optional
+            Remove solid Earth tidal displacement phase. Default is True. Requires GMTSAR solid_tide binary.
+        remove_thermal_noise : bool, optional
+            Apply thermal noise removal using Sentinel-1 noise annotation LUT. Default is True.
+            Note: Pre-March 2018 data (IPF < 2.9) has placeholder zeros in noise LUT and will raise
+            an error; set to False for old data.
+        radiometric_calibration : str or None, optional
+            Apply radiometric calibration. Options: 'sigmaNought', 'betaNought', 'gamma', or None.
+            Default is 'sigmaNought'. Output amplitude represents sqrt(σ₀) in linear units and uses
+            a calibration-specific output scale factor. Set to None to preserve raw DN values.
         dem_vertical_accuracy : float, optional
             The DEM vertical accuracy in meters.
         alignment_spacing : float, optional
@@ -1009,6 +1069,16 @@ class S1_transform(S1_topo):
 
         # Suppress zarr v3 consolidated metadata warnings
         warnings.filterwarnings('ignore', message='.*Consolidated metadata.*', category=UserWarning)
+
+        # Early check: verify insardev_backscatter extension is installed if needed
+        if remove_thermal_noise or radiometric_calibration:
+            try:
+                import insardev_backscatter
+                print("NOTE: Radiometric calibration and thermal noise removal are provided by insardev_backscatter extension")
+            except ImportError:
+                raise ImportError(
+                    "Radiometric calibration and thermal noise removal require insardev_backscatter extension"
+                )
 
         # Control library threading to prevent over-subscription
         # Must be set BEFORE workers spawn (loky inherits env from parent process)
@@ -1119,6 +1189,11 @@ class S1_transform(S1_topo):
                 burst_name = burst_item[-1]
                 prm_ref = prm_cache[burst_ref_name]
 
+                # Build calibration/noise XML paths
+                prefix = self.fullBurstId(burst_name)
+                calibration_xml = os.path.join(self.datadir, prefix, 'calibration', f'{burst_name}.xml')
+                noise_xml = os.path.join(self.datadir, prefix, 'noise', f'{burst_name}.xml')
+
                 if is_reference:
                     # Deramped SLC for symmetric geocoding (same as rep path)
                     _, slc, reramp_params = self.align_ref(burst_name, debug=debug)
@@ -1140,24 +1215,15 @@ class S1_transform(S1_topo):
                         'B_offset_end': baseline_result.get('B_offset_end')
                     }
 
-                # Build record_dict for zarr metadata
-                record = self.get_record(burst_name)
-                record_dict = {}
-                for _, row in record.reset_index().iterrows():
-                    for name, value in row.items():
-                        if isinstance(value, (pd.Timestamp, np.datetime64)):
-                            value = pd.Timestamp(value).strftime('%Y-%m-%d %H:%M:%S')
-                        elif hasattr(value, 'wkt'):
-                            value = value.wkt
-                        record_dict[name] = value
-
-                # Call module-level function directly (same as _process_date_worker)
-                _transform_slc_int16(outdir, transform, topo, prm, prm_ref, slc,
-                                     burst_name=burst_name, record_dict=record_dict, epsg=epsg,
-                                     baseline_params=baseline_params,
-                                     sc_height_params=sc_height_cache[burst_ref_name],
-                                     reramp_params=reramp_params,
-                                     remove_tidal_phase=remove_tidal_phase, debug=debug)
+                self.transform_slc_int16(outdir, transform, topo, prm, prm_ref, slc, epsg=epsg,
+                                        baseline_params=baseline_params,
+                                        sc_height_params=sc_height_cache[burst_ref_name],
+                                        reramp_params=reramp_params,
+                                        remove_tidal_phase=remove_tidal_phase,
+                                        remove_thermal_noise=remove_thermal_noise,
+                                        radiometric_calibration=radiometric_calibration,
+                                        calibration_xml=calibration_xml,
+                                        noise_xml=noise_xml)
                 del slc
 
             # Cleanup and consolidate
@@ -1257,6 +1323,15 @@ class S1_transform(S1_topo):
                 tiff_file = os.path.join(self.datadir, prefix, 'measurement', f'{burst_name}.tiff')
                 orbit_file = os.path.join(self.datadir, record['orbit'].iloc[0])
 
+                # Derive calibration and noise XML paths (ASF burst format: {burst_name}.xml)
+                calibration_xml = os.path.join(self.datadir, prefix, 'calibration', f'{burst_name}.xml')
+                noise_xml = os.path.join(self.datadir, prefix, 'noise', f'{burst_name}.xml')
+                # Raise error if files don't exist when corrections are requested
+                if radiometric_calibration and not os.path.exists(calibration_xml):
+                    raise FileNotFoundError(f"Calibration XML not found: {calibration_xml}")
+                if remove_thermal_noise and not os.path.exists(noise_xml):
+                    raise FileNotFoundError(f"Noise XML not found: {noise_xml}")
+
                 # Build record dict for worker (use reset_index to include index values like polarization)
                 record_dict = {}
                 record_reset = record.reset_index()
@@ -1276,7 +1351,9 @@ class S1_transform(S1_topo):
                     xml_file, tiff_file, orbit_file, record_dict,
                     topo, transform,
                     prm_ref_df, prm_ref_orbit_df, sc_height,
-                    topo_llt, epsg, remove_tidal_phase, debug
+                    topo_llt, epsg, remove_tidal_phase,
+                    remove_thermal_noise, radiometric_calibration,
+                    calibration_xml, noise_xml, debug
                 ))
 
             # Use ProcessPoolExecutor or ThreadPoolExecutor based on scheduler
@@ -1338,3 +1415,258 @@ class S1_transform(S1_topo):
 
         # Consolidate zarr metadata for the target directory
         self.consolidate_metadata(target, resolution=resolution)
+
+    def transform_slc_int16(self,
+                            outdir: str,
+                            transform: xr.Dataset,
+                            topo: xr.DataArray | None,
+                            prm_rep: "PRM",
+                            prm_ref: "PRM",
+                            slc_data: np.ndarray,
+                            epsg: int,
+                            baseline_params: dict=None,
+                            sc_height_params: dict=None,
+                            reramp_params: dict=None,
+                            remove_tidal_phase: bool=True,
+                            remove_thermal_noise: bool=False,
+                            radiometric_calibration: str|None=None,
+                            calibration_xml: str|None=None,
+                            noise_xml: str|None=None
+                            ):
+        """
+        Perform geocoding from radar to geographic coordinates.
+
+        Input: complex64 SLC data (raw DN values from deramped_burst).
+        Output: int16 zarr with scale determined by calibration mode.
+
+        Delegates to the module-level _transform_slc_int16 function.
+        """
+        import os
+        import pandas as pd
+        import numpy as np
+
+        # Extract burst name and record dict from self
+        if 'input_file' in prm_rep.df.index:
+            burst_name = os.path.splitext(os.path.basename(prm_rep.get('input_file')))[0]
+        else:
+            burst_name = 'burst'
+
+        df = self.get_record(burst_name)
+        record_dict = {}
+        for _, row in df.reset_index().iterrows():
+            for name, value in row.items():
+                if isinstance(value, (pd.Timestamp, np.datetime64)):
+                    value = pd.Timestamp(value).strftime('%Y-%m-%d %H:%M:%S')
+                elif hasattr(value, 'wkt'):
+                    value = value.wkt
+                record_dict[name] = value
+
+        _transform_slc_int16(
+            outdir=outdir, transform=transform, topo=topo,
+            prm_rep=prm_rep, prm_ref=prm_ref, slc_data=slc_data,
+            burst_name=burst_name, record_dict=record_dict,
+            epsg=epsg,
+            baseline_params=baseline_params, sc_height_params=sc_height_params,
+            reramp_params=reramp_params, remove_tidal_phase=remove_tidal_phase,
+            remove_thermal_noise=remove_thermal_noise,
+            radiometric_calibration=radiometric_calibration,
+            calibration_xml=calibration_xml, noise_xml=noise_xml,
+            debug=bool(os.environ.get('INSAR_DEBUG'))
+        )
+
+    def flat_earth_topo_phase(self, topo: xr.DataArray | None, prm_rep: "PRM", prm_ref: "PRM",
+                               baseline_params: dict = None, sc_height_params: dict = None) -> xr.DataArray:
+        """
+        Compute the combined earth curvature and topographic phase correction.
+
+        Uses the full GMTSAR algorithm with time-varying baseline geometry.
+
+        Parameters
+        ----------
+        topo : xr.DataArray
+            Topographic elevation in radar coordinates (meters).
+        prm_rep : PRM
+            Repeat burst PRM object.
+        prm_ref : PRM
+            Reference burst PRM object.
+        baseline_params : dict, optional
+            Pre-computed baseline parameters (from SAT_baseline). If None, computed on the fly.
+        sc_height_params : dict, optional
+            Pre-computed SC_height parameters (from SAT_baseline). If None, computed on the fly.
+
+        Returns
+        -------
+        xr.DataArray
+            Combined flat earth and topo phase (radians).
+        """
+        import numpy as np
+        import xarray as xr
+        from scipy import constants
+        import warnings
+        import time
+        import os
+        warnings.filterwarnings('ignore')
+
+        _t0 = time.perf_counter()
+        _timings = {}
+
+        # For reference burst (same as itself), we still compute flat earth correction
+        # with baseline=0 to go through the same code path as repeat bursts
+        is_reference = (prm_rep is prm_ref)
+
+        # Create topo with zeros if None (flat-earth only correction)
+        if topo is None:
+            xdim = prm_ref.get('num_rng_bins')
+            ydim = prm_ref.get('num_patches') * prm_ref.get('num_valid_az')
+            azis = np.arange(0.5, ydim, 1)
+            rngs = np.arange(0.5, xdim, 1)
+            topo = xr.DataArray(np.zeros((len(azis), len(rngs)), dtype=np.float32),
+                                dims=['a', 'r'],
+                                coords={'a': azis, 'r': rngs}).rename('topo')
+
+        # Calculate the combined earth curvature and topography correction
+        def calc_drho(rho, topo_vals, earth_radius, height, b, alpha, Bx):
+            sina = np.sin(alpha)
+            cosa = np.cos(alpha)
+            c = earth_radius + height
+            ret = earth_radius + topo_vals
+            cost = ((rho**2 + c**2 - ret**2) / (2. * rho * c))
+            sint = np.sqrt(1. - cost**2)
+            term1 = rho**2 + b**2 - 2 * rho * b * (sint * cosa - cost * sina) - Bx**2
+            drho = -rho + np.sqrt(term1)
+            return drho
+
+        # Create copies to avoid modifying cached PRMs
+        # fix_aligned() modifies near_range, so calling it multiple times on cached PRMs causes drift
+        from .PRM import PRM
+        prm1 = PRM().set(prm_ref)  # copy of reference PRM
+        prm1.orbit_df = prm_ref.orbit_df  # copy orbit data reference
+        prm2 = PRM().set(prm_rep)  # copy of repeat PRM
+        prm2.orbit_df = prm_rep.orbit_df  # copy orbit data reference
+        _timings['prm_copy'] = time.perf_counter() - _t0
+
+        # Set baseline parameters on PRM copies
+        # Order follows GMTSAR: SAT_baseline first, then fix_aligned
+        _t0 = time.perf_counter()
+        if is_reference:
+            # For reference burst, baseline is 0 - set explicitly to avoid SAT_baseline issues
+            prm2.set(
+                baseline_start=0, baseline_center=0, baseline_end=0,
+                alpha_start=0, alpha_center=0, alpha_end=0,
+                B_offset_start=0, B_offset_center=0, B_offset_end=0
+            ).fix_aligned()
+        elif baseline_params is not None:
+            # Use cached baseline parameters (avoids expensive SAT_baseline call)
+            prm2.set(**baseline_params).fix_aligned()
+        else:
+            # Only set the 9 baseline geometry parameters on prm2 (equivalent to GMTSAR's tail=9)
+            # Do NOT set SC_height values on prm2 - those belong to prm1
+            prm2.set(prm1.SAT_baseline(prm2).sel(
+                'baseline_start', 'baseline_center', 'baseline_end',
+                'alpha_start', 'alpha_center', 'alpha_end',
+                'B_offset_start', 'B_offset_center', 'B_offset_end'
+            )).fix_aligned()
+        _timings['SAT_baseline_prm2'] = time.perf_counter() - _t0
+
+        _t0 = time.perf_counter()
+        if sc_height_params is not None:
+            # Use cached SC_height parameters (avoids expensive SAT_baseline call)
+            prm1.set(**sc_height_params).fix_aligned()
+        else:
+            prm1.set(prm1.SAT_baseline(prm1).sel('SC_height', 'SC_height_start', 'SC_height_end')).fix_aligned()
+        _timings['SAT_baseline_prm1'] = time.perf_counter() - _t0
+
+        # Fill NaNs by 0 (avoid np.where temp array)
+        topo_vals = topo.values.copy()
+        np.copyto(topo_vals, 0, where=np.isnan(topo_vals))
+        y_coords = topo.a.values
+        x_coords = topo.r.values
+
+        # Get full dimensions
+        xdim = prm1.get('num_rng_bins')
+        ydim = prm1.get('num_patches') * prm1.get('num_valid_az')
+
+        # Get heights (from prm1 = reference copy)
+        htc = prm1.get('SC_height')
+        ht0 = prm1.get('SC_height_start')
+        htf = prm1.get('SC_height_end')
+
+        # Compute the time span and the time spacing (from prm2 = repeat copy)
+        tspan = 86400 * abs(prm2.get('SC_clock_stop') - prm2.get('SC_clock_start'))
+        assert (tspan >= 0.01) and (prm2.get('PRF') >= 0.01), \
+            f"ERROR in sc_clock_start={prm2.get('SC_clock_start')}, sc_clock_stop={prm2.get('SC_clock_stop')}, or PRF={prm2.get('PRF')}"
+
+        # Setup the default parameters
+        drange = constants.speed_of_light / (2 * prm2.get('rng_samp_rate'))
+        alpha = prm2.get('alpha_start') * np.pi / 180
+        cnst = -4 * np.pi / prm2.get('radar_wavelength')
+
+        # Calculate initial baselines (from prm2 which has baseline params set)
+        Bh0 = prm2.get('baseline_start') * np.cos(prm2.get('alpha_start') * np.pi / 180)
+        Bv0 = prm2.get('baseline_start') * np.sin(prm2.get('alpha_start') * np.pi / 180)
+        Bhf = prm2.get('baseline_end') * np.cos(prm2.get('alpha_end') * np.pi / 180)
+        Bvf = prm2.get('baseline_end') * np.sin(prm2.get('alpha_end') * np.pi / 180)
+        Bx0 = prm2.get('B_offset_start')
+        Bxf = prm2.get('B_offset_end')
+
+        # First case is quadratic baseline model, second case is default linear model
+        if prm2.get('baseline_center') != 0 or prm2.get('alpha_center') != 0 or prm2.get('B_offset_center') != 0:
+            Bhc = prm2.get('baseline_center') * np.cos(prm2.get('alpha_center') * np.pi / 180)
+            Bvc = prm2.get('baseline_center') * np.sin(prm2.get('alpha_center') * np.pi / 180)
+            Bxc = prm2.get('B_offset_center')
+
+            dBh = (-3 * Bh0 + 4 * Bhc - Bhf) / tspan
+            dBv = (-3 * Bv0 + 4 * Bvc - Bvf) / tspan
+            ddBh = (2 * Bh0 - 4 * Bhc + 2 * Bhf) / (tspan * tspan)
+            ddBv = (2 * Bv0 - 4 * Bvc + 2 * Bvf) / (tspan * tspan)
+
+            dBx = (-3 * Bx0 + 4 * Bxc - Bxf) / tspan
+            ddBx = (2 * Bx0 - 4 * Bxc + 2 * Bxf) / (tspan * tspan)
+        else:
+            dBh = (Bhf - Bh0) / tspan
+            dBv = (Bvf - Bv0) / tspan
+            dBx = (Bxf - Bx0) / tspan
+            ddBh = ddBv = ddBx = 0
+
+        # Calculate height increment
+        dht = (-3 * ht0 + 4 * htc - htf) / tspan
+        ddht = (2 * ht0 - 4 * htc + 2 * htf) / (tspan * tspan)
+
+        # Ensure float64 precision for near_range calculation to avoid sqrt precision issues
+        # (float32 rho gives sqrt(rho**2) != rho due to precision loss)
+        x_coords_f64 = x_coords.astype(np.float64)
+        y_coords_f64 = y_coords.astype(np.float64)
+        near_range = (prm1.get('near_range') + \
+            x_coords_f64.reshape(1, -1) * (1 + prm1.get('stretch_r')) * drange) + \
+            y_coords_f64.reshape(-1, 1) * prm1.get('a_stretch_r') * drange
+
+        # Calculate the change in baseline and height along the frame
+        t_arr = y_coords_f64 * tspan / (ydim - 1)
+        Bh = Bh0 + dBh * t_arr + ddBh * t_arr**2
+        Bv = Bv0 + dBv * t_arr + ddBv * t_arr**2
+        Bx = Bx0 + dBx * t_arr + ddBx * t_arr**2
+        B = np.sqrt(Bh * Bh + Bv * Bv)
+        alpha = np.arctan2(Bv, Bh)
+        height = ht0 + dht * t_arr + ddht * t_arr**2
+
+        # Calculate the combined earth curvature and topography correction
+        _t0 = time.perf_counter()
+        drho = calc_drho(near_range, topo_vals, prm1.get('earth_radius'),
+                         height.reshape(-1, 1), B.reshape(-1, 1), alpha.reshape(-1, 1), Bx.reshape(-1, 1))
+
+        phase_shift = (cnst * drho).astype(np.float32)
+        _timings['calc_drho'] = time.perf_counter() - _t0
+
+        _t0 = time.perf_counter()
+        topo_phase = xr.DataArray(phase_shift, topo.coords)
+        topo_phase = topo_phase.where(np.isfinite(topo)).rename('phase')
+        _timings['xarray_wrap'] = time.perf_counter() - _t0
+
+        # Print timing breakdown in debug mode
+        if os.environ.get('INSAR_DEBUG'):
+            total = sum(_timings.values())
+            print(f'  PROFILE flat_earth_topo_phase: ' +
+                  ' | '.join(f'{k}={v:.2f}s' for k, v in sorted(_timings.items(), key=lambda x: -x[1])) +
+                  f' | total={total:.2f}s')
+
+        return topo_phase

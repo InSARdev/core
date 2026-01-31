@@ -17,11 +17,11 @@ Optimized implementation with:
 - Memory-efficient chunked processing
 - Direct time series output option
 """
-from .Stack_phasediff import Stack_phasediff
+from .BatchCore import BatchCore
 import numpy as np
 
 
-class Stack_unwrap1d(Stack_phasediff):
+class Stack_unwrap1d(BatchCore):
     """1D phase unwrapping along the temporal dimension using L1-norm IRLS."""
 
     @staticmethod

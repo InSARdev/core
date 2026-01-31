@@ -15,3 +15,14 @@ from .Stack import Stack
 from .BatchCore import BatchCore
 from .Batch import Batch, BatchWrap, BatchUnit, BatchComplex, BatchList
 from .Baseline import Baseline
+
+# Auto-load extensions if available
+try:
+    import insardev_polsar
+except ImportError:
+    pass
+
+try:
+    import insardev_backscatter
+except ImportError:
+    pass

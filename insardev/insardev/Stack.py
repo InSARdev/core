@@ -11,7 +11,7 @@
 from __future__ import annotations
 from .Stack_plot import Stack_plot
 from .BatchCore import BatchCore
-from .Batch import Batch, BatchWrap, BatchUnit, BatchComplex
+from .Batch import Batch, BatchWrap, BatchUnit, BatchComplex, BatchList
 #from collections.abc import Mapping
 from . import utils_io
 from . import utils_xarray
@@ -22,10 +22,23 @@ if TYPE_CHECKING:
     import xarray as xr
 
 class Stack(Stack_plot, BatchCore):
-    
+
     def __init__(self, mapping:dict[str, xr.Dataset] | None = None):
         #print('Stack __init__', 0 if mapping is None else len(mapping))
         super().__init__(mapping)
+
+    @staticmethod
+    def _batch_type_for_subset(subset: dict) -> type:
+        """Determine appropriate Batch type based on dtypes in subset."""
+        import numpy as np
+        dtypes = set()
+        for ds in subset.values():
+            for var in ds.data_vars:
+                dtypes.add(ds[var].dtype)
+        # If all variables are complex, use BatchComplex
+        if dtypes and all(np.issubdtype(dt, np.complexfloating) for dt in dtypes):
+            return BatchComplex
+        return Batch
 
     @property
     def coords(self):
@@ -96,7 +109,8 @@ class Stack(Stack_plot, BatchCore):
                 subset = {k: ds[[var]] for k, ds in self.items() if var in ds.data_vars}
                 if not subset:
                     raise KeyError(var)
-                return Batch(subset)
+                batch_type = self._batch_type_for_subset(subset)
+                return batch_type(subset)
             # Multiple variables - return Stack with subset
             return type(self)({k: ds[key] for k, ds in self.items()})
         return dict.__getitem__(self, key)
@@ -117,7 +131,8 @@ class Stack(Stack_plot, BatchCore):
                 if name in sample.data_vars or name in sample.coords:
                     subset = {k: ds[[name]] for k, ds in self.items() if name in ds.data_vars or name in ds.coords}
                     if subset:
-                        return Batch(subset)
+                        batch_type = self._batch_type_for_subset(subset)
+                        return batch_type(subset)
 
         raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
@@ -994,6 +1009,7 @@ class Stack(Stack_plot, BatchCore):
             dask.delayed tasks for each date's data. File handles are opened
             and closed cleanly for each load operation.
             """
+            import rioxarray
             root = zarr.open_consolidated(zarr_path, zarr_format=3, mode='r')
             grp = root[group]
 
@@ -1334,6 +1350,78 @@ class Stack(Stack_plot, BatchCore):
                                  'This may be caused by corrupted data or library issues. '
                                  'Try restarting the runtime and reloading the data.')
         return self
+
+
+    def pairs(self,
+              pairs: list[tuple[str|int, str|int]] | np.ndarray | pd.DataFrame
+              ) -> BatchList:
+        """
+        Select SLC data organized by interferometric pairs.
+
+        Returns reference and repeat SLC data as a BatchList, ready for
+        interferogram computation via multiplication.
+
+        Parameters
+        ----------
+        pairs : list, np.ndarray, or pd.DataFrame
+            Pairs of dates as [(ref1, rep1), (ref2, rep2), ...].
+            Dates can be indices (int) or date strings.
+
+        Returns
+        -------
+        BatchList
+            BatchList containing [BatchComplex(ref), BatchComplex(rep)]
+            with 'pair' dimension and ref/rep date coordinates.
+
+        Examples
+        --------
+        # Get paired SLC data
+        ref, rep = stack.pairs(baseline.tolist())
+
+        # Manual phase difference
+        phasediff = ref * rep.conj()
+
+        # With filtering
+        intf = (ref * rep.conj()).gaussian(wavelength=30).angle()
+        """
+        import numpy as np
+
+        pairs = np.array(pairs if isinstance(pairs[0], (list, tuple, np.ndarray)) else [pairs])
+
+        # Check for duplicate pairs
+        unique, counts = np.unique(pairs, axis=0, return_counts=True)
+        if (counts > 1).any():
+            duplicates = unique[counts > 1]
+            raise ValueError(f'Input pairs contain duplicates: {duplicates.tolist()}')
+
+        ref_dates = pairs[:, 0]
+        rep_dates = pairs[:, 1]
+        n_pairs = len(ref_dates)
+
+        # Rename date->pair and reset to integer index
+        data1 = self.isel(date=ref_dates).rename(date='pair').map(lambda ds: ds.assign_coords(pair=np.arange(n_pairs)))
+        data2 = self.isel(date=rep_dates).rename(date='pair').map(lambda ds: ds.assign_coords(pair=np.arange(n_pairs)))
+
+        # BPR differences aligned with pair dimension: BPR(rep) - BPR(ref)
+        # Keep as per-burst dict structure (each burst has its own BPR)
+        bpr = data2[['BPR']] - data1[['BPR']]
+
+        # Store original datetime values for ref/rep (already materialized via .values)
+        ref_values = self.isel(date=ref_dates).coords['date'].values
+        rep_values = self.isel(date=rep_dates).coords['date'].values
+
+        def add_pair_coords(batch):
+            # Add ref/rep/BPR as non-dimension coordinates along pair dimension
+            return batch.assign_coords(
+                ref=('pair', ref_values),
+                rep=('pair', rep_values),
+                BPR=('pair', bpr)
+            )
+
+        ref_batch = add_pair_coords(BatchComplex(data1))
+        rep_batch = add_pair_coords(BatchComplex(data2))
+
+        return BatchList([ref_batch, rep_batch])
 
     def elevation(self, phase: Batch | float | list | "np.ndarray", baseline: float | None = None, transform: Batch | None = None) -> "Batch | float | np.ndarray":
         """Compute elevation (meters) from unwrapped phase grids in radar coordinates.

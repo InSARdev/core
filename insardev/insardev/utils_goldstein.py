@@ -9,7 +9,7 @@
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
 
-def goldstein_numpy(phase_np, corr_np, psize_y, psize_x, chunk_memory_mb=256):
+def goldstein_numpy(phase_np, corr_np, psize_y, psize_x, threshold=0.5, chunk_memory_mb=256):
     """
     Goldstein adaptive filter using NumPy with batched FFT.
 
@@ -25,6 +25,9 @@ def goldstein_numpy(phase_np, corr_np, psize_y, psize_x, chunk_memory_mb=256):
         Patch size in y dimension.
     psize_x : int
         Patch size in x dimension.
+    threshold : float
+        Minimum fraction of valid (non-NaN) pixels required to process a patch.
+        Default 0.5 means at least 50% of pixels must be valid.
     chunk_memory_mb : int
         Target memory per chunk in MB (default 256).
 
@@ -43,8 +46,21 @@ def goldstein_numpy(phase_np, corr_np, psize_y, psize_x, chunk_memory_mb=256):
     ny, nx = phase_np.shape
     step_y, step_x = psize_y // 2, psize_x // 2
 
+    # Save original NaN mask to restore at the end
+    nan_mask = np.isnan(phase_np)
+
+    # Pad input to ensure all pixels are covered by at least one patch
+    pad_y = psize_y - step_y  # Need to cover bottom edge
+    pad_x = psize_x - step_x  # Need to cover right edge
+    phase_np = np.pad(phase_np, ((0, pad_y), (0, pad_x)), mode='constant', constant_values=np.nan)
+    corr_np = np.pad(corr_np, ((0, pad_y), (0, pad_x)), mode='constant', constant_values=np.nan)
+    padded_ny, padded_nx = phase_np.shape
+
+    # Create valid mask before filling NaN with zeros
+    valid_input = ~np.isnan(phase_np)
+
     # Calculate adaptive chunk_rows based on target memory
-    n_patches_x = (nx - psize_x) // step_x + 1
+    n_patches_x = (padded_nx - psize_x) // step_x + 1
     bytes_per_row = n_patches_x * psize_y * psize_x * (8 + 4 + 8 + 8 + 8)  # ~36 bytes per element
     chunk_rows = max(1, int(chunk_memory_mb * 1e6 / bytes_per_row))
 
@@ -58,21 +74,23 @@ def goldstein_numpy(phase_np, corr_np, psize_y, psize_x, chunk_memory_mb=256):
     del quadrant, wx, wy
 
     # Output arrays
-    out = np.zeros((ny, nx), dtype=np.complex64)
-    count = np.zeros((ny, nx), dtype=np.float32)
-    n_patches_x = (nx - psize_x) // step_x + 1
+    out = np.zeros((padded_ny, padded_nx), dtype=np.complex64)
+    count = np.zeros((padded_ny, padded_nx), dtype=np.float32)
 
     # Fill NaN with 0 (copy to avoid modifying input)
     phase_np = phase_np.copy()
-    np.copyto(phase_np, 0.0, where=np.isnan(phase_np))
+    np.copyto(phase_np, 0.0, where=~valid_input)
     corr_np = corr_np.copy()
     np.copyto(corr_np, 0.0, where=np.isnan(corr_np))
 
+    # Threshold for valid patches
+    min_valid_pixels = int(psize_y * psize_x * threshold)
+
     # Process in row chunks for memory efficiency
     y = 0
-    while y <= ny - psize_y:
+    while y <= padded_ny - psize_y:
         # Determine chunk bounds
-        chunk_end_patch = min(y + chunk_rows * step_y, ny - psize_y + 1)
+        chunk_end_patch = min(y + chunk_rows * step_y, padded_ny - psize_y + 1)
         chunk_n_rows = (chunk_end_patch - y) // step_y
         if chunk_n_rows == 0:
             break
@@ -81,24 +99,26 @@ def goldstein_numpy(phase_np, corr_np, psize_y, psize_x, chunk_memory_mb=256):
         # Extract all patches in chunk using sliding_window_view
         phase_chunk = phase_np[y:chunk_end_y]
         corr_chunk = corr_np[y:chunk_end_y]
+        valid_chunk = valid_input[y:chunk_end_y]
 
         phase_windows = sliding_window_view(phase_chunk, (psize_y, psize_x))
         corr_windows = sliding_window_view(corr_chunk, (psize_y, psize_x))
+        valid_windows = sliding_window_view(valid_chunk, (psize_y, psize_x))
 
         # Subsample to get patches at step intervals: (n_patches, psize_y, psize_x)
         phase_patches = phase_windows[::step_y, ::step_x].reshape(-1, psize_y, psize_x).copy()
         corr_patches = corr_windows[::step_y, ::step_x].reshape(-1, psize_y, psize_x).copy()
+        valid_patches = valid_windows[::step_y, ::step_x].reshape(-1, psize_y, psize_x)
 
         # Compute alpha for each patch: alpha = 1 - weighted_corr / wgt_sum
-        # Use einsum to avoid creating (n_patches, psize_y, psize_x) temp array
         alpha = np.einsum('ij,kij->k', wgt, corr_patches)
         del corr_patches
-        # In-place: alpha = 1 - alpha / wgt_sum
         alpha /= -wgt_sum
         alpha += 1.0
 
-        # Valid mask: at least 50% non-zero pixels
-        valid_mask = (phase_patches != 0).sum(axis=(1, 2)) >= (psize_y * psize_x * 0.5)
+        # Valid mask: at least threshold fraction of valid pixels
+        valid_mask = valid_patches.sum(axis=(1, 2)) >= min_valid_pixels
+        del valid_patches
 
         # Batched FFT2 on all patches at once
         fft_patches = np.fft.fft2(phase_patches, axes=(1, 2))
@@ -119,7 +139,6 @@ def goldstein_numpy(phase_np, corr_np, psize_y, psize_x, chunk_memory_mb=256):
         # Apply triangular weight and mask invalid patches (in-place)
         filtered *= wgt[np.newaxis, :, :]
         filtered[~valid_mask] = 0
-        # Pre-allocate wgt_expanded and use copyto instead of np.where
         n_patches = filtered.shape[0]
         wgt_expanded = np.zeros((n_patches, psize_y, psize_x), dtype=np.float32)
         np.copyto(wgt_expanded, wgt, where=valid_mask[:, np.newaxis, np.newaxis])
@@ -138,15 +157,26 @@ def goldstein_numpy(phase_np, corr_np, psize_y, psize_x, chunk_memory_mb=256):
         del filtered, wgt_expanded
         y += chunk_n_rows * step_y
 
-    # Normalize by accumulated weights (in-place)
+    # Mark pixels with no valid contribution as invalid
+    # Use small epsilon to catch pixels that only received negligible weight
+    insufficient_weight = count < 1e-6
+
+    # Normalize by accumulated weights
     np.clip(count, 1e-10, None, out=count)
     out /= count
     del count
+
+    # Crop to original size
+    out = out[:ny, :nx]
+    insufficient_weight = insufficient_weight[:ny, :nx]
+
+    # Restore NaN mask (original NaN + insufficient contributions)
+    out[nan_mask | insufficient_weight] = np.nan + 1j * np.nan
     assert out.dtype == np.complex64, f"Output must be complex64, got {out.dtype}"
     return out
 
 
-def goldstein_pytorch(phase_np, corr_np, psize_y, psize_x, device):
+def goldstein_pytorch(phase_np, corr_np, psize_y, psize_x, device, threshold=0.5):
     """
     Goldstein adaptive filter using PyTorch with vectorized unfold/fold.
 
@@ -164,6 +194,9 @@ def goldstein_pytorch(phase_np, corr_np, psize_y, psize_x, device):
         Patch size in x dimension.
     device : torch.device
         PyTorch device: 'cuda', 'mps', or 'cpu'.
+    threshold : float
+        Minimum fraction of valid (non-NaN) pixels required to process a patch.
+        Default 0.5 means at least 50% of pixels must be valid.
 
     Returns
     -------
@@ -181,6 +214,9 @@ def goldstein_pytorch(phase_np, corr_np, psize_y, psize_x, device):
     ny, nx = phase_np.shape
     step_y, step_x = psize_y // 2, psize_x // 2
 
+    # Save original NaN mask to restore at the end
+    nan_mask = np.isnan(phase_np)
+
     # Create triangular weight matrix
     wx = 1.0 - np.abs(np.arange(psize_x // 2) - (psize_x / 2.0 - 1.0)) / (psize_x / 2.0 - 1.0)
     wy = 1.0 - np.abs(np.arange(psize_y // 2) - (psize_y / 2.0 - 1.0)) / (psize_y / 2.0 - 1.0)
@@ -190,18 +226,31 @@ def goldstein_pytorch(phase_np, corr_np, psize_y, psize_x, device):
     wgt = torch.from_numpy(wgt_np).to(device)
     wgt_sum = wgt.sum()
 
-    # Fill NaN with 0 in-place (safe - caller saves nan_mask before calling)
-    np.copyto(phase_np, 0.0, where=np.isnan(phase_np))
+    # Create valid mask before filling NaN
+    valid_input = ~nan_mask
+
+    # Fill NaN with 0
+    phase_np = phase_np.copy()
+    np.copyto(phase_np, 0.0, where=~valid_input)
+    corr_np = corr_np.copy()
     np.copyto(corr_np, 0.0, where=np.isnan(corr_np))
 
-    with torch.no_grad():
-        # Pad to make dimensions work with unfold/fold
-        pad_h = (step_y - ((ny - psize_y) % step_y)) % step_y
-        pad_w = (step_x - ((nx - psize_x) % step_x)) % step_x
+    # Threshold for valid patches
+    min_valid_pixels = int(psize_y * psize_x * threshold)
 
-        if pad_h > 0 or pad_w > 0:
-            phase_np = np.pad(phase_np, ((0, pad_h), (0, pad_w)), mode='constant', constant_values=0)
-            corr_np = np.pad(corr_np, ((0, pad_h), (0, pad_w)), mode='constant', constant_values=0)
+    with torch.no_grad():
+        # Pad to ensure all pixels are covered and dimensions work with unfold/fold
+        pad_y = psize_y - step_y  # Need to cover bottom edge
+        pad_x = psize_x - step_x  # Need to cover right edge
+        # Additional padding to make dimensions divisible by step
+        extra_pad_h = (step_y - ((ny + pad_y - psize_y) % step_y)) % step_y
+        extra_pad_w = (step_x - ((nx + pad_x - psize_x) % step_x)) % step_x
+        total_pad_y = pad_y + extra_pad_h
+        total_pad_x = pad_x + extra_pad_w
+
+        phase_np = np.pad(phase_np, ((0, total_pad_y), (0, total_pad_x)), mode='constant', constant_values=0)
+        corr_np = np.pad(corr_np, ((0, total_pad_y), (0, total_pad_x)), mode='constant', constant_values=0)
+        valid_input = np.pad(valid_input, ((0, total_pad_y), (0, total_pad_x)), mode='constant', constant_values=False)
 
         padded_h, padded_w = phase_np.shape
 
@@ -210,12 +259,14 @@ def goldstein_pytorch(phase_np, corr_np, psize_y, psize_x, device):
             np.stack([phase_np.real, phase_np.imag], axis=0)
         ).unsqueeze(0).float().to(device)
         corr_t = torch.from_numpy(corr_np).unsqueeze(0).unsqueeze(0).to(device)
-        del phase_np, corr_np
+        valid_t = torch.from_numpy(valid_input.astype(np.float32)).unsqueeze(0).unsqueeze(0).to(device)
+        del phase_np, corr_np, valid_input
 
         # Use unfold to extract all patches at once
         phase_patches = F.unfold(phase_t, kernel_size=(psize_y, psize_x), stride=(step_y, step_x))
         corr_patches = F.unfold(corr_t, kernel_size=(psize_y, psize_x), stride=(step_y, step_x))
-        del phase_t, corr_t
+        valid_patches = F.unfold(valid_t, kernel_size=(psize_y, psize_x), stride=(step_y, step_x))
+        del phase_t, corr_t, valid_t
 
         num_patches = phase_patches.shape[2]
 
@@ -226,15 +277,18 @@ def goldstein_pytorch(phase_np, corr_np, psize_y, psize_x, device):
         # Reshape corr: (1, psize*psize, L) -> (L, psize, psize)
         corr_patches = corr_patches.squeeze(0).view(psize_y, psize_x, num_patches).permute(2, 0, 1)
 
+        # Reshape valid: (1, psize*psize, L) -> (L, psize, psize)
+        valid_patches = valid_patches.squeeze(0).view(psize_y, psize_x, num_patches).permute(2, 0, 1)
+
         # Compute alpha for each patch
         weighted_corr = (wgt.unsqueeze(0) * corr_patches).sum(dim=(1, 2))
         alpha = 1.0 - weighted_corr / wgt_sum
         del corr_patches, weighted_corr
 
-        # Check valid patches (at least 50% non-zero)
-        valid_count = (phase_patches != 0).sum(dim=(1, 2)).float()
-        valid_mask = valid_count >= (psize_y * psize_x * 0.5)
-        del valid_count
+        # Check valid patches using threshold
+        valid_count = valid_patches.sum(dim=(1, 2))
+        valid_mask = valid_count >= min_valid_pixels
+        del valid_count, valid_patches
 
         # Batched FFT and power spectrum filtering
         fft_patches = torch.fft.fft2(phase_patches)
@@ -270,6 +324,9 @@ def goldstein_pytorch(phase_np, corr_np, psize_y, psize_x, device):
                        kernel_size=(psize_y, psize_x), stride=(step_y, step_x))
         del weighted_ri, valid_for_fold
 
+        # Mark pixels with no valid contribution
+        insufficient_weight = (count.squeeze(0).squeeze(0) < 1e-6).cpu().numpy()
+
         # Normalize
         result_ri = result_ri / count.clamp(min=1)
         result_ri = result_ri.squeeze(0)  # (2, H, W)
@@ -278,7 +335,11 @@ def goldstein_pytorch(phase_np, corr_np, psize_y, psize_x, device):
         # Crop to original size and combine real/imag
         result = torch.complex(result_ri[0, :ny, :nx], result_ri[1, :ny, :nx])
         result = result.cpu().numpy()
+        insufficient_weight = insufficient_weight[:ny, :nx]
         del result_ri
+
+    # Restore NaN mask (original NaN + insufficient contributions)
+    result[nan_mask | insufficient_weight] = np.nan + 1j * np.nan
 
     # Clear GPU cache
     if device.type == 'mps':

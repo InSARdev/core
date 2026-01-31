@@ -614,8 +614,8 @@ def deramped_burst(xml_path: str, tiff_path: str, eof_path: str) -> tuple:
     orbit_df : pd.DataFrame
         Orbit state vectors from EOF file
     slc_data : np.ndarray
-        Deramped SLC as int16 array with shape (n_valid, num_rng_bins*2).
-        Format: [re0, im0, re1, im1, ...] matching GMTSAR SLC format.
+        Deramped SLC as complex64 array with shape (n_valid, num_rng_bins).
+        Values are raw DN (digital numbers) without any scaling.
     reramp_params : dict
         Parameters for analytical reramp phase computation:
         fka, fnc, ks, dta, dts, ts0, tau0, lpb, k_start, n_valid
@@ -751,8 +751,8 @@ def deramped_burst(xml_path: str, tiff_path: str, eof_path: str) -> tuple:
 
     del data_complex, eta, jj, taus, ka, kt, fnct_arr, etaref
 
-    # Extract valid region and return as complex64 (raw DN values)
-    slc_valid = slc_deramped[k_start:k_start + n_valid, :width].astype(np.complex64)
+    # Extract valid region - return as complex64 (raw DN values, no scaling)
+    slc_valid = slc_deramped[k_start:k_start + n_valid, :width].copy()
     del slc_deramped
 
     reramp_params = {
