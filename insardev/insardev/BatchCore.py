@@ -146,6 +146,91 @@ def _dissolve_pol_3d_for_dask(da_slice, das_others_slice, wrap, extend, weight):
     return _dissolve_pol_for_dask(da_slice, das_others_slice, wrap, extend, weight)[np.newaxis, ...]
 
 
+def _apply_gaussian_for_dask(block, weight_block, sigmas, threshold, device, pixel_sizes, out_dtype):
+    """
+    Module-level function for gaussian blockwise operation.
+
+    Defined at module level to avoid dask serialization issues with nested functions.
+    Weight is passed as a separate dask array to blockwise (not via partial) to avoid
+    serializing large arrays with each task - which causes memory explosions.
+
+    Parameters
+    ----------
+    block : np.ndarray
+        Data block from dask, shape (1, y, x) or (y, x)
+    weight_block : np.ndarray or None
+        Weight block from dask, shape (y, x) or None if no weight
+    sigmas : tuple
+        Gaussian sigmas (sigma_y, sigma_x)
+    threshold : float
+        Threshold for weighted convolution
+    device : str
+        PyTorch device
+    pixel_sizes : tuple
+        Pixel sizes (dy, dx) in meters
+    out_dtype : np.dtype
+        Output dtype
+    """
+    from .utils_gaussian import gaussian_numpy
+    return gaussian_numpy(block, weight_block, sigma=sigmas, truncate=4.0, threshold=threshold,
+                          device=device, pixel_sizes=pixel_sizes).astype(out_dtype)
+
+
+def _neighbors_kernel_2d_for_dask(data_chunk, window_y, window_x, half_y, half_x, device):
+    """Count valid neighbors for 2D data.
+
+    Defined at module level to avoid dask serialization issues with nested functions.
+    Closures capturing variables can cause memory explosions in dask workers.
+
+    Parameters
+    ----------
+    device : str
+        Device string ('cpu', 'cuda', 'mps') - converted to torch.device internally.
+    """
+    import torch
+    import numpy as np
+
+    # Convert string to torch.device
+    dev = torch.device(device)
+
+    H, W = data_chunk.shape
+    ny, nx = H - 2 * half_y, W - 2 * half_x
+    n_total_neighbors = window_y * window_x - 1
+
+    if ny <= 0 or nx <= 0:
+        return np.full((H, W), np.nan, dtype=np.float32)
+
+    data_t = torch.from_numpy(data_chunk.astype(np.float32)).to(dev)
+    valid = torch.isfinite(data_t).float()
+
+    # Neighbor mask (exclude center)
+    center_idx = (window_y // 2) * window_x + (window_x // 2)
+    neighbor_mask = torch.ones(window_y * window_x, dtype=torch.bool, device=dev)
+    neighbor_mask[center_idx] = False
+
+    # Unfold to get windows
+    window_valid = valid.unfold(0, window_y, 1).unfold(1, window_x, 1)
+    neighbors_valid = window_valid.reshape(ny, nx, -1)[:, :, neighbor_mask]
+    count = neighbors_valid.sum(dim=-1)
+
+    # Set zero neighbors to NaN (isolated/invalid pixels)
+    count = torch.where(count > 0, count, torch.full_like(count, float('nan')))
+
+    # Pad back to full size
+    result = torch.full((H, W), float('nan'), device=dev)
+    result[half_y:H - half_y, half_x:W - half_x] = count
+
+    output = result.cpu().numpy()
+
+    del data_t, valid, window_valid, neighbors_valid, result
+    if dev.type == 'mps':
+        torch.mps.empty_cache()
+    elif dev.type == 'cuda':
+        torch.cuda.empty_cache()
+
+    return output
+
+
 class BatchCore(dict):
     """
     This class has 'pair' stack variable for the datasets in the dict and stores real values (correlation and unwrapped phase).
@@ -179,56 +264,9 @@ class BatchCore(dict):
 
     @staticmethod
     def _get_torch_device(device='auto', debug=False):
-        """
-        Get PyTorch device for GPU-accelerated operations.
-
-        Checks Dask cluster resources:
-        - If workers have resources={'gpu': N} where N >= 1 → use GPU
-        - Otherwise (default) → CPU for parallel processing
-
-        Parameters
-        ----------
-        device : str
-            Device specification: 'auto', 'cuda', 'mps', or 'cpu'.
-            'auto' uses CPU by default, GPU only if Dask has resources={'gpu': 1}.
-        debug : bool
-            Print debug information.
-
-        Returns
-        -------
-        torch.device
-            PyTorch device object.
-        """
-        import torch
-
-        if device == 'auto':
-            gpu_enabled = False
-
-            try:
-                from dask.distributed import get_client
-                client = get_client()
-                workers = client.scheduler_info().get('workers', {})
-                if workers:
-                    # Only enable GPU if explicitly set to gpu >= 1
-                    gpu_enabled = any(w.get('resources', {}).get('gpu', 0) >= 1 for w in workers.values())
-            except ValueError:
-                # No Dask client active - still default to CPU
-                pass
-
-            if gpu_enabled:
-                if torch.cuda.is_available():
-                    device = 'cuda'
-                elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-                    device = 'mps'
-                else:
-                    device = 'cpu'
-            else:
-                device = 'cpu'
-
-        if debug:
-            print(f"DEBUG: using device={device}")
-
-        return torch.device(device)
+        """Get PyTorch device. Delegates to utils_torch to avoid circular imports."""
+        from .utils_torch import get_torch_device
+        return get_torch_device(device, debug)
 
     @staticmethod
     def _gaussian(data_np, weight_np=None, sigma=None, truncate=4.0, threshold=0.5, device='auto',
@@ -617,10 +655,15 @@ class BatchCore(dict):
     def __le__(self, other):   return self._binop(other, operator.le)
     def __eq__(self, other):   return self._binop(other, operator.eq)
     def __ne__(self, other):   return self._binop(other, operator.ne)
+    def __and__(self, other):  return self._binop(other, operator.and_)
+    def __or__(self, other):   return self._binop(other, operator.or_)
+    def __invert__(self):      return type(self)({k: ~v for k, v in self.items()})
 
     # reversed ops
     __rgt__ = __gt__
     __rlt__ = __lt__
+    __rand__ = __and__
+    __ror__ = __or__
 
     def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
         """
@@ -781,13 +824,33 @@ class BatchCore(dict):
                 mask_obj = cond[k]
                 # extract DataArray from a 1-var Dataset or use it direct
                 if isinstance(mask_obj, xr.Dataset):
-                    data_vars = list(mask_obj.data_vars)
-                    if len(data_vars) != 1:
-                        raise ValueError(f"Batch.where: expected 1 var in mask for '{k}', got {data_vars}")
-                    mask_da = mask_obj[data_vars[0]]
+                    mask_vars = list(mask_obj.data_vars)
+                    if isinstance(ds, xr.Dataset):
+                        data_vars = list(ds.data_vars)
+                        # Multi-var case: apply each mask var to corresponding data var
+                        if set(mask_vars) == set(data_vars) or set(mask_vars) >= set(data_vars):
+                            new_ds = ds.copy()
+                            for var in data_vars:
+                                if var in mask_vars:
+                                    mask_da = mask_obj[var]
+                                    mask_da = mask_da.reindex_like(ds[var], method='nearest')
+                                    new_ds[var] = ds[var].where(mask_da, other, **kwargs)
+                            out[k] = new_ds
+                            continue
+                        # Single mask var case
+                        elif len(mask_vars) == 1:
+                            mask_da = mask_obj[mask_vars[0]]
+                        else:
+                            raise ValueError(
+                                f"Batch.where: mask vars {mask_vars} don't match data vars {data_vars} for '{k}'"
+                            )
+                    else:
+                        if len(mask_vars) != 1:
+                            raise ValueError(f"Batch.where: expected 1 var in mask for '{k}', got {mask_vars}")
+                        mask_da = mask_obj[mask_vars[0]]
                 else:
                     mask_da = mask_obj
-                
+
                 # Align mask to data coordinates (handles different x/y grids)
                 # Get reference DataArray from ds for alignment (use spatial variable)
                 if isinstance(ds, xr.Dataset):
@@ -797,13 +860,82 @@ class BatchCore(dict):
                 else:
                     ref_da = ds
                 mask_da = mask_da.reindex_like(ref_da, method='nearest')
-                
+
                 out[k] = ds.where(mask_da, other, **kwargs)
             return type(self)(out)
 
         # fallback: single scalar or DataArray broadcast
         # DataArray case seems not usefull because Batch datasets differ in shape
         return self.map_da(lambda da: da.where(cond, other, **kwargs), **kwargs)
+
+    def combine_first(self, other: 'BatchCore') -> 'BatchCore':
+        """
+        Combine two Batches, using values from self where valid, filling with other.
+
+        For each pixel: use self's value if finite, otherwise use other's value.
+        This is useful for merging results processed with different parameters
+        (e.g., dense vs sparse regions) on the same grid.
+
+        Parameters
+        ----------
+        other : BatchCore
+            Batch to fill gaps from. Must have same keys and same grid as self.
+
+        Returns
+        -------
+        BatchCore
+            Combined result with same type as self.
+
+        Raises
+        ------
+        ValueError
+            If keys don't match or grids differ between self and other.
+
+        Examples
+        --------
+        >>> # Process dense and sparse regions separately (same grid)
+        >>> sim_dense = S_sparse.where(dense_mask).similarity(...)
+        >>> sim_sparse = S_sparse.where(sparse_mask).similarity(...)
+        >>> # Merge: use dense where available, fill with sparse
+        >>> sim_merged = sim_dense.combine_first(sim_sparse)
+        """
+        if set(self.keys()) != set(other.keys()):
+            raise ValueError(
+                f"combine_first: keys must match. "
+                f"self has {set(self.keys())}, other has {set(other.keys())}"
+            )
+
+        out = {}
+        for k, ds_self in self.items():
+            ds_other = other[k]
+
+            if isinstance(ds_self, xr.Dataset):
+                combined_vars = {}
+                for var in ds_self.data_vars:
+                    da_self = ds_self[var]
+                    if var in ds_other.data_vars:
+                        da_other = ds_other[var]
+                        # Check grids match
+                        if da_self.shape != da_other.shape:
+                            raise ValueError(
+                                f"combine_first: grid shapes must match for '{k}/{var}'. "
+                                f"self has {da_self.shape}, other has {da_other.shape}"
+                            )
+                        # Use xarray's combine_first
+                        combined_vars[var] = da_self.combine_first(da_other)
+                    else:
+                        combined_vars[var] = da_self
+                out[k] = xr.Dataset(combined_vars, attrs=ds_self.attrs)
+            else:
+                # DataArray case
+                if ds_self.shape != ds_other.shape:
+                    raise ValueError(
+                        f"combine_first: grid shapes must match for '{k}'. "
+                        f"self has {ds_self.shape}, other has {ds_other.shape}"
+                    )
+                out[k] = ds_self.combine_first(ds_other)
+
+        return type(self)(out)
 
     def mask(self, mask, other=np.nan):
         """
@@ -884,6 +1016,258 @@ class BatchCore(dict):
             # preserve original chunking structure for lazy computation
             out[key] = ds.where(mask_burst, other)
         return type(self)(out)
+
+    def trend2d(self, transform: 'BatchCore', weight: 'BatchUnit | None' = None,
+                degree: int = 1, device: str = 'auto', debug: bool = False) -> 'Batch':
+        """
+        Compute 2D polynomial trend (ramp) from data.
+
+        Parameters
+        ----------
+        transform : BatchCore
+            Coordinate transform from stack.transform() containing 'azi' and 'rng'.
+        weight : BatchUnit or None
+            Optional weight for the fitting (typically correlation).
+        degree : int
+            Polynomial degree (1=plane, 2=quadratic). Default 1.
+        device : str
+            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
+        debug : bool
+            Print diagnostic information.
+
+        Returns
+        -------
+        Batch
+            Trend surface.
+
+        Examples
+        --------
+        >>> phase, corr = stack.pairs(baseline.tolist()).phasediff(wavelength=30).angle()
+        >>> trend = phase.trend2d(stack.transform(), weight=corr)
+        >>> detrended = phase - trend
+        """
+        from .Stack_detrend import Stack_detrend
+
+        return Stack_detrend.trend2d(Stack_detrend(), self, weight=weight, transform=transform,
+                                     degree=degree, device=device, debug=debug)
+
+    def regression1d_baseline(self, weight: 'BatchUnit | None' = None, baseline: str = 'BPR',
+                               degree: int = 1, wrap: bool = False, iterations: int = 1,
+                               device: str = 'auto', debug: bool = False) -> 'Batch':
+        """
+        Fit 1D polynomial trend along perpendicular baseline at each (y, x) pixel.
+
+        Parameters
+        ----------
+        weight : BatchUnit or None
+            Optional weight for the fitting (typically correlation).
+        baseline : str
+            Variable name to regress against (default 'BPR' for perpendicular baseline).
+        degree : int
+            Polynomial degree (1=linear, 2=quadratic). Default 1.
+        wrap : bool
+            If True, use circular (sin/cos) fitting for wrapped phase.
+        iterations : int
+            Number of fitting iterations (default 1). For wrap=True, multiple
+            iterations capture more of the trend.
+        device : str
+            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
+        debug : bool
+            Print diagnostic information.
+
+        Returns
+        -------
+        Batch
+            Fitted trend values, same shape as input data.
+
+        Examples
+        --------
+        >>> trend = intf.regression1d_baseline(weight=corr)
+        >>> detrended = intf - trend
+        """
+        from .Stack_detrend import Stack_detrend
+
+        return Stack_detrend.regression1d_baseline(Stack_detrend(), self, weight=weight,
+                                                    baseline=baseline, degree=degree,
+                                                    wrap=wrap, iterations=iterations,
+                                                    device=device, debug=debug)
+
+    def regression1d_pairs(self, weight: 'BatchUnit | None' = None, degree: int = 0,
+                            days: int | None = None, count: int | None = None,
+                            wrap: bool = False, iterations: int = 1,
+                            device: str = 'auto', debug: bool = False) -> 'Batch':
+        """
+        Fit 1D polynomial trend along temporal pairs for each date.
+
+        For each date, fits a polynomial along the time dimension using interferometric
+        pairs that contain that date, then reconstructs the trend for each pair.
+
+        Parameters
+        ----------
+        weight : BatchUnit or None
+            Optional weight for the fitting (typically correlation).
+        degree : int
+            Polynomial degree (0=mean, 1=linear). Default 0.
+        days : int or None
+            Maximum time interval (in days) to include. Default None (all pairs).
+        count : int or None
+            Maximum number of pairs per date to use. Default None (all pairs).
+        wrap : bool
+            If True, use circular (sin/cos) fitting for wrapped phase.
+        iterations : int
+            Number of fitting iterations (default 1).
+        device : str
+            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
+        debug : bool
+            Print diagnostic information.
+
+        Returns
+        -------
+        Batch
+            Fitted trend values, same shape as input data.
+
+        Examples
+        --------
+        >>> trend = intf.regression1d_pairs(degree=0, days=100)
+        >>> detrended = intf - trend
+        """
+        from .Stack_detrend import Stack_detrend
+
+        return Stack_detrend.regression1d_pairs(Stack_detrend(), self, weight=weight,
+                                                 degree=degree, days=days, count=count,
+                                                 wrap=wrap, iterations=iterations,
+                                                 device=device, debug=debug)
+
+    def neighbors(
+        self,
+        window: tuple = (5, 5),
+        neighbors: tuple | None = None,
+        device: str = 'auto'
+    ) -> 'Batch':
+        """
+        Count valid (non-NaN) neighbors per pixel within a spatial window.
+
+        Works on any 2D spatial data (y, x). For each pixel, counts how many
+        neighbors in the window have finite values.
+
+        Parameters
+        ----------
+        window : tuple of int
+            Window size (y, x). Must be odd numbers.
+        neighbors : tuple of int or None
+            If provided, filter output: (min, max)
+            - Pixels with count < min: set to NaN
+            - Pixels with count > max: clipped to max
+            If None, return raw counts.
+        device : str
+            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'
+
+        Returns
+        -------
+        Batch
+            Valid neighbor count per pixel (float, NaN at borders)
+
+        Examples
+        --------
+        >>> # Count neighbors on similarity result
+        >>> sim = S_opt.similarity(window=(5, 5), neighbors=(5, 5))
+        >>> sparse_sim = sim.where(sim < 0.5)
+        >>> nbrs = sparse_sim.neighbors(window=(15, 15))
+        >>> dense_mask = nbrs >= 10
+        """
+        import torch
+        import dask
+        import dask.array as da
+
+        window_y, window_x = window
+
+        # Validate window sizes are odd
+        if window_y % 2 == 0 or window_x % 2 == 0:
+            raise ValueError(f"Window sizes must be odd, got ({window_y}, {window_x})")
+
+        # Validate neighbors if provided
+        if neighbors is not None:
+            neighbors_min, neighbors_max = neighbors
+            max_possible = window_y * window_x - 1
+            if neighbors_max > max_possible:
+                raise ValueError(
+                    f"neighbors max={neighbors_max} exceeds maximum for window ({window_y}, {window_x}): {max_possible}"
+                )
+            if neighbors_min > neighbors_max:
+                raise ValueError(
+                    f"neighbors min={neighbors_min} cannot exceed max={neighbors_max}"
+                )
+
+        # Resolve device once and convert to string for clean serialization
+        resolved = BatchCore._get_torch_device(device)
+        device_str = resolved.type  # 'cpu', 'cuda', or 'mps'
+        half_y, half_x = window_y // 2, window_x // 2
+
+        # Use functools.partial with module-level function to avoid closure
+        # Closures capturing variables can cause memory explosions in dask workers
+        import functools
+        neighbors_func = functools.partial(
+            _neighbors_kernel_2d_for_dask,
+            window_y=window_y,
+            window_x=window_x,
+            half_y=half_y,
+            half_x=half_x,
+            device=device_str
+        )
+
+        results = {}
+
+        for burst_id, ds in self.items():
+            count_vars = {}
+
+            for var_name in ds.data_vars:
+                data = ds[var_name]
+
+                # Skip non-spatial variables
+                if 'y' not in data.dims or 'x' not in data.dims:
+                    continue
+
+                # Handle 2D data only
+                if data.ndim != 2:
+                    continue
+
+                # Rechunk for map_overlap
+                auto_chunks = dask.array.core.normalize_chunks(
+                    'auto', data.shape, dtype=np.float32
+                )
+                data_chunked = data.data.rechunk(auto_chunks)
+
+                # Use map_overlap with module-level function via functools.partial
+                with dask.annotate(resources={'gpu': 1} if device_str != 'cpu' else {}):
+                    count_da = da.map_overlap(
+                        neighbors_func,
+                        data_chunked,
+                        depth={0: half_y, 1: half_x},
+                        boundary='none',
+                        trim=True,
+                        dtype=np.float32,
+                    )
+
+                # Apply neighbors filtering if provided
+                if neighbors is not None:
+                    neighbors_min, neighbors_max = neighbors
+                    count_da = da.clip(count_da, 0, neighbors_max)
+                    count_da = da.where(count_da >= neighbors_min, count_da, np.nan)
+
+                count_xr = xr.DataArray(
+                    count_da,
+                    dims=['y', 'x'],
+                    coords={'y': data.y, 'x': data.x},
+                    name=var_name
+                )
+
+                count_vars[var_name] = count_xr
+
+            if count_vars:
+                results[burst_id] = xr.Dataset(count_vars)
+
+        from .Batch import Batch
+        return Batch(results)
 
     def crop(self, geometry):
         """
@@ -2403,67 +2787,351 @@ class BatchCore(dict):
             return
         return geojson
 
-    def to_vtk(self, path: str, mask: bool = True):
-        """
-        Export the batch data to VTK files.
+    def to_vtk(self, path: str, transform: 'BatchCore | Stack | None' = None,
+               overlay: "xr.DataArray | None" = None, mask: bool = True):
+        """Export to VTK.
 
-        Converts the batch to a unified dataset using to_dataset(), then saves
-        each data variable as a separate VTK file named {varname}.vtk in the
-        specified directory.
+        Merges bursts using to_dataset() and exports one VTK file per data variable
+        (e.g., VV.vtk). Within each file, pairs become separate VTK arrays named
+        by date (e.g., 20190708_20190702).
 
         Parameters
         ----------
         path : str
-            Output directory where VTK files will be saved.
+            Output directory/filename for VTK files.
+        transform : BatchCore, Stack, or None, optional
+            Optional transform Batch providing topography (``ele`` or ``z``),
+            or a Stack (will call .transform() internally).
+        overlay : xarray.DataArray | None, optional
+            Optional overlay (e.g., imagery). If it lacks a ``band`` dim, one is added.
         mask : bool, optional
-            If True (default), set z-coordinate to NaN where data values are NaN,
-            effectively masking those areas in the VTK visualization.
+            If True, mask topography by valid data pixels.
 
         Examples
         --------
-        >>> intfs20.to_vtk('vtk')  # Creates vtk/VV.vtk, etc.
-        >>> intfs20.to_vtk('vtk', mask=False)  # No masking
+        >>> velocity.to_vtk('velocity', transform=stack)
+        >>> velocity.to_vtk('velocity', transform=stack.transform())
+        >>> velocity.to_vtk('velocity', transform=stack, overlay=gmap)
         """
         import os
         import numpy as np
+        import pandas as pd
+        from tqdm.auto import tqdm
         from vtk import vtkStructuredGridWriter, VTK_BINARY
         from .utils_vtk import as_vtk
+        from .Batch import Batch
+        from .Stack import Stack
 
-        os.makedirs(path, exist_ok=True)
+        # If Stack passed, get transform from it
+        if isinstance(transform, Stack):
+            transform = transform.transform()
 
-        ds = self.to_dataset()
-        if ds is None:
-            return
+        # Handle overlay-only case (export just overlay on topography)
+        if not self and overlay is not None and transform is not None:
+            tfm = transform if isinstance(transform, BatchCore) else Batch(transform)
+            topo_merged = tfm[['ele']].to_dataset()
+            topo_da = topo_merged['ele'] if 'ele' in topo_merged else None
+            if topo_da is None:
+                raise ValueError("transform must contain 'ele' variable")
 
-        # Handle both Dataset and DataArray
-        if isinstance(ds, xr.DataArray):
-            ds = ds.to_dataset()
+            ov = overlay
+            if 'band' not in ov.dims:
+                ov = ov.expand_dims('band')
+            topo_da = topo_da.interp(y=ov.y, x=ov.x, method='linear')
 
-        for varname in ds.data_vars:
-            if varname == 'spatial_ref':
-                continue
-            # Select this variable and convert to dataset for as_vtk
-            da = ds[varname]
-            # Handle 3D data (pair, y, x) - select first pair for VTK
-            if 'pair' in da.dims:
-                da = da.isel(pair=0)
-            
-            # Create dataset with z-coordinate for VTK
-            ds_var = da.to_dataset()
             if mask:
-                # Set z to NaN where data is NaN to mask those areas
-                z = xr.zeros_like(da, dtype=np.float32)
-                z = z.where(np.isfinite(da))
-                ds_var['z'] = z
-            
-            vtk_grid = as_vtk(ds_var)
+                topo_da = topo_da.where(np.isfinite(ov.isel(band=0)))
 
-            filename = os.path.join(path, f"{varname}.vtk")
+            layers = [topo_da.rename('z'), ov.rename('colors')]
+            ds_out = xr.merge(layers, compat='override', join='left')
+            vtk_grid = as_vtk(ds_out)
+
+            if path.endswith('.vtk'):
+                filename = path
+            else:
+                filename = f'{path}.vtk'
+            os.makedirs(os.path.dirname(filename) or '.', exist_ok=True)
+
             writer = vtkStructuredGridWriter()
             writer.SetFileName(filename)
             writer.SetInputData(vtk_grid)
             writer.SetFileType(VTK_BINARY)
             writer.Write()
+            return
+
+        if not self:
+            return
+
+        tfm = transform if transform is None or isinstance(transform, BatchCore) else Batch(transform)
+
+        def _format_dt(val):
+            try:
+                ts = pd.to_datetime(val)
+                if pd.isna(ts):
+                    return str(val)
+                return ts.strftime('%Y%m%d')
+            except Exception:
+                return str(val)
+
+        def _format_pair(da, idx):
+            if 'ref' in da.coords and 'rep' in da.coords:
+                ref_val = da.coords['ref'].values[idx]
+                rep_val = da.coords['rep'].values[idx]
+                return f"{_format_dt(ref_val)}_{_format_dt(rep_val)}"
+            return str(idx)
+
+        os.makedirs(path, exist_ok=True)
+
+        # Merge bursts into unified dataset(s) per variable
+        merged = self.to_dataset()
+        if isinstance(merged, xr.DataArray):
+            merged = merged.to_dataset()
+
+        # Get transform elevation merged via to_dataset()
+        topo_merged = None
+        if tfm is not None:
+            # Decimate each burst's transform to match corresponding input burst
+            def _nearest_indices(source_coords, target_coords):
+                descending = len(source_coords) > 1 and source_coords[0] > source_coords[-1]
+                if descending:
+                    source_coords = source_coords[::-1]
+                indices = np.searchsorted(source_coords, target_coords)
+                indices = np.clip(indices, 0, len(source_coords) - 1)
+                prev_indices = np.clip(indices - 1, 0, len(source_coords) - 1)
+                prev_diff = np.abs(source_coords[prev_indices] - target_coords)
+                curr_diff = np.abs(source_coords[indices] - target_coords)
+                indices = np.where(prev_diff < curr_diff, prev_indices, indices)
+                if descending:
+                    indices = len(source_coords) - 1 - indices
+                return indices
+
+            decimated = {}
+            for k in self.keys():
+                if k not in tfm:
+                    continue
+                tfm_ds = tfm[k][['ele']]
+                tgt_ds = self[k]
+                y_idx = _nearest_indices(tfm_ds.y.values, tgt_ds.y.values)
+                x_idx = _nearest_indices(tfm_ds.x.values, tgt_ds.x.values)
+                selected = tfm_ds.isel(y=y_idx, x=x_idx)
+                selected = selected.assign_coords(y=tgt_ds.y, x=tgt_ds.x)
+                decimated[k] = selected
+            topo_merged = Batch(decimated).to_dataset()
+
+        data_vars = list(merged.data_vars)
+
+        with tqdm(total=len(data_vars), desc='Exporting VTK') as pbar:
+            for data_var in data_vars:
+                da = merged[data_var]
+
+                if 'pair' in da.dims:
+                    n_pairs = da.sizes['pair']
+                    export_items = []
+                    for i in range(n_pairs):
+                        da_slice = da.isel(pair=i)
+                        if 'pair' in da_slice.dims:
+                            da_slice = da_slice.squeeze('pair', drop=True)
+                        pair_label = _format_pair(da, i)
+                        export_items.append((pair_label, da_slice))
+                else:
+                    export_items = [(None, da)]
+
+                if not export_items:
+                    pbar.update(1)
+                    continue
+
+                ref_da = export_items[0][1]
+                layers = []
+
+                ov = None
+                if overlay is not None:
+                    if not isinstance(overlay, xr.DataArray):
+                        raise TypeError("overlay must be an xarray.DataArray")
+                    ov = overlay
+                    if 'band' not in ov.dims:
+                        ov = ov.expand_dims('band')
+                    y_min, y_max = float(ref_da.y.min()), float(ref_da.y.max())
+                    x_min, x_max = float(ref_da.x.min()), float(ref_da.x.max())
+                    try:
+                        ov_y_asc = len(ov.y) < 2 or float(ov.y[1]) > float(ov.y[0])
+                        ov_x_asc = len(ov.x) < 2 or float(ov.x[1]) > float(ov.x[0])
+                        y_slice = slice(y_min, y_max) if ov_y_asc else slice(y_max, y_min)
+                        x_slice = slice(x_min, x_max) if ov_x_asc else slice(x_max, x_min)
+                        ov = ov.sel(y=y_slice, x=x_slice)
+                    except Exception:
+                        pass
+                    if ov.size == 0:
+                        ov = None
+
+                target_y = ov.y if ov is not None else ref_da.y
+                target_x = ov.x if ov is not None else ref_da.x
+
+                if topo_merged is not None:
+                    topo_da = topo_merged['ele'] if 'ele' in topo_merged else None
+                    if topo_da is not None:
+                        topo_da = topo_da.interp(y=target_y, x=target_x, method='linear')
+                        if mask:
+                            ref_for_mask = ref_da.interp(y=target_y, x=target_x, method='nearest') if ov is not None else ref_da
+                            topo_da = topo_da.where(np.isfinite(ref_for_mask))
+                        layers.append(topo_da.rename('z'))
+
+                if ov is not None:
+                    layers.append(ov.rename('colors'))
+
+                for pair_label, da_item in export_items:
+                    var_name = pair_label if pair_label is not None else data_var
+                    if ov is not None:
+                        da_item = da_item.interp(y=target_y, x=target_x, method='linear')
+                    layers.append(da_item.rename(var_name))
+
+                ds_out = xr.merge(layers, compat='override', join='left')
+                vtk_grid = as_vtk(ds_out)
+
+                filename = os.path.join(path, f"{data_var}.vtk")
+
+                writer = vtkStructuredGridWriter()
+                writer.SetFileName(filename)
+                writer.SetInputData(vtk_grid)
+                writer.SetFileType(VTK_BINARY)
+                writer.Write()
+
+                pbar.update(1)
+
+    def to_vtks(self, path: str, transform: 'BatchCore | Stack | None' = None,
+                overlay: "xr.DataArray | None" = None, mask: bool = True):
+        """Export to VTK per-burst (separate file per burst).
+
+        Parameters
+        ----------
+        path : str
+            Output directory for VTK files.
+        transform : BatchCore, Stack, or None, optional
+            Optional transform Batch providing topography (`ele`),
+            or a Stack (will call .transform() internally).
+        overlay : xarray.DataArray | None, optional
+            Optional overlay (e.g., imagery). If it lacks a ``band`` dim, one is added.
+        mask : bool, optional
+            If True, mask topography by valid data pixels.
+
+        Examples
+        --------
+        >>> velocity.to_vtks('vtk', transform=stack)
+        >>> velocity.to_vtks('vtk', transform=stack.transform())
+        """
+        import os
+        import numpy as np
+        import pandas as pd
+        from tqdm.auto import tqdm
+        from vtk import vtkStructuredGridWriter, VTK_BINARY
+        from .utils_vtk import as_vtk
+        from .Batch import Batch
+        from .Stack import Stack
+
+        # If Stack passed, get transform from it
+        if isinstance(transform, Stack):
+            transform = transform.transform()
+
+        tfm = transform if transform is None or isinstance(transform, BatchCore) else Batch(transform)
+
+        if not self:
+            return
+
+        def _interp_to_grid(source: xr.DataArray, target_da: xr.DataArray) -> xr.DataArray:
+            if {'y', 'x'}.issubset(source.dims):
+                return source.interp(y=target_da.y, x=target_da.x, method='linear')
+            if {'lat', 'lon'}.issubset(source.dims):
+                if {'lat', 'lon'}.issubset(target_da.coords):
+                    return source.interp(lat=target_da.lat, lon=target_da.lon, method='linear')
+                return source.rename({'lat': 'y', 'lon': 'x'}).interp(y=target_da.y, x=target_da.x, method='linear')
+            return source
+
+        def _format_dt(val):
+            try:
+                ts = pd.to_datetime(val)
+                if pd.isna(ts):
+                    return str(val)
+                return ts.strftime('%Y%m%d')
+            except Exception:
+                return str(val)
+
+        def _format_pair(val):
+            if isinstance(val, (list, tuple)) and len(val) == 2:
+                return f"{_format_dt(val[0])}_{_format_dt(val[1])}"
+            return _format_dt(val)
+
+        os.makedirs(path, exist_ok=True)
+
+        with tqdm(total=len(self), desc='Exporting VTK') as pbar:
+            for burst, ds in self.items():
+                if not ds.data_vars:
+                    pbar.update(1)
+                    continue
+
+                data_var = next(iter(ds.data_vars))
+                base_da = ds[data_var]
+
+                if 'pair' in ds.dims:
+                    pair_coord = ds.coords.get('pair')
+                    pair_values = pair_coord.values if pair_coord is not None else range(ds.sizes.get('pair', 0))
+                    export_items = []
+                    for i, pair_val in enumerate(pair_values):
+                        ds_slice = ds.isel(pair=i)
+                        if 'pair' in ds_slice.dims:
+                            ds_slice = ds_slice.squeeze('pair', drop=True)
+                        else:
+                            ds_slice = ds_slice.squeeze(drop=True)
+                        export_items.append((pair_val, ds_slice))
+                else:
+                    export_items = [(None, ds)]
+
+                for pair_val, ds_item in export_items:
+                    base_da_item = ds_item[data_var]
+                    layers = [base_da_item.rename(data_var)]
+
+                    if tfm is not None and burst in tfm:
+                        tfm_ds = tfm[burst]
+                        topo_da = tfm_ds.get('ele') if 'ele' in tfm_ds else tfm_ds.get('z') if 'z' in tfm_ds else None
+                        if topo_da is not None:
+                            topo_da = _interp_to_grid(topo_da, base_da_item)
+                            if mask:
+                                topo_da = topo_da.where(np.isfinite(base_da_item))
+                            layers.append(topo_da.rename('z'))
+
+                    if overlay is not None:
+                        if not isinstance(overlay, xr.DataArray):
+                            raise TypeError("overlay must be an xarray.DataArray")
+
+                        ov = overlay
+                        if 'band' not in ov.dims:
+                            ov = ov.expand_dims('band')
+                        try:
+                            ov = ov.sel(y=slice(float(base_da_item.y.min()), float(base_da_item.y.max())),
+                                        x=slice(float(base_da_item.x.min()), float(base_da_item.x.max())))
+                        except Exception:
+                            try:
+                                ov = ov.sel(lat=slice(float(base_da_item.lat.min()), float(base_da_item.lat.max())),
+                                            lon=slice(float(base_da_item.lon.min()), float(base_da_item.lon.max())))
+                            except Exception:
+                                pass
+                        ov = _interp_to_grid(ov, base_da_item)
+                        layers.append(ov.rename('colors'))
+
+                    ds_out = xr.merge(layers, compat='override', join='left')
+                    vtk_grid = as_vtk(ds_out)
+
+                    pair_suffix = ''
+                    if pair_val is not None:
+                        pair_suffix = f"_{_format_pair(pair_val)}"
+
+                    filename = os.path.join(path, f"{burst}{pair_suffix}.vtk")
+
+                    writer = vtkStructuredGridWriter()
+                    writer.SetFileName(filename)
+                    writer.SetInputData(vtk_grid)
+                    writer.SetFileType(VTK_BINARY)
+                    writer.Write()
+
+                pbar.update(1)
 
     def plot(self,
             cmap: matplotlib.colors.Colormap | str | None = 'viridis',
@@ -2678,65 +3346,87 @@ class BatchCore(dict):
         import dask
         import dask.array as da
 
-        # Determine if GPU resource annotation is needed
+        # Resolve device ONCE here, not in every task
+        # This avoids repeated get_client()/scheduler_info() calls inside workers
+        if device == 'auto':
+            resolved_device = BatchCore._get_torch_device(device, debug=debug)
+            device = resolved_device.type  # 'cpu', 'cuda', or 'mps' as string
+
+        # Resource annotation limits concurrent torch operations
+        # Workers must be configured with resources={'gaussian': N} to limit concurrency
         use_gpu = device in ('cuda', 'mps')
+        task_resources = {'gaussian': 1, 'gpu': 1} if use_gpu else {'gaussian': 1}
 
         out = {}
         # loop over each key
         for key, ds in self.items():
+            # weight is BatchUnit (dict of Datasets) - get Dataset for this burst
             w = weight[key] if weight is not None else None
 
-            def gaussian_da(data_arr: xr.DataArray, w_da: xr.DataArray | None = None) -> xr.DataArray:
+            new_vars = {}
+            for var in ds.data_vars:
+                data_arr = ds[var]
+                # Skip non-spatial variables
+                if not (data_arr.ndim in (2, 3) and data_arr.dims[-2:] == ('y', 'x')):
+                    continue
+
                 is_complex = np.issubdtype(data_arr.dtype, np.complexfloating)
                 out_dtype = np.complex64 if is_complex else np.float32
 
-                # Get weight numpy array if provided
-                weight_np = w_da.values if w_da is not None else None
+                # Get weight array for this variable (keep as dask, don't materialize!)
+                weight_dask = w[var].data if w is not None and var in w.data_vars else None
 
-                # Create wrapper for _gaussian (expects 2D input)
-                def apply_gaussian(block):
-                    return BatchCore._gaussian(block, weight_np, sigma=sigmas, threshold=threshold,
-                                               device=device, pixel_sizes=(dy, dx)).astype(out_dtype)
-
-                # Chunk first dim to 1 so _gaussian gets 2D slices (works for numpy and dask)
+                # Chunk first dim to 1 so gaussian gets 2D slices
                 first_dim = data_arr.dims[0]
                 data_arr = data_arr.chunk({first_dim: 1})
                 dask_data = data_arr.data
 
-                # Build dimension string based on ndim (e.g., 'yx' for 2D, 'pyx' for 3D)
+                # Build dimension string based on ndim (e.g., 'ayx' for 3D)
                 dim_str = ''.join(chr(ord('a') + i) for i in range(dask_data.ndim))
+                # Weight dimension string is always 'yx' (2D, broadcast over first dim)
+                weight_dim_str = dim_str[-2:]  # last two chars, e.g., 'yx' from 'ayx'
 
-                with dask.annotate(resources={'gpu': 1} if use_gpu else {}):
-                    result_dask = da.blockwise(
-                        apply_gaussian, dim_str,
-                        dask_data, dim_str,
-                        dtype=out_dtype,
-                    )
+                with dask.annotate(resources=task_resources):
+                    meta = np.empty((0,) * dask_data.ndim, dtype=out_dtype)
+                    if weight_dask is not None:
+                        # Ensure weight is a dask array (not numpy) for blockwise
+                        if not isinstance(weight_dask, da.Array):
+                            weight_dask = da.from_array(weight_dask, chunks=weight_dask.shape)
+                        # Pass scalars directly with None as dimension indicator
+                        result_dask = da.blockwise(
+                            _apply_gaussian_for_dask, dim_str,
+                            dask_data, dim_str,
+                            weight_dask, weight_dim_str,
+                            sigmas, None,
+                            threshold, None,
+                            device, None,
+                            (dy, dx), None,
+                            out_dtype, None,
+                            dtype=out_dtype,
+                            meta=meta,
+                        )
+                    else:
+                        # No weight - pass None directly
+                        result_dask = da.blockwise(
+                            _apply_gaussian_for_dask, dim_str,
+                            dask_data, dim_str,
+                            None, None,
+                            sigmas, None,
+                            threshold, None,
+                            device, None,
+                            (dy, dx), None,
+                            out_dtype, None,
+                            dtype=out_dtype,
+                            meta=meta,
+                        )
 
-                return xr.DataArray(
+                new_vars[var] = xr.DataArray(
                     result_dask,
                     dims=data_arr.dims,
                     coords=data_arr.coords
                 )
 
-            # determine weight for each variable:
-            # - if w is DataArray: use same weight for all variables
-            # - if w is Dataset: use matching variable name from weight
-            def get_weight(var):
-                if w is None:
-                    return None
-                if isinstance(w, xr.DataArray):
-                    return w
-                # Dataset: use matching variable if exists
-                return w[var] if var in w.data_vars else None
-
-            # apply to every 2D or 3D (yx) var in the Dataset
-            new_ds = xr.Dataset({
-                var: gaussian_da(ds[var], get_weight(var))
-                for var in ds.data_vars
-                if (ds[var].ndim in (2,3) and ds[var].dims[-2:] == ('y','x'))
-            })
-            # preserve original Dataset attributes
+            new_ds = xr.Dataset(new_vars)
             new_ds.attrs = ds.attrs
             out[key] = new_ds
 

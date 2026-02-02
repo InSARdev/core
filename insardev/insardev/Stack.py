@@ -11,7 +11,7 @@
 from __future__ import annotations
 from .Stack_plot import Stack_plot
 from .BatchCore import BatchCore
-from .Batch import Batch, BatchWrap, BatchUnit, BatchComplex, BatchList
+from .Batch import Batch, BatchWrap, BatchUnit, BatchComplex, Batches
 #from collections.abc import Mapping
 from . import utils_io
 from . import utils_xarray
@@ -28,17 +28,33 @@ class Stack(Stack_plot, BatchCore):
         super().__init__(mapping)
 
     @staticmethod
-    def _batch_type_for_subset(subset: dict) -> type:
-        """Determine appropriate Batch type based on dtypes in subset."""
+    def _batch_type_for_subset(subset: dict) -> type | None:
+        """Determine appropriate Batch type based on dtypes and dims in subset.
+
+        Returns
+        -------
+        type or None
+            BatchComplex if all variables are complex with date/pair dimension.
+            Batch if all variables are spatial-only (no date/pair dimension).
+            None if variables have date/pair dimension but are not complex (should be Stack).
+        """
         import numpy as np
         dtypes = set()
+        has_temporal_dim = False
         for ds in subset.values():
             for var in ds.data_vars:
                 dtypes.add(ds[var].dtype)
-        # If all variables are complex, use BatchComplex
-        if dtypes and all(np.issubdtype(dt, np.complexfloating) for dt in dtypes):
+                # Check if variable has temporal dimension (date or pair)
+                if 'date' in ds[var].dims or 'pair' in ds[var].dims:
+                    has_temporal_dim = True
+        # If all variables are complex with temporal dim, use BatchComplex
+        if dtypes and all(np.issubdtype(dt, np.complexfloating) for dt in dtypes) and has_temporal_dim:
             return BatchComplex
-        return Batch
+        # If no temporal dimension, return Batch (spatial-only variables)
+        if not has_temporal_dim:
+            return Batch
+        # Has temporal dimension but not complex - should be Stack
+        return None
 
     @property
     def coords(self):
@@ -101,7 +117,7 @@ class Stack(Stack_plot, BatchCore):
 
     def __getitem__(self, key):
         """Access by key or variable list."""
-        # Handle variable selection like sbas[['ele']]
+        # Handle variable selection like sbas[['ele']] or sbas[['VV', 'VH']]
         if isinstance(key, list):
             if len(key) == 1 and self:
                 var = key[0]
@@ -109,10 +125,15 @@ class Stack(Stack_plot, BatchCore):
                 subset = {k: ds[[var]] for k, ds in self.items() if var in ds.data_vars}
                 if not subset:
                     raise KeyError(var)
-                batch_type = self._batch_type_for_subset(subset)
+            else:
+                # Multiple variables
+                subset = {k: ds[key] for k, ds in self.items()}
+            # Return appropriate Batch type if spatial-only or complex, else Stack
+            batch_type = self._batch_type_for_subset(subset)
+            if batch_type is not None:
                 return batch_type(subset)
-            # Multiple variables - return Stack with subset
-            return type(self)({k: ds[key] for k, ds in self.items()})
+            # Has temporal dimension but not complex - return Stack
+            return type(self)(subset)
         return dict.__getitem__(self, key)
 
     def __getattr__(self, name: str):
@@ -132,6 +153,9 @@ class Stack(Stack_plot, BatchCore):
                     subset = {k: ds[[name]] for k, ds in self.items() if name in ds.data_vars or name in ds.coords}
                     if subset:
                         batch_type = self._batch_type_for_subset(subset)
+                        # For single attribute access, default to Batch if not BatchComplex
+                        if batch_type is None:
+                            batch_type = Batch
                         return batch_type(subset)
 
         raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
@@ -139,6 +163,257 @@ class Stack(Stack_plot, BatchCore):
     def transform(self) -> Batch:
         """Return a Batch view of this Stack (including 1D/2D non-complex vars)."""
         return Batch(self)
+
+    def adi2(self, angle_coarse: float = 15, angle_fine: float = 5, device: str = 'auto') -> "Batches":
+        """
+        Polarimetric ADI optimization for dual-pol data (VV/VH or HH/HV).
+
+        NOTE: Requires insardev_polsar extension.
+
+        Finds optimal polarimetric combination that minimizes Amplitude Dispersion
+        Index (ADI) for each pixel. Uses coarse-to-fine search for efficiency:
+        ~7x faster than exhaustive grid search with <0.1% PS loss.
+
+        Parameters
+        ----------
+        angle_coarse : float
+            Coarse grid step in degrees. Default 15°.
+            Smaller = more accurate coarse pass but slower.
+        angle_fine : float
+            Fine grid step in degrees. Default 5°.
+            This is the final angular precision of the result.
+        device : str
+            PyTorch device: 'auto', 'cuda', 'mps', or 'cpu'.
+
+        Returns
+        -------
+        Batches
+            [S_opt, adi, psi] where:
+
+            - **S_opt** (Stack): Optimized SLC stack with mixed VV/VH signal.
+              Preserves all original variables (BPR, coords, attrs).
+              Use for interferograms: ``S_opt.pairs(baseline).phasediff()``
+
+            - **adi** (Batch): Minimum ADI values per pixel.
+              Use for PS selection: ``ps_mask = adi < 0.25``
+
+            - **psi** (Batch): Optimal mixing angle per pixel (radians).
+              ψ=0 means VV was optimal, ψ>0 means VH contributed.
+              Use to identify where dual-pol helped: ``vh_helped = psi > 0.1``
+
+        Examples
+        --------
+        Basic PS selection with dual-pol optimization:
+
+        >>> S_opt, adi, psi = stack.adi2()
+        >>> ps_mask = adi < 0.25
+
+        Higher precision (slower):
+
+        >>> S_opt, adi, psi = stack.adi2(angle_coarse=10, angle_fine=2)
+
+        Faster but less accurate:
+
+        >>> S_opt, adi, psi = stack.adi2(angle_coarse=20, angle_fine=5)
+
+        Compare with single-pol to see improvement:
+
+        >>> adi_vv = stack.adi()  # Single-pol VV
+        >>> new_ps = (adi < 0.25) & (adi_vv > 0.25)  # PS found only by dual-pol
+        >>> print(f"New PS from dual-pol: {new_ps.sum().compute()}")
+
+        Use optimized stack for interferograms:
+
+        >>> phase, corr = S_opt.pairs(baseline).phasediff()
+
+        Notes
+        -----
+        - For pixels where ψ≈0, S_opt≈VV (no benefit from VH)
+        - For pixels where ψ>0, S_opt phase should be more stable than VV
+        - For DS processing, use ``phasediff2()`` instead (better coherence optimization)
+        - Improvement varies by scene type; urban areas may see less benefit
+
+        Algorithm
+        ---------
+        Uses coarse-to-fine (CTF) search:
+        1. Search at angle_coarse step over full (ψ, φ) space
+        2. Refine within ±angle_coarse at angle_fine step around best
+
+        Default (15°, 5°) uses ~200 combinations vs ~1400 for full 5° grid.
+
+        References
+        ----------
+        Ramirez et al. (2023), "Extending polarimetric optimization of multi-temporal
+        InSAR techniques on dual polarized Sentinel-1 data"
+        https://doi.org/10.1016/j.asr.2023.03.007
+        """
+        # Detect polarizations
+        sample_ds = next(iter(self.values()))
+        if 'VV' in sample_ds.data_vars and 'VH' in sample_ds.data_vars:
+            pols = ['VV', 'VH']
+        elif 'HH' in sample_ds.data_vars and 'HV' in sample_ds.data_vars:
+            pols = ['HH', 'HV']
+        else:
+            raise ValueError("Dual-pol data required (VV+VH or HH+HV)")
+
+        # Import implementation from insardev_polsar
+        try:
+            from insardev_polsar.adi2 import adi2 as _adi2_impl
+        except ImportError:
+            raise ImportError("adi2() requires insardev_polsar extension. Install it first.")
+
+        # Get dual-pol subset as BatchComplex
+        batch_complex = self[pols]
+
+        # Call internal adi2 implementation
+        s_opt_batch, adi_batch, psi_batch = _adi2_impl(batch_complex, angle_coarse, angle_fine, device)
+
+        # Merge S_opt back into original stack structure (preserves BPR, etc.)
+        # Replace VV/VH with optimized output, keep all other variables
+        output_pol = pols[0]  # VV or HH
+        s_opt_dict = {}
+        for burst_id, orig_ds in self.items():
+            s_opt_ds = s_opt_batch[burst_id]
+            # Drop original pols, add optimized output
+            merged = orig_ds.drop_vars(pols).assign({output_pol: s_opt_ds[output_pol]})
+            s_opt_dict[burst_id] = merged
+
+        s_opt_stack = type(self)(s_opt_dict)
+
+        return Batches([s_opt_stack, adi_batch, psi_batch])
+
+    def adi(self, device: str = 'auto') -> Batch:
+        """
+        Compute Amplitude Dispersion Index (ADI) for calibrated σ₀ data.
+
+        Wrapper that calls BatchComplex.adi() on complex variables.
+
+        Parameters
+        ----------
+        device : str
+            PyTorch device: 'auto', 'cuda', 'mps', or 'cpu'.
+
+        Returns
+        -------
+        Batch
+            ADI values for each polarization variable present.
+
+        Examples
+        --------
+        >>> adi = stack.adi()
+        >>> ps_mask = adi < 0.25
+        """
+        # Get complex variables
+        sample_ds = next(iter(self.values()))
+        complex_vars = [v for v in sample_ds.data_vars
+                        if sample_ds[v].dtype.kind == 'c' and 'date' in sample_ds[v].dims]
+
+        if not complex_vars:
+            raise ValueError("No complex time-series data found")
+
+        # Get as BatchComplex and call adi()
+        batch_complex = self[complex_vars]
+        return batch_complex.adi(device)
+
+    def similarity(
+        self,
+        window: tuple = (5, 5),
+        neighbors: tuple = (5, 5),
+        valid_threshold: float = 0.5,
+        device: str = 'auto'
+    ) -> Batch:
+        """
+        Compute spatial phase similarity using neighbor phase difference variance.
+
+        NOTE: Requires insardev_polsar extension.
+
+        Wrapper that calls BatchComplex.similarity() on complex variables.
+        Use with adi2()-optimized stack for best results.
+
+        Parameters
+        ----------
+        window : tuple of int
+            Window size (y, x). Asymmetric to account for different pixel spacing.
+        neighbors : tuple of int
+            Neighbor count range (min, max):
+            - min: Minimum valid neighbors required, else NaN
+            - max: Maximum neighbors to use (top N most similar)
+        valid_threshold : float
+            Minimum fraction of dates with valid (non-NaN) data.
+        device : str
+            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'
+
+        Returns
+        -------
+        Batch
+            Phase similarity values (lower = more spatially similar)
+
+        Examples
+        --------
+        >>> sim = stack.similarity(window=(5, 5), neighbors=(5, 5))
+        >>> stable_mask = sim < 0.5
+        """
+        # Get complex variables
+        sample_ds = next(iter(self.values()))
+        complex_vars = [v for v in sample_ds.data_vars
+                        if sample_ds[v].dtype.kind == 'c' and 'date' in sample_ds[v].dims]
+
+        if not complex_vars:
+            raise ValueError("No complex time-series data found")
+
+        # Get as BatchComplex and call similarity()
+        batch_complex = self[complex_vars]
+        return batch_complex.similarity(window, neighbors, valid_threshold, device)
+
+    def neighbors(
+        self,
+        window: tuple = (5, 5),
+        neighbors: tuple | None = None,
+        valid_threshold: float = 0.5,
+        device: str = 'auto'
+    ) -> Batch:
+        """
+        Count valid neighbors per pixel within a spatial window.
+
+        NOTE: Requires insardev_polsar extension.
+
+        Wrapper that calls BatchComplex.neighbors() on complex variables.
+        Useful for estimating pixel density before running similarity().
+
+        Parameters
+        ----------
+        window : tuple of int
+            Window size (y, x). Must be odd numbers.
+        neighbors : tuple of int or None
+            If provided, filter output: (min, max)
+            - Pixels with count < min: set to NaN
+            - Pixels with count > max: clipped to max
+        valid_threshold : float
+            Minimum fraction of dates with valid data.
+        device : str
+            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'
+
+        Returns
+        -------
+        Batch
+            Valid neighbor count per pixel
+
+        Examples
+        --------
+        >>> counts = stack.neighbors(window=(15, 15))
+        >>> dense_mask = counts >= 10
+        """
+        # Get complex variables
+        sample_ds = next(iter(self.values()))
+        complex_vars = [v for v in sample_ds.data_vars
+                        if sample_ds[v].dtype.kind == 'c' and 'date' in sample_ds[v].dims]
+
+        if not complex_vars:
+            raise ValueError("No complex time-series data found")
+
+        # Get as BatchComplex and call neighbors()
+        batch_complex = self[complex_vars]
+        return batch_complex.neighbors(window, neighbors, valid_threshold, device)
 
     def to_vtk(self, path: str, data: BatchCore | dict | None = None,
                transform: Batch | None = None, overlay: "xr.DataArray" | None = None, mask: bool = True):
@@ -546,8 +821,8 @@ class Stack(Stack_plot, BatchCore):
         >>> mintf, mcorr = stack.phasediff(pairs, wavelength=200)
         >>> mintf, mcorr = Stack().compute(mintf.downsample(20), mcorr.downsample(20))
         """
-        from .Batch import BatchList
-        return BatchList(batches).compute()
+        from .Batch import Batches
+        return Batches(batches).compute()
 
     def snapshot(self, *args, store: str | None = None, storage_options: dict[str, str] | None = None,
                 caption: str | None = None, n_jobs: int = -1, debug=False):
@@ -587,7 +862,7 @@ class Stack(Stack_plot, BatchCore):
         >>> # Save batches
         >>> mintf, mcorr = stack.snapshot(mintf, mcorr, store='mintf_corr')
         """
-        from .Batch import BatchList
+        from .Batch import Batches
         from . import utils_io
 
         # Handle case where first arg is store path
@@ -601,7 +876,7 @@ class Stack(Stack_plot, BatchCore):
                 raise ValueError("store path is required to save/open snapshot")
             # Empty Stack -> open mode, non-empty Stack -> save mode
             if len(self) == 0:
-                result = BatchList().snapshot(store=store, storage_options=storage_options,
+                result = Batches().snapshot(store=store, storage_options=storage_options,
                                              caption=caption, n_jobs=n_jobs, debug=debug)
                 # Unwrap single Stack from tuple
                 if len(result) == 1 and isinstance(result[0], Stack):
@@ -612,7 +887,7 @@ class Stack(Stack_plot, BatchCore):
             return self
 
         # Save mode - args are batches
-        return BatchList(args).snapshot(store=store, storage_options=storage_options, caption=caption, n_jobs=n_jobs, debug=debug)
+        return Batches(args).snapshot(store=store, storage_options=storage_options, caption=caption, n_jobs=n_jobs, debug=debug)
 
     def archive(self, *args, store: str | None = None, caption: str | None = None,
                 compression: int = 6, n_jobs: int = -1, debug=False):
@@ -665,7 +940,7 @@ class Stack(Stack_plot, BatchCore):
         import os
         import fsspec
         import zarr
-        from .Batch import BatchList
+        from .Batch import Batches
         from . import utils_io
 
         # Handle case where first arg is store path
@@ -695,7 +970,7 @@ class Stack(Stack_plot, BatchCore):
                     raise FileNotFoundError(f"Archive not found: {store}")
                 # Use ZipStore directly for reading
                 zip_store = zarr.storage.ZipStore(store, mode='r')
-                result = BatchList().snapshot(store=zip_store, caption=caption or 'Opening archive...', n_jobs=n_jobs, debug=debug)
+                result = Batches().snapshot(store=zip_store, caption=caption or 'Opening archive...', n_jobs=n_jobs, debug=debug)
                 zip_store.close()
                 # Unwrap single Stack from tuple
                 if len(result) == 1 and isinstance(result[0], Stack):
@@ -721,7 +996,7 @@ class Stack(Stack_plot, BatchCore):
             return self
 
         # Save mode - args are batches
-        return BatchList(args).archive(store, caption=caption, compression=compression, n_jobs=n_jobs, debug=debug)
+        return Batches(args).archive(store, caption=caption, compression=compression, n_jobs=n_jobs, debug=debug)
 
     # def downsample(self, *args, coarsen=None, resolution=60, func='mean', debug:bool=False):
     #     datas = []
@@ -1075,11 +1350,14 @@ class Stack(Stack_plot, BatchCore):
                 )
 
                 # Create delayed dask arrays for each date
+                # Resource annotation limits concurrent loads to prevent memory accumulation
+                # Workers must be configured with resources={'load': N} to limit concurrency
                 delayed_arrays = []
                 for info in pol_infos:
-                    delayed_load = dask.delayed(Stack._load_zarr_complex)(
-                        zarr_path, info['burst_path'], storage_options
-                    )
+                    with dask.annotate(resources={'load': 1}):
+                        delayed_load = dask.delayed(Stack._load_zarr_complex)(
+                            zarr_path, info['burst_path'], storage_options
+                        )
                     arr = da.from_delayed(delayed_load, shape=info['shape'], dtype=np.complex64)
                     arr = arr[np.newaxis, :, :]  # Add date dim: (y, x) -> (1, y, x)
                     delayed_arrays.append(arr)
@@ -1264,11 +1542,13 @@ class Stack(Stack_plot, BatchCore):
                         key=lambda x: x['date']
                     )
 
+                    # Resource annotation limits concurrent loads to prevent memory accumulation
                     delayed_arrays = []
                     for info in pol_infos:
-                        delayed_load = dask.delayed(Stack._load_zarr_complex)(
-                            info['url'], '', storage_options
-                        )
+                        with dask.annotate(resources={'load': 1}):
+                            delayed_load = dask.delayed(Stack._load_zarr_complex)(
+                                info['url'], '', storage_options
+                            )
                         arr = da.from_delayed(delayed_load, shape=info['shape'], dtype=np.complex64)
                         arr = arr[np.newaxis, :, :]
                         delayed_arrays.append(arr)
@@ -1354,11 +1634,11 @@ class Stack(Stack_plot, BatchCore):
 
     def pairs(self,
               pairs: list[tuple[str|int, str|int]] | np.ndarray | pd.DataFrame
-              ) -> BatchList:
+              ) -> Batches:
         """
         Select SLC data organized by interferometric pairs.
 
-        Returns reference and repeat SLC data as a BatchList, ready for
+        Returns reference and repeat SLC data as a Batches, ready for
         interferogram computation via multiplication.
 
         Parameters
@@ -1369,8 +1649,8 @@ class Stack(Stack_plot, BatchCore):
 
         Returns
         -------
-        BatchList
-            BatchList containing [BatchComplex(ref), BatchComplex(rep)]
+        Batches
+            Batches containing [BatchComplex(ref), BatchComplex(rep)]
             with 'pair' dimension and ref/rep date coordinates.
 
         Examples
@@ -1421,7 +1701,7 @@ class Stack(Stack_plot, BatchCore):
         ref_batch = add_pair_coords(BatchComplex(data1))
         rep_batch = add_pair_coords(BatchComplex(data2))
 
-        return BatchList([ref_batch, rep_batch])
+        return Batches([ref_batch, rep_batch])
 
     def elevation(self, phase: Batch | float | list | "np.ndarray", baseline: float | None = None, transform: Batch | None = None) -> "Batch | float | np.ndarray":
         """Compute elevation (meters) from unwrapped phase grids in radar coordinates.

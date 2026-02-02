@@ -38,6 +38,7 @@ def goldstein_numpy(phase_np, corr_np, psize_y, psize_x, threshold=0.5, chunk_me
     """
     import numpy as np
     from numpy.lib.stride_tricks import sliding_window_view
+    from scipy import fft as scipy_fft  # scipy.fft has much lower memory overhead than numpy.fft
 
     # Enforce input types
     assert phase_np.dtype == np.complex64, f"phase must be complex64, got {phase_np.dtype}"
@@ -77,10 +78,8 @@ def goldstein_numpy(phase_np, corr_np, psize_y, psize_x, threshold=0.5, chunk_me
     out = np.zeros((padded_ny, padded_nx), dtype=np.complex64)
     count = np.zeros((padded_ny, padded_nx), dtype=np.float32)
 
-    # Fill NaN with 0 (copy to avoid modifying input)
-    phase_np = phase_np.copy()
+    # Fill NaN with 0 in-place (np.pad already created copies, no need to copy again)
     np.copyto(phase_np, 0.0, where=~valid_input)
-    corr_np = corr_np.copy()
     np.copyto(corr_np, 0.0, where=np.isnan(corr_np))
 
     # Threshold for valid patches
@@ -120,8 +119,8 @@ def goldstein_numpy(phase_np, corr_np, psize_y, psize_x, threshold=0.5, chunk_me
         valid_mask = valid_patches.sum(axis=(1, 2)) >= min_valid_pixels
         del valid_patches
 
-        # Batched FFT2 on all patches at once
-        fft_patches = np.fft.fft2(phase_patches, axes=(1, 2))
+        # Batched FFT2 on all patches at once (scipy.fft has much lower memory overhead)
+        fft_patches = scipy_fft.fft2(phase_patches, axes=(1, 2), workers=1, overwrite_x=True)
         del phase_patches
 
         # Power spectrum filter: magnitude^alpha (in-place chain)
@@ -133,7 +132,7 @@ def goldstein_numpy(phase_np, corr_np, psize_y, psize_x, threshold=0.5, chunk_me
         # Batched IFFT2 (in-place multiply first)
         fft_patches *= pspec_weight
         del pspec_weight
-        filtered = np.fft.ifft2(fft_patches, axes=(1, 2))
+        filtered = scipy_fft.ifft2(fft_patches, axes=(1, 2), workers=1, overwrite_x=True)
         del fft_patches
 
         # Apply triangular weight and mask invalid patches (in-place)
@@ -229,12 +228,6 @@ def goldstein_pytorch(phase_np, corr_np, psize_y, psize_x, device, threshold=0.5
     # Create valid mask before filling NaN
     valid_input = ~nan_mask
 
-    # Fill NaN with 0
-    phase_np = phase_np.copy()
-    np.copyto(phase_np, 0.0, where=~valid_input)
-    corr_np = corr_np.copy()
-    np.copyto(corr_np, 0.0, where=np.isnan(corr_np))
-
     # Threshold for valid patches
     min_valid_pixels = int(psize_y * psize_x * threshold)
 
@@ -248,9 +241,14 @@ def goldstein_pytorch(phase_np, corr_np, psize_y, psize_x, device, threshold=0.5
         total_pad_y = pad_y + extra_pad_h
         total_pad_x = pad_x + extra_pad_w
 
+        # Pad with 0 (creates copies - no need for separate .copy())
         phase_np = np.pad(phase_np, ((0, total_pad_y), (0, total_pad_x)), mode='constant', constant_values=0)
         corr_np = np.pad(corr_np, ((0, total_pad_y), (0, total_pad_x)), mode='constant', constant_values=0)
         valid_input = np.pad(valid_input, ((0, total_pad_y), (0, total_pad_x)), mode='constant', constant_values=False)
+
+        # Fill NaN with 0 in-place (np.pad already created copies)
+        np.copyto(phase_np, 0.0, where=~valid_input)
+        np.copyto(corr_np, 0.0, where=np.isnan(corr_np))
 
         padded_h, padded_w = phase_np.shape
 

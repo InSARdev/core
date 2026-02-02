@@ -100,12 +100,14 @@ def interp2d_like(data, grid, method='cubic', **kwargs):
     grid_x = da.from_array(grid[dim2].values, chunks=chunk_sizes[1])
 
     # Perform interpolation
+    meta = np.empty((0, 0), dtype=data.dtype)
     dask_out = da.blockwise(
         interpolate_chunk,
         'yx',
         grid_y, 'y',
         grid_x, 'x',
         dtype=data.dtype,
+        meta=meta,
         dim1=dim1,
         dim2=dim2,
         interpolation=interpolation,

@@ -10,11 +10,10 @@
 # ----------------------------------------------------------------------------
 from insardev_toolkit.progressbar_joblib import progressbar_joblib
 
-# import zarr
-# zarr_clevel: int = 0
-# zarr.config['array.v3_default_compressors.numeric'][0]['configuration']['level'] = zarr_clevel
-# zarr.config['array.v3_default_compressors.bytes'][0]['configuration']['level']   = zarr_clevel
-# zarr.config['array.v3_default_compressors.string'][0]['configuration']['level'] = zarr_clevel
+# Zarr v3 performance fix: disable expensive all_equal() check on every chunk
+# See https://github.com/zarr-developers/zarr-python/issues/2710
+import zarr
+zarr.config.set({'array.write_empty_chunks': True})
 
 # def snapshot_interleave(*args, store: str | None = None, storage_options: dict[str, str] | None = None,
 #                         compat: bool = True, n_jobs: int = -1, debug=False):

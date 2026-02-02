@@ -10,6 +10,7 @@
 # ----------------------------------------------------------------------------
 from .Stack_sbas import Stack_sbas
 from .Batch import Batch
+from . import utils_stl
 
 class Stack_stl(Stack_sbas):
 
@@ -84,77 +85,6 @@ class Stack_stl(Stack_sbas):
 
         return Batch(results)
 
-    @staticmethod
-    def _stl1d(ts, dt, dt_periodic, periods=52, robust=False):
-        """
-        Perform Seasonal-Trend decomposition using LOESS (STL) on the input time series data.
-
-        The function performs the following steps:
-        1. Check for NaN values in the input time series and return arrays filled with NaNs if found.
-        2. Create an interpolation function using the input time series and corresponding time values.
-        3. Interpolate the time series data for the periodic time values.
-        4. Perform STL decomposition using the interpolated time series data.
-        5. Return the trend, seasonal, and residual components of the decomposed time series.
-
-        Parameters
-        ----------
-        ts : numpy.ndarray
-            Input time series data.
-        dt : numpy.ndarray
-            Corresponding time values for the input time series data.
-        dt_periodic : numpy.ndarray
-            Periodic time values for interpolation.
-        periods : int
-            Number of periods for seasonal decomposition.
-        robust : bool, optional
-            Whether to use a robust fitting procedure for the STL decomposition (default is False).
-
-        Returns
-        -------
-        numpy.ndarray
-            Trend component of the decomposed time series.
-        numpy.ndarray
-            Seasonal component of the decomposed time series.
-        numpy.ndarray
-            Residual component of the decomposed time series.
-
-        """
-        import numpy as np
-        from scipy.interpolate import interp1d
-        from statsmodels.tsa.seasonal import STL
-
-        # Check for NaNs in the input time series; this check is faster than letting STL handle NaNs
-        if np.any(np.isnan(ts)):
-            nodata = np.nan * np.zeros(dt_periodic.size)
-            return nodata, nodata, nodata
-
-        # Create an interpolation function for the input time series and time values
-        interp_func = interp1d(dt, ts, kind='nearest', fill_value='extrapolate', assume_sorted=True)
-        # Interpolate the time series data for the periodic time values
-        ts = interp_func(dt_periodic)
-
-        # Perform STL decomposition on the interpolated time series data
-        stl = STL(ts, period=periods, robust=robust)
-        res = stl.fit()
-
-        return res.trend, res.seasonal, res.resid
-
-    @staticmethod
-    def _stl_periodic(dates, freq='W'):
-        import pandas as pd
-        import xarray as xr
-        import numpy as np
-
-        # convert coordinate to valid dates
-        dates = pd.to_datetime(dates)
-        # original dates
-        dt = dates.astype(np.int64)
-        # Unify date intervals; using weekly intervals should be suitable for a mix of 6 and 12 days intervals
-        dates_weekly = pd.date_range(dates[0], dates[-1], freq=freq)
-        dt_weekly = xr.DataArray(dates_weekly, dims=['date'])
-        dt_periodic = dt_weekly.astype(np.int64)
-        return (dt, dt_periodic)
-
     # Aggregate data for varying frequencies (e.g., 12+ days for 6 days S1AB images interval)
     # Use frequency strings like '1W' for 1 week, '2W' for 2 weeks, '10d' for 10 days, '1M' for 1 month, etc.
     def _stl(self, data, freq='W', periods=52, robust=False):
@@ -213,7 +143,7 @@ class Stack_stl(Stack_sbas):
         if not isinstance(data, xr.DataArray):
             raise Exception('Invalid input: The "data" parameter should be of type xarray.DataArray.')
 
-        dt, dt_periodic = self._stl_periodic(data.date, freq)
+        dt, dt_periodic = utils_stl.stl_periodic(data.date, freq)
         n_dates_out = len(dt_periodic)
         n_dates_in = data.date.size
 
@@ -234,7 +164,7 @@ class Stack_stl(Stack_sbas):
             # transpose to (y, x, n_dates) for vectorized STL
             data_transposed = data_block.transpose(1, 2, 0)
             vec_stl = np.vectorize(
-                lambda ts: self._stl1d(ts, dt, dt_periodic, periods, robust),
+                lambda ts: utils_stl.stl1d(ts, dt, dt_periodic, periods, robust),
                 signature='(n)->(m),(m),(m)'
             )
             # result: (3, y, x, n_dates_out) after asarray

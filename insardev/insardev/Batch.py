@@ -18,6 +18,26 @@ if TYPE_CHECKING:
     from .Stack import Stack
     import inspect
 
+
+def _apply_goldstein_for_dask(phase_block, corr_block, psize, threshold, device):
+    """Module-level function for Goldstein filter blockwise operation.
+
+    Defined at module level to avoid dask serialization issues with nested functions.
+    Closures capturing variables can cause memory explosions in dask workers.
+    """
+    return BatchComplex._goldstein(phase_block, corr_block, psize=psize,
+                                   threshold=threshold, device=device)
+
+
+def _apply_velocity_for_dask(data, times_years, min_valid, device):
+    """Module-level function for velocity computation.
+
+    Defined at module level to avoid dask serialization issues with nested functions.
+    Closures capturing variables can cause memory explosions in dask workers.
+    """
+    return Batch._velocity_torch(data, times_years, min_valid=min_valid, device=device)
+
+
 class Batch(BatchCore):
     def __init__(self, mapping: dict[str, xr.Dataset] | Stack | None = None):
         from .Stack import Stack
@@ -212,14 +232,18 @@ class Batch(BatchCore):
 
         nanoseconds_per_year = 365.25 * 24 * 60 * 60 * 1e9
 
-        # Auto-detect device based on Dask cluster resources and hardware
-        device = Batch._get_torch_device(device, debug=debug)
+        # Resolve device ONCE here, not in every task - use string for serialization
+        if device == 'auto':
+            resolved_device = Batch._get_torch_device(device, debug=debug)
+            device = resolved_device.type  # 'cpu', 'cuda', or 'mps' as string
 
         if debug:
             print(f"DEBUG: velocity using device={device}")
 
         # Get CRS from input batch
         crs = self.crs
+
+        import functools
 
         vel_results = {}
         int_results = {}
@@ -236,14 +260,18 @@ class Batch(BatchCore):
                 times_ns = (dates - dates[0]).total_seconds() * 1e9
                 times_years = np.array(times_ns / nanoseconds_per_year, dtype=np.float32)
 
-                # Create wrapper for apply_ufunc
-                def compute_velocity(data, times_years=times_years, min_valid=min_valid, device=device):
-                    return Batch._velocity_torch(data, times_years, min_valid=min_valid, device=device)
+                # Use functools.partial - apply_ufunc doesn't support blockwise scalar passing
+                velocity_func = functools.partial(
+                    _apply_velocity_for_dask,
+                    times_years=times_years,
+                    min_valid=min_valid,
+                    device=device
+                )
 
                 # Use apply_ufunc with dask='parallelized' for lazy evaluation
-                with dask.annotate(resources={'gpu': 1} if device.type != 'cpu' else {}):
+                with dask.annotate(resources={'gpu': 1} if device != 'cpu' else {}):
                     vel_da, int_da = xr.apply_ufunc(
-                        compute_velocity,
+                        velocity_func,
                         da,
                         input_core_dims=[['date', 'y', 'x']],
                         output_core_dims=[['y', 'x'], ['y', 'x']],
@@ -372,6 +400,319 @@ class Batch(BatchCore):
         """
         import xarray as xr
         return BatchComplex(self.map_da(lambda da: xr.ufuncs.exp(sign * 1j * da), **kwargs))
+
+    def lstsq(self, weight: 'BatchUnit | None' = None, device: str = 'auto',
+              cumsum: bool = True, debug: bool = False) -> 'Batch':
+        """
+        Weighted least squares network inversion to date-based time series.
+
+        Takes unwrapped pair phases and inverts the network to get per-date
+        accumulated phase.
+
+        Parameters
+        ----------
+        weight : BatchUnit or None
+            Optional weight for the inversion (typically correlation).
+        device : str
+            PyTorch device ('auto', 'cuda', 'mps', 'cpu'). Default 'auto'.
+        cumsum : bool
+            If True (default), return cumulative displacement time series.
+            If False, return incremental phase changes between dates.
+        debug : bool
+            Print debug information.
+
+        Returns
+        -------
+        Batch
+            Phase time series with 'date' dimension instead of 'pair'.
+
+        Examples
+        --------
+        >>> phase, corr = stack.pairs(baseline.tolist()).phasediff(wavelength=30).angle()
+        >>> unwrapped = phase.unwrap1d(weight=corr)
+        >>> disp = unwrapped.lstsq(weight=corr)
+        """
+        from .Stack_unwrap1d import Stack_unwrap1d
+
+        return Stack_unwrap1d.lstsq(Stack_unwrap1d(), self, weight=weight,
+                                    device=device, cumsum=cumsum, debug=debug)
+
+    def displacement_los(self, transform: 'Batch | Stack') -> 'Batch':
+        """Compute line-of-sight displacement (meters) from unwrapped phase.
+
+        Parameters
+        ----------
+        transform : Batch or Stack
+            Transform batch providing mission constants (radar_wavelength),
+            or a Stack (will call .transform() internally).
+
+        Returns
+        -------
+        Batch
+            LOS displacement grids (meters), lazily scaled by the mission wavelength.
+
+        Examples
+        --------
+        >>> disp_los = unwrapped.displacement_los(stack)
+        >>> disp_los = unwrapped.displacement_los(stack.transform())
+        """
+        import numpy as np
+        import xarray as xr
+        from .Stack import Stack
+
+        # If Stack passed, get transform from it
+        if isinstance(transform, Stack):
+            transform = transform.transform()
+
+        if not transform:
+            raise ValueError('transform must contain at least one burst with radar_wavelength')
+
+        transform_first = next(iter(transform.values()))
+
+        def _scalar_from_ds(ds, name: str):
+            if name in ds:
+                var = ds[name]
+                if var.ndim == 0:
+                    return var.item()
+                elif var.ndim >= 1:
+                    values = var.values.flatten()
+                    unique = np.unique(values)
+                    if len(unique) != 1:
+                        raise ValueError(f'{name} has multiple distinct values: {unique}')
+                    return unique[0]
+            return ds.attrs.get(name)
+
+        wavelength = _scalar_from_ds(transform_first, 'radar_wavelength')
+        if wavelength is None:
+            raise KeyError('Missing radar_wavelength in transform')
+
+        # scale factor from phase in radians to displacement in meters
+        # constant is negative to make LOS = -1 * range change
+        scale = -float(wavelength) / (4 * np.pi)
+
+        out: dict[str, xr.Dataset] = {}
+        for key, phase_ds in self.items():
+            disp_vars: dict[str, xr.DataArray] = {}
+            for var_name, data in phase_ds.data_vars.items():
+                disp = (data * scale).astype('float32')
+                disp_vars[var_name] = disp
+            out[key] = xr.Dataset(disp_vars, coords=phase_ds.coords, attrs=phase_ds.attrs)
+
+        return Batch(out)
+
+    def _displacement_component(self, transform: 'Batch | Stack', func, suffix: str = '') -> 'Batch':
+        """Internal helper to scale LOS displacement by an incidence-based function (e.g., cos/sin)."""
+        import xarray as xr
+        import numpy as np
+        from .Stack import Stack
+
+        # If Stack passed, get transform from it
+        if isinstance(transform, Stack):
+            transform = transform.transform()
+
+        # Decimate transform to match phase resolution for efficiency
+        transform = Batch({k: transform[k].reindex(y=self[k].y, x=self[k].x, method='nearest')
+                           for k in self.keys() if k in transform})
+
+        los_batch = self.displacement_los(transform)
+        incidence_batch = transform.incidence()
+
+        out: dict[str, xr.Dataset] = {}
+
+        for key, los_ds in los_batch.items():
+            if key not in incidence_batch:
+                raise KeyError(f'Missing incidence for key: {key}')
+
+            inc_da = incidence_batch[key]['incidence']
+            comp_vars: dict[str, xr.DataArray] = {}
+
+            for var_name, data in los_ds.data_vars.items():
+                # align incidence to data grid
+                if 'y' in data.coords and 'x' in data.coords:
+                    incidence = inc_da.interp(y=data.y, x=data.x, method='linear')
+                else:
+                    incidence = inc_da.reindex_like(data, method='nearest')
+
+                comp = (data / func(incidence)).astype('float32')
+
+                if len(los_ds.data_vars) == 1:
+                    name = suffix
+                elif var_name.endswith('_los'):
+                    name = var_name[:-4] + f'_{suffix}'
+                else:
+                    name = f'{var_name}_{suffix}'
+
+                comp_vars[name] = comp
+
+            out[key] = xr.Dataset(comp_vars, coords=los_ds.coords, attrs=los_ds.attrs)
+
+        return Batch(out)
+
+    def displacement_vertical(self, transform: 'Batch | Stack') -> 'Batch':
+        """Compute vertical displacement (meters) from unwrapped phase and incidence.
+
+        Parameters
+        ----------
+        transform : Batch or Stack
+            Transform batch providing incidence angle and mission constants,
+            or a Stack (will call .transform() internally).
+
+        Returns
+        -------
+        Batch
+            Vertical displacement grids (meters).
+
+        Examples
+        --------
+        >>> disp_v = unwrapped.displacement_vertical(stack)
+        >>> disp_v = unwrapped.displacement_vertical(stack.transform())
+        """
+        import xarray as xr
+        return self._displacement_component(transform, func=xr.ufuncs.cos, suffix='vertical')
+
+    def displacement_eastwest(self, transform: 'Batch | Stack') -> 'Batch':
+        """Compute east-west displacement (meters) from unwrapped phase and incidence.
+
+        Parameters
+        ----------
+        transform : Batch or Stack
+            Transform batch providing incidence angle and mission constants,
+            or a Stack (will call .transform() internally).
+
+        Returns
+        -------
+        Batch
+            East-west displacement grids (meters).
+
+        Examples
+        --------
+        >>> disp_ew = unwrapped.displacement_eastwest(stack)
+        >>> disp_ew = unwrapped.displacement_eastwest(stack.transform())
+        """
+        import xarray as xr
+        return self._displacement_component(transform, func=xr.ufuncs.sin, suffix='eastwest')
+
+    def elevation(self, transform: 'Batch | Stack', baseline: float | None = None) -> 'Batch':
+        """Compute elevation (meters) from unwrapped phase grids.
+
+        Parameters
+        ----------
+        transform : Batch or Stack
+            Transform batch containing look vectors for incidence calculation,
+            or a Stack (will call .transform() internally).
+        baseline : float | None, optional
+            Perpendicular baseline in meters. If None, uses burst-specific BPR
+            from phase coordinates.
+
+        Returns
+        -------
+        Batch
+            Elevation grids as float32 datasets.
+
+        Examples
+        --------
+        >>> elev = unwrapped.elevation(stack)
+        >>> elev = unwrapped.elevation(stack.transform())
+        """
+        import xarray as xr
+        import numpy as np
+        from .Stack import Stack
+
+        # If Stack passed, get transform from it
+        if isinstance(transform, Stack):
+            transform = transform.transform()
+
+        incidence_batch = transform.incidence()
+        out: dict[str, xr.Dataset] = {}
+
+        for key, phase_ds in self.items():
+            if key not in incidence_batch:
+                raise KeyError(f'Missing incidence for key: {key}')
+
+            tfm = transform[key]
+
+            def _scalar_from_ds(ds, name: str):
+                if name in ds:
+                    var = ds[name]
+                    if var.ndim == 0:
+                        return float(var.item())
+                    return float(var.mean().item())
+                return ds.attrs.get(name)
+
+            wavelength = _scalar_from_ds(tfm, 'radar_wavelength')
+            slant_start = _scalar_from_ds(tfm, 'SC_height_start')
+            slant_end = _scalar_from_ds(tfm, 'SC_height_end')
+            if wavelength is None or slant_start is None or slant_end is None:
+                raise KeyError(f"Missing parameters in transform for burst {key}: radar_wavelength, SC_height_start, SC_height_end")
+
+            # Get BPR - either scalar or per-pair DataArray for broadcasting
+            if baseline is not None:
+                bpr = float(baseline)
+            elif 'BPR' in phase_ds.coords:
+                bpr = phase_ds.coords['BPR']
+            else:
+                raise KeyError(f"Missing baseline (BPR) for burst {key}")
+
+            inc_da = incidence_batch[key]['incidence']
+            slant_range = xr.DataArray(
+                np.linspace(slant_start, slant_end, inc_da.sizes['x']),
+                coords={'x': inc_da.coords['x']},
+                dims=('x',)
+            )
+
+            elev_vars: dict[str, xr.DataArray] = {}
+            for var_name, data in phase_ds.data_vars.items():
+                if 'y' in data.coords and 'x' in data.coords:
+                    incidence = inc_da.interp(y=data.y, x=data.x, method='linear')
+                    slant = slant_range.interp(x=data.x)
+                else:
+                    incidence = inc_da.reindex_like(data, method='nearest')
+                    slant = slant_range.reindex_like(data.x, method='nearest')
+
+                # Height from phase formula: h = -λ * φ * R * cos(incidence) / (4π * B⊥)
+                elev = -(wavelength * data * slant * xr.ufuncs.cos(incidence) / (4 * np.pi * bpr))
+                name = 'ele' if len(phase_ds.data_vars) == 1 else f'{var_name}_ele'
+                elev_vars[name] = elev.astype('float32')
+
+            out[key] = xr.Dataset(elev_vars, coords=phase_ds.coords, attrs=phase_ds.attrs)
+
+        return Batch(out)
+
+    def stl(self, freq: str = 'W', periods: int = 52, robust: bool = False) -> 'Batch':
+        """
+        Perform Seasonal-Trend decomposition using LOESS (STL).
+
+        Decomposes time series into trend, seasonal, and residual components.
+        The Batch must have a 'date' dimension.
+
+        Parameters
+        ----------
+        freq : str, optional
+            Frequency string for resampling (default 'W' for weekly).
+            Examples: '1W' for 1 week, '2W' for 2 weeks, '10d' for 10 days.
+        periods : int, optional
+            Number of periods for seasonal decomposition (default 52 for weekly data = 1 year).
+        robust : bool, optional
+            Whether to use robust fitting (slower but handles outliers better). Default False.
+
+        Returns
+        -------
+        Batch
+            Batch containing 'trend', 'seasonal', and 'resid' variables for each polarization.
+
+        Examples
+        --------
+        >>> displacement = unwrapped.lstsq(weight=corr)
+        >>> stl_result = displacement.stl(freq='W', periods=52)
+        >>> stl_result.plot()  # Shows trend, seasonal, resid components
+
+        See Also
+        --------
+        statsmodels.tsa.seasonal.STL : Seasonal-Trend decomposition using LOESS
+        """
+        from .Stack_stl import Stack_stl
+
+        return Stack_stl.stl(Stack_stl(), self, freq=freq, periods=periods, robust=robust)
 
 class BatchWrap(BatchCore):
     """
@@ -648,6 +989,87 @@ class BatchWrap(BatchCore):
 
         return BatchWrap(out)
 
+    def unwrap2d(self, weight: 'BatchUnit | None' = None, conncomp: bool = False,
+                 conncomp_size: int = 1000, conncomp_gap: int | None = None,
+                 conncomp_linksize: int = 5, conncomp_linkcount: int = 30,
+                 device: str = 'auto', debug: bool = False, **kwargs) -> 'Batch':
+        """
+        Unwrap phase using GPU-accelerated IRLS algorithm (L1 norm).
+
+        Parameters
+        ----------
+        weight : BatchUnit or None
+            Optional weight for the unwrapping (typically correlation).
+        conncomp : bool
+            If False (default), link disconnected components using ILP.
+            If True, keep components separate and return conncomp labels.
+        conncomp_size : int
+            Minimum pixels for a connected component. Default 1000.
+        conncomp_gap : int or None
+            Maximum pixel distance between connectable components.
+        conncomp_linksize : int
+            Pixels on each side for phase offset estimation. Default 5.
+        conncomp_linkcount : int
+            Max nearest neighbor components to consider. Default 30.
+        device : str
+            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
+        debug : bool
+            Print diagnostic information.
+        **kwargs
+            Additional arguments: max_iter, tol, cg_max_iter, cg_tol, epsilon.
+
+        Returns
+        -------
+        Batch or tuple
+            If conncomp=False: Batch of unwrapped phase.
+            If conncomp=True: tuple of (Batch unwrapped, BatchUnit conncomp).
+
+        Examples
+        --------
+        >>> phase, corr = stack.pairs(baseline.tolist()).phasediff(wavelength=30).angle()
+        >>> unwrapped = phase.unwrap2d()  # Without weights
+        >>> unwrapped = phase.unwrap2d(weight=corr)  # With weights
+        """
+        from .Stack_unwrap2d import Stack_unwrap2d
+
+        return Stack_unwrap2d.unwrap2d(Stack_unwrap2d(), self, weight=weight,
+                                       conncomp=conncomp, conncomp_size=conncomp_size,
+                                       conncomp_gap=conncomp_gap, conncomp_linksize=conncomp_linksize,
+                                       conncomp_linkcount=conncomp_linkcount, device=device,
+                                       debug=debug, **kwargs)
+
+    def unwrap1d(self, weight: 'BatchUnit | None' = None, device: str = 'auto',
+                 debug: bool = False, **kwargs) -> 'Batch':
+        """
+        1D temporal phase unwrapping using IRLS optimization.
+
+        Parameters
+        ----------
+        weight : BatchUnit or None
+            Optional weight for the unwrapping (typically correlation).
+        device : str
+            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
+        debug : bool
+            Print diagnostic information.
+        **kwargs
+            Additional arguments: max_iter, epsilon, batch_size.
+
+        Returns
+        -------
+        Batch
+            Temporally unwrapped phase.
+
+        Examples
+        --------
+        >>> phase, corr = stack.pairs(baseline.tolist()).phasediff(wavelength=30).angle()
+        >>> unwrapped = phase.unwrap1d()  # Without weights
+        >>> unwrapped = phase.unwrap1d(weight=corr)  # With weights
+        """
+        from .Stack_unwrap1d import Stack_unwrap1d
+
+        return Stack_unwrap1d.unwrap1d(Stack_unwrap1d(), self, weight=weight,
+                                       device=device, debug=debug, **kwargs)
+
 class BatchUnit(BatchCore):
     """
     This class has 'pair' stack variable for the datasets in the dict and stores correlation in the range [0,1].
@@ -744,15 +1166,22 @@ class BatchComplex(BatchCore):
             "backscatter() requires insardev_backscatter extension"
         )
 
+    def adi(self, *args, **kwargs):
+        """
+        Compute Amplitude Dispersion Index (ADI) for calibrated σ₀ data.
+
+        ADI = std(amplitude) / mean(amplitude) over time.
+        Lower ADI indicates more stable scatterers (PS candidates).
+
+        This method requires the insardev_backscatter extension package.
+        """
+        raise ImportError(
+            "adi() requires insardev_backscatter extension"
+        )
+
     def conj(self, **kwargs):
         """intfs.iexp().conj() for np.exp(-1j * intfs)"""
         return self.map_da(lambda da: xr.ufuncs.conj(da), **kwargs)
-
-    def angle(self, **kwargs):
-        """
-        Compute element-wise phase (angle), returning a BatchWrap of float32 DataArrays in [-π, π].
-        """
-        return BatchWrap(self.map_da(lambda da: np.arctan2(da.imag, da.real).astype(np.float32), **kwargs))
 
     def angle(self, **kwargs):
         """
@@ -904,8 +1333,15 @@ class BatchComplex(BatchCore):
         if isinstance(window, int):
             window = {'y': window, 'x': window}
 
-        # Determine if GPU resource annotation is needed
+        # Resolve device ONCE here, not in every task
+        if device == 'auto':
+            resolved_device = BatchCore._get_torch_device(device, debug=debug)
+            device = resolved_device.type  # 'cpu', 'cuda', or 'mps' as string
+
+        # Resource annotation limits concurrent torch operations
+        # Workers must be configured with resources={'goldstein': N} to limit concurrency
         use_gpu = device in ('cuda', 'mps')
+        task_resources = {'goldstein': 1, 'gpu': 1} if use_gpu else {'goldstein': 1}
 
         # Apply Goldstein filter to each dataset
         result = {}
@@ -921,21 +1357,21 @@ class BatchComplex(BatchCore):
                     phase_dask = var_data.data
                     corr_dask = corr_da.data
 
-                    # Wrapper for _goldstein
-                    def goldstein_block(phase_block, corr_block):
-                        return BatchComplex._goldstein(phase_block, corr_block, psize=window,
-                                                       threshold=threshold, device=device)
-
                     # Build dimension string based on ndim (e.g., 'yx' for 2D, 'pyx' for 3D)
                     dim_str = ''.join(chr(ord('a') + i) for i in range(phase_dask.ndim))
 
-                    # Use da.blockwise for efficient dask integration
-                    with dask.annotate(resources={'gpu': 1} if use_gpu else {}):
+                    # Use da.blockwise - pass scalars directly with None as dimension indicator
+                    with dask.annotate(resources=task_resources):
+                        meta = np.empty((0,) * phase_dask.ndim, dtype=np.complex64)
                         filtered_dask = da.blockwise(
-                            goldstein_block, dim_str,
+                            _apply_goldstein_for_dask, dim_str,
                             phase_dask, dim_str,
                             corr_dask, dim_str,
+                            window, None,
+                            threshold, None,
+                            device, None,
                             dtype=np.complex64,
+                            meta=meta,
                         )
                     filtered_vars[var_name] = xr.DataArray(
                         filtered_dask,
@@ -955,14 +1391,14 @@ class BatchComplex(BatchCore):
         return type(self)(result)
 
 
-class BatchList(tuple):
+class Batches(tuple):
     """
     A tuple-like container for multiple Batch objects that allows chained operations.
 
     Enables operations like:
         mintf, mcorr = stack.phasediff(...).downsample(20).compute()
         mintf, mcorr = stack.phasediff(...).downsample(20).snapshot('mintf_corr')
-        mintf, mcorr = BatchList.open('mintf_corr')
+        mintf, mcorr = Batches.open('mintf_corr')
 
     Instead of:
         mintf, mcorr = stack.phasediff(...)
@@ -974,10 +1410,10 @@ class BatchList(tuple):
 
     def snapshot(self, store: str | None = None, storage_options: dict[str, str] | None = None,
                  caption: str | None = None, n_jobs: int = -1, debug: bool = False):
-        """Save or open a BatchList snapshot.
+        """Save or open a Batches snapshot.
 
-        When called on a BatchList with data, saves all batches to Zarr store.
-        When called on an empty BatchList(), opens an existing store.
+        When called on a Batches with data, saves all batches to Zarr store.
+        When called on an empty Batches(), opens an existing store.
 
         Parameters
         ----------
@@ -1002,7 +1438,7 @@ class BatchList(tuple):
         >>> # Save
         >>> mintf, mcorr = stack.phasediff(...).downsample(20).snapshot('mintf_corr')
         >>> # Open
-        >>> mintf, mcorr = BatchList().snapshot('mintf_corr')
+        >>> mintf, mcorr = Batches().snapshot('mintf_corr')
         """
         from . import utils_io
 
@@ -1021,7 +1457,7 @@ class BatchList(tuple):
 
     def archive(self, store: str, caption: str | None = None, compression: int = 6,
                 n_jobs: int = -1, debug: bool = False):
-        """Save or open a BatchList archive as a single ZIP file.
+        """Save or open a Batches archive as a single ZIP file.
 
         Wrapper around snapshot() that uses ZipStore for single-file storage.
         Useful for downloading data from Google Colab or similar environments.
@@ -1054,7 +1490,7 @@ class BatchList(tuple):
         >>> # Save to cloud storage (GCS, S3, etc.)
         >>> mintf, mcorr = stack.phasediff(...).archive('gs://bucket/mintf_corr.zip')
         >>> # Open from zip
-        >>> mintf, mcorr = BatchList().archive('mintf_corr.zip')
+        >>> mintf, mcorr = Batches().archive('mintf_corr.zip')
         """
         import zarr
         import zipfile
@@ -1103,27 +1539,27 @@ class BatchList(tuple):
 
     def downsample(self, *args, **kwargs):
         """Apply downsample to all batches."""
-        return BatchList([b.downsample(*args, **kwargs) for b in self])
+        return Batches([b.downsample(*args, **kwargs) for b in self])
 
     def crop(self, *args, **kwargs):
         """Apply crop to all batches."""
-        return BatchList([b.crop(*args, **kwargs) for b in self])
+        return Batches([b.crop(*args, **kwargs) for b in self])
 
     def sel(self, *args, **kwargs):
         """Apply sel to all batches."""
-        return BatchList([b.sel(*args, **kwargs) for b in self])
+        return Batches([b.sel(*args, **kwargs) for b in self])
 
     def isel(self, *args, **kwargs):
         """Apply isel to all batches."""
-        return BatchList([b.isel(*args, **kwargs) for b in self])
+        return Batches([b.isel(*args, **kwargs) for b in self])
 
     def angle(self):
         """Apply angle() to BatchComplex batches, return others unchanged.
 
         Returns
         -------
-        BatchList
-            BatchList with BatchComplex converted to BatchWrap (phase angles),
+        Batches
+            Batches with BatchComplex converted to BatchWrap (phase angles),
             other batch types unchanged.
 
         Examples
@@ -1137,12 +1573,12 @@ class BatchList(tuple):
                 results.append(b.angle())
             else:
                 results.append(b)
-        return BatchList(results)
+        return Batches(results)
 
     def goldstein(self, window: int | list[int, int] = 32, threshold: float = 0.5, device: str = 'auto'):
         """Apply Goldstein filter to phase using correlation as weight.
 
-        Expects BatchList with [BatchComplex (phase), BatchUnit (correlation)].
+        Expects Batches with [BatchComplex (phase), BatchUnit (correlation)].
 
         Parameters
         ----------
@@ -1156,15 +1592,15 @@ class BatchList(tuple):
 
         Returns
         -------
-        BatchList
-            BatchList with Goldstein-filtered phase and unchanged correlation.
+        Batches
+            Batches with Goldstein-filtered phase and unchanged correlation.
 
         Examples
         --------
         >>> phase, corr = stack.phasediff(pairs, wavelength=30).goldstein(32).angle()
         """
         if len(self) < 2:
-            raise ValueError("goldstein() requires BatchList with at least 2 elements: [phase, correlation]")
+            raise ValueError("goldstein() requires Batches with at least 2 elements: [phase, correlation]")
 
         phase, corr = self[0], self[1]
 
@@ -1174,18 +1610,18 @@ class BatchList(tuple):
             raise TypeError(f"Second element must be BatchUnit, got {type(corr).__name__}")
 
         filtered_phase = phase.goldstein(corr, window, threshold=threshold, device=device)
-        return BatchList([filtered_phase, corr] + list(self[2:]))
+        return Batches([filtered_phase, corr] + list(self[2:]))
 
-    def phasediff(self,
+    def interferogram(self,
                   weight: 'BatchUnit | None' = None,
                   phase: 'BatchComplex | None' = None,
                   wavelength: float | None = None,
                   gaussian_threshold: float = 0.5,
-                  device: str = 'auto') -> 'BatchList':
+                  device: str = 'auto') -> 'Batches':
         """
         Compute phase difference from paired SLC data.
 
-        Expects BatchList from pairs() with [ref, rep] BatchComplex objects.
+        Expects Batches from pairs() with [ref, rep] BatchComplex objects.
 
         Parameters
         ----------
@@ -1202,18 +1638,18 @@ class BatchList(tuple):
 
         Returns
         -------
-        BatchList
-            BatchList with [phase, correlation].
+        Batches
+            Batches with [phase, correlation].
 
         Examples
         --------
         >>> ref, rep = stack.pairs(baseline.tolist())
-        >>> phase, corr = ref.phasediff(rep, wavelength=30)
+        >>> phase, corr = ref.interferogram(rep, wavelength=30)
         >>> # Or chained:
-        >>> phase, corr = stack.pairs(baseline.tolist()).phasediff(wavelength=30)
+        >>> phase, corr = stack.pairs(baseline.tolist()).interferogram(wavelength=30)
         """
         if len(self) != 2:
-            raise ValueError("phasediff() requires BatchList with exactly 2 elements: [ref, rep]")
+            raise ValueError("interferogram() requires Batches with exactly 2 elements: [ref, rep]")
 
         ref, rep = self[0], self[1]
 
@@ -1226,40 +1662,44 @@ class BatchList(tuple):
                 'Use BatchUnit(stack.from_dataset(data)) to convert a single DataArray.'
             )
 
-        phasediff = ref * rep.conj()
-        if phase is not None:
-            if isinstance(phase, BatchComplex):
-                phasediff = phasediff * phase
+        # Resource annotation limits concurrent interferogram operations
+        # Workers must be configured with resources={'interferogram': N} to limit concurrency
+        import dask
+        with dask.annotate(resources={'interferogram': 1}):
+            intf = ref * rep.conj()
+            if phase is not None:
+                if isinstance(phase, BatchComplex):
+                    intf = intf * phase
+                else:
+                    intf = intf * phase.iexp(-1)
+
+            corr_look = BatchUnit()
+            if wavelength is not None:
+                intf_look = intf.gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold, device=device)
+                intensity_ref = ref.power().gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold, device=device)
+                intensity_rep = rep.power().gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold, device=device)
+                del ref, rep
+                corr_look = (intf_look.abs() / (intensity_ref * intensity_rep).sqrt()).clip(0, 1)
+                del intensity_ref, intensity_rep
             else:
-                phasediff = phasediff * phase.iexp(-1)
+                intf_look = intf
+                del ref, rep
+            del intf
 
-        corr_look = BatchUnit()
-        if wavelength is not None:
-            phasediff_look = phasediff.gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold, device=device)
-            intensity_ref = ref.power().gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold, device=device)
-            intensity_rep = rep.power().gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold, device=device)
-            del ref, rep
-            corr_look = (phasediff_look.abs() / (intensity_ref * intensity_rep).sqrt()).clip(0, 1)
-            del intensity_ref, intensity_rep
-        else:
-            phasediff_look = phasediff
-            del ref, rep
-        del phasediff
+            if weight is not None:
+                intf_look = intf_look.where(weight.isfinite())
+                corr_look = corr_look.where(weight.isfinite()) if corr_look else None
 
-        if weight is not None:
-            phasediff_look = phasediff_look.where(weight.isfinite())
-            corr_look = corr_look.where(weight.isfinite()) if corr_look else None
+        return Batches([intf_look, corr_look])
 
-        return BatchList([phasediff_look, corr_look])
-
-    def phasediff2(self, *args, **kwargs):
+    def interferogram2(self, *args, **kwargs):
         """
         Compute optimized interferogram using dual-polarization coherence optimization.
 
         This method requires the insardev_polsar extension package.
         """
         raise ImportError(
-            "phasediff2() requires insardev_polsar extension"
+            "interferogram2() requires insardev_polsar extension"
         )
 
     def compute(self):
@@ -1291,10 +1731,10 @@ class BatchList(tuple):
                     ds = ds.assign_coords(new_coords)
                 computed[key] = ds
             computed_batches.append(type(self[i])(computed))
-        return BatchList(computed_batches)
+        return Batches(computed_batches)
 
     def persist(self):
-        """Persist all batches together efficiently and return as BatchList.
+        """Persist all batches together efficiently and return as Batches.
 
         Persists all batches in a single dask graph execution, which is faster
         than persisting them separately because shared computations are only
@@ -1314,22 +1754,310 @@ class BatchList(tuple):
 
         # Convert back to Batch objects preserving types
         persisted_batches = [type(self[i])(batch_dict) for i, batch_dict in enumerate(result)]
-        return BatchList(persisted_batches)
+        return Batches(persisted_batches)
+
+    def unwrap2d(self, conncomp=False, conncomp_size=1000, conncomp_gap=None,
+                 conncomp_linksize=5, conncomp_linkcount=30, device='auto', debug=False, **kwargs):
+        """
+        Unwrap phase using GPU-accelerated IRLS algorithm (L¹ norm).
+
+        Expects Batches with [BatchWrap (phase), BatchUnit (weight, optional)].
+
+        Parameters
+        ----------
+        conncomp : bool
+            If False (default), link disconnected components using ILP.
+            If True, keep components separate and return conncomp labels.
+        conncomp_size : int
+            Minimum pixels for a connected component. Default 1000.
+        conncomp_gap : int or None
+            Maximum pixel distance between connectable components.
+        conncomp_linksize : int
+            Pixels on each side for phase offset estimation. Default 5.
+        conncomp_linkcount : int
+            Max nearest neighbor components to consider. Default 30.
+        device : str
+            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
+        debug : bool
+            Print diagnostic information.
+        **kwargs
+            Additional arguments: max_iter, tol, cg_max_iter, cg_tol, epsilon.
+
+        Returns
+        -------
+        Batch or tuple
+            If conncomp=False: Batch of unwrapped phase.
+            If conncomp=True: tuple of (Batch unwrapped, BatchUnit conncomp).
+
+        Examples
+        --------
+        >>> phase, corr = stack.pairs(baseline.tolist()).phasediff(wavelength=30).angle()
+        >>> unwrapped = phase.unwrap2d()  # Without weights
+        >>> unwrapped = Batches([phase, corr]).unwrap2d()  # With weights
+        """
+        if len(self) < 1:
+            raise ValueError("unwrap2d() requires Batches with at least 1 element: [phase]")
+
+        phase = self[0]
+        weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
+
+        if not isinstance(phase, BatchWrap):
+            raise TypeError(f"First element must be BatchWrap, got {type(phase).__name__}")
+
+        # Delegate to BatchWrap.unwrap2d
+        return phase.unwrap2d(weight=weight, conncomp=conncomp, conncomp_size=conncomp_size,
+                              conncomp_gap=conncomp_gap, conncomp_linksize=conncomp_linksize,
+                              conncomp_linkcount=conncomp_linkcount, device=device,
+                              debug=debug, **kwargs)
+
+    def unwrap1d(self, device='auto', debug=False, **kwargs):
+        """
+        1D temporal phase unwrapping using IRLS optimization.
+
+        Expects Batches with [BatchWrap (phase), BatchUnit (weight, optional)].
+
+        Parameters
+        ----------
+        device : str
+            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
+        debug : bool
+            Print diagnostic information.
+        **kwargs
+            Additional arguments: max_iter, epsilon, batch_size.
+
+        Returns
+        -------
+        Batch
+            Temporally unwrapped phase.
+
+        Examples
+        --------
+        >>> phase, corr = stack.pairs(baseline.tolist()).phasediff(wavelength=30).angle()
+        >>> unwrapped = Batches([phase, corr]).unwrap1d()
+        """
+        if len(self) < 1:
+            raise ValueError("unwrap1d() requires Batches with at least 1 element: [phase]")
+
+        phase = self[0]
+        weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
+
+        if not isinstance(phase, BatchWrap):
+            raise TypeError(f"First element must be BatchWrap, got {type(phase).__name__}")
+
+        # Delegate to BatchWrap.unwrap1d
+        return phase.unwrap1d(weight=weight, device=device, debug=debug, **kwargs)
+
+    def trend2d(self, transform, degree=1, device='auto', debug=False):
+        """
+        Compute 2D polynomial trend (ramp) from phase.
+
+        Expects Batches with [Batch/BatchWrap (phase), BatchUnit (weight, optional)].
+
+        Parameters
+        ----------
+        transform : Batch
+            Coordinate transform from stack.transform() containing 'azi' and 'rng'.
+        degree : int
+            Polynomial degree (1=plane, 2=quadratic). Default 1.
+        device : str
+            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
+        debug : bool
+            Print diagnostic information.
+
+        Returns
+        -------
+        Batch
+            Trend surface.
+
+        Examples
+        --------
+        >>> phase, corr = stack.pairs(baseline.tolist()).phasediff(wavelength=30).angle()
+        >>> trend = Batches([phase, corr]).trend2d(stack.transform())
+        >>> detrended = phase - trend
+        """
+        if len(self) < 1:
+            raise ValueError("trend2d() requires Batches with at least 1 element: [phase]")
+
+        phase = self[0]
+        weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
+
+        if not isinstance(phase, (Batch, BatchWrap)):
+            raise TypeError(f"First element must be Batch or BatchWrap, got {type(phase).__name__}")
+
+        # Delegate to Batch.trend2d
+        return phase.trend2d(transform, weight=weight, degree=degree, device=device, debug=debug)
+
+    def lstsq(self, device='auto', cumsum=True, debug=False):
+        """
+        Weighted least squares network inversion to date-based time series.
+
+        Takes unwrapped pair phases and inverts the network to get per-date
+        accumulated phase. Expects Batches with [Batch (unwrapped phase), BatchUnit (weight, optional)].
+
+        Parameters
+        ----------
+        device : str
+            PyTorch device ('auto', 'cuda', 'mps', 'cpu'). Default 'auto'.
+        cumsum : bool
+            If True (default), return cumulative displacement time series.
+            If False, return incremental phase changes between dates.
+        debug : bool
+            Print debug information.
+
+        Returns
+        -------
+        Batch
+            Phase time series with 'date' dimension instead of 'pair'.
+
+        Examples
+        --------
+        >>> phase, corr = stack.pairs(baseline.tolist()).phasediff(wavelength=30).angle()
+        >>> unwrapped = Batches([phase, corr]).unwrap1d()
+        >>> disp = Batches([unwrapped, corr]).lstsq()
+        """
+        if len(self) < 1:
+            raise ValueError("lstsq() requires Batches with at least 1 element: [data]")
+
+        data = self[0]
+        weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
+
+        # Delegate to Batch.lstsq
+        return data.lstsq(weight=weight, device=device, cumsum=cumsum, debug=debug)
+
+    def regression1d_baseline(self, baseline='BPR', degree=1, wrap=False, iterations=1,
+                               device='auto', debug=False):
+        """
+        Fit 1D polynomial trend along perpendicular baseline at each (y, x) pixel.
+
+        Expects Batches with [Batch/BatchWrap (phase), BatchUnit (weight, optional)].
+
+        Parameters
+        ----------
+        baseline : str
+            Variable name to regress against (default 'BPR' for perpendicular baseline).
+        degree : int
+            Polynomial degree (1=linear, 2=quadratic). Default 1.
+        wrap : bool
+            If True, use circular (sin/cos) fitting for wrapped phase.
+        iterations : int
+            Number of fitting iterations (default 1).
+        device : str
+            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
+        debug : bool
+            Print diagnostic information.
+
+        Returns
+        -------
+        Batch
+            Fitted trend values, same shape as input data.
+
+        Examples
+        --------
+        >>> trend = Batches([intf, corr]).regression1d_baseline()
+        >>> detrended = intf - trend
+        """
+        if len(self) < 1:
+            raise ValueError("regression1d_baseline() requires Batches with at least 1 element: [data]")
+
+        data = self[0]
+        weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
+
+        # Delegate to BatchCore.regression1d_baseline
+        return data.regression1d_baseline(weight=weight, baseline=baseline, degree=degree,
+                                           wrap=wrap, iterations=iterations,
+                                           device=device, debug=debug)
+
+    def regression1d_pairs(self, degree=0, days=None, count=None, wrap=False, iterations=1,
+                            device='auto', debug=False):
+        """
+        Fit 1D polynomial trend along temporal pairs for each date.
+
+        Expects Batches with [Batch/BatchWrap (phase), BatchUnit (weight, optional)].
+
+        Parameters
+        ----------
+        degree : int
+            Polynomial degree (0=mean, 1=linear). Default 0.
+        days : int or None
+            Maximum time interval (in days) to include. Default None (all pairs).
+        count : int or None
+            Maximum number of pairs per date to use. Default None (all pairs).
+        wrap : bool
+            If True, use circular (sin/cos) fitting for wrapped phase.
+        iterations : int
+            Number of fitting iterations (default 1).
+        device : str
+            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
+        debug : bool
+            Print diagnostic information.
+
+        Returns
+        -------
+        Batch
+            Fitted trend values, same shape as input data.
+
+        Examples
+        --------
+        >>> trend = Batches([intf, corr]).regression1d_pairs(degree=0, days=100)
+        >>> detrended = intf - trend
+        """
+        if len(self) < 1:
+            raise ValueError("regression1d_pairs() requires Batches with at least 1 element: [data]")
+
+        data = self[0]
+        weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
+
+        # Delegate to BatchCore.regression1d_pairs
+        return data.regression1d_pairs(weight=weight, degree=degree, days=days, count=count,
+                                        wrap=wrap, iterations=iterations,
+                                        device=device, debug=debug)
+
+    def stl(self, freq='W', periods=52, robust=False):
+        """
+        Perform Seasonal-Trend decomposition using LOESS (STL).
+
+        Expects Batches with [Batch (time series data)]. No weight parameter needed.
+
+        Parameters
+        ----------
+        freq : str
+            Frequency string for resampling (default 'W' for weekly).
+        periods : int
+            Number of periods for seasonal decomposition (default 52).
+        robust : bool
+            Whether to use robust fitting. Default False.
+
+        Returns
+        -------
+        Batch
+            Batch containing 'trend', 'seasonal', and 'resid' variables.
+
+        Examples
+        --------
+        >>> stl_result = Batches([displacement]).stl(freq='W', periods=52)
+        """
+        if len(self) < 1:
+            raise ValueError("stl() requires Batches with at least 1 element: [data]")
+
+        data = self[0]
+
+        # Delegate to Batch.stl
+        return data.stl(freq=freq, periods=periods, robust=robust)
 
     def __getattr__(self, name):
         """Proxy unknown attributes to all batches if they're callable."""
         if name.startswith('_'):
-            raise AttributeError(f"BatchList has no attribute '{name}'")
+            raise AttributeError(f"Batches has no attribute '{name}'")
 
         # Check if all batches have this attribute and it's callable
         attrs = [getattr(b, name, None) for b in self]
         if all(callable(a) for a in attrs if a is not None):
             def method(*args, **kwargs):
                 results = [getattr(b, name)(*args, **kwargs) for b in self]
-                # If results are Batch-like, wrap in BatchList
+                # If results are Batch-like, wrap in Batches
                 if results and hasattr(results[0], 'keys') and callable(results[0].keys):
-                    return BatchList(results)
+                    return Batches(results)
                 return tuple(results)
             return method
 
-        raise AttributeError(f"BatchList has no attribute '{name}'")
+        raise AttributeError(f"Batches has no attribute '{name}'")

@@ -334,16 +334,19 @@ def gaussian_numpy(data_np, weight_np=None, sigma=None, truncate=4.0, threshold=
             del data_aa
             dec_shape = (ny_trim // scale_y, nx_trim // scale_x)
             reshaped = data_trimmed.reshape(dec_shape[0], scale_y, dec_shape[1], scale_x)
-            data_dec = np.einsum('ijkl->ik', reshaped) / (scale_y * scale_x)
+            # In-place division avoids temporary array
+            data_dec = np.einsum('ijkl->ik', reshaped, dtype=data_trimmed.dtype)
             del data_trimmed, reshaped
+            data_dec /= (scale_y * scale_x)
             # 3. Main filter
             result_dec = nanconvolve2d_gaussian_numpy(
                 data_dec, None, sigma=sigma_dec, truncate=truncate, threshold=threshold
             )
             del data_dec
-            # 4. Upsample (np.repeat)
-            result = np.repeat(np.repeat(result_dec, scale_y, axis=0), scale_x, axis=1)
+            # 4. Upsample (np.repeat) - split to allow earlier del
+            result = np.repeat(result_dec, scale_y, axis=0)
             del result_dec
+            result = np.repeat(result, scale_x, axis=1)
             pad_y = original_shape[0] - result.shape[0]
             pad_x = original_shape[1] - result.shape[1]
             if pad_y > 0 or pad_x > 0:

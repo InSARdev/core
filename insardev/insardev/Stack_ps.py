@@ -145,7 +145,9 @@ class Stack_ps(Stack_stl):
         from .Batch import BatchUnit
 
         # Auto-detect device based on Dask cluster resources and hardware
-        device = Stack_ps._get_torch_device(device, debug=debug)
+        # Convert to string once to avoid serialization issues and repeated resolution
+        resolved = Stack_ps._get_torch_device(device, debug=debug)
+        device = resolved.type  # 'cpu', 'cuda', or 'mps' as string
 
         if debug:
             print(f"DEBUG: psfunction using device={device}")
@@ -196,7 +198,7 @@ class Stack_ps(Stack_stl):
             # Use GPU annotation to prevent MPS command buffer conflicts
             # Provide explicit meta to avoid ComplexWarning when dask infers
             # output type from complex input (we intentionally convert to real)
-            with dask.annotate(resources={'gpu': 1} if device.type != 'cpu' else {}):
+            with dask.annotate(resources={'gpu': 1} if device != 'cpu' else {}):
                 psf_da = xr.apply_ufunc(
                     wrapper,
                     slc_data,
@@ -213,29 +215,29 @@ class Stack_ps(Stack_stl):
 
         return BatchUnit(results)
 
-    def plot_psfunction(self, data='auto', caption='PS Function', cmap='gray', quantile=None, vmin=None, vmax=None, **kwargs):
-        import numpy as np
-        import pandas as pd
-        import matplotlib.pyplot as plt
+    # def plot_psfunction(self, data='auto', caption='PS Function', cmap='gray', quantile=None, vmin=None, vmax=None, **kwargs):
+    #     import numpy as np
+    #     import pandas as pd
+    #     import matplotlib.pyplot as plt
 
-        if isinstance(data, str) and data == 'auto':
-            data = self.psfunction()
-        elif 'stack' in data.dims and isinstance(data.coords['stack'].to_index(), pd.MultiIndex):
-            data = data.unstack('stack')
+    #     if isinstance(data, str) and data == 'auto':
+    #         data = self.psfunction()
+    #     elif 'stack' in data.dims and isinstance(data.coords['stack'].to_index(), pd.MultiIndex):
+    #         data = data.unstack('stack')
 
-        if quantile is not None:
-            assert vmin is None and vmax is None, "ERROR: arguments 'quantile' and 'vmin', 'vmax' cannot be used together"
+    #     if quantile is not None:
+    #         assert vmin is None and vmax is None, "ERROR: arguments 'quantile' and 'vmin', 'vmax' cannot be used together"
 
-        if quantile is not None:
-            vmin, vmax = np.nanquantile(data, quantile)
+    #     if quantile is not None:
+    #         vmin, vmax = np.nanquantile(data, quantile)
 
-        plt.figure()
-        data.plot.imshow(cmap=cmap, vmin=vmin, vmax=vmax, interpolation='none')
-        #self.plot_AOI(**kwargs)
-        #self.plot_POI(**kwargs)
-        #plt.xlabel('Range')
-        #plt.ylabel('Azimuth')
-        plt.title(caption)
+    #     plt.figure()
+    #     data.plot.imshow(cmap=cmap, vmin=vmin, vmax=vmax, interpolation='none')
+    #     #self.plot_AOI(**kwargs)
+    #     #self.plot_POI(**kwargs)
+    #     #plt.xlabel('Range')
+    #     #plt.ylabel('Azimuth')
+    #     plt.title(caption)
 
 #     def get_adi_threshold(self, threshold):
 #         """
