@@ -877,11 +877,9 @@ class ASF(progressbar_joblib):
                 print(f"NISAR URL: {url}")
 
             # 5. Setup auth and session for connection reuse
+            # Use ASF session which handles OAuth for Earthdata Cloud
             auth_tuple = (self.username, self.password)
-
-            # Create session for connection pooling (reuses TCP/SSL connections)
-            http_session = requests.Session()
-            http_session.auth = auth_tuple
+            http_session = self._get_asf_session()
 
             # Get file size (HEAD request) and detect layout
             head_resp = http_session.head(url, allow_redirects=True)
