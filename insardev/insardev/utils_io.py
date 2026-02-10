@@ -24,7 +24,8 @@ zarr.config.set({'array.write_empty_chunks': True})
 #     return snapshot(*args, store=store, storage_options=storage_options, compat=compat, interleave=True, n_jobs=n_jobs, debug=debug)
 
 def snapshot(*args, store: str | None = None, storage_options: dict[str, str] | None = None,
-                compat: bool = True, caption: str | None = 'Snapshotting...', n_jobs: int = -1, debug=False):
+                compat: bool = True, caption: str | None = 'Snapshotting...',
+                allow_rechunk: bool = False, n_jobs: int = 1, debug=False):
     """
     Save and open a Zarr store or just open it when no data arguments are provided.
     This function wraps save(...) and open(...) functions.
@@ -44,18 +45,24 @@ def snapshot(*args, store: str | None = None, storage_options: dict[str, str] | 
         If False, only allow a dictionary of datasets. Default is True.
     caption : str, optional
         Caption for the progress bar. Default is 'Snapshotting...'.
+    allow_rechunk : bool, optional
+        If True, rechunk loaded data to optimal chunk sizes based on dask.config['array.chunk-size'].
+        If False (default), rechunk to single spatial chunks (-1 for y,x) for MPS/GPU compatibility.
     n_jobs : int, optional
-        Number of parallel jobs to use for saving. Default is -1 (use all available cores).
+        Number of bursts to process in parallel during save. Default is 1 (sequential).
+        Higher values increase parallelism but also memory usage and file descriptors.
     debug : bool, optional
-        If True, print debug information and use sequential joblib backend. Default is False.
+        If True, print debug information. Default is False.
     """
     # call the function without data arguments to only open existing store
     if len(args) > 0:
         save(*args, store=store, storage_options=storage_options, compat=compat, caption=caption, n_jobs=n_jobs, debug=debug)
-    return open(store=store, storage_options=storage_options, compat=compat, n_jobs=n_jobs, debug=debug)
+    # Always use -1 for open (fast parallel loading)
+    return open(store=store, storage_options=storage_options, compat=compat,
+                allow_rechunk=allow_rechunk, n_jobs=-1, debug=debug)
 
 def save(*args, store, storage_options: dict[str, str] | None = None, compat: bool = True,
-            caption: str | None = 'Saving...', n_jobs: int = -1, debug=False):
+            caption: str | None = 'Saving...', n_jobs: int = 1, debug=False):
     """
     Save multiple xarray.Datasets into one Zarr store, each under its own subgroup.
 
@@ -66,29 +73,35 @@ def save(*args, store, storage_options: dict[str, str] | None = None, compat: bo
         - Individual xarray.Datasets
         - Dictionary of xarray.Datasets
         - List of xarray.Datasets
-    name : str, optional
-        base name for the store directory.
+    store : str or zarr.storage.Store
+        Path to the store directory or a Zarr storage object.
+    storage_options : dict[str, str], optional
+        Storage options for cloud stores.
     compat : bool, optional
         If True, automatically pack datasets saved as a list or a single dataset into a dictionary.
         If False, only allow a dictionary of datasets. Default is True.
-    interleave : bool, optional
-        If True, save two datasets as interleaved variables. Default is False.
     n_jobs : int, optional
-        Number of parallel jobs to use for saving. Default is -1 (use all available cores).
+        Number of bursts to process in parallel. Default is 1 (sequential).
+        Higher values increase parallelism but also memory usage and file descriptors.
+        Interleaved dependent outputs (e.g., phase+conncomp) are always written together
+        to share upstream computation.
     debug : bool, optional
-        If True, print debug information and use sequential backend. Default is False.
+        If True, print debug information. Default is False.
+
     Notes
     -----
-    The empty consolidated metadata created at the start and the groups one at the end.
-    In case the data are not saved correctly, the consolidated metadata is valid but empty.
-    When the data are saved correctly, the consolidated metadata lists groups names but not all groups variables.
+    Uses dask.array.store() to write arrays with shared upstream computation.
+    Interleaved outputs from the same burst are written together to avoid
+    duplicate computation.
     """
     import xarray as xr
     import dask
+    import dask.array as da
+    import numpy as np
     import zarr
     import gc
     from dask.distributed import get_client
-    from insardev_toolkit.progressbar import progressbar
+    from tqdm.auto import tqdm
 
     interleave = len(args) > 1
 
@@ -116,7 +129,7 @@ def save(*args, store, storage_options: dict[str, str] | None = None, compat: bo
                 datas.update(arg)
             else:
                 raise ValueError('Arguments must be xarray.Datasets or dictionaries of xarray.Datasets when compat is True')
-    
+
     # Check if store is a string path or a store object
     is_store_object = not isinstance(store, str)
 
@@ -127,31 +140,98 @@ def save(*args, store, storage_options: dict[str, str] | None = None, compat: bo
         for cls in (type(arg) for arg in args)
     ]
 
-    # Create lazy write tasks for all datasets, then compute together
-    # This allows Dask to share intermediate results while streaming to disk
-    write_tasks = []
+    # Group datasets by burst (keeping interleaved pairs together for shared computation)
+    burst_groups = {}  # burst_id -> [(grp, ds), ...]
     for grp, ds in datas.items():
-        ds_clean = ds.copy()
-        # drop problematic attributes
-        for v in ds_clean.data_vars:
-            ds_clean[v].attrs.pop('grid_mapping', None)
-        # prevent chunks mismatch between variables and coordinates
-        for coord in ds_clean.coords:
-            ds_clean[coord].encoding.pop('chunks', None)
-        if is_store_object:
-            task = ds_clean.to_zarr(store=store, group=grp, mode='a', consolidated=True, zarr_format=3, compute=False)
+        # Extract burst_id (strip i0_/i1_ prefix for interleaved data)
+        if grp.startswith(('i0_', 'i1_')):
+            burst_id = grp.split('_', 1)[1]
         else:
-            task = ds_clean.to_zarr(store=f'{store}/{grp}', mode='w', consolidated=True, zarr_format=3, compute=False)
-        write_tasks.append(task)
+            burst_id = grp
+        burst_groups.setdefault(burst_id, []).append((grp, ds))
 
-    # Compute all writes together - Dask shares intermediate results across bursts
-    progressbar(persisted := dask.persist(*write_tasks), desc=caption.ljust(25))
-    dask.compute(*persisted)  # Wait for completion
+    burst_ids = list(burst_groups.keys())
+    n_bursts = len(burst_ids)
+
+    # Process bursts in batches of n_jobs
+    for batch_start in tqdm(range(0, n_bursts, n_jobs), desc=caption.ljust(25), total=(n_bursts + n_jobs - 1) // n_jobs):
+        batch_burst_ids = burst_ids[batch_start:batch_start + n_jobs]
+
+        # Collect all datasets for this batch
+        batch_datas = {}
+        for burst_id in batch_burst_ids:
+            for grp, ds in burst_groups[burst_id]:
+                batch_datas[grp] = ds
+
+        # Write this batch using dask.array.store() for shared computation
+        sources = []
+        targets = []
+        grp_info = []  # Track (grp, ds, grp_store) for metadata writing
+
+        for grp, ds in batch_datas.items():
+            # Create zarr group for this dataset
+            if is_store_object:
+                grp_path = grp
+                grp_store = store
+            else:
+                grp_path = None
+                grp_store = f'{store}/{grp}'
+
+            # Initialize the group structure
+            ds_grp = zarr.group(store=grp_store, path=grp_path, zarr_format=3, overwrite=True)
+            grp_info.append((grp, ds, grp_store))
+
+            for var_name in ds.data_vars:
+                da_xr = ds[var_name]
+                # Get dimension names for zarr v3 metadata
+                dim_names = list(da_xr.dims)
+                if hasattr(da_xr.data, 'dask'):
+                    # Create zarr array target with proper shape/chunks/dtype and dimension_names
+                    chunks = da_xr.data.chunksize
+                    z = ds_grp.create_array(
+                        var_name,
+                        shape=da_xr.shape,
+                        chunks=chunks,
+                        dtype=da_xr.dtype,
+                        dimension_names=dim_names,
+                        overwrite=True
+                    )
+                    sources.append(da_xr.data)
+                    targets.append(z)
+                else:
+                    # Non-dask array - write directly with dimension_names
+                    ds_grp.create_array(
+                        var_name,
+                        data=np.asarray(da_xr.data),
+                        chunks=da_xr.shape,
+                        dtype=da_xr.dtype,
+                        dimension_names=dim_names,
+                        overwrite=True
+                    )
+
+        # Store all dask arrays in this batch together - shares upstream computation
+        if sources:
+            da.store(sources, targets, lock=False)
+
+        # Write xarray metadata (coords, attrs) AFTER data is written
+        for grp, ds, grp_store in grp_info:
+            ds_clean = ds.copy()
+            for v in list(ds_clean.data_vars):
+                ds_clean = ds_clean.drop_vars(v)
+            for coord in ds_clean.coords:
+                ds_clean[coord].encoding.pop('chunks', None)
+            if is_store_object:
+                ds_clean.to_zarr(store=store, group=grp, mode='a', consolidated=True, zarr_format=3)
+            else:
+                ds_clean.to_zarr(store=grp_store, mode='a', consolidated=True, zarr_format=3)
+
+        # Clear memory after each batch
+        del sources, targets, batch_datas, grp_info
+        gc.collect()
 
     # consolidate metadata for the groups in the store
     zarr.consolidate_metadata(store, zarr_format=3)
-    del datas
-    # clear memory
+    del datas, burst_groups
     gc.collect()
     try:
         client = get_client()
@@ -160,7 +240,7 @@ def save(*args, store, storage_options: dict[str, str] | None = None, compat: bo
         pass
 
 def open(store: str, storage_options: dict[str, str] | None = None, compat: bool = True,
-            caption: str | None = 'Opening...', n_jobs: int = -1, debug=False):
+            caption: str | None = 'Opening...', allow_rechunk: bool = False, n_jobs: int = -1, debug=False):
     """
     Load a Zarr store created by save(...).
 
@@ -173,8 +253,9 @@ def open(store: str, storage_options: dict[str, str] | None = None, compat: bool
     compat : bool, optional
         If True, automatically unpack datasets saved as a list or a single dataset.
         If False, return a dictionary of datasets. Default is True.
-    interleave : bool, optional
-        If True, return two dictionaries of datasets saved as interleaved variables. Default is False.
+    allow_rechunk : bool, optional
+        If True, rechunk to optimal chunk sizes based on dask.config['array.chunk-size'].
+        If False (default), rechunk to single spatial chunks (-1 for y,x) for MPS/GPU compatibility.
     n_jobs : int, optional
         Number of parallel jobs to use for opening. Default is -1 (use all available cores).
     debug : bool, optional
@@ -182,14 +263,16 @@ def open(store: str, storage_options: dict[str, str] | None = None, compat: bool
 
     Returns
     -------
-    Stack
+    Stack or Batch or Batches
     """
     import os
+    import dask
     import zarr
     import xarray as xr
     import joblib
     from tqdm.auto import tqdm
     from pydoc import locate
+    from .utils_dask import rechunk2d
 
     # Check if store is a string path or a store object
     is_store_object = not isinstance(store, str)
@@ -197,18 +280,17 @@ def open(store: str, storage_options: dict[str, str] | None = None, compat: bool
     root = zarr.open_consolidated(store, storage_options=storage_options, zarr_format=3, mode='r')
     classes = [locate(c) for c in root.attrs.get('__class__')]
     interleave = len(classes) > 1
-    #print('classes', classes)
     groups = list(root.group_keys())
-    #print(len(groups))
 
     joblib_backend = 'sequential' if debug else 'threading'
 
     def _load_grp(grp):
         import rioxarray
+        # Use consolidated=False for subgroups - they share root's consolidated metadata
         if is_store_object:
-            ds = xr.open_zarr(store, group=grp, storage_options=storage_options, consolidated=True, zarr_format=3)
+            ds = xr.open_zarr(store, group=grp, storage_options=storage_options, consolidated=False, zarr_format=3)
         else:
-            ds = xr.open_zarr(f'{store}/{grp}', storage_options=storage_options, consolidated=True, zarr_format=3)
+            ds = xr.open_zarr(f'{store}/{grp}', storage_options=storage_options, consolidated=False, zarr_format=3)
         # restore rioxarray CRS from spatial_ref coordinate/variable if present
         if ds.rio.crs is None:
             # check both coords and data_vars for spatial_ref
@@ -223,16 +305,55 @@ def open(store: str, storage_options: dict[str, str] | None = None, compat: bool
                 if crs_wkt:
                     ds = ds.rio.write_crs(crs_wkt)
         return grp, ds
+
     with progressbar_joblib.progressbar_joblib(tqdm(desc=caption.ljust(25), total=len(groups))) as progress_bar:
         results = joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(_load_grp) (grp) for grp in groups)
     dss = dict(results)
     del results
 
+    # Apply rechunking based on allow_rechunk setting
+    # allow_rechunk=True: rechunk to dask config size (for efficient processing)
+    # allow_rechunk=False: rechunk to single spatial chunks (for MPS/GPU compatibility)
+    for key, ds in dss.items():
+        rechunked_vars = {}
+        for var_name in ds.data_vars:
+            arr = ds[var_name]
+            if not (arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x')):
+                continue
+
+            if allow_rechunk:
+                # Rechunk to dask config size
+                y_size, x_size = arr.shape[-2], arr.shape[-1]
+                element_bytes = arr.dtype.itemsize
+                optimal = rechunk2d((y_size, x_size), element_bytes)
+                if arr.ndim == 3:
+                    chunks = {arr.dims[0]: 1, 'y': optimal['y'], 'x': optimal['x']}
+                else:
+                    chunks = optimal
+            else:
+                # Single spatial chunk for MPS/GPU compatibility
+                if arr.ndim == 3:
+                    chunks = {arr.dims[0]: 1, 'y': -1, 'x': -1}
+                else:
+                    chunks = {'y': -1, 'x': -1}
+
+            rechunked_vars[var_name] = arr.chunk(chunks)
+        if rechunked_vars:
+            dss[key] = ds.assign(rechunked_vars)
+
+    if debug:
+        if allow_rechunk:
+            dask_chunk_mb = int(dask.config.get('array.chunk-size', '128 MiB').replace(' MiB', '').replace(' MB', ''))
+            print(f"NOTE open: rechunking to dask.config['array.chunk-size']={dask_chunk_mb} MB")
+        else:
+            print(f"NOTE open: using single spatial chunk (allow_rechunk=False)")
+
     if interleave:
-        # unpack interleaved datasets
+        # unpack interleaved datasets and return as Batches for chaining
+        from .Batch import Batches
         dss0 = {k[len('i0_'):]: v for k, v in dss.items() if k.startswith('i0_')}
         dss1 = {k[len('i1_'):]: v for k, v in dss.items() if k.startswith('i1_')}
-        return classes[0](dss0), classes[1](dss1)
+        return Batches((classes[0](dss0), classes[1](dss1)))
     elif compat and len(dss) == 1 and 'default' in dss:
         # unpack single dataset
         return dss['default']

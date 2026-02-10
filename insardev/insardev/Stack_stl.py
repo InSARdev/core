@@ -49,10 +49,14 @@ class Stack_stl(Stack_sbas):
         statsmodels.tsa.seasonal.STL : Seasonal-Trend decomposition using LOESS
         """
         import xarray as xr
+        from .BatchCore import BatchCore
 
         # Validate input
         if not isinstance(data, dict):
             raise TypeError(f"data must be a Batch, got {type(data).__name__}")
+
+        # Validate lazy data
+        BatchCore._require_lazy(data, 'stl')
 
         sample_ds = next(iter(data.values()))
         if 'date' not in sample_ds.dims:
@@ -147,12 +151,13 @@ class Stack_stl(Stack_sbas):
         n_dates_out = len(dt_periodic)
         n_dates_in = data.date.size
 
-        # Use dask auto-chunking for y,x based on memory
+        # Use rechunk2d for uniform chunk sizes based on memory
         # Multiplier accounts for STL internal memory (trend, seasonal, resid, weights, etc.)
-        auto_chunks = dask.array.core.normalize_chunks(
-            'auto', (8 * n_dates_in, data.y.size, data.x.size), dtype=np.complex128
-        )
-        chunks_y, chunks_x = auto_chunks[1][0], auto_chunks[2][0]
+        # Effective memory: 8 * n_dates_in * 16 bytes (complex128) per pixel
+        from .utils_dask import rechunk2d
+        mem_per_pixel = 8 * n_dates_in * 16  # complex128 = 16 bytes
+        optimal = rechunk2d((data.y.size, data.x.size), element_bytes=mem_per_pixel)
+        chunks_y, chunks_x = optimal['y'], optimal['x']
 
         # Rechunk: all dates together (-1), auto-chunked y,x
         first_dim = data.dims[0]
@@ -189,9 +194,9 @@ class Stack_stl(Stack_sbas):
         keys_vars = {}
         for varidx, varname in enumerate(varnames):
             var_data = models[varidx]
-            # Rechunk to (1, -1, -1) for efficient per-slice downstream operations (e.g., plot)
+            # Rechunk to date=1 for efficient per-slice downstream operations (preserve spatial chunks)
             if hasattr(var_data, 'rechunk'):
-                var_data = var_data.rechunk({0: 1, 1: -1, 2: -1})
+                var_data = var_data.rechunk({0: 1})
             keys_vars[varname] = xr.DataArray(var_data, coords=coords)
         model = xr.Dataset({**keys_vars})
         del models

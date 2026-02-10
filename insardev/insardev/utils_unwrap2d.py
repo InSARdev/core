@@ -15,9 +15,64 @@ These functions contain the core algorithms for 2D phase unwrapping,
 component detection, and component linking.
 """
 import numpy as np
+import numba as nb
 
 # 4-connectivity structure for scipy.ndimage.label (no diagonals)
 STRUCTURE_4CONN = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
+
+
+@nb.njit(parallel=False, cache=True)
+def _accum_sincos_count(labeled_flat, phase_flat, unwrapped_flat, n_labels):
+    """
+    Single-pass accumulation of sin/cos sums and pixel counts per component.
+
+    ~6x faster than separate np.bincount calls because:
+    - Single pass over data (better cache locality)
+    - sin/cos computed inline (no intermediate arrays)
+    - Counts computed simultaneously (replaces cv2.connectedComponentsWithStats)
+
+    Parameters
+    ----------
+    labeled_flat : np.ndarray (int32)
+        Flattened label array from cv2.connectedComponents.
+        Label 0 = invalid pixels, labels 1..n_labels-1 = valid components.
+    phase_flat : np.ndarray (float32)
+        Flattened input (wrapped) phase array.
+    unwrapped_flat : np.ndarray (float32)
+        Flattened unwrapped phase array.
+    n_labels : int
+        Number of labels including background (0).
+
+    Returns
+    -------
+    sin_in, cos_in, sin_out, cos_out, counts : tuple of np.ndarray
+        Accumulated sin/cos sums (float64) and pixel counts (int64) per label.
+    """
+    sin_in = np.zeros(n_labels, np.float64)
+    cos_in = np.zeros(n_labels, np.float64)
+    sin_out = np.zeros(n_labels, np.float64)
+    cos_out = np.zeros(n_labels, np.float64)
+    counts = np.zeros(n_labels, np.int64)
+    for i in range(labeled_flat.size):
+        k = labeled_flat[i]
+        if k > 0:  # Skip invalid pixels (label 0)
+            p_in = phase_flat[i]
+            p_out = unwrapped_flat[i]
+            sin_in[k] += np.sin(p_in)
+            cos_in[k] += np.cos(p_in)
+            sin_out[k] += np.sin(p_out)
+            cos_out[k] += np.cos(p_out)
+            counts[k] += 1
+    return sin_in, cos_in, sin_out, cos_out, counts
+
+
+@nb.njit(parallel=False, cache=True)
+def _apply_adjustment(unwrapped_flat, labeled_flat, adjustment):
+    """Apply per-component adjustment to unwrapped phase (in-place)."""
+    for i in range(labeled_flat.size):
+        k = labeled_flat[i]
+        if k > 0:
+            unwrapped_flat[i] += adjustment[k]
 
 
 def get_connected_components(valid_mask_2d, min_size=4):
@@ -135,6 +190,326 @@ def line_crosses_mask(p1, p2, mask):
                 return True
 
     return False
+
+
+def find_component_connections_fast(labeled_array, phase, components,
+                                     conncomp_gap=None, max_neighbors=30, n_neighbors=5):
+    """
+    Find connections between components using vectorized boundaries and STRtree.
+
+    Uses OpenCV contours to vectorize components, extracts boundaries (not polygons),
+    and uses Shapely STRtree for efficient spatial queries.
+
+    Parameters
+    ----------
+    labeled_array : np.ndarray
+        2D int32 array with component labels (0=invalid, 1+=components).
+    phase : np.ndarray
+        2D float32 array of unwrapped phase.
+    components : list of dict
+        Component info with 'label', 'size', 'slices' (from get_connected_components).
+    conncomp_gap : int or None
+        Maximum gap in pixels. None = unlimited.
+    max_neighbors : int
+        Maximum connections per component.
+    n_neighbors : int
+        Window size for phase offset estimation (n_neighbors x n_neighbors).
+
+    Returns
+    -------
+    list of tuple
+        (comp_i, comp_j, closest_i, closest_j, distance, k_offset, confidence)
+    """
+    import cv2
+    from shapely.geometry import Polygon, LinearRing, LineString, box
+    from shapely import make_valid
+    from shapely.strtree import STRtree
+    from shapely.ops import nearest_points
+
+    n_comps = len(components)
+    if n_comps < 2:
+        return []
+
+    shape = labeled_array.shape
+
+    # Step 1: Vectorize components and extract BOUNDARIES (not polygons)
+    boundary_list = []  # List of boundary geometries (LinearRing or MultiLineString)
+    boundary_to_comp = []  # Map boundary index to component index
+
+    for comp_idx, comp in enumerate(components):
+        sl = comp['slices']
+        label = comp['label']
+
+        sub_labeled = labeled_array[sl]
+        comp_mask = (sub_labeled == label).astype(np.uint8)
+
+        # Get ALL contours (external and holes)
+        contours, hierarchy = cv2.findContours(comp_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+        for contour in contours:
+            if len(contour) >= 3:
+                pts = contour.squeeze()
+                if pts.ndim == 2 and len(pts) >= 3:
+                    pts = pts + np.array([sl[1].start, sl[0].start])
+                    try:
+                        poly = Polygon(pts)
+                        if not poly.is_valid:
+                            poly = make_valid(poly)
+                        # Extract boundaries from valid polygon/multipolygon
+                        if poly.geom_type == 'Polygon':
+                            if poly.boundary.length > 0:
+                                boundary_list.append(poly.boundary)
+                                boundary_to_comp.append(comp_idx)
+                        elif poly.geom_type == 'MultiPolygon':
+                            for g in poly.geoms:
+                                if g.boundary.length > 0:
+                                    boundary_list.append(g.boundary)
+                                    boundary_to_comp.append(comp_idx)
+                        elif poly.geom_type == 'GeometryCollection':
+                            for g in poly.geoms:
+                                if hasattr(g, 'boundary') and g.boundary.length > 0:
+                                    boundary_list.append(g.boundary)
+                                    boundary_to_comp.append(comp_idx)
+                    except Exception:
+                        pass
+
+    n_boundaries = len(boundary_list)
+    if n_boundaries < 2:
+        return []
+
+    # Step 2: Build STRtree of boundaries
+    strtree = STRtree(boundary_list)
+    centroids = [b.centroid for b in boundary_list]
+
+    # Step 3: Build polygon-level STRtree for efficient component neighbor search
+    # Group boundaries by component and build per-component structures
+    comp_polygons = []  # One polygon per component (union of all boundaries)
+    comp_boundary_trees = []  # STRtree of boundaries for each component
+    comp_boundary_lists = []  # List of boundary indices for each component
+
+    for comp_idx in range(n_comps):
+        # Get all boundaries for this component
+        comp_boundaries = [i for i, c in enumerate(boundary_to_comp) if c == comp_idx]
+        comp_boundary_lists.append(comp_boundaries)
+
+        # Build boundary STRtree for this component
+        if comp_boundaries:
+            comp_geoms = [boundary_list[i] for i in comp_boundaries]
+            comp_boundary_trees.append(STRtree(comp_geoms))
+        else:
+            comp_boundary_trees.append(None)
+
+        # Create component polygon (convex hull of all boundaries for bbox search)
+        if comp_boundaries:
+            from shapely.ops import unary_union
+            all_bounds = unary_union([boundary_list[i] for i in comp_boundaries])
+            comp_polygons.append(all_bounds.convex_hull)
+        else:
+            comp_polygons.append(None)
+
+    # Build polygon-level STRtree (one entry per component)
+    valid_comp_indices = [i for i in range(n_comps) if comp_polygons[i] is not None]
+    valid_comp_polys = [comp_polygons[i] for i in valid_comp_indices]
+    poly_strtree = STRtree(valid_comp_polys)
+
+    # Step 4: For each component, find nearest neighbor components using polygon tree
+    candidate_pairs = set()
+
+    for comp_i in range(n_comps):
+        if comp_polygons[comp_i] is None:
+            continue
+
+        # Query polygon tree for nearest components
+        poly_i = comp_polygons[comp_i]
+        # Get all components sorted by distance
+        all_indices = poly_strtree.query(poly_i.buffer(max(shape[0], shape[1])))
+        neighbors_with_dist = []
+        for idx in all_indices:
+            comp_j = valid_comp_indices[idx]
+            if comp_j != comp_i:
+                d = poly_i.distance(comp_polygons[comp_j])
+                neighbors_with_dist.append((comp_j, d))
+
+        neighbors_with_dist.sort(key=lambda x: x[1])
+
+        # Take max_neighbors nearest components
+        for comp_j, _ in neighbors_with_dist[:max_neighbors]:
+            # Find nearest boundary pair between comp_i and comp_j
+            if not comp_boundary_lists[comp_i] or not comp_boundary_lists[comp_j]:
+                continue
+
+            # Use boundary trees to find closest pair
+            best_pair = None
+            best_dist = float('inf')
+
+            for bi in comp_boundary_lists[comp_i]:
+                boundary_i = boundary_list[bi]
+                # Query comp_j's boundary tree for nearest
+                if comp_boundary_trees[comp_j] is not None:
+                    nearest_idx = comp_boundary_trees[comp_j].nearest(boundary_i)
+                    bj = comp_boundary_lists[comp_j][nearest_idx]
+                    d = boundary_i.distance(boundary_list[bj])
+                    if d < best_dist:
+                        best_dist = d
+                        best_pair = (bi, bj)
+
+            if best_pair:
+                candidate_pairs.add((min(best_pair), max(best_pair)))
+
+    # Step 5: Compute nearest_points and filter by polygon intersection
+    valid_pairs = []
+
+    for i, j in candidate_pairs:
+        try:
+            p1, p2 = nearest_points(boundary_list[i], boundary_list[j])
+            dist = p1.distance(p2)
+
+            if conncomp_gap is not None and dist > conncomp_gap:
+                continue
+
+            line = LineString([p1, p2])
+
+            # Check intersection with other component polygons (not boundaries)
+            intersecting = poly_strtree.query(line, predicate='intersects')
+            # Filter to components other than i or j's component
+            comp_i = boundary_to_comp[i]
+            comp_j = boundary_to_comp[j]
+            # Convert poly_strtree indices to component indices
+            blocking = [valid_comp_indices[k] for k in intersecting
+                       if valid_comp_indices[k] != comp_i and valid_comp_indices[k] != comp_j]
+
+            if len(blocking) == 0:
+                valid_pairs.append((i, j, dist, p1, p2))
+        except Exception:
+            pass
+
+    # Sort by distance
+    valid_pairs.sort(key=lambda x: x[2])
+
+    # Step 5: Apply max_neighbors limit and compute phase offsets
+    connections = []
+    conn_count = {i: 0 for i in range(n_comps)}
+    half = n_neighbors // 2
+
+    for i, j, dist, p1, p2 in valid_pairs:
+        comp_i = boundary_to_comp[i]
+        comp_j = boundary_to_comp[j]
+
+        if conn_count[comp_i] >= max_neighbors or conn_count[comp_j] >= max_neighbors:
+            continue
+
+        label_i = components[comp_i]['label']
+        label_j = components[comp_j]['label']
+
+        # Connection points (shapely x,y = col,row)
+        cx1, cy1 = int(round(p1.x)), int(round(p1.y))
+        cx2, cy2 = int(round(p2.x)), int(round(p2.y))
+        p_i = (cy1, cx1)
+        p_j = (cy2, cx2)
+
+        # Estimate phase offset using square windows filtered by component label
+        y0, y1 = max(0, cy1-half), min(shape[0], cy1+half+1)
+        x0, x1 = max(0, cx1-half), min(shape[1], cx1+half+1)
+        window_phase_i = phase[y0:y1, x0:x1]
+        window_label_i = labeled_array[y0:y1, x0:x1]
+        vals_i = window_phase_i[window_label_i == label_i]
+
+        y0, y1 = max(0, cy2-half), min(shape[0], cy2+half+1)
+        x0, x1 = max(0, cx2-half), min(shape[1], cx2+half+1)
+        window_phase_j = phase[y0:y1, x0:x1]
+        window_label_j = labeled_array[y0:y1, x0:x1]
+        vals_j = window_phase_j[window_label_j == label_j]
+
+        if len(vals_i) == 0 or len(vals_j) == 0:
+            continue
+
+        mean_i = np.nanmean(vals_i)
+        mean_j = np.nanmean(vals_j)
+
+        if np.isnan(mean_i) or np.isnan(mean_j):
+            continue
+
+        # Compute phase offset
+        delta = mean_i - mean_j
+        k_offset = int(np.round(delta / (2 * np.pi)))
+
+        # Confidence based on fractional part
+        fractional = (delta / (2 * np.pi)) - k_offset
+        confidence = max(0, 1.0 - 2 * abs(fractional))
+
+        connections.append((comp_i, comp_j, p_i, p_j, dist, k_offset, confidence, delta))
+        conn_count[comp_i] += 1
+        conn_count[comp_j] += 1
+
+    return connections
+
+
+def _line_crosses_other_labels(labeled_array, p1, p2, label1, label2):
+    """Check if line from p1 to p2 crosses labels other than label1/label2."""
+    r1, c1 = p1
+    r2, c2 = p2
+    dr, dc = r2 - r1, c2 - c1
+    n_steps = max(abs(dr), abs(dc), 1)
+
+    for step in range(1, n_steps):
+        t = step / n_steps
+        r = int(round(r1 + t * dr))
+        c = int(round(c1 + t * dc))
+
+        label_at = labeled_array[r, c]
+        if label_at > 0 and label_at != label1 and label_at != label2:
+            return True
+    return False
+
+
+def _estimate_offset_fast(phase, labeled_array, label_i, label_j, p_i, p_j, n_neighbors=5):
+    """Estimate phase offset between components at connection point."""
+    # Sample pixels near connection point
+    r_i, c_i = p_i
+    r_j, c_j = p_j
+
+    # Search window around connection points
+    window = max(n_neighbors * 2, 10)
+
+    # Get nearby pixels from component i
+    r_min_i = max(0, r_i - window)
+    r_max_i = min(labeled_array.shape[0], r_i + window + 1)
+    c_min_i = max(0, c_i - window)
+    c_max_i = min(labeled_array.shape[1], c_i + window + 1)
+
+    sub_label_i = labeled_array[r_min_i:r_max_i, c_min_i:c_max_i]
+    sub_phase_i = phase[r_min_i:r_max_i, c_min_i:c_max_i]
+    mask_i = (sub_label_i == label_i) & ~np.isnan(sub_phase_i)
+
+    # Get nearby pixels from component j
+    r_min_j = max(0, r_j - window)
+    r_max_j = min(labeled_array.shape[0], r_j + window + 1)
+    c_min_j = max(0, c_j - window)
+    c_max_j = min(labeled_array.shape[1], c_j + window + 1)
+
+    sub_label_j = labeled_array[r_min_j:r_max_j, c_min_j:c_max_j]
+    sub_phase_j = phase[r_min_j:r_max_j, c_min_j:c_max_j]
+    mask_j = (sub_label_j == label_j) & ~np.isnan(sub_phase_j)
+
+    if mask_i.sum() < 3 or mask_j.sum() < 3:
+        return 0, 0.0
+
+    # Get phase values
+    phase_vals_i = sub_phase_i[mask_i]
+    phase_vals_j = sub_phase_j[mask_j]
+
+    # Use median for robustness
+    median_i = np.median(phase_vals_i[:n_neighbors] if len(phase_vals_i) > n_neighbors else phase_vals_i)
+    median_j = np.median(phase_vals_j[:n_neighbors] if len(phase_vals_j) > n_neighbors else phase_vals_j)
+
+    delta = median_i - median_j
+    k_offset = int(np.round(delta / (2 * np.pi)))
+
+    # Confidence based on fractional part
+    fractional = (delta / (2 * np.pi)) - k_offset
+    confidence = 1.0 - 2 * abs(fractional)
+
+    return k_offset, max(0, confidence)
 
 
 def find_component_connections(components, conncomp_gap=None, max_neighbors=30):
@@ -508,6 +883,163 @@ def connect_components_ilp(unwrapped, components, connections, n_neighbors=5, ma
     return result
 
 
+def connect_components_ilp_fast(unwrapped, labeled_array, components, connections, max_time=60.0, debug=False):
+    """
+    Connect components using ILP optimization with labeled array (memory efficient).
+
+    Parameters
+    ----------
+    unwrapped : np.ndarray
+        2D array with separately unwrapped components.
+    labeled_array : np.ndarray
+        2D int32 array with component labels (0=invalid, 1+=components).
+    components : list of dict
+        Component info with 'label', 'size', 'slices' from get_connected_components.
+    connections : list of tuple
+        Output from find_component_connections_fast:
+        (comp_i, comp_j, p_i, p_j, distance, k_offset, confidence)
+    max_time : float, optional
+        Maximum solver time in seconds. Default is 60.
+    debug : bool, optional
+        If True, print diagnostic information.
+
+    Returns
+    -------
+    np.ndarray
+        2D array with connected unwrapped phase.
+    """
+    from ortools.sat.python import cp_model
+
+    n_comps = len(components)
+    if n_comps < 2 or len(connections) == 0:
+        return unwrapped.copy()
+
+    # Extract edge data from connections (already computed by find_component_connections_fast)
+    # Weight by sqrt of component sizes so large components anchor small ones
+    edge_data = []
+    for conn in connections:
+        comp_i, comp_j, p_i, p_j, distance, k_offset, confidence, delta = conn
+        # Size weight: sqrt of minimum size ensures small components align to large ones
+        size_i = components[comp_i]['size']
+        size_j = components[comp_j]['size']
+        size_weight = np.sqrt(min(size_i, size_j))
+        # Use sqrt(distance) for gentler decay - raw distance is too aggressive
+        weight = confidence * size_weight / (np.sqrt(distance) + 1.0)
+        edge_data.append((comp_i, comp_j, k_offset, weight))
+
+        if debug:
+            print(f'  Connection {comp_i}-{comp_j}: dist={distance:.1f}, '
+                  f'delta={delta:.3f}, k_offset={k_offset}, confidence={confidence:.3f}, '
+                  f'sizes=({size_i}, {size_j})')
+
+    # Build ILP model
+    model = cp_model.CpModel()
+
+    # Variables: k_i = integer offset for component i
+    k_vars = [model.NewIntVar(-100, 100, f'k_{i}') for i in range(n_comps)]
+
+    # Fix component 0 as reference (largest component)
+    model.Add(k_vars[0] == 0)
+
+    # Objective: minimize weighted sum of |(k_i - k_j) - k_offset|
+    # k_offset = round((phase_j - phase_i) / (2π)), so we want k_i - k_j = k_offset
+    scale = 1000
+    abs_vars = []
+
+    for idx, (comp_i, comp_j, k_offset, weight) in enumerate(edge_data):
+        diff_var = model.NewIntVar(-200, 200, f'diff_{idx}')
+        # diff = (k_i - k_j) - k_offset, should be 0 for perfect alignment
+        model.Add(diff_var == k_vars[comp_i] - k_vars[comp_j] - k_offset)
+
+        abs_var = model.NewIntVar(0, 200, f'abs_{idx}')
+        model.AddAbsEquality(abs_var, diff_var)
+
+        abs_vars.append((abs_var, int(weight * scale)))
+
+    model.Minimize(sum(w * v for v, w in abs_vars))
+
+    # Solve
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = max_time
+
+    status = solver.Solve(model)
+
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        if debug:
+            print(f'  ILP solver failed with status {status}')
+        return unwrapped.copy()
+
+    # Extract solution
+    k_offsets = [solver.Value(k_vars[i]) for i in range(n_comps)]
+
+    # Find components reachable from reference (component 0) using BFS
+    from collections import deque
+    adj = {i: set() for i in range(n_comps)}
+    for comp_i, comp_j, k_offset, weight in edge_data:
+        adj[comp_i].add(comp_j)
+        adj[comp_j].add(comp_i)
+
+    # Debug: check which components have any connections
+    if debug:
+        connected_comps = set()
+        for comp_i, comp_j, k_offset, weight in edge_data:
+            connected_comps.add(comp_i)
+            connected_comps.add(comp_j)
+        no_connections = [i for i in range(n_comps) if i not in connected_comps]
+        print(f'  Components with connections: {len(connected_comps)}/{n_comps}')
+        if no_connections:
+            print(f'  Components with NO connections: {no_connections}')
+
+    reachable = set([0])
+    queue = deque([0])
+    while queue:
+        node = queue.popleft()
+        for neighbor in adj[node]:
+            if neighbor not in reachable:
+                reachable.add(neighbor)
+                queue.append(neighbor)
+
+    # Set k=0 for unreachable components (they have no constraint, solver picks boundary)
+    for i in range(n_comps):
+        if i not in reachable:
+            k_offsets[i] = 0
+
+    if debug:
+        n_unreachable = n_comps - len(reachable)
+        print(f'  Reachable from comp 0: {len(reachable)}/{n_comps}')
+        if n_unreachable > 0:
+            unreachable = [i for i in range(n_comps) if i not in reachable]
+            print(f'  Unreachable components: {unreachable[:20]}{"..." if len(unreachable) > 20 else ""}')
+
+    # Apply offsets using labeled_array (memory efficient - no boolean masks)
+    result = unwrapped.copy()
+    n_adjusted = 0
+    for i, comp in enumerate(components):
+        if k_offsets[i] != 0:
+            label = comp['label']
+            result[labeled_array == label] += k_offsets[i] * 2 * np.pi
+            n_adjusted += 1
+
+    if debug:
+        # Summary of k_offsets applied
+        nonzero_k = [(i, k_offsets[i]) for i in range(n_comps) if k_offsets[i] != 0]
+        print(f'  Applied 2π offsets to {n_adjusted}/{n_comps} components')
+        if nonzero_k:
+            # Show first 10 offsets
+            for i, k in nonzero_k[:10]:
+                print(f'    comp {i}: k={k:+d} ({k*2*np.pi:+.2f} rad)')
+            if len(nonzero_k) > 10:
+                print(f'    ... and {len(nonzero_k)-10} more')
+        # Show histogram of k values
+        k_values = [k for _, k in nonzero_k]
+        if k_values:
+            from collections import Counter
+            k_counts = Counter(k_values)
+            print(f'  k value distribution: {dict(sorted(k_counts.items()))}')
+
+    return result
+
+
 def conncomp_2d(phase):
     """
     Compute connected components for a 2D phase array.
@@ -548,7 +1080,7 @@ def wrapped_gradient(phase):
 
 
 def irls_unwrap_2d(phase, weight=None, device='auto', max_iter=50, tol=1e-3,
-                   cg_max_iter=20, cg_tol=1e-4, epsilon=1e-2, debug=False):
+                   cg_max_iter=20, cg_tol=1e-4, epsilon=1e-2, conncomp_size=30, debug=False):
     """
     Unwrap 2D phase using GPU/TPU-accelerated Iteratively Reweighted Least Squares (L¹ norm).
 
@@ -579,13 +1111,17 @@ def irls_unwrap_2d(phase, weight=None, device='auto', max_iter=50, tol=1e-3,
         Conjugate gradient convergence tolerance. Default is 1e-4.
     epsilon : float, optional
         Smoothing parameter for L¹ approximation. Default is 1e-2.
+    conncomp_size : int, optional
+        Minimum connected component size in pixels. Components smaller than this
+        are marked invalid (label 0). Default is 30. Set to 1 to keep all components.
     debug : bool, optional
         If True, print convergence information. Default is False.
 
     Returns
     -------
-    np.ndarray
-        2D array of unwrapped phase values.
+    tuple of (np.ndarray, np.ndarray)
+        - unwrapped: 2D float32 array of unwrapped phase values
+        - conncomp: 2D uint16 array of component labels (0=invalid, 1=largest, 2=second, ...)
 
     Notes
     -----
@@ -609,38 +1145,72 @@ def irls_unwrap_2d(phase, weight=None, device='auto', max_iter=50, tol=1e-3,
     >>> irls_unwrap_2d(phase, weight, max_iter=20, tol=1e-2)
     """
     import torch
-    from torch_dct import dct_2d, idct_2d
     import time
     from .BatchCore import BatchCore
 
-    # Validate and set device using shared helper
+    # Validate input is 2D
+    if debug:
+        print(f"DEBUG irls_unwrap_2d: input phase.shape={phase.shape}, weight.shape={weight.shape if weight is not None else None}")
+    if phase.ndim != 2:
+        raise ValueError(f"irls_unwrap_2d expects 2D phase array, got shape {phase.shape}")
+
+    # Validate and set device
     if isinstance(device, str):
         if device == 'tpu':
             # TPU uses torch_xla device
             import torch_xla.core.xla_model as xm
             device = xm.xla_device()
-        else:
+        elif device == 'auto':
+            # Only call helper for auto-detection (respects Dask cluster resources)
             device = BatchCore._get_torch_device(device, debug=debug)
+        else:
+            # Explicit device ('cpu', 'cuda', 'mps') - use directly without re-detection
+            if debug:
+                print(f"DEBUG: using device={device}")
+            device = torch.device(device)
 
     device_name = str(device)
-    height, width = phase.shape
+    device_type = device.type if hasattr(device, 'type') else str(device).split(':')[0]
 
     # Use float32 for all devices - sufficient for phase unwrapping
     dtype = torch.float32
     np_dtype = np.float32
 
     _t_start = time.time()
+    original_shape = phase.shape
 
     # Handle NaN values
     nan_mask = np.isnan(phase)
     if np.all(nan_mask):
-        return np.full_like(phase, np.nan)
+        return np.full_like(phase, np.nan), np.zeros(phase.shape, dtype=np.uint16)
+
+    # Find bounding box of valid pixels efficiently (only creates small 1D arrays)
+    valid_rows = np.any(~nan_mask, axis=1)  # shape: (height,)
+    valid_cols = np.any(~nan_mask, axis=0)  # shape: (width,)
+    r0, r1 = np.argmax(valid_rows), len(valid_rows) - np.argmax(valid_rows[::-1])
+    c0, c1 = np.argmax(valid_cols), len(valid_cols) - np.argmax(valid_cols[::-1])
+    del valid_rows, valid_cols
+
+    # Crop to bounding box if it saves significant space
+    crop_applied = False
+    if (r1 - r0) < phase.shape[0] or (c1 - c0) < phase.shape[1]:
+        crop_applied = True
+        phase = phase[r0:r1, c0:c1]  # view, no copy yet
+        nan_mask = nan_mask[r0:r1, c0:c1]  # view
+        if weight is not None:
+            weight = weight[r0:r1, c0:c1]  # view
+        if debug:
+            print(f'  Cropped to bbox [{r0}:{r1}, {c0}:{c1}] = {r1-r0}x{c1-c0} '
+                  f'(from {original_shape[0]}x{original_shape[1]})', flush=True)
+
+    # Get dimensions after cropping
+    height, width = phase.shape
 
     # Create valid mask for computation
     valid_mask = ~nan_mask
 
     # Fill NaN with 0 for computation (avoid np.where temp array)
-    phase_filled = phase.copy()
+    phase_filled = phase.copy()  # now copies only cropped region
     np.copyto(phase_filled, 0.0, where=nan_mask)
 
     # Prepare weights (avoid np.where temp arrays)
@@ -654,18 +1224,16 @@ def irls_unwrap_2d(phase, weight=None, device='auto', max_iter=50, tol=1e-3,
         # 1 where valid, 0 where NaN (avoid ~nan_mask temp bool array)
         weight_filled = np.subtract(1.0, nan_mask, dtype=np.float32)
 
-    # Save input circular mean for later restoration (unwrapping removes DC component)
-    # Use circular mean for wrapped phase: atan2(mean(sin), mean(cos))
-    if valid_mask.any():
-        phase_valid = phase[valid_mask]
-        input_mean = np.arctan2(np.mean(np.sin(phase_valid)), np.mean(np.cos(phase_valid)))
-    else:
-        input_mean = 0.0
+    # Note: circular mean restoration is now done per-component at the end
+    # to automatically align disconnected components
 
     # Convert to torch tensors
     phi = torch.from_numpy(phase_filled.astype(np_dtype)).to(device)
     w = torch.from_numpy(weight_filled.astype(np_dtype)).to(device)
     valid = torch.from_numpy(valid_mask).to(device)
+
+    # Free numpy arrays - no longer needed
+    del phase_filled, weight_filled
 
     # Compute wrapped phase differences (target gradients)
     dx_target = torch.zeros_like(phi)
@@ -673,9 +1241,12 @@ def irls_unwrap_2d(phase, weight=None, device='auto', max_iter=50, tol=1e-3,
     dx_target[:, :-1] = phi[:, 1:] - phi[:, :-1]
     dy_target[:-1, :] = phi[1:, :] - phi[:-1, :]
 
-    # Wrap to [-π, π]
-    dx_target = torch.atan2(torch.sin(dx_target), torch.cos(dx_target))
-    dy_target = torch.atan2(torch.sin(dy_target), torch.cos(dy_target))
+    # Wrap to [-π, π] - in-place to avoid temporaries
+    torch.atan2(torch.sin(dx_target), torch.cos(dx_target), out=dx_target)
+    torch.atan2(torch.sin(dy_target), torch.cos(dy_target), out=dy_target)
+
+    # phi no longer needed after target gradients computed
+    del phi
 
     # Edge weights (average of adjacent pixel weights)
     wx = torch.zeros_like(w)
@@ -687,23 +1258,95 @@ def irls_unwrap_2d(phase, weight=None, device='auto', max_iter=50, tol=1e-3,
     wx[:, :-1] *= (valid[:, :-1] & valid[:, 1:]).to(dtype)
     wy[:-1, :] *= (valid[:-1, :] & valid[1:, :]).to(dtype)
 
+    # w no longer needed after edge weights computed
+    del w
+
     # Precompute DCT eigenvalues for preconditioner
     # IMPORTANT: Trigonometric functions require float64 precision!
     # Small errors in cos() accumulate through thousands of preconditioner
-    # applications in the CG solver. Using float32 on GPU for eigenvalues
-    # causes residuals to degrade from ~0.4 rad to ~1.4 rad at 6400x6400.
-    # Compute on CPU with float64, then convert to float32 and transfer.
+    # applications in the CG solver. Compute on CPU with float64, then transfer.
     i_idx = torch.arange(height, dtype=torch.float64)
     j_idx = torch.arange(width, dtype=torch.float64)
     cos_i = torch.cos(torch.pi * i_idx / height)
     cos_j = torch.cos(torch.pi * j_idx / width)
     eigenvalues = (2 * cos_i.unsqueeze(1) + 2 * cos_j.unsqueeze(0) - 4).to(dtype).to(device)
     eigenvalues[0, 0] = 1.0  # Avoid division by zero
+    del i_idx, j_idx, cos_i, cos_j
+    # Pre-allocate buffers - MINIMIZED count to reduce memory
+    # Laplacian/gradient buffers (reused for dx_u, dy_u in IRLS)
+    _dx_buf = torch.zeros((height, width), dtype=dtype, device=device)
+    _dy_buf = torch.zeros((height, width), dtype=dtype, device=device)
+    _result_buf = torch.zeros((height, width), dtype=dtype, device=device)
 
-    # Pre-allocate buffers for gradient computation (avoid repeated allocation)
-    _dx_buf = torch.zeros_like(phi)
-    _dy_buf = torch.zeros_like(phi)
-    _result_buf = torch.zeros_like(phi)
+    # CG solver buffers (_cg_Ap eliminated - reuse _result_buf from apply_laplacian)
+    _cg_r = torch.zeros((height, width), dtype=dtype, device=device)
+    _cg_z = torch.zeros((height, width), dtype=dtype, device=device)
+    _cg_p = torch.zeros((height, width), dtype=dtype, device=device)
+
+    # IRLS buffers - rx, ry hold residuals needed for IRLS weights
+    rx = torch.zeros((height, width), dtype=dtype, device=device)
+    ry = torch.zeros((height, width), dtype=dtype, device=device)
+    wx_irls = torch.zeros((height, width), dtype=dtype, device=device)
+    wy_irls = torch.zeros((height, width), dtype=dtype, device=device)
+    b = torch.zeros((height, width), dtype=dtype, device=device)
+    u_prev = torch.zeros((height, width), dtype=dtype, device=device)
+
+    # Use scalar for epsilon squared (saves 1.6GB vs full tensor)
+    eps_sq = epsilon * epsilon
+
+    # DCT work buffer
+    _dct_work = torch.zeros((height, width), dtype=dtype, device=device)
+
+    # Adaptive DCT chunking based on 2D pixels per chunk:
+    # - Row DCT chunk: dct_chunk rows × width cols
+    # - Col DCT chunk: height rows × dct_chunk cols
+    # - CPU: no chunking (fastest)
+    # - GPU/MPS: ~10M pixels per chunk (optimal for parallelism)
+    if device_type == 'cpu':
+        target_pixels = 1_000_000_000  # 1B = no chunking
+    else:
+        target_pixels = 10_000_000  # 10M pixels per chunk
+
+    total_pixels = height * width
+    if total_pixels < 2 * target_pixels:
+        # Small array - no chunking needed
+        dct_chunk = max(height, width)
+    else:
+        # Large array - chunk to target_pixels per operation
+        dct_chunk = target_pixels // max(height, width)
+
+    from torch_dct import dct as torch_dct_fn, idct as torch_idct_fn
+    _dct_col_buf = torch.zeros((min(dct_chunk, width), height), dtype=dtype, device=device)
+
+    def dct_2d_chunked(x, out):
+        """2D DCT with adaptive chunking."""
+        H, W = x.shape
+        # Row DCT in chunks
+        for i in range(0, H, dct_chunk):
+            i_end = min(i + dct_chunk, H)
+            out[i:i_end] = torch_dct_fn(x[i:i_end])
+        # Column DCT via transpose buffer
+        for j in range(0, W, dct_chunk):
+            j_end = min(j + dct_chunk, W)
+            cw = j_end - j
+            _dct_col_buf[:cw, :].copy_(out[:, j:j_end].T)
+            _dct_col_buf[:cw, :] = torch_dct_fn(_dct_col_buf[:cw, :])
+            out[:, j:j_end].copy_(_dct_col_buf[:cw, :].T)
+
+    def idct_2d_chunked(x, out):
+        """2D IDCT with adaptive chunking."""
+        H, W = x.shape
+        # Column IDCT first
+        for j in range(0, W, dct_chunk):
+            j_end = min(j + dct_chunk, W)
+            cw = j_end - j
+            _dct_col_buf[:cw, :].copy_(x[:, j:j_end].T)
+            _dct_col_buf[:cw, :] = torch_idct_fn(_dct_col_buf[:cw, :])
+            out[:, j:j_end].copy_(_dct_col_buf[:cw, :].T)
+        # Row IDCT
+        for i in range(0, H, dct_chunk):
+            i_end = min(i + dct_chunk, H)
+            out[i:i_end] = torch_idct_fn(out[i:i_end])
 
     def apply_laplacian(x, wx_irls, wy_irls):
         """Apply weighted Laplacian operator: -∇·(w·∇x)"""
@@ -724,31 +1367,57 @@ def irls_unwrap_2d(phase, weight=None, device='auto', max_iter=50, tol=1e-3,
         _result_buf[1:, :].sub_(_dy_buf[:-1, :])
         _result_buf[:-1, :].add_(_dy_buf[:-1, :])
 
-        return _result_buf.neg()
+        # In-place negation to avoid creating new tensor
+        _result_buf.neg_()
+        return _result_buf
 
-    def apply_preconditioner(r):
-        """Apply DCT-based preconditioner (approximate inverse Laplacian)"""
-        r_dct = dct_2d(r)
-        r_dct.div_(-eigenvalues + 1e-10)
-        r_dct[0, 0] = 0.0
-        return idct_2d(r_dct)
+    def apply_preconditioner(r, out):
+        """Apply DCT-based preconditioner (approximate inverse Laplacian) into out buffer."""
+        with torch.no_grad():
+            # DCT-2D using chunked implementation
+            dct_2d_chunked(r, _dct_work)
+
+            # Divide by negative eigenvalues
+            _dct_work.div_(eigenvalues)
+            _dct_work.neg_()
+            _dct_work[0, 0] = 0.0
+
+            # IDCT-2D using chunked implementation
+            idct_2d_chunked(_dct_work, out)
+        return out
 
     def conjugate_gradient(b, wx_irls, wy_irls, x0, max_iter_cg, tol_cg):
-        """Preconditioned conjugate gradient solver for IRLS."""
+        """Preconditioned conjugate gradient solver for IRLS using pre-allocated buffers.
+
+        Returns (x, n_iters) where n_iters is the number of CG iterations performed.
+        """
         x = x0  # No clone - modify in place, caller provides buffer
-        r = b - apply_laplacian(x, wx_irls, wy_irls)
+        n_iters = 0
+
+        # r = b - A*x (use _cg_r buffer)
+        _cg_r.copy_(b)
+        _cg_r.sub_(apply_laplacian(x, wx_irls, wy_irls))
 
         # Check for NaN in initial residual
-        if not torch.isfinite(r).all():
-            return x0
+        if not torch.isfinite(_cg_r).all():
+            return x0, 0
 
-        z = apply_preconditioner(r)
-        p = z.clone()  # Need clone here - p gets modified
-        rz = torch.sum(r * z)
+        # z = preconditioner(r) (use _cg_z buffer)
+        apply_preconditioner(_cg_r, _cg_z)
+
+        # p = z.clone() (use _cg_p buffer)
+        _cg_p.copy_(_cg_z)
+
+        # Use dot product to avoid creating height*width temporary tensor
+        rz = torch.dot(_cg_r.view(-1), _cg_z.view(-1))
 
         for i in range(max_iter_cg):
-            Ap = apply_laplacian(p, wx_irls, wy_irls).clone()  # Need clone - buffer reused
-            pAp = torch.sum(p * Ap)
+            n_iters = i + 1
+            # Ap = A*p (apply_laplacian returns _result_buf directly - no copy needed)
+            Ap = apply_laplacian(_cg_p, wx_irls, wy_irls)
+
+            # Use dot product to avoid creating height*width temporary tensor
+            pAp = torch.dot(_cg_p.view(-1), Ap.view(-1))
             if pAp.abs() < 1e-15 or not torch.isfinite(pAp):
                 break
             alpha = rz / pAp
@@ -757,62 +1426,84 @@ def irls_unwrap_2d(phase, weight=None, device='auto', max_iter=50, tol=1e-3,
             alpha = torch.clamp(alpha, -1e6, 1e6)
             alpha_val = alpha.item()
 
-            # Update x
-            x.add_(p, alpha=alpha_val)
+            # Update x in-place
+            x.add_(_cg_p, alpha=alpha_val)
 
-            r.sub_(Ap, alpha=alpha_val)
+            # Update r in-place (Ap is _result_buf, will be overwritten next iteration)
+            _cg_r.sub_(Ap, alpha=alpha_val)
 
             # Check for numerical issues mid-iteration
             if not torch.isfinite(x).all():
                 break
 
-            r_norm = torch.sqrt(torch.sum(r * r))
+            # norm() is efficient and doesn't create intermediate tensor
+            r_norm = _cg_r.norm()
             if r_norm < tol_cg or not torch.isfinite(r_norm):
                 break
 
-            z = apply_preconditioner(r)
-            rz_new = torch.sum(r * z)
+            # z = preconditioner(r) (reuse _cg_z buffer)
+            apply_preconditioner(_cg_r, _cg_z)
+
+            # Use dot product to avoid creating height*width temporary tensor
+            rz_new = torch.dot(_cg_r.view(-1), _cg_z.view(-1))
             if rz.abs() < 1e-15:
                 break
             beta = rz_new / rz
             beta = torch.clamp(beta, -1e6, 1e6)
-            p.mul_(beta.item()).add_(z)
+
+            # p = z + beta*p (in-place)
+            _cg_p.mul_(beta.item()).add_(_cg_z)
             rz = rz_new
 
-        return x
+        return x, n_iters
 
     # Initialize with DCT solution (L² result)
-    rho = torch.zeros_like(phi)
+    # Use _result_buf temporarily for rho to avoid extra allocation
+    rho = _result_buf
+    rho.zero_()
     rho[:, 1:] += wx[:, :-1] * dx_target[:, :-1]
     rho[:, :-1] -= wx[:, :-1] * dx_target[:, :-1]
     rho[1:, :] += wy[:-1, :] * dy_target[:-1, :]
     rho[:-1, :] -= wy[:-1, :] * dy_target[:-1, :]
 
-    rho_dct = dct_2d(rho)
-    u_dct = rho_dct / (-eigenvalues + 1e-10)
-    u_dct[0, 0] = 0.0
-    u = idct_2d(u_dct)
+    # DCT initialization using chunked implementation
+    dct_2d_chunked(rho, _dct_work)
 
-    # Check DCT initialization for NaN/inf
+    # Divide by negative eigenvalues
+    _dct_work.div_(eigenvalues)
+    _dct_work.neg_()
+    _dct_work[0, 0] = 0.0
+
+    # IDCT to get initial solution (use rho buffer as temporary output, then clone)
+    idct_2d_chunked(_dct_work, rho)
+    u = rho.clone()
+
+    # Check DCT initialization for NaN/inf - fix in-place to avoid temp allocation
     if not torch.isfinite(u).all():
         if debug:
             nan_count = (~torch.isfinite(u)).sum().item()
             print(f'  DCT init produced {nan_count} NaN/inf values, filling with zeros')
-        u = torch.where(torch.isfinite(u), u, torch.zeros_like(u))
+        u.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Pre-compute valid mask as float and count for efficient mean computation
+    # (avoids creating 1GB+ temporary from u[valid] indexing on each iteration)
+    valid_float = valid.to(dtype)
+    valid_count = valid_float.sum()
 
     # Re-center DCT result to improve float32 precision
     # This keeps values near zero where float32 has best precision
-    if valid.any():
-        u_mean = u[valid].mean()
+    if valid_count > 0:
+        u_mean = (u * valid_float).sum() / valid_count
         u.sub_(u_mean)
 
     _t_init = time.time()
 
     if debug:
         # Handle case where weights might still have issues
-        w_valid = w[valid]
-        if w_valid.numel() > 0:
-            w_min, w_max = w_valid.min().item(), w_valid.max().item()
+        edge_valid = valid[:, :-1] & valid[:, 1:]
+        valid_wx = wx[:, :-1][edge_valid]
+        if valid_wx.numel() > 0:
+            w_min, w_max = valid_wx.min().item(), valid_wx.max().item()
         else:
             w_min, w_max = 0.0, 0.0
         print(f'  Input: {height}x{width}, valid pixels: {valid_mask.sum().item()}, '
@@ -823,51 +1514,44 @@ def irls_unwrap_2d(phase, weight=None, device='auto', max_iter=50, tol=1e-3,
     u_best = u.clone()
     best_residual = float('inf')
 
-    # Pre-allocate buffers for IRLS loop
-    dx_u = torch.zeros_like(u)
-    dy_u = torch.zeros_like(u)
-    rx = torch.zeros_like(u)
-    ry = torch.zeros_like(u)
-    wx_irls = torch.zeros_like(u)
-    wy_irls = torch.zeros_like(u)
-    b = torch.zeros_like(u)
-    u_prev = torch.zeros_like(u)
-    eps_sq = epsilon * epsilon
-
     for iteration in range(max_iter):
         u_prev.copy_(u)
 
         # Re-center u to prevent numerical drift (important for float32)
         # Phase unwrapping only cares about gradients, so mean is arbitrary
-        if valid.any():
-            u_mean = u[valid].mean()
+        # Use pre-computed valid_float to avoid creating 1GB+ temporary from u[valid]
+        if valid_count > 0:
+            u_mean = (u * valid_float).sum() / valid_count
             u.sub_(u_mean)
 
-        # Compute current gradients (reuse buffers)
-        dx_u.zero_()
-        dy_u.zero_()
-        dx_u[:, :-1] = u[:, 1:] - u[:, :-1]
-        dy_u[:-1, :] = u[1:, :] - u[:-1, :]
+        # Compute current gradients into rx, ry directly (will subtract target next)
+        rx.zero_()
+        ry.zero_()
+        rx[:, :-1] = u[:, 1:] - u[:, :-1]
+        ry[:-1, :] = u[1:, :] - u[:-1, :]
 
-        # Compute residuals in-place
-        torch.sub(dx_u, dx_target, out=rx)
-        torch.sub(dy_u, dy_target, out=ry)
+        # Compute residuals in-place: rx = grad_x(u) - dx_target
+        rx.sub_(dx_target)
+        ry.sub_(dy_target)
 
         # Track best solution by residual magnitude
-        current_residual = (torch.sum(rx * rx) + torch.sum(ry * ry)).item()
+        # Use dot product to avoid creating height*width temporary tensors from pow(2)
+        current_residual = (torch.dot(rx.view(-1), rx.view(-1)) + torch.dot(ry.view(-1), ry.view(-1))).item()
         if current_residual < best_residual and torch.isfinite(u).all():
             best_residual = current_residual
             u_best.copy_(u)
 
         # Update IRLS weights: w_irls = w / sqrt(r² + ε²)
-        # In-place operations
-        torch.addcmul(torch.full_like(rx, eps_sq), rx, rx, out=wx_irls)
-        wx_irls.sqrt_()
-        torch.div(wx, wx_irls, out=wx_irls)
+        # Use scalar eps_sq to avoid 1.6GB tensor
+        torch.mul(rx, rx, out=wx_irls)  # wx_irls = rx²
+        wx_irls.add_(eps_sq)             # wx_irls = rx² + ε²
+        wx_irls.sqrt_()                  # wx_irls = sqrt(rx² + ε²)
+        torch.div(wx, wx_irls, out=wx_irls)  # wx_irls = wx / sqrt(...)
 
-        torch.addcmul(torch.full_like(ry, eps_sq), ry, ry, out=wy_irls)
-        wy_irls.sqrt_()
-        torch.div(wy, wy_irls, out=wy_irls)
+        torch.mul(ry, ry, out=wy_irls)  # wy_irls = ry²
+        wy_irls.add_(eps_sq)             # wy_irls = ry² + ε²
+        wy_irls.sqrt_()                  # wy_irls = sqrt(ry² + ε²)
+        torch.div(wy, wy_irls, out=wy_irls)  # wy_irls = wy / sqrt(...)
 
         # Clamp weights in-place
         wx_irls.clamp_(min=1e-6, max=1e6)
@@ -880,23 +1564,45 @@ def irls_unwrap_2d(phase, weight=None, device='auto', max_iter=50, tol=1e-3,
         b[1:, :].addcmul_(wy_irls[:-1, :], dy_target[:-1, :])
         b[:-1, :].addcmul_(wy_irls[:-1, :], dy_target[:-1, :], value=-1)
 
+        # Free rx, ry before CG - they're not needed during CG solve
+        # This reduces peak memory during preconditioner calls by 3.2 GB
+        del rx, ry
+        if device_type == 'mps':
+            torch.mps.synchronize()
+            torch.mps.empty_cache()
+        elif device_type == 'cuda':
+            torch.cuda.empty_cache()
+
         # Solve weighted Laplacian system using CG
-        u = conjugate_gradient(b, wx_irls, wy_irls, u, cg_max_iter, cg_tol)
+        u, cg_iters = conjugate_gradient(b, wx_irls, wy_irls, u, cg_max_iter, cg_tol)
+
+        # Recreate rx, ry for next iteration
+        rx = torch.zeros((height, width), dtype=dtype, device=device)
+        ry = torch.zeros((height, width), dtype=dtype, device=device)
 
         # Check for numerical issues during iteration
         if not torch.isfinite(u).all():
             if debug:
                 print(f'  IRLS iter {iteration}: NaN/inf detected, reverting to best solution')
-            u = u_best.clone()
+            u.copy_(u_best)
             break
 
-        # Check convergence (in-place computation)
-        diff = torch.norm(u - u_prev)
+        # Check convergence using pre-allocated buffer
+        u_prev.sub_(u)  # u_prev now holds diff
+        diff = torch.norm(u_prev)
         norm_u = torch.norm(u) + 1e-10
         rel_change = (diff / norm_u).item()
 
         if debug and iteration % 5 == 0:
-            print(f'  IRLS iter {iteration}: rel_change = {rel_change:.2e}, residual = {current_residual:.2e}')
+            print(f'  IRLS iter {iteration}: rel_change = {rel_change:.2e}, residual = {current_residual:.2e}, cg_iters = {cg_iters}')
+
+        # Aggressive memory cleanup to prevent accumulation from DCT temporaries
+        # torch_dct creates ~15GB of intermediates per DCT/IDCT pair
+        if device_type == 'mps':
+            torch.mps.synchronize()
+            torch.mps.empty_cache()
+        elif device_type == 'cuda':
+            torch.cuda.empty_cache()
 
         if rel_change < tol:
             if debug:
@@ -911,8 +1617,28 @@ def irls_unwrap_2d(phase, weight=None, device='auto', max_iter=50, tol=1e-3,
 
     _t_end = time.time()
 
-    # Convert back to numpy
+    # Convert back to numpy before cleanup
     unwrapped = u.cpu().numpy().astype(np.float32)
+
+    # Explicit cleanup of all GPU tensors to free memory
+    del u, u_best, u_prev
+    del dx_target, dy_target, wx, wy, eigenvalues
+    del _dx_buf, _dy_buf, _result_buf, _dct_work
+    del _cg_r, _cg_z, _cg_p
+    del rx, ry, wx_irls, wy_irls, b
+    del valid, valid_float, valid_count
+
+    # Force synchronization and clear GPU cache
+    if device_type == 'mps':
+        torch.mps.synchronize()
+        torch.mps.empty_cache()
+    elif device_type == 'cuda':
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+    # Force Python garbage collection
+    import gc
+    gc.collect()
 
     # Check for NaN/inf from numerical issues - return NaN array (no hidden fallback)
     if not np.isfinite(unwrapped[~nan_mask]).all():
@@ -920,7 +1646,7 @@ def irls_unwrap_2d(phase, weight=None, device='auto', max_iter=50, tol=1e-3,
         nan_count = np.sum(~np.isfinite(unwrapped[~nan_mask]))
         total_valid = np.sum(~nan_mask)
         warnings.warn(f'IRLS produced {nan_count}/{total_valid} NaN/inf values - returning NaN for this component', RuntimeWarning)
-        return np.full_like(phase, np.nan, dtype=np.float32)
+        return np.full(original_shape, np.nan, dtype=np.float32), np.zeros(original_shape, dtype=np.uint16)
 
     # Restore NaN values
     unwrapped[nan_mask] = np.nan
@@ -933,23 +1659,95 @@ def irls_unwrap_2d(phase, weight=None, device='auto', max_iter=50, tol=1e-3,
         k_median = np.median(k_values)
         unwrapped[valid_mask] = unwrapped[valid_mask] - k_median * 2 * np.pi
 
-    # Restore input circular mean (unwrapping removes DC component)
-    # Wrap the output to compute its circular mean, then adjust
+    # Restore input circular mean PER COMPONENT (not global) - VECTORIZED
+    # Each disconnected component should be aligned to its own input circular mean
+    # This automatically aligns components with sub-π offsets without needing ILP
+    _t_align_start = time.time()
+    n_components = 0
+    conncomp = np.zeros(unwrapped.shape, dtype=np.uint16)
+
     if np.any(valid_mask):
-        unwrapped_valid = unwrapped[valid_mask]
-        # Wrap to [-π, π] for circular mean computation
-        wrapped_output = np.mod(unwrapped_valid + np.pi, 2 * np.pi) - np.pi
-        output_mean = np.arctan2(np.mean(np.sin(wrapped_output)), np.mean(np.cos(wrapped_output)))
-        # Adjust by the difference in circular means
-        unwrapped[valid_mask] = unwrapped_valid + (input_mean - output_mean)
+        # Use cv2.connectedComponents (faster than WithStats - counts come from numba)
+        import cv2
+        _t0 = time.time()
+        n_labels, labeled = cv2.connectedComponents(
+            valid_mask.astype(np.uint8), connectivity=4, ltype=cv2.CV_32S
+        )
+        n_components = n_labels - 1  # cv2 counts background as label 0
+        _t1 = time.time()
+
+        # Prepare contiguous arrays for numba
+        labeled_flat = np.ascontiguousarray(labeled.ravel(), dtype=np.int32)
+        phase_flat = np.ascontiguousarray(phase.ravel(), dtype=np.float32)
+        unwrapped_flat = unwrapped.ravel()  # Will modify in-place
+        _t2 = time.time()
+
+        # Single-pass numba accumulation: sin/cos sums AND counts (6x faster than bincounts)
+        sin_sum, cos_sum, sin_sum_out, cos_sum_out, count_per_label = _accum_sincos_count(
+            labeled_flat, phase_flat, unwrapped_flat.astype(np.float32), n_labels
+        )
+        _t2b = time.time()
+
+        # Circular mean per component: atan2(mean(sin), mean(cos))
+        count_float = count_per_label.astype(np.float64)
+        count_float[count_float == 0] = 1  # Avoid division by zero
+        input_mean = np.arctan2(sin_sum / count_float, cos_sum / count_float)
+        output_mean = np.arctan2(sin_sum_out / count_float, cos_sum_out / count_float)
+        _t3 = time.time()
+
+        # Adjustment per label - wrap to [-π, π] to avoid adding/removing full cycles
+        diff = input_mean - output_mean
+        adjustment = np.arctan2(np.sin(diff), np.cos(diff))  # wrap to [-π, π]
+        adjustment[0] = 0
+        # Apply adjustment using numba (faster than numpy fancy indexing)
+        _apply_adjustment(unwrapped_flat, labeled_flat, adjustment)
+        _t4 = time.time()
+
+        # Relabel by size: 0=invalid, 1=largest, 2=second largest, etc.
+        # Filter out components smaller than conncomp_size
+        sizes_1_to_n = count_per_label[1:n_labels]  # sizes for labels 1..n_labels-1
+        # argsort descending: largest first
+        sorted_indices = np.argsort(sizes_1_to_n)[::-1]  # indices 0..n-1, sorted by size desc
+        # Build mapping: old_label -> new_label (0 for small components)
+        old_to_new = np.zeros(n_labels, dtype=np.uint16)
+        new_label = 1
+        for old_idx in sorted_indices:
+            old_label = old_idx + 1  # labels are 1-indexed
+            if sizes_1_to_n[old_idx] >= conncomp_size:
+                old_to_new[old_label] = new_label
+                new_label += 1
+            # else: old_to_new[old_label] stays 0 (invalid)
+        n_components = new_label - 1  # Update to count only kept components
+        _t5 = time.time()
+
+        if debug:
+            n_filtered = np.sum(sizes_1_to_n < conncomp_size)
+            print(f'  align timing: label={(_t1-_t0)*1000:.0f}ms, prep={(_t2-_t1)*1000:.0f}ms, '
+                  f'accum={(_t2b-_t2)*1000:.0f}ms, mean={(_t3-_t2b)*1000:.0f}ms, '
+                  f'adjust={(_t4-_t3)*1000:.0f}ms, relabel={(_t5-_t4)*1000:.0f}ms')
+            print(f'  conncomp: {n_components} kept, {n_filtered} filtered (size<{conncomp_size})')
+        # Apply relabeling vectorized
+        conncomp = old_to_new[labeled].astype(np.uint16)
+
+    _t_align_end = time.time()
+
+    # Place cropped result back into full-size output if cropping was applied
+    if crop_applied:
+        result = np.full(original_shape, np.nan, dtype=np.float32)
+        result[r0:r1, c0:c1] = unwrapped
+        unwrapped = result
+        conncomp_full = np.zeros(original_shape, dtype=np.uint16)
+        conncomp_full[r0:r1, c0:c1] = conncomp
+        conncomp = conncomp_full
 
     if debug:
         print(f'TIMING irls_unwrap_2d ({height}x{width}) on {device_name}:')
         print(f'  init (DCT):   {(_t_init - _t_start)*1000:.1f} ms')
         print(f'  IRLS iters:   {(_t_end - _t_init)*1000:.1f} ms ({iteration+1} iterations)')
-        print(f'  TOTAL:        {(_t_end - _t_start)*1000:.1f} ms')
+        print(f'  align comps:  {(_t_align_end - _t_align_start)*1000:.1f} ms ({n_components} components)')
+        print(f'  TOTAL:        {(_t_align_end - _t_start)*1000:.1f} ms')
 
-    return unwrapped
+    return unwrapped, conncomp
 
 
 def detect_discontinuity_hough_focal(phase, grad_threshold=2.0, mask_width=3, debug=False):

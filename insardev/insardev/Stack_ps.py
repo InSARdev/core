@@ -108,7 +108,7 @@ class Stack_ps(Stack_stl):
 
         return result
 
-    def psfunction(self, device='auto', debug=False):
+    def psfunction(self, device='auto', allow_rechunk=True, debug=False):
         """
         Compute PS (Persistent Scatterer) function for weighting in single-look processing.
 
@@ -123,6 +123,10 @@ class Stack_ps(Stack_stl):
         ----------
         device : str
             Device for PyTorch computation ('auto', 'mps', 'cuda', 'cpu').
+        allow_rechunk : bool
+            If True (default), automatically rechunk input data to fit within Dask chunk size
+            (dask.config['array.chunk-size']) using aligned chunk boundaries (//2, //4, etc.)
+            to prevent dask slowdowns. Output is rechunked back to original spatial chunks.
         debug : bool
             Print debug information.
 
@@ -136,6 +140,14 @@ class Stack_ps(Stack_stl):
         # Use PS function as weight for single-look interferograms
         psf = stack.psfunction()
         sintf, scorr = stack.phasediff_multilook(pairs, wavelength=30, weight=psf)
+
+        # Control memory via Dask config
+        import dask.config
+        dask.config.set({'array.chunk-size': '256MiB'})
+        psf = stack.psfunction()
+
+        # Disable automatic rechunking (manual chunk control)
+        psf = stack.chunk({'y': 2048, 'x': 2048}).psfunction(allow_rechunk=False)
         """
         import dask
         import dask.array
@@ -143,16 +155,21 @@ class Stack_ps(Stack_stl):
         import torch
         import xarray as xr
         from .Batch import BatchUnit
+        from .utils_dask import rechunk3d, restore_chunks, get_dask_chunk_size_mb
 
         # Auto-detect device based on Dask cluster resources and hardware
         # Convert to string once to avoid serialization issues and repeated resolution
         resolved = Stack_ps._get_torch_device(device, debug=debug)
         device = resolved.type  # 'cpu', 'cuda', or 'mps' as string
 
+        # Get Dask chunk size from config
+        dask_chunk_mb = get_dask_chunk_size_mb()
+
         if debug:
-            print(f"DEBUG: psfunction using device={device}")
+            print(f"DEBUG: psfunction using device={device}, allow_rechunk={allow_rechunk}, dask.config['array.chunk-size']={dask_chunk_mb} MB")
 
         results = {}
+        note_printed = False  # Only print NOTE once for first burst
         for key, ds in self.items():
             # Get complex SLC data variable (usually 'VV' or 'VH')
             complex_vars = [v for v in ds.data_vars if ds[v].dtype.kind == 'c']
@@ -167,8 +184,62 @@ class Stack_ps(Stack_stl):
             if not isinstance(slc_data.data, dask.array.Array):
                 slc_data = slc_data.chunk({'y': 512, 'x': 512})
 
+            # Save original spatial chunks for restoring output
+            original_y_chunks = slc_data.chunks[1] if len(slc_data.chunks) > 1 else None
+            original_x_chunks = slc_data.chunks[2] if len(slc_data.chunks) > 2 else None
+
             if debug:
                 print(f'DEBUG: psfunction for {key}: shape={slc_data.shape}, chunks={slc_data.chunks}')
+
+            # Calculate target chunks for memory efficiency
+            from .utils_dask import compute_aligned_chunks_3d
+            dask_chunk_bytes = dask_chunk_mb * 1024 * 1024
+            element_bytes = slc_data.dtype.itemsize
+            target_chunks = compute_aligned_chunks_3d(
+                slc_data.shape, slc_data.chunks, dask_chunk_bytes, element_bytes,
+                min_chunk=256, keep_first_dim=True
+            )
+
+            # Get current spatial chunk sizes (use first chunk as representative)
+            orig_y = slc_data.chunks[1][0] if len(slc_data.chunks) > 1 and slc_data.chunks[1] else slc_data.shape[1]
+            orig_x = slc_data.chunks[2][0] if len(slc_data.chunks) > 2 and slc_data.chunks[2] else slc_data.shape[2]
+
+            # Calculate chunk memory sizes
+            n_dates = slc_data.shape[0]
+            orig_chunk_mb = n_dates * orig_y * orig_x * element_bytes / (1024 * 1024)
+            # target_chunks is tuple of tuples: ((n,), (y1, y2, ...), (x1, x2, ...))
+            target_y = max(target_chunks[1]) if target_chunks[1] else orig_y
+            target_x = max(target_chunks[2]) if target_chunks[2] else orig_x
+            target_chunk_mb = n_dates * target_y * target_x * element_bytes / (1024 * 1024)
+
+            # Determine if rechunking is needed (only if original is larger than target)
+            needs_rechunk = (orig_y > target_y) or (orig_x > target_x)
+
+            # Print NOTE about chunks (only once for first burst)
+            if not note_printed:
+                chunk_size_note = f"dask.config['array.chunk-size']={dask_chunk_mb} MB"
+                if needs_rechunk:
+                    if allow_rechunk:
+                        print(f'NOTE psfunction: rechunking from ({n_dates}, {orig_y}, {orig_x}) [{orig_chunk_mb:.0f} MB] '
+                              f'to ({n_dates}, {target_chunks[1]}, {target_chunks[2]}) [{target_chunk_mb:.0f} MB] for {chunk_size_note}')
+                    else:
+                        print(f'NOTE psfunction: chunks ({n_dates}, {orig_y}, {orig_x}) [{orig_chunk_mb:.0f} MB] exceed '
+                              f'{chunk_size_note}, recommended: ({n_dates}, {target_chunks[1]}, {target_chunks[2]}) [{target_chunk_mb:.0f} MB]. '
+                              f'Use allow_rechunk=True or .chunk() manually.')
+                else:
+                    # Chunks already fit - just confirm, no "optimal" claim
+                    print(f'NOTE psfunction: chunks ({n_dates}, {orig_y}, {orig_x}) [{orig_chunk_mb:.0f} MB] '
+                          f'fit {chunk_size_note}')
+                note_printed = True
+
+            # Apply rechunking if needed and allowed (pass exact chunk tuples)
+            if needs_rechunk and allow_rechunk:
+                slc_data = slc_data.chunk({'date': -1, 'y': target_chunks[1], 'x': target_chunks[2]})
+                if debug:
+                    print(f'DEBUG: after rechunk: chunks={slc_data.chunks}')
+            else:
+                # Just ensure date is single chunk
+                slc_data = slc_data.chunk({'date': -1})
 
             # Create wrapper that captures device and debug
             def make_wrapper(dev, dbg):
@@ -177,7 +248,6 @@ class Stack_ps(Stack_stl):
 
                     Note: input_core_dims=[['date']] moves date to last axis.
                     """
-                    from contextlib import nullcontext
                     # Transpose to (n_dates, chunk_y, chunk_x) for _psfunction_torch
                     slc_transposed = np.moveaxis(slc_chunk, -1, 0)
                     # Compute amplitude |z|
@@ -188,9 +258,6 @@ class Stack_ps(Stack_stl):
                 return process_wrapper
 
             wrapper = make_wrapper(device, debug)
-
-            # Rechunk so date is a single chunk (required for core dim reduction)
-            slc_data = slc_data.chunk({'date': -1})
 
             # Use xr.apply_ufunc with dask='parallelized' for lazy execution
             # Core dim is 'date' (reduction), chunked dims are y, x
@@ -207,6 +274,12 @@ class Stack_ps(Stack_stl):
                     dask='parallelized',
                     dask_gufunc_kwargs={'meta': np.array((), dtype=np.float32)},
                 )
+
+            # Restore original spatial chunks if we rechunked (pass full tuples)
+            if allow_rechunk and original_y_chunks is not None:
+                psf_da = psf_da.chunk({'y': original_y_chunks, 'x': original_x_chunks})
+                if debug:
+                    print(f'DEBUG: restored output chunks: {psf_da.chunks}')
 
             # Assign name to match SLC variable
             psf_da.name = var_name

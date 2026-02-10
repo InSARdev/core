@@ -346,6 +346,9 @@ def trend2d_array(phase, weight, variables, device, degree=1):
             A_all[:, -1:]
         ], dim=1)
         trend = (A_all_scaled @ coeffs).cpu().numpy()
+        # Mask invalid pixels (where variables or phase were NaN)
+        trend[~valid_coords] = np.nan
+        trend[~np.isfinite(phase_flat)] = np.nan
         trends[i] = trend.reshape(ny, nx)
 
     if squeeze:

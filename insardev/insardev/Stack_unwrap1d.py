@@ -86,6 +86,9 @@ class Stack_unwrap1d(BatchCore):
                 'Use BatchUnit(data) to convert correlation data.'
             )
 
+        # Validate lazy data
+        BatchCore._require_lazy(data, 'lstsq')
+
         # Process each burst
         results = {}
         for key in data.keys():
@@ -129,16 +132,14 @@ class Stack_unwrap1d(BatchCore):
         n_dates = len(dates)
         n_pairs = len(pair_dates)
 
-        # Use dask auto-chunking for y,x based on actual memory usage
+        # Use rechunk2d for uniform chunk sizes based on actual memory usage
         # WA tensor is (n_pixels, n_pairs, n_intervals) - dominant memory consumer
         # Memory per pixel = n_pairs * n_intervals * 4 bytes
-        # Use 2D auto-chunks with memory-equivalent dtype
+        from .utils_dask import rechunk2d
         n_intervals = n_dates - 1
         mem_per_pixel = n_pairs * n_intervals * 4
-        auto_chunks = dask.array.core.normalize_chunks(
-            'auto', (data.y.size, data.x.size), dtype=np.dtype(f'V{mem_per_pixel}')
-        )
-        chunks_y, chunks_x = auto_chunks[0][0], auto_chunks[1][0]
+        optimal = rechunk2d((data.y.size, data.x.size), element_bytes=mem_per_pixel)
+        chunks_y, chunks_x = optimal['y'], optimal['x']
 
         # Rechunk: all pairs together (-1), auto-chunked y,x
         first_dim = data.dims[0]
@@ -177,8 +178,8 @@ class Stack_unwrap1d(BatchCore):
                 chunks=(n_dates,) + data_dask.chunks[1:],
             )
 
-        # Rechunk to (1, -1, -1) for efficient per-slice downstream operations (e.g., plot)
-        ts_dask = result_dask.rechunk({0: 1, 1: -1, 2: -1})
+        # Rechunk to date=1 for efficient per-slice downstream operations (preserve spatial chunks)
+        ts_dask = result_dask.rechunk({0: 1})
 
         # Build coordinates
         coords = {
@@ -261,6 +262,10 @@ class Stack_unwrap1d(BatchCore):
                 'Use BatchUnit(data) to convert correlation data.'
             )
 
+        # Validate lazy data
+        from .BatchCore import BatchCore
+        BatchCore._require_lazy(data, 'unwrap1d')
+
         # Process each burst
         results = {}
         for key in data.keys():
@@ -293,7 +298,7 @@ class Stack_unwrap1d(BatchCore):
         import xarray as xr
         import pandas as pd
         import dask
-        import dask.array
+        import dask.array as da
 
         # Extract pairs from data coords (inline _get_pairs logic for DataArray)
         refs = data.coords['ref'].values
@@ -317,13 +322,13 @@ class Stack_unwrap1d(BatchCore):
             else:
                 original_coords[k] = vals
 
-        # Use dask auto-chunking for y,x based on memory
+        # Use rechunk2d for uniform chunk sizes based on memory
         # Multiplier accounts for unwrap1d internal memory (IRLS iterations)
-        import dask.array as da
-        auto_chunks = dask.array.core.normalize_chunks(
-            'auto', (4 * n_pairs, data.y.size, data.x.size), dtype=np.complex128
-        )
-        chunks_y, chunks_x = auto_chunks[1][0], auto_chunks[2][0]
+        # Effective memory: 4 * n_pairs * 16 bytes (complex128) per pixel
+        from .utils_dask import rechunk2d
+        mem_per_pixel = 4 * n_pairs * 16  # complex128 = 16 bytes
+        optimal = rechunk2d((data.y.size, data.x.size), element_bytes=mem_per_pixel)
+        chunks_y, chunks_x = optimal['y'], optimal['x']
 
         # Rechunk: all pairs together (-1), auto-chunked y,x
         first_dim = data.dims[0]
@@ -366,8 +371,8 @@ class Stack_unwrap1d(BatchCore):
                     meta=meta,
                 )
 
-        # Rechunk to (1, -1, -1) for efficient per-slice downstream operations (e.g., plot)
-        unwrapped_dask = unwrapped_dask.rechunk({0: 1, 1: -1, 2: -1})
+        # Rechunk to pair=1 for efficient per-slice downstream operations (preserve spatial chunks)
+        unwrapped_dask = unwrapped_dask.rechunk({0: 1})
 
         result = xr.DataArray(
             unwrapped_dask,

@@ -12,6 +12,76 @@ from .Stack_unwrap1d import Stack_unwrap1d
 from . import utils_unwrap2d
 import numpy as np
 
+
+def _irls_process_chunk_with_tuple(phase_chunk, weight_chunk, params_tuple):
+    """Module-level function for IRLS processing with params as tuple.
+
+    Returns tuple of (unwrapped, conncomp) arrays, each with shape (1, y, x).
+    """
+    # Unpack params tuple: (device, max_iter, tol, cg_max_iter, cg_tol, epsilon, conncomp_size, debug)
+    device, max_iter, tol, cg_max_iter, cg_tol, epsilon, conncomp_size, debug = params_tuple
+
+    if debug:
+        print(f'DEBUG _irls_process_chunk: phase_chunk.shape={phase_chunk.shape}, device={device!r}')
+
+    # Squeeze to 2D for processing - handle both (1, y, x) and (y, x) input
+    if phase_chunk.ndim == 3:
+        phase_2d = phase_chunk[0]
+        weight_2d = weight_chunk[0] if weight_chunk is not None else None
+    elif phase_chunk.ndim == 2:
+        phase_2d = phase_chunk
+        weight_2d = weight_chunk
+    else:
+        raise ValueError(f"Expected 2D or 3D phase_chunk, got shape {phase_chunk.shape}")
+
+    if debug:
+        print(f'DEBUG _irls_process_chunk: phase_2d.shape={phase_2d.shape}')
+
+    if np.all(np.isnan(phase_2d)):
+        if debug:
+            print('  All NaN, skipping')
+        unwrapped = phase_2d.astype(np.float32)
+        conncomp = np.zeros_like(phase_2d, dtype=np.uint16)
+        return unwrapped[np.newaxis, ...], conncomp[np.newaxis, ...]
+
+    # Call utils function directly - no object references
+    unwrapped, conncomp = utils_unwrap2d.irls_unwrap_2d(
+        phase_2d, weight=weight_2d, device=device,
+        max_iter=max_iter, tol=tol, cg_max_iter=cg_max_iter,
+        cg_tol=cg_tol, epsilon=epsilon, conncomp_size=conncomp_size, debug=debug
+    )
+    # Add pair dim back: (y, x) -> (1, y, x)
+    return unwrapped[np.newaxis, ...], conncomp[np.newaxis, ...]
+
+
+def _irls_process_no_weight(phase_chunk, params_tuple):
+    """Process phase chunk without weight. Returns only unwrapped phase."""
+    unwrapped, _ = _irls_process_chunk_with_tuple(phase_chunk, None, params_tuple)
+    return unwrapped
+
+
+def _irls_process_with_weight(phase_chunk, weight_chunk, params_tuple):
+    """Process phase chunk with weight. Returns only unwrapped phase."""
+    unwrapped, _ = _irls_process_chunk_with_tuple(phase_chunk, weight_chunk, params_tuple)
+    return unwrapped
+
+
+def _irls_process_no_weight_conncomp(phase_chunk, params_tuple):
+    """Process phase chunk without weight. Returns stacked (1, 2, y, x)."""
+    unwrapped, conncomp = _irls_process_chunk_with_tuple(phase_chunk, None, params_tuple)
+    # Stack: (1, y, x) + (1, y, x) -> (1, 2, y, x) for blockwise with 'pcyx' output
+    stacked = np.stack([unwrapped[0].astype(np.float32), conncomp[0].astype(np.float32)], axis=0)
+    return stacked[np.newaxis, ...]  # (1, 2, y, x)
+
+
+def _irls_process_with_weight_conncomp(phase_chunk, weight_chunk, params_tuple):
+    """Process phase chunk with weight. Returns stacked (1, 2, y, x)."""
+    unwrapped, conncomp = _irls_process_chunk_with_tuple(phase_chunk, weight_chunk, params_tuple)
+    # Stack: (1, y, x) + (1, y, x) -> (1, 2, y, x) for blockwise with 'pcyx' output
+    stacked = np.stack([unwrapped[0].astype(np.float32), conncomp[0].astype(np.float32)], axis=0)
+    return stacked[np.newaxis, ...]  # (1, 2, y, x)
+
+
 class Stack_unwrap2d(Stack_unwrap1d):
     """2D phase unwrapping using GPU-accelerated IRLS algorithm with DCT initialization."""
 
@@ -110,7 +180,69 @@ class Stack_unwrap2d(Stack_unwrap1d):
 
         return BatchUnit(result)
 
-    def _link_components(self, unwrapped, conncomp_size=100, conncomp_gap=None,
+    def _compute_conncomp_labels(self, phase):
+        """
+        Compute connected component labels from phase data.
+
+        Parameters
+        ----------
+        phase : BatchWrap
+            Batch of wrapped phase datasets.
+
+        Returns
+        -------
+        BatchUnit
+            Batch of connected component labels (int32).
+        """
+        import dask
+        import dask.array as da
+        import xarray as xr
+        from .Batch import BatchUnit
+
+        result = {}
+        for key in phase.keys():
+            phase_ds = phase[key]
+            data_vars = [v for v in phase_ds.data_vars
+                        if 'y' in phase_ds[v].dims and 'x' in phase_ds[v].dims]
+
+            label_vars = {}
+            for var in data_vars:
+                phase_da = phase_ds[var]
+
+                def compute_labels(phase_chunk):
+                    """Compute connected components for a chunk."""
+                    if phase_chunk.ndim == 3:
+                        # (pair, y, x) -> process each pair
+                        result = np.zeros_like(phase_chunk, dtype=np.int32)
+                        for i in range(phase_chunk.shape[0]):
+                            result[i] = utils_unwrap2d.conncomp_2d(phase_chunk[i])
+                        return result
+                    else:
+                        return utils_unwrap2d.conncomp_2d(phase_chunk).astype(np.int32)
+
+                dask_data = phase_da.data
+                dim_str = ''.join(chr(ord('a') + i) for i in range(dask_data.ndim))
+                meta = np.empty((0,) * dask_data.ndim, dtype=np.int32)
+
+                result_dask = da.blockwise(
+                    compute_labels, dim_str,
+                    dask_data, dim_str,
+                    dtype=np.int32,
+                    meta=meta,
+                )
+
+                label_da = xr.DataArray(
+                    result_dask,
+                    dims=phase_da.dims,
+                    coords=phase_da.coords
+                )
+                label_vars[var] = label_da
+
+            result[key] = xr.Dataset(label_vars, coords=phase_ds.coords, attrs=phase_ds.attrs)
+
+        return BatchUnit(result)
+
+    def _link_components(self, unwrapped, conncomp_labels=None, conncomp_size=100, conncomp_gap=None,
                          conncomp_linksize=5, conncomp_linkcount=30, debug=False):
         """
         Link disconnected components in unwrapped phase by finding optimal 2π offsets.
@@ -119,6 +251,9 @@ class Stack_unwrap2d(Stack_unwrap1d):
         ----------
         unwrapped : Batch
             Batch of unwrapped phase datasets.
+        conncomp_labels : BatchUnit or None
+            Optional pre-computed connected component labels from IRLS.
+            Labels should be size-ordered (1=largest, 2=second, etc.).
         conncomp_size : int
             Minimum component size to process.
         conncomp_gap : int or None
@@ -137,9 +272,10 @@ class Stack_unwrap2d(Stack_unwrap1d):
         """
         import xarray as xr
         import dask.array
+        from scipy import ndimage
         from .Batch import Batch
 
-        def _link_2d(phase_2d):
+        def _link_2d(phase_2d, conncomp_2d=None):
             """Link components in a single 2D array."""
             import time
 
@@ -148,43 +284,70 @@ class Stack_unwrap2d(Stack_unwrap1d):
             if phase_2d.ndim == 3 and phase_2d.shape[0] == 1:
                 phase_2d = phase_2d[0]
                 squeeze = True
+            if conncomp_2d is not None and conncomp_2d.ndim == 3 and conncomp_2d.shape[0] == 1:
+                conncomp_2d = conncomp_2d[0]
 
-            # Find connected components - use efficient labeling
+            # Find connected components - use pre-computed or compute fresh
             valid_mask = ~np.isnan(phase_2d)
             if not np.any(valid_mask):
                 return phase_2d[np.newaxis, ...] if squeeze else phase_2d
 
             min_size = max(conncomp_size, 4)
-            labeled, components, n_total, sizes = utils_unwrap2d.get_connected_components(valid_mask, min_size)
+            if debug:
+                print(f'  Component filtering: conncomp_size={conncomp_size}, min_size={min_size}')
+
+            if conncomp_2d is not None:
+                # Use pre-computed conncomp from IRLS (size-ordered: 1=largest, 2=second, etc.)
+                labeled = conncomp_2d.astype(np.int32)
+                n_total = int(labeled.max())
+                sizes = np.bincount(labeled.ravel(), minlength=n_total + 1)
+                slices = ndimage.find_objects(labeled)
+                # Build components list - already size-ordered, just filter by min_size
+                components = [
+                    {'label': i, 'size': sizes[i], 'slices': slices[i - 1] if i > 0 and i <= len(slices) else None}
+                    for i in range(1, n_total + 1)
+                    if sizes[i] >= min_size and (i <= len(slices) and slices[i - 1] is not None)
+                ]
+                if debug:
+                    print(f'  Using pre-computed conncomp: {n_total} components, {len(components)} after size filter')
+            else:
+                labeled, components, n_total, sizes = utils_unwrap2d.get_connected_components(valid_mask, min_size)
+
+            # Filter small components BEFORE linking - set to NaN
+            linked_labels = np.array([comp['label'] for comp in components])
+            is_linked = np.isin(labeled, linked_labels) | (labeled == 0)
+            phase_2d = phase_2d.copy()
+            phase_2d[~is_linked] = np.nan
+
+            if debug:
+                n_filtered = n_total - len(components)
+                print(f'  Filtered {n_filtered} small components (< {min_size} pixels)')
 
             if len(components) < 2:
-                result = phase_2d  # Not enough components to link
-                return result[np.newaxis, ...] if squeeze else result
-
-            # Create masks for valid components (already sorted by size, largest first)
-            processed_components = [(labeled == comp['label']) for comp in components]
+                return phase_2d[np.newaxis, ...] if squeeze else phase_2d
 
             if debug:
                 gap_str = 'unlimited' if conncomp_gap is None else str(conncomp_gap)
                 print(f'  Linking {len(components)} components (conncomp_gap={gap_str})...')
                 t0 = time.time()
 
-            # Find connections
-            connections = utils_unwrap2d.find_component_connections(
-                processed_components, conncomp_gap=conncomp_gap, max_neighbors=conncomp_linkcount
+            # Find connections using labeled array (memory efficient - no boolean masks)
+            connections = utils_unwrap2d.find_component_connections_fast(
+                labeled, phase_2d, components,
+                conncomp_gap=conncomp_gap, max_neighbors=conncomp_linkcount,
+                n_neighbors=conncomp_linksize
             )
 
             if debug:
                 print(f'    Found {len(connections)} connections')
 
             if len(connections) == 0:
-                result = phase_2d  # No connections found
-                return result[np.newaxis, ...] if squeeze else result
+                return phase_2d[np.newaxis, ...] if squeeze else phase_2d
 
-            # Apply ILP to find optimal offsets
-            result = utils_unwrap2d.connect_components_ilp(
-                phase_2d, processed_components, connections,
-                n_neighbors=conncomp_linksize, max_time=60.0, debug=debug
+            # Apply ILP to find optimal offsets (using labeled array, memory efficient)
+            result = utils_unwrap2d.connect_components_ilp_fast(
+                phase_2d, labeled, components, connections,
+                max_time=60.0, debug=debug
             )
 
             if debug:
@@ -197,6 +360,8 @@ class Stack_unwrap2d(Stack_unwrap1d):
         result = {}
         for key in unwrapped.keys():
             ds = unwrapped[key]
+            # Get corresponding conncomp dataset if available
+            conncomp_ds = conncomp_labels[key] if conncomp_labels is not None and key in conncomp_labels else None
             data_vars = list(ds.data_vars)
 
             linked_vars = {}
@@ -209,12 +374,25 @@ class Stack_unwrap2d(Stack_unwrap1d):
 
                 # Provide meta to avoid calling _link_2d during graph construction
                 meta = np.empty((0,) * dask_data.ndim, dtype=np.float32)
-                result_dask = dask.array.blockwise(
-                    _link_2d, dim_str,
-                    dask_data, dim_str,
-                    dtype=np.float32,
-                    meta=meta,
-                )
+
+                if conncomp_ds is not None and var in conncomp_ds:
+                    # Pass conncomp to _link_2d
+                    conncomp_dask = conncomp_ds[var].data
+                    result_dask = dask.array.blockwise(
+                        _link_2d, dim_str,
+                        dask_data, dim_str,
+                        conncomp_dask, dim_str,
+                        dtype=np.float32,
+                        meta=meta,
+                    )
+                else:
+                    # No conncomp - will recompute inside _link_2d
+                    result_dask = dask.array.blockwise(
+                        lambda phase: _link_2d(phase, None), dim_str,
+                        dask_data, dim_str,
+                        dtype=np.float32,
+                        meta=meta,
+                    )
 
                 linked_da = xr.DataArray(
                     result_dask,
@@ -227,8 +405,77 @@ class Stack_unwrap2d(Stack_unwrap1d):
 
         return Batch(result)
 
+    def unwrap2d_link(self, phase, conncomp_size=10_000, conncomp_gap=None,
+                      conncomp_linksize=5, conncomp_linkcount=30, debug=False):
+        """
+        Link disconnected components in already unwrapped phase.
+
+        This function applies component linking to already unwrapped phase data
+        by finding optimal 2π offsets between disconnected components.
+        Use this to correct phase jumps between components after unwrapping.
+
+        Parameters
+        ----------
+        phase : Batch
+            Batch of already unwrapped phase datasets (output from unwrap2d_irls).
+        conncomp_size : int, optional
+            Minimum number of pixels for a connected component to be linked.
+            Components smaller than this are set to NaN. Default is 10,000.
+        conncomp_gap : int or None, optional
+            Maximum pixel distance between components to consider them connectable.
+            If None (default), no distance limit - all components can connect.
+        conncomp_linksize : int, optional
+            Number of pixels to use on each side of a connection point for
+            estimating the phase offset. Default is 5.
+        conncomp_linkcount : int, optional
+            Maximum number of nearest neighbor components to consider.
+            Default is 30.
+        debug : bool, optional
+            If True, print diagnostic information. Default is False.
+
+        Returns
+        -------
+        Batch
+            Batch of unwrapped phase with linked components.
+
+        Examples
+        --------
+        Link components in already unwrapped phase:
+
+        >>> # First unwrap without linking
+        >>> unwrapped = phase.unwrap2d_irls(weight=corr)
+        >>>
+        >>> # Then link components separately
+        >>> linked = unwrapped.unwrap2d_link(conncomp_size=10_000, debug=True)
+
+        Notes
+        -----
+        The linking algorithm:
+        1. Identifies connected components in the valid phase data
+        2. Filters out components smaller than conncomp_size (set to NaN)
+        3. Finds connection points between components using STRtree spatial indexing
+        4. Estimates phase offsets at connection points
+        5. Uses Integer Linear Programming (ILP) to find globally optimal 2π offsets
+        6. Applies offsets to align all components with the reference (largest) component
+        """
+        from .Batch import Batch
+
+        # Validate parameters
+        if conncomp_linksize > conncomp_size:
+            raise ValueError(
+                f'conncomp_linksize ({conncomp_linksize}) cannot be greater than conncomp_size ({conncomp_size}). '
+                f'Components must have at least conncomp_linksize pixels for reliable offset estimation.'
+            )
+
+        # Link components using the existing method
+        return self._link_components(
+            phase, conncomp_size=conncomp_size, conncomp_gap=conncomp_gap,
+            conncomp_linksize=conncomp_linksize, conncomp_linkcount=conncomp_linkcount,
+            debug=debug
+        )
+
     def unwrap2d(self, phase, weight=None, conncomp=False,
-                conncomp_size=1000, conncomp_gap=None,
+                conncomp_size=1_000, conncomp_gap=None,
                 conncomp_linksize=5, conncomp_linkcount=30, device='auto', debug=False, **kwargs):
         """
         Unwrap phase using GPU-accelerated IRLS algorithm (L¹ norm).
@@ -328,19 +575,20 @@ class Stack_unwrap2d(Stack_unwrap1d):
                 f'Components must have at least conncomp_linksize pixels for reliable offset estimation.'
             )
 
-        # Use IRLS unwrapping (always get conncomp for internal use)
-        unwrapped, conncomp_labels = self.unwrap2d_irls(phase, weight, conncomp=True,
-                                                        conncomp_size=conncomp_size, device=device,
-                                                        debug=debug, **kwargs)
+        # Use IRLS unwrapping - always returns (unwrapped, conncomp)
+        # Pass conncomp_size to filter small components during IRLS
+        unwrapped, conncomp_labels = self.unwrap2d_irls(
+            phase, weight, device=device, conncomp_size=conncomp_size, debug=debug, **kwargs
+        )
 
         if conncomp:
-            # Return separate components with size-ordered labels
-            conncomp_labels = self._reorder_conncomp_by_size(conncomp_labels)
+            # Return size-ordered conncomp labels (already computed by irls)
             return unwrapped, conncomp_labels
         else:
-            # Link components
+            # Link components using pre-computed conncomp from IRLS
             unwrapped = self._link_components(
-                unwrapped, conncomp_size=conncomp_size, conncomp_gap=conncomp_gap,
+                unwrapped, conncomp_labels=conncomp_labels,
+                conncomp_size=conncomp_size, conncomp_gap=conncomp_gap,
                 conncomp_linksize=conncomp_linksize, conncomp_linkcount=conncomp_linkcount,
                 debug=debug
             )
@@ -409,10 +657,27 @@ class Stack_unwrap2d(Stack_unwrap1d):
         if weight is not None and not isinstance(weight, xr.Dataset):
             raise TypeError(f"weight must be xr.Dataset, got {type(weight).__name__}")
 
-        # Rechunk to single chunk for y/x dimensions (required by unwrap2d_irls)
-        phase = phase.chunk({'y': -1, 'x': -1})
-        if weight is not None:
-            weight = weight.chunk({'y': -1, 'x': -1})
+        # Check for spatial chunking and rechunk if needed
+        # Phase unwrapping is a global operation that needs single spatial chunk
+        needs_rechunk = False
+        for var_name in phase.data_vars:
+            var_data = phase[var_name]
+            if hasattr(var_data.data, 'chunks'):
+                chunks = var_data.data.chunks
+                # For 2D or 3D data, check spatial dimensions (last two)
+                y_chunks = chunks[-2] if len(chunks) >= 2 else chunks[0]
+                x_chunks = chunks[-1]
+                if len(y_chunks) > 1 or len(x_chunks) > 1:
+                    print(f"NOTE: unwrap2d_dataset() rechunking to single spatial chunk "
+                          f"(from y: {len(y_chunks)} chunks, x: {len(x_chunks)} chunks)")
+                    needs_rechunk = True
+                break  # Only check first variable
+
+        if needs_rechunk:
+            # Rechunk to single spatial chunk (keep first dim if present)
+            phase = phase.chunk({'y': -1, 'x': -1})
+            if weight is not None:
+                weight = weight.chunk({'y': -1, 'x': -1})
 
         # Wrap datasets in temporary batches with empty key
         intf_batch = BatchWrap({'': phase})
@@ -437,8 +702,9 @@ class Stack_unwrap2d(Stack_unwrap1d):
     # GPU-Accelerated Phase Unwrapping Methods (PyTorch)
     # =========================================================================
 
-    def unwrap2d_irls(self, phase, weight=None, conncomp=False, conncomp_size=100, device='auto',
-                      max_iter=50, tol=1e-2, cg_max_iter=10, cg_tol=1e-3, epsilon=1e-2, debug=False):
+    def unwrap2d_irls(self, phase, weight=None, device='auto',
+                      max_iter=50, tol=1e-2, cg_max_iter=10, cg_tol=1e-3, epsilon=1e-2,
+                      conncomp_size=30, debug=False):
         """
         Unwrap phase using GPU-accelerated IRLS algorithm (L¹ norm).
 
@@ -451,6 +717,10 @@ class Stack_unwrap2d(Stack_unwrap1d):
         weighted IRLS iterations. This handles phase residues properly by
         down-weighting inconsistent regions based on correlation.
 
+        Disconnected components (separated by NaN regions) are unwrapped
+        independently - the algorithm naturally handles this through edge
+        weight zeroing where either adjacent pixel is invalid.
+
         Parameters
         ----------
         phase : BatchWrap
@@ -458,11 +728,6 @@ class Stack_unwrap2d(Stack_unwrap1d):
         weight : BatchUnit, optional
             Batch of correlation values for weighting. Higher values indicate
             more reliable phase measurements.
-        conncomp : bool, optional
-            If True, also return connected components. Default is False.
-        conncomp_size : int, optional
-            Minimum number of pixels for a connected component to be processed.
-            Components smaller than this are left as NaN. Default is 100.
         device : str, optional
             PyTorch device: 'auto' (default), 'cuda', 'mps', 'cpu', or 'tpu'.
             'auto' uses GPU if Dask client has resources={'gpu': 1}.
@@ -477,14 +742,18 @@ class Stack_unwrap2d(Stack_unwrap1d):
         epsilon : float, optional
             Smoothing parameter for L¹ approximation. Larger values improve
             numerical stability but reduce L¹ approximation quality. Default is 1e-2.
+        conncomp_size : int, optional
+            Minimum connected component size in pixels. Components smaller than this
+            are marked invalid (label 0). Default is 30.
         debug : bool, optional
             If True, print diagnostic information. Default is False.
 
         Returns
         -------
-        Batch or tuple
-            If conncomp is False: Batch of unwrapped phase.
-            If conncomp is True: tuple of (Batch unwrapped phase, BatchUnit conncomp).
+        Batches
+            Tuple-like container with (Batch, BatchUnit):
+            - unwrapped: Batch of unwrapped phase (float32)
+            - conncomp: BatchUnit of component labels (uint16, 0=invalid, 1=largest, 2=second, ...)
 
         Notes
         -----
@@ -496,13 +765,17 @@ class Stack_unwrap2d(Stack_unwrap1d):
         - Based on arXiv:2401.09961
         """
         import dask
-        import dask.array
+        import dask.array as da
         import torch
         import xarray as xr
         from .Batch import Batch, BatchWrap, BatchUnit
 
         assert isinstance(phase, BatchWrap), 'ERROR: phase should be a BatchWrap object'
         assert weight is None or isinstance(weight, BatchUnit), 'ERROR: weight should be a BatchUnit object'
+
+        # Validate lazy data
+        from .BatchCore import BatchCore
+        BatchCore._require_lazy(phase, 'unwrap2d')
 
         # Resolve device using shared helper (handles Dask cluster resources)
         # Convert to string once to avoid serialization issues and repeated resolution
@@ -531,18 +804,21 @@ class Stack_unwrap2d(Stack_unwrap1d):
                         if 'y' in phase_ds[v].dims and 'x' in phase_ds[v].dims]
 
             unwrap_vars = {}
-            comp_vars = {}
+            conncomp_vars = {}
 
             for var in data_vars:
                 phase_da = phase_ds[var]
                 weight_da = weight_ds[var] if weight_ds is not None else None
 
-                # Ensure data is chunked for lazy processing (1 chunk per pair)
+                # Ensure pair dimension is chunked as 1
                 if 'pair' in phase_da.dims:
-                    if not isinstance(phase_da.data, dask.array.Array):
+                    chunks = phase_da.data.chunks
+                    if chunks[0][0] != 1:
                         phase_da = phase_da.chunk({'pair': 1})
-                    if weight_da is not None and not isinstance(weight_da.data, dask.array.Array):
-                        weight_da = weight_da.chunk({'pair': 1})
+                    if weight_da is not None:
+                        weight_chunks = weight_da.data.chunks
+                        if weight_chunks[0][0] != 1:
+                            weight_da = weight_da.chunk({'pair': 1})
 
                 # Save non-dimension coords along pair (ref, rep, BPR) for output
                 pair_coords = {}
@@ -562,26 +838,6 @@ class Stack_unwrap2d(Stack_unwrap1d):
                 # Use da.blockwise for efficient dask integration
                 # With chunk={'pair': 1}, dask splits (n_pairs, y, x) into n_pairs chunks of (1, y, x)
 
-                def process_wrapper(phase_chunk, weight_chunk=None):
-                    """Wrapper for IRLS processing that returns stacked results.
-
-                    Input: phase_chunk shape (1, y, x) - single pair chunk
-                    Output: shape (1, 2, y, x) where dim 1 is [unwrapped, labels]
-                    """
-                    from contextlib import nullcontext
-                    # Squeeze to 2D for processing
-                    phase_2d = phase_chunk[0]
-                    weight_2d = weight_chunk[0] if weight_chunk is not None else None
-
-                    unwrapped, labels = self._process_irls_slice(
-                        phase_2d, weight_2d, device, conncomp_size,
-                        max_iter, tol, cg_max_iter, cg_tol, epsilon, debug
-                    )
-                    # Stack and add pair dim back: (2, y, x) -> (1, 2, y, x)
-                    result = np.stack([unwrapped, labels.astype(np.float32)], axis=0)
-                    result = result[np.newaxis, ...]
-                    return result
-
                 # Use da.blockwise for efficient chunk processing
                 phase_dask = phase_da.data
                 weight_dask = weight_da.data if weight_da is not None else None
@@ -591,138 +847,105 @@ class Stack_unwrap2d(Stack_unwrap1d):
                 use_gpu = device != 'cpu'
                 task_resources = {'unwrap2d': 1, 'gpu': 1} if use_gpu else {'unwrap2d': 1}
                 # Provide meta to avoid calling process_wrapper during graph construction
-                # Output shape is (n_pairs, 2, y, x) where 2 = [unwrapped, labels]
-                meta = np.empty((0, 2, 0, 0), dtype=np.float32)
+                meta = np.empty((0, 0, 0), dtype=np.float32)
+
+                # Create params tuple - simple immutable structure for reliable serialization
+                # Use str() to create a fresh string copy
+                params_tuple = (str(device), max_iter, tol, cg_max_iter, cg_tol, epsilon, conncomp_size, debug)
+
+                if debug:
+                    print(f'DEBUG creating params tuple with device={params_tuple[0]!r}')
+
+                # Use conncomp versions that return stacked (1, 2, y, x) per chunk
+                # Output shape is (n_pairs, 2, y, x)
+                meta_stacked = np.empty((0, 0, 0, 0), dtype=np.float32)
 
                 with dask.annotate(resources=task_resources):
                     if weight_dask is None:
+                        # Pass params tuple as scalar through blockwise
                         result_dask = dask.array.blockwise(
-                            process_wrapper, 'poyx',
+                            _irls_process_no_weight_conncomp, 'pcyx',
                             phase_dask, 'pyx',
-                            new_axes={'o': 2},
+                            params_tuple, None,  # None index means scalar (not broadcasted)
                             dtype=np.float32,
-                            meta=meta,
+                            meta=meta_stacked,
+                            new_axes={'c': 2},  # Output has new axis of size 2
                         )
                     else:
-                        def process_wrapper_with_weight(phase_chunk, weight_chunk):
-                            return process_wrapper(phase_chunk, weight_chunk)
                         result_dask = dask.array.blockwise(
-                            process_wrapper_with_weight, 'poyx',
+                            _irls_process_with_weight_conncomp, 'pcyx',
                             phase_dask, 'pyx',
                             weight_dask, 'pyx',
-                            new_axes={'o': 2},
+                            params_tuple, None,
                             dtype=np.float32,
-                            meta=meta,
+                            meta=meta_stacked,
+                            new_axes={'c': 2},
                         )
 
-                # Build xarray result with proper dimensions
-                result_dims = ('pair', 'output', 'y', 'x') if 'pair' in phase_da.dims else ('output', 'y', 'x')
-                result = xr.DataArray(
-                    result_dask,
+                # Split stacked result: (n_pairs, 2, y, x) -> unwrapped (n_pairs, y, x), conncomp (n_pairs, y, x)
+                unwrapped_dask = result_dask[:, 0, :, :]  # First channel is unwrapped phase
+                conncomp_dask = result_dask[:, 1, :, :].astype(np.uint16)  # Second channel is conncomp
+
+                # Build xarray results with proper dimensions
+                # unwrapped_dask and conncomp_dask already have (n_pairs, y, x) shape
+                result_dims = ('pair', 'y', 'x') if 'pair' in phase_da.dims else ('y', 'x')
+
+                unwrap_da = xr.DataArray(
+                    unwrapped_dask,
+                    dims=result_dims,
+                    coords={'y': phase_da.y, 'x': phase_da.x}
+                )
+                unwrap_da.attrs['units'] = 'radians'
+
+                conncomp_da = xr.DataArray(
+                    conncomp_dask,
                     dims=result_dims,
                     coords={'y': phase_da.y, 'x': phase_da.x}
                 )
 
-                # Extract unwrapped phase and connected components
-                result_da = result.isel(output=0)
-                result_da.attrs['units'] = 'radians'
-                comp_da = result.isel(output=1).astype(np.int32)
-
                 # Assign non-dimension coords (ref, rep, BPR) - pair uses positional indexing
                 if pair_coords:
-                    result_da = result_da.assign_coords(**pair_coords)
-                    comp_da = comp_da.assign_coords(**pair_coords)
+                    unwrap_da = unwrap_da.assign_coords(**pair_coords)
+                    conncomp_da = conncomp_da.assign_coords(**pair_coords)
 
-                unwrap_vars[var] = result_da
-                comp_vars[var] = comp_da
+                unwrap_vars[var] = unwrap_da
+                conncomp_vars[var] = conncomp_da
 
             # Preserve dataset attributes (subswath, pathNumber, etc.)
             unwrap_result[key] = xr.Dataset(unwrap_vars, attrs=phase_ds.attrs)
-            conncomp_result[key] = xr.Dataset(comp_vars, attrs=phase_ds.attrs)
+            conncomp_result[key] = xr.Dataset(conncomp_vars, attrs=phase_ds.attrs)
             # Preserve CRS from input dataset
             if phase_ds.rio.crs is not None:
                 unwrap_result[key].rio.write_crs(phase_ds.rio.crs, inplace=True)
                 conncomp_result[key].rio.write_crs(phase_ds.rio.crs, inplace=True)
 
-        output = Batch(unwrap_result)
+        from .Batch import BatchUnit, Batches
+        return Batches((Batch(unwrap_result), BatchUnit(conncomp_result)))
 
-        if conncomp:
-            return output, BatchUnit(conncomp_result)
-        return output
+    def _process_irls_slice(self, phase_np, weight_np, device,
+                            max_iter, tol, cg_max_iter, cg_tol, epsilon, conncomp_size, debug):
+        """Process a single 2D phase slice with IRLS unwrapping.
 
-    def _process_irls_slice(self, phase_np, weight_np, device, conncomp_size,
-                            max_iter, tol, cg_max_iter, cg_tol, epsilon, debug):
-        """Process a single 2D phase slice with IRLS unwrapping."""
+        Unwraps the full raster directly - disconnected components (separated
+        by NaN regions) are handled automatically through edge weight zeroing.
 
+        Returns only unwrapped phase (discards conncomp).
+        """
         if debug:
-            print(f'  Slice shape: {phase_np.shape}, '
-                  f'valid: {np.sum(~np.isnan(phase_np))}, '
-                  f'phase range: [{np.nanmin(phase_np):.3f}, {np.nanmax(phase_np):.3f}]')
-            if weight_np is not None:
-                print(f'  Weight range: [{np.nanmin(weight_np):.3f}, {np.nanmax(weight_np):.3f}]')
+            print(f'DEBUG _process_irls_slice: received device={device}')
 
         if np.all(np.isnan(phase_np)):
             if debug:
                 print('  All NaN, skipping')
-            return phase_np.astype(np.float32), np.zeros_like(phase_np, dtype=np.int32)
+            return phase_np.astype(np.float32)
 
-        # Get connected components
-        labels = utils_unwrap2d.conncomp_2d(phase_np)
-        unique_labels = np.unique(labels[labels > 0])
-
-        if debug:
-            print(f'  Connected components: {len(unique_labels)}')
-
-        # Process each component
-        result = np.full_like(phase_np, np.nan, dtype=np.float32)
-
-        for label in unique_labels:
-            mask = labels == label
-            comp_size = np.sum(mask)
-            if comp_size < conncomp_size:
-                continue
-
-            # Extract component bounding box for efficiency
-            rows, cols = np.where(mask)
-            r0, r1 = rows.min(), rows.max() + 1
-            c0, c1 = cols.min(), cols.max() + 1
-
-            if debug:
-                print(f'  Component {label}: size={comp_size}, '
-                      f'bbox=[{r0}:{r1}, {c0}:{c1}] ({r1-r0}x{c1-c0})')
-
-            phase_crop = phase_np[r0:r1, c0:c1].copy()
-            mask_crop = mask[r0:r1, c0:c1]
-            phase_crop[~mask_crop] = np.nan
-
-            weight_crop = None
-            if weight_np is not None:
-                weight_crop = weight_np[r0:r1, c0:c1].copy()
-                weight_crop[~mask_crop] = np.nan
-
-            # Unwrap using IRLS
-            unwrapped_crop = utils_unwrap2d.irls_unwrap_2d(
-                phase_crop, weight=weight_crop, device=device,
-                max_iter=max_iter, tol=tol, cg_max_iter=cg_max_iter,
-                cg_tol=cg_tol, epsilon=epsilon, debug=debug
-            )
-
-            # Check result
-            valid_in_crop = ~np.isnan(phase_crop)
-            nan_in_result = np.sum(np.isnan(unwrapped_crop[valid_in_crop]))
-            if debug and nan_in_result > 0:
-                print(f'    WARNING: {nan_in_result}/{np.sum(valid_in_crop)} NaN in unwrapped result')
-
-            # Place back (direct indexing avoids np.where temp array)
-            result[r0:r1, c0:c1][mask_crop] = unwrapped_crop[mask_crop]
-
-        # Final check
-        if debug:
-            valid_original = ~np.isnan(phase_np)
-            nan_in_final = np.sum(np.isnan(result[valid_original]))
-            print(f'  Final result: {nan_in_final}/{np.sum(valid_original)} NaN in valid region')
-
-        return result, labels
+        # Unwrap using IRLS directly on full raster
+        unwrapped, _ = utils_unwrap2d.irls_unwrap_2d(
+            phase_np, weight=weight_np, device=device,
+            max_iter=max_iter, tol=tol, cg_max_iter=cg_max_iter,
+            cg_tol=cg_tol, epsilon=epsilon, conncomp_size=conncomp_size, debug=debug
+        )
+        return unwrapped
 
     # =========================================================================
     # Discontinuity Detection for Phase Unwrapping

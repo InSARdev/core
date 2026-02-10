@@ -60,6 +60,10 @@ class Stack_detrend(Stack_unwrap2d):
         import torch
         import xarray as xr
         import numpy as np
+        from .BatchCore import BatchCore
+
+        # Validate lazy data
+        BatchCore._require_lazy(phase, 'trend2d')
 
         # Auto-detect device based on Dask cluster resources and hardware
         # Convert to string once to avoid serialization issues and repeated resolution
@@ -142,8 +146,16 @@ class Stack_detrend(Stack_unwrap2d):
                 # Use da.blockwise for efficient dask integration
                 phase_dask = phase_da.data
 
-                # Get transform variables as dask arrays (keep lazy, already have correct 2D chunks)
-                var_dask_list = [trans_ds[v].data for v in var_names]
+                # Get transform variables as dask arrays and rechunk to match phase spatial chunks
+                # This is critical when phase is single-chunk but transform comes from zarr with different chunks
+                phase_spatial_chunks = phase_dask.chunks[-2:]  # (y_chunks, x_chunks)
+                var_dask_list = []
+                for v in var_names:
+                    var_dask = trans_ds[v].data
+                    # Rechunk transform to match phase spatial chunks
+                    if var_dask.chunks != phase_spatial_chunks:
+                        var_dask = var_dask.rechunk(phase_spatial_chunks)
+                    var_dask_list.append(var_dask)
 
                 # Create wrapper function for blockwise - receives variable chunks
                 def make_process_chunk(n_vars, device, degree):
@@ -182,6 +194,9 @@ class Stack_detrend(Stack_unwrap2d):
                     blockwise_args = [phase_dask, dim_str]
                     if weight_da is not None:
                         weight_dask = weight_da.data
+                        # Rechunk weight to match phase chunks if needed
+                        if weight_dask.chunks != phase_dask.chunks:
+                            weight_dask = weight_dask.rechunk(phase_dask.chunks)
                         blockwise_args.extend([weight_dask, dim_str])
                     # Add all variable arrays with spatial-only dims
                     for var_dask in var_dask_list:
@@ -256,6 +271,30 @@ class Stack_detrend(Stack_unwrap2d):
             raise TypeError(f"weight must be xr.Dataset, got {type(weight).__name__}")
         if transform is not None and not isinstance(transform, xr.Dataset):
             raise TypeError(f"transform must be xr.Dataset, got {type(transform).__name__}")
+
+        # Check for spatial chunking and rechunk if needed
+        # Polynomial regression is a global operation that needs single spatial chunk
+        needs_rechunk = False
+        for var_name in phase.data_vars:
+            var_data = phase[var_name]
+            if hasattr(var_data.data, 'chunks'):
+                chunks = var_data.data.chunks
+                # For 2D or 3D data, check spatial dimensions (last two)
+                y_chunks = chunks[-2] if len(chunks) >= 2 else chunks[0]
+                x_chunks = chunks[-1]
+                if len(y_chunks) > 1 or len(x_chunks) > 1:
+                    print(f"NOTE: trend2d_dataset() rechunking to single spatial chunk "
+                          f"(from y: {len(y_chunks)} chunks, x: {len(x_chunks)} chunks)")
+                    needs_rechunk = True
+                break  # Only check first variable
+
+        if needs_rechunk:
+            # Rechunk to single spatial chunk (keep first dim if present)
+            phase = phase.chunk({'y': -1, 'x': -1})
+            if weight is not None:
+                weight = weight.chunk({'y': -1, 'x': -1})
+            if transform is not None:
+                transform = transform.chunk({'y': -1, 'x': -1})
 
         # Wrap datasets in single-key Batches for trend2d()
         dummy_key = '__dataset__'
@@ -332,6 +371,10 @@ class Stack_detrend(Stack_unwrap2d):
         import pandas as pd
 
         from .Batch import BatchWrap
+        from .BatchCore import BatchCore
+
+        # Validate lazy data
+        BatchCore._require_lazy(data, 'regression1d_baseline')
 
         # Auto-detect device based on Dask cluster resources and hardware
         # Convert to string once to avoid serialization issues and repeated resolution
@@ -525,6 +568,11 @@ class Stack_detrend(Stack_unwrap2d):
         import xarray as xr
         import numpy as np
         import pandas as pd
+
+        from .BatchCore import BatchCore
+
+        # Validate lazy data
+        BatchCore._require_lazy(data, 'regression1d_pairs')
 
         # Auto-detect device
         # Convert to string once to avoid serialization issues and repeated resolution

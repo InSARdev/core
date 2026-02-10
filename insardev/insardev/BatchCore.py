@@ -148,7 +148,7 @@ def _dissolve_pol_3d_for_dask(da_slice, das_others_slice, wrap, extend, weight):
 
 def _apply_gaussian_for_dask(block, weight_block, sigmas, threshold, device, pixel_sizes, out_dtype):
     """
-    Module-level function for gaussian blockwise operation.
+    Module-level function for gaussian blockwise operation (DEPRECATED - use _apply_gaussian_2d_for_dask).
 
     Defined at module level to avoid dask serialization issues with nested functions.
     Weight is passed as a separate dask array to blockwise (not via partial) to avoid
@@ -172,6 +172,37 @@ def _apply_gaussian_for_dask(block, weight_block, sigmas, threshold, device, pix
         Output dtype
     """
     from .utils_gaussian import gaussian_numpy
+    return gaussian_numpy(block, weight_block, sigma=sigmas, truncate=4.0, threshold=threshold,
+                          device=device, pixel_sizes=pixel_sizes).astype(out_dtype)
+
+
+def _apply_gaussian_2d_for_dask(block, weight_block=None, sigmas=None, threshold=0.5,
+                                 device='cpu', pixel_sizes=None, out_dtype=np.float32):
+    """
+    Module-level function for gaussian map_overlap operation.
+
+    Defined at module level to avoid dask serialization issues with nested functions.
+    Handles both 2D (y, x) and 3D (1, y, x) blocks - gaussian_numpy() handles squeeze/unsqueeze.
+
+    Parameters
+    ----------
+    block : np.ndarray
+        Data block from dask, shape (y, x) or (1, y, x)
+    weight_block : np.ndarray or None
+        Weight block from dask, shape (y, x) or (1, y, x) or None
+    sigmas : tuple
+        Gaussian sigmas (sigma_y, sigma_x)
+    threshold : float
+        Threshold for weighted convolution
+    device : str
+        PyTorch device
+    pixel_sizes : tuple
+        Pixel sizes (dy, dx) in meters
+    out_dtype : np.dtype
+        Output dtype
+    """
+    from .utils_gaussian import gaussian_numpy
+    # gaussian_numpy handles (1, y, x) -> squeeze -> process -> unsqueeze
     return gaussian_numpy(block, weight_block, sigma=sigmas, truncate=4.0, threshold=threshold,
                           device=device, pixel_sizes=pixel_sizes).astype(out_dtype)
 
@@ -268,6 +299,63 @@ class BatchCore(dict):
         from .utils_torch import get_torch_device
         return get_torch_device(device, debug)
 
+    @property
+    def is_lazy(self) -> bool:
+        """
+        Check if batch data is lazy (dask arrays).
+
+        Returns True if all data variables are dask arrays (lazy/deferred computation).
+        Returns False if data has been computed to numpy arrays.
+
+        Returns
+        -------
+        bool
+            True if data is lazy (dask), False if materialized (numpy).
+
+        Examples
+        --------
+        >>> if phase.is_lazy:
+        ...     phase = phase.compute()
+        >>> assert not phase.is_lazy  # Now it's computed
+        """
+        import dask.array as da
+
+        for key, ds in self.items():
+            for var in ds.data_vars:
+                if not isinstance(ds[var].data, da.Array):
+                    return False
+            break  # Only check first burst
+        return True
+
+    @staticmethod
+    def _require_lazy(batch, func_name: str):
+        """
+        Require that batch data is lazy (dask arrays) for memory-efficient processing.
+
+        Parameters
+        ----------
+        batch : BatchCore
+            Batch to validate.
+        func_name : str
+            Name of the calling function for error messages.
+
+        Raises
+        ------
+        TypeError
+            If data is not a dask array (e.g., numpy array from .compute(load=True)).
+        """
+        if not batch.is_lazy:
+            # Get type name for error message
+            for key, ds in batch.items():
+                for var in ds.data_vars:
+                    data_type = type(ds[var].data).__name__
+                    break
+                break
+            raise TypeError(
+                f"{func_name}() requires lazy (dask) data, got {data_type}. "
+                f"Use .chunk('auto') to convert to dask arrays before calling {func_name}()."
+            )
+
     @staticmethod
     def _gaussian(data_np, weight_np=None, sigma=None, truncate=4.0, threshold=0.5, device='auto',
                   pixel_sizes=None, resolution=67.0):
@@ -290,7 +378,7 @@ class BatchCore(dict):
         #print('BatchCore __init__ mapping', mapping or {}, '\n')
         super().__init__(mapping or {})
 
-    def from_dataset(self, data: xr.Dataset) -> Batch:
+    def from_dataset(self, data: xr.Dataset, allow_rechunk: bool = False) -> Batch:
         """
         Create a Batch by selecting each burst's coordinates from a merged Dataset.
 
@@ -301,6 +389,11 @@ class BatchCore(dict):
         ----------
         data : xr.Dataset
             The input data to split back into per-burst datasets.
+        allow_rechunk : bool, optional
+            If True (default), rechunk output bursts for efficient processing:
+            - 3D data: chunk size 1 for first dim (date/pair), auto for y,x
+            - 2D data: auto for y,x based on dask.config['array.chunk-size']
+            This is recommended since merged dataset chunks differ from optimal burst chunks.
 
         Returns
         -------
@@ -316,10 +409,14 @@ class BatchCore(dict):
         result = batch.from_dataset(processed)
         """
         from .Batch import Batch
+        from .utils_dask import get_dask_chunk_size_mb, rechunk2d
 
         # Validate input type
         if not isinstance(data, xr.Dataset):
             raise TypeError(f"data must be xr.Dataset, got {type(data).__name__}")
+
+        note_printed = False
+        dask_chunk_mb = get_dask_chunk_size_mb()
 
         out = {}
         for key, ds in dict.items(self):
@@ -332,6 +429,37 @@ class BatchCore(dict):
                     # Select matching size and assign burst's coordinates
                     selected = selected.isel({dim: slice(0, ds.sizes[dim])})
                     selected = selected.assign_coords({dim: ds.coords[dim]})
+
+            # Rechunk for burst processing (always convert to lazy dask arrays)
+            rechunked_vars = {}
+            for var in selected.data_vars:
+                arr = selected[var]
+                if not (arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x')):
+                    continue
+                if allow_rechunk:
+                    # Use rechunk2d for uniform chunk sizes
+                    y_size, x_size = arr.shape[-2], arr.shape[-1]
+                    element_bytes = arr.dtype.itemsize
+                    optimal = rechunk2d((y_size, x_size), element_bytes)
+                    if arr.ndim == 3:
+                        chunks = {arr.dims[0]: 1, 'y': optimal['y'], 'x': optimal['x']}
+                    else:
+                        chunks = {'y': optimal['y'], 'x': optimal['x']}
+                else:
+                    # Single spatial chunk
+                    if arr.ndim == 3:
+                        chunks = {arr.dims[0]: 1, 'y': -1, 'x': -1}
+                    else:
+                        chunks = {'y': -1, 'x': -1}
+                rechunked_vars[var] = arr.chunk(chunks)
+            if rechunked_vars:
+                selected = selected.assign(rechunked_vars)
+            if not note_printed:
+                if allow_rechunk:
+                    print(f"NOTE from_dataset: rechunking to dask.config['array.chunk-size']={dask_chunk_mb} MB")
+                else:
+                    print(f"NOTE from_dataset: using single spatial chunk (allow_rechunk=False)")
+                note_printed = True
 
             out[key] = selected
         return Batch(out)
@@ -471,9 +599,9 @@ class BatchCore(dict):
         chunks = sample[data_var].chunks
         #print ('chunks', chunks)
         if chunks is None:
-            print ('WARNING: Batch.chunks undefined, i.e. the data is not lazy and parallel chunks processing is not possible.')
-            # use "common" chunking for 2D and 3D data
-            return -1 if data_var.ndim == 2 else (1, -1, -1)
+            # Data is not lazy (numpy arrays) - return empty dict silently
+            # Use batch.is_lazy to check if data is lazy before calling .chunks
+            return {}
 
         # build dict of first‐chunk sizes, one chunk means chunk size 1 or -1
         return {dim: sizes[0] if len(sizes) > 1 else (1 if sizes[0] == 1 else -1) for dim, sizes in zip(sample[data_var].dims, chunks)}
@@ -713,11 +841,24 @@ class BatchCore(dict):
     #     })
 
     def map_da(self, func, **kwargs):
-        """Apply func(DataArray) → DataArray to every var in every dataset."""
-        return type(self)({
-            k: ds.map(func, **kwargs)
-            for k, ds in self.items()
-        })
+        """Apply func(DataArray) → DataArray to every numeric var in every dataset.
+
+        Non-numeric variables (strings, objects) are passed through unchanged.
+        """
+        def apply_to_numeric(ds):
+            result_vars = {}
+            for var in ds.data_vars:
+                da = ds[var]
+                # Skip non-numeric dtypes (strings, objects, etc.)
+                if not np.issubdtype(da.dtype, np.number) and not np.issubdtype(da.dtype, np.complexfloating):
+                    result_vars[var] = da
+                else:
+                    result_vars[var] = func(da, **kwargs)
+            result = xr.Dataset(result_vars)
+            result.attrs = ds.attrs
+            return result
+
+        return type(self)({k: apply_to_numeric(ds) for k, ds in self.items()})
 
     def astype(self, dtype, **kwargs):
         return self.map_da(lambda da: da.astype(dtype), **kwargs)
@@ -1231,11 +1372,10 @@ class BatchCore(dict):
                 if data.ndim != 2:
                     continue
 
-                # Rechunk for map_overlap
-                auto_chunks = dask.array.core.normalize_chunks(
-                    'auto', data.shape, dtype=np.float32
-                )
-                data_chunked = data.data.rechunk(auto_chunks)
+                # Rechunk for map_overlap using uniform chunk sizes
+                from .utils_dask import rechunk2d
+                optimal = rechunk2d(data.shape, element_bytes=4)  # float32
+                data_chunked = data.data.rechunk((optimal['y'], optimal['x']))
 
                 # Use map_overlap with module-level function via functools.partial
                 with dask.annotate(resources={'gpu': 1} if device_str != 'cpu' else {}):
@@ -2030,7 +2170,59 @@ class BatchCore(dict):
         return type(self)(out)
 
     def chunk(self, chunks):
-        return type(self)({k: ds.chunk(chunks) for k, ds in self.items()})
+        """
+        Rechunk the data in each burst dataset.
+
+        Parameters
+        ----------
+        chunks : dict or 'auto'
+            Chunk specification. If 'auto', uses chunk size 1 for first dimension
+            (date/pair) and uniform chunking for spatial dimensions (y, x).
+
+        Returns
+        -------
+        BatchCore
+            New batch with rechunked data.
+
+        Examples
+        --------
+        >>> # Explicit chunks
+        >>> batch.chunk({'y': 2048, 'x': 2048})
+
+        >>> # Auto: date=1, y/x=uniform based on dask.config['array.chunk-size']
+        >>> batch.chunk('auto')
+        """
+        from .utils_dask import rechunk2d
+
+        # Only chunk spatial variables (y, x dims), leave non-spatial as-is
+        result = {}
+        for k, ds in self.items():
+            rechunked_vars = {}
+            for var in ds.data_vars:
+                arr = ds[var]
+                # Only touch spatial variables
+                if not (arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x')):
+                    continue
+                if chunks == 'auto':
+                    # Use rechunk2d for uniform chunk sizes
+                    y_size, x_size = arr.shape[-2], arr.shape[-1]
+                    element_bytes = arr.dtype.itemsize
+                    optimal = rechunk2d((y_size, x_size), element_bytes)
+                    if arr.ndim == 3:
+                        var_chunks = {arr.dims[0]: 1, 'y': optimal['y'], 'x': optimal['x']}
+                    else:
+                        var_chunks = {'y': optimal['y'], 'x': optimal['x']}
+                else:
+                    # Explicit chunks - add first dim=1 for 3D
+                    if arr.ndim == 3:
+                        var_chunks = {arr.dims[0]: 1, **chunks}
+                    else:
+                        var_chunks = chunks
+                rechunked_vars[var] = arr.chunk(var_chunks)
+            if rechunked_vars:
+                ds = ds.assign(rechunked_vars)
+            result[k] = ds
+        return type(self)(result)
 
     def pipe(self, func, *args, **kwargs):
         return func(self, *args, **kwargs)
@@ -2060,7 +2252,7 @@ class BatchCore(dict):
             result[key] = {var: ds[var].values for var in ds.data_vars}
         return result
 
-    def compute(self, load: bool = False):
+    def compute(self, load: bool = False, allow_rechunk: bool = False):
         """
         Compute lazy data in the batch.
 
@@ -2071,6 +2263,11 @@ class BatchCore(dict):
             but triggers computation and caches results in distributed memory.
             If True, fully loads data into numpy arrays (uses more memory but
             ensures data is fully materialized for subsequent operations).
+        allow_rechunk : bool, optional
+            If True (default), auto-rechunk output for efficient further processing:
+            - 3D data: chunk size 1 for first dim (date/pair), auto for y,x
+            - 2D data: auto for y,x based on dask.config['array.chunk-size']
+            If False, use single spatial chunk (-1 for y,x).
 
         Returns
         -------
@@ -2079,6 +2276,14 @@ class BatchCore(dict):
         """
         import dask
         from insardev_toolkit.progressbar import progressbar
+        from .utils_dask import get_dask_chunk_size_mb, rechunk2d
+
+        # Print NOTE before progress bar
+        dask_chunk_mb = get_dask_chunk_size_mb()
+        if allow_rechunk:
+            print(f"NOTE compute: rechunking to dask.config['array.chunk-size']={dask_chunk_mb} MB")
+        else:
+            print(f"NOTE compute: using single spatial chunk (allow_rechunk=False)")
 
         if load:
             # Fully load data to numpy arrays
@@ -2089,6 +2294,7 @@ class BatchCore(dict):
 
         # Ensure coordinates are also computed (not lazy dask arrays)
         computed = {}
+
         for key, ds in result.items():
             # Compute any lazy coordinates, preserving their dims
             new_coords = {}
@@ -2098,6 +2304,38 @@ class BatchCore(dict):
                     new_coords[name] = (coord.dims, coord.compute().values)
             if new_coords:
                 ds = ds.assign_coords(new_coords)
+
+            # Rechunk computed data for efficient further processing
+            # xarray's .chunk() handles both numpy and dask arrays
+            rechunked_vars = {}
+            for var in ds.data_vars:
+                arr = ds[var]
+                # Skip non-spatial variables
+                if not (arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x')):
+                    continue
+
+                if allow_rechunk:
+                    # Use rechunk2d for uniform chunk sizes
+                    y_size, x_size = arr.shape[-2], arr.shape[-1]
+                    element_bytes = arr.dtype.itemsize
+                    optimal = rechunk2d((y_size, x_size), element_bytes)
+                    if arr.ndim == 3:
+                        chunks = {arr.dims[0]: 1, 'y': optimal['y'], 'x': optimal['x']}
+                    else:
+                        chunks = {'y': optimal['y'], 'x': optimal['x']}
+                else:
+                    # Single spatial chunk
+                    if arr.ndim == 3:
+                        chunks = {arr.dims[0]: 1, 'y': -1, 'x': -1}
+                    else:
+                        chunks = {'y': -1, 'x': -1}
+
+                rechunked_vars[var] = arr.chunk(chunks)
+
+            # Update dataset with rechunked variables
+            if rechunked_vars:
+                ds = ds.assign(rechunked_vars)
+
             computed[key] = ds
         return type(self)(computed)
 
@@ -2275,11 +2513,13 @@ class BatchCore(dict):
         return data
     
     def snapshot(self, store: str | None = None, storage_options: dict[str, str] | None = None,
-                caption: str | None = 'Snapshotting...', n_jobs: int = -1, debug=False):
+                caption: str | None = 'Snapshotting...', allow_rechunk: bool = False,
+                n_jobs: int = 1, debug=False):
         # Only save if this batch has data; otherwise just open existing store
         if len(self) > 0:
-            self.save(store=store, storage_options=storage_options, caption=caption, n_jobs=n_jobs, debug=debug)
-        return utils_io.open(store=store, storage_options=storage_options, compat=False, n_jobs=n_jobs, debug=debug)
+            utils_io.save(self, store=store, storage_options=storage_options, caption=caption, n_jobs=n_jobs, debug=debug)
+        return utils_io.open(store=store, storage_options=storage_options, compat=False,
+                            allow_rechunk=allow_rechunk, n_jobs=-1, debug=debug)
 
     def to_dataset(self, polarization=None, chunks='auto', compute: bool = False, debug: bool = False):
         """
@@ -2416,11 +2656,12 @@ class BatchCore(dict):
         # Determine chunk sizes for spatial dimensions
         # Stack dimension is always processed one slice at a time (chunked to 1)
         if chunks == 'auto':
-            # Use complex128 (16 bytes) to account for memory overhead:
-            # output chunk + 2-4 overlapping input bursts to load and merge
-            auto_chunks = dask.array.core.normalize_chunks('auto', (ys.size, xs.size), dtype=np.complex128)
-            y_chunk_size = auto_chunks[0][0] if auto_chunks[0] else ys.size
-            x_chunk_size = auto_chunks[1][0] if auto_chunks[1] else xs.size
+            # Use rechunk2d for uniform chunk sizes
+            # Use 16 bytes to account for memory overhead (output + overlapping inputs)
+            from .utils_dask import rechunk2d
+            optimal = rechunk2d((ys.size, xs.size), element_bytes=16)
+            y_chunk_size = optimal['y']
+            x_chunk_size = optimal['x']
         elif isinstance(chunks, (int, np.integer)):
             # Single int: use same size for both dimensions
             y_chunk_size = min(int(chunks), ys.size)
@@ -2532,12 +2773,12 @@ class BatchCore(dict):
         for pol in polarizations:
             datas = datas_by_pol[pol]
 
-            # Ensure data is dask and rechunk: stack dim = 1, spatial = single chunk
+            # Ensure data is dask and rechunk stack dim to 1 (keep spatial chunks)
             def ensure_dask_rechunked(d):
                 arr = d.data
                 if not isinstance(arr, da.Array):
                     arr = da.from_array(arr, chunks=arr.shape)
-                return arr.rechunk({0: 1, 1: -1, 2: -1})
+                return arr.rechunk({0: 1})
 
             datas_rechunked = [ensure_dask_rechunked(d) for d in datas]
 
@@ -2616,8 +2857,8 @@ class BatchCore(dict):
                                         continue  # Skip misaligned tiles
 
                                     # Slice the dask array to get this tile
-                                    # Input is single-chunked, so this just creates a slice view
-                                    tile_slice = datas_rechunked[burst_idx][s_idx:s_idx+1, by0:by1, bx0:bx1]
+                                    # Then rechunk to single spatial chunk for the merge function
+                                    tile_slice = datas_rechunked[burst_idx][s_idx:s_idx+1, by0:by1, bx0:bx1].rechunk({1: -1, 2: -1})
                                     # Convert to delayed - dask will auto-compute when merge is called
                                     tile_delayed = tile_slice.to_delayed().ravel()[0]
                                     tiles_delayed.append(tile_delayed)
@@ -3148,8 +3389,78 @@ class BatchCore(dict):
             aspect: float = 1.02,
             y: float = 1.05,
             flip: bool = False,
-            _size: tuple[int, int] | None = None,
+            extent: tuple[int, int] = (8000, 4000),
+            composite: bool = False,
+            gamma: float = 1.0,
+            brightness: float = 2.0,
             ):
+        """
+        Plot batch data as images.
+
+        Parameters
+        ----------
+        cmap : str or Colormap, optional
+            Colormap for single-polarization plots. Default 'viridis'.
+        alpha : float, optional
+            Transparency. Default 0.7.
+        vmin, vmax : float, optional
+            Value range for colormap. Mutually exclusive with quantile.
+        quantile : float or list, optional
+            Quantile(s) for automatic range, e.g., [0.02, 0.98].
+        symmetrical : bool, optional
+            Center colormap at zero. Default False.
+        caption : str, optional
+            Title caption.
+        cols, rows : int, optional
+            Max columns/rows for subplots. Default 4.
+        size : float, optional
+            Figure size multiplier. Default 4.
+        nbins : int, optional
+            Number of axis tick bins. Default 5.
+        aspect : float, optional
+            Figure aspect ratio. Default 1.02.
+        y : float, optional
+            Suptitle y position. Default 1.05.
+        flip : bool, optional
+            Flip y-axis (north up). Default False.
+        extent : tuple, optional
+            Target display extent in pixels. Default (8000, 4000).
+        composite : bool, optional
+            Enable RGB composite mode for dual-pol data. Default False.
+            R=co-pol, G=cross-pol, B=co-pol produces:
+            - Magenta/pink: surface scattering (high co-pol)
+            - Green: volume scattering (vegetation, high cross-pol)
+            - White/gray: mixed scattering
+            Requires exactly 2 polarizations (e.g., HH+HV or VV+VH).
+            For best results: backscatter(decibels=False).lee().
+        gamma : float, optional
+            Gamma correction for composite tone curve. Default 1.0.
+            Values > 1 brighten dark areas, < 1 increase contrast.
+            Note: gamma changes color ratios; use brightness for uniform scaling.
+        brightness : float, optional
+            Linear brightness multiplier for composite mode. Default 2.0.
+            Values > 1 brighten the image, < 1 darken it.
+            Preserves color ratios (unlike gamma).
+
+        Returns
+        -------
+        list
+            List of FacetGrid (non-composite) or Figure (composite).
+            Always returns a list for consistent handling.
+
+        Examples
+        --------
+        >>> # Single polarization plot
+        >>> stack[['VV']].backscatter().plot(quantile=[0.02, 0.98])
+
+        >>> # Dual-pol RGB composite with Lee filter (recommended)
+        >>> stack[['HH', 'HV']].backscatter(decibels=False).lee().plot(
+        ...     composite=True)  # default brightness=2.0
+
+        >>> # Adjust brightness while preserving colors
+        >>> stack[['HH', 'HV']].backscatter(decibels=False).lee().plot(
+        ...     composite=True, brightness=2.5)
+        """
         import xarray as xr
         import numpy as np
         import pandas as pd
@@ -3165,33 +3476,30 @@ class BatchCore(dict):
 
         wrap = True if type(self) == BatchWrap else False
 
-        # screen size in pixels (width, height) to estimate reasonable number pixels per plot
-        # this is quite large to prevent aliasing on 600dpi plots without additional processing
-        if _size is None:
-            _size = (8000,4000)
-
         # use outer variables
         def plot_polarization(polarization):
             stackvar = list(sample[polarization].dims)[0] if len(sample[polarization].dims) > 2 else None
+
+            # Calculate decimation factors from batch extent (without materializing full grid)
+            batch = self[[polarization]]
+            if stackvar is not None:
+                batch = batch.isel({stackvar: slice(0, rows*cols)})
+            # Estimate merged grid size from coordinate ranges
+            y_coords = np.concatenate([np.asarray(ds[polarization].y) for ds in batch.values()])
+            x_coords = np.concatenate([np.asarray(ds[polarization].x) for ds in batch.values()])
+            dy, dx = self.spacing
+            size_y = int((y_coords.max() - y_coords.min()) / abs(dy)) + 1
+            size_x = int((x_coords.max() - x_coords.min()) / abs(dx)) + 1
+            factor_y = max(1, int(np.round(size_y / (extent[1] / rows))))
+            factor_x = max(1, int(np.round(size_x / (extent[0] / cols))))
+
+            # Decimate batches BEFORE to_dataset() - much more memory efficient
+            batch_decimated = batch.isel(y=slice(None, None, factor_y), x=slice(None, None, factor_x))
+            da = batch_decimated.to_dataset()[polarization]
             if stackvar is None:
                 stackvar = 'fake'
-                da = self[[polarization]].to_dataset()[polarization].expand_dims({stackvar: [0]})
-            else:
-                da = self[[polarization]].isel({stackvar: slice(0, rows*cols)}).to_dataset()[polarization]
-            #print ('da', da)
-            if 'stack' in da.dims and isinstance(da.coords['stack'].to_index(), pd.MultiIndex):
-                da = da.unstack('stack')
-            
-            # there is no reason to plot huge arrays much larger than screen size for small plots
-            #print ('screen_size', screen_size)
-            size_y, size_x = da.shape[-2:]
-            #print ('size_x, size_y', size_x, size_y)
-            factor_y = int(np.round(size_y / (_size[1] / rows)))
-            factor_x = int(np.round(size_x / (_size[0] / cols)))
-            #print ('factor_x, factor_y', factor_x, factor_y)
-            # decimate for faster plot, do not coarsening without antialiasing
-            # maybe data is already smoothed and maybe not, decimation is the only safe option
-            da = da[:,::max(1, factor_y), ::max(1, factor_x)]
+                da = da.expand_dims({stackvar: [0]})
+
             # materialize for all the calculations and plotting
             progressbar(da := da.persist(), desc=f'Computing {polarization} Plot'.ljust(25))
 
@@ -3269,6 +3577,156 @@ class BatchCore(dict):
 
             return fg
 
+        def plot_composite(pol1, pol2):
+            """
+            Plot RGB composite using ASF HyP3 decomposition formula.
+
+            Based on: https://github.com/ASFHyP3/hyp3-lib/blob/develop/docs/rgb_decomposition.md
+            - Red: Surface scattering (co-pol dominant areas)
+            - Green: Volume scattering (cross-pol, vegetation/ice)
+            - Blue: Surface scattering with low volume
+            """
+            # Get stack variable from first polarization
+            stackvar = list(sample[pol1].dims)[0] if len(sample[pol1].dims) > 2 else None
+
+            # Calculate decimation factors
+            batch = self[[pol1, pol2]]
+            if stackvar is not None:
+                batch = batch.isel({stackvar: slice(0, rows*cols)})
+            y_coords = np.concatenate([np.asarray(ds[pol1].y) for ds in batch.values()])
+            x_coords = np.concatenate([np.asarray(ds[pol1].x) for ds in batch.values()])
+            dy, dx = self.spacing
+            size_y = int((y_coords.max() - y_coords.min()) / abs(dy)) + 1
+            size_x = int((x_coords.max() - x_coords.min()) / abs(dx)) + 1
+            factor_y = max(1, int(np.round(size_y / (extent[1] / rows))))
+            factor_x = max(1, int(np.round(size_x / (extent[0] / cols))))
+
+            # Decimate and convert to dataset
+            batch_decimated = batch.isel(y=slice(None, None, factor_y), x=slice(None, None, factor_x))
+            ds_merged = batch_decimated.to_dataset()
+            da_copol = ds_merged[pol1]   # Co-pol (HH or VV)
+            da_xpol = ds_merged[pol2]    # Cross-pol (HV or VH)
+
+            if stackvar is None:
+                stackvar = 'fake'
+                da_copol = da_copol.expand_dims({stackvar: [0]})
+                da_xpol = da_xpol.expand_dims({stackvar: [0]})
+
+            # Materialize both polarizations together
+            import dask
+            da_copol, da_xpol = dask.persist(da_copol, da_xpol)
+            progressbar([da_copol, da_xpol], desc='Computing RGB composite'.ljust(25))
+
+            # Get values
+            copol = da_copol.values  # Co-pol (HH or VV)
+            xpol = da_xpol.values    # Cross-pol (HV or VH)
+
+            # Standard dual-pol RGB decomposition
+            # R=copol, G=xpol, B=copol produces:
+            # - Magenta/pink: high co-pol, low cross-pol (surface scattering, urban)
+            # - Green: high cross-pol (volume scattering, vegetation)
+            # - White/gray: both high (mixed scattering)
+            # - Dark: both low (smooth surfaces, water)
+            r_data = copol
+            g_data = xpol
+            b_data = copol
+
+            # Normalize each channel to [0, 1] using quantile stretch
+            def normalize_channel(data):
+                valid = data[np.isfinite(data)]
+                if len(valid) == 0:
+                    return np.zeros_like(data)
+                # Use quantile arg or default 2-98%
+                q_vals = quantile if quantile is not None else [0.02, 0.98]
+                if np.isscalar(q_vals):
+                    q_vals = [q_vals, 1 - q_vals] if q_vals < 0.5 else [1 - q_vals, q_vals]
+                q = np.nanquantile(valid, q_vals)
+                vmin_ch, vmax_ch = q[0], q[-1]
+                if vmax_ch <= vmin_ch:
+                    vmax_ch = vmin_ch + 1e-10
+                normalized = (data - vmin_ch) / (vmax_ch - vmin_ch)
+                return np.clip(normalized, 0, 1)
+
+            r_norm = normalize_channel(r_data)
+            g_norm = normalize_channel(g_data)
+            b_norm = normalize_channel(b_data)
+
+            # Apply gamma correction for brightness adjustment
+            if gamma != 1.0:
+                r_norm = np.power(r_norm, 1.0 / gamma)
+                g_norm = np.power(g_norm, 1.0 / gamma)
+                b_norm = np.power(b_norm, 1.0 / gamma)
+
+            # Stack into RGBA array: shape (n_stack, ny, nx, 4)
+            # Alpha channel: 0 for NaN (transparent), 1 for valid pixels
+            nan_mask = ~np.isfinite(r_data) | ~np.isfinite(g_data) | ~np.isfinite(b_data)
+            alpha_channel = np.where(nan_mask, 0.0, 1.0)
+            # Set NaN pixels to 0 in RGB channels (they'll be transparent anyway)
+            r_norm = np.where(nan_mask, 0, r_norm)
+            g_norm = np.where(nan_mask, 0, g_norm)
+            b_norm = np.where(nan_mask, 0, b_norm)
+            rgba_array = np.stack([r_norm, g_norm, b_norm, alpha_channel], axis=-1)
+
+            # Apply linear brightness (preserves color ratios unlike gamma)
+            if brightness != 1.0:
+                rgba_array[..., :3] = rgba_array[..., :3] * brightness
+                rgba_array[..., :3] = np.clip(rgba_array[..., :3], 0, 1)
+
+            # Create figure with subplots
+            n_panels = rgba_array.shape[0]
+            n_cols = min(cols, n_panels)
+            n_rows = int(np.ceil(n_panels / n_cols))
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(size * n_cols * aspect, size * n_rows),
+                                     squeeze=False)
+            axes = axes.flatten()
+
+            # Get coordinate extent for imshow
+            y_min, y_max = float(da_copol.y.min()), float(da_copol.y.max())
+            x_min, x_max = float(da_copol.x.min()), float(da_copol.x.max())
+            img_extent = [x_min, x_max, y_max, y_min] if flip else [x_min, x_max, y_min, y_max]
+
+            km_formatter = FuncFormatter(lambda v, _: f'{v/1000:.0f}')
+
+            for idx in range(len(axes)):
+                ax = axes[idx]
+                if idx < n_panels:
+                    ax.imshow(rgba_array[idx], extent=img_extent, aspect='auto',
+                              origin='upper' if flip else 'lower', alpha=alpha)
+                    ax.xaxis.set_major_formatter(km_formatter)
+                    ax.yaxis.set_major_formatter(km_formatter)
+                    ax.xaxis.set_major_locator(mticker.MaxNLocator(nbins))
+                    ax.yaxis.set_major_locator(mticker.MaxNLocator(nbins))
+                    ax.set_xlabel('easting [km]')
+                    ax.set_ylabel('northing [km]')
+
+                    # Set title
+                    if stackvar == 'fake':
+                        ax.set_title('')
+                    elif stackvar in ('pair', 'date') and idx < da_copol[stackvar].size:
+                        if stackvar == 'pair':
+                            if 'ref' in da_copol.coords and 'rep' in da_copol.coords:
+                                ref_val = da_copol.coords['ref'].values[idx]
+                                rep_val = da_copol.coords['rep'].values[idx]
+                                ref_str = pd.Timestamp(ref_val).strftime('%Y-%m-%d')
+                                rep_str = pd.Timestamp(rep_val).strftime('%Y-%m-%d')
+                                ax.set_title(f'{ref_str} {rep_str}')
+                            else:
+                                ax.set_title(f'pair={idx}')
+                        elif stackvar == 'date':
+                            coord_val = da_copol[stackvar].values[idx]
+                            if hasattr(coord_val, 'strftime'):
+                                ax.set_title(f'date={coord_val.strftime("%Y-%m-%d")}')
+                            else:
+                                ax.set_title(f'date={pd.Timestamp(coord_val).strftime("%Y-%m-%d")}')
+                else:
+                    ax.set_visible(False)
+
+            # Add suptitle with RGB assignment
+            fig.suptitle(f'{caption or "RGB Composite"} (R={pol1}, G={pol2}, B={pol1})', y=y)
+            plt.tight_layout()
+
+            return fig
+
         if quantile is not None:
             assert vmin is None and vmax is None, "ERROR: arguments 'quantile' and 'vmin', 'vmax' cannot be used together"
 
@@ -3278,6 +3736,18 @@ class BatchCore(dict):
         #polarizations = [pol for pol in ['VV','VH','HH','HV'] if pol in sample.data_vars]
         polarizations = list(sample.data_vars)
         #print ('polarizations', polarizations)
+
+        # Handle composite mode
+        if composite:
+            if len(polarizations) < 2:
+                raise ValueError(f"Composite mode requires exactly 2 polarizations, found {len(polarizations)}: {polarizations}")
+            if len(polarizations) > 2:
+                raise ValueError(f"Composite mode requires exactly 2 polarizations, found {len(polarizations)}: {polarizations}. "
+                               "Pre-select polarizations using batch[[pol1, pol2]].plot(composite=True)")
+
+            pol1, pol2 = polarizations[0], polarizations[1]
+            fg = plot_composite(pol1, pol2)
+            return [fg]
 
         # process polarizations one by one
         fgs = []
@@ -3328,6 +3798,9 @@ class BatchCore(dict):
             if not isinstance(weight, BatchUnit) or set(weight.keys()) != set(self.keys()):
                 raise ValueError('`weight` must be a BatchUnit with the same keys as `self`')
 
+        # Validate lazy data
+        BatchCore._require_lazy(self, 'gaussian')
+
         # precompute pixel sizes for decimation
         dy, dx = self.spacing
 
@@ -3373,52 +3846,134 @@ class BatchCore(dict):
                 is_complex = np.issubdtype(data_arr.dtype, np.complexfloating)
                 out_dtype = np.complex64 if is_complex else np.float32
 
-                # Get weight array for this variable (keep as dask, don't materialize!)
+                # Get weight dask array for this variable
                 weight_dask = w[var].data if w is not None and var in w.data_vars else None
 
-                # Chunk first dim to 1 so gaussian gets 2D slices
-                first_dim = data_arr.dims[0]
-                data_arr = data_arr.chunk({first_dim: 1})
+                # Require first dimension chunked as 1 (avoid hidden rechunking overhead)
+                chunks = data_arr.data.chunks
+                if data_arr.ndim == 3 and chunks[0][0] != 1:
+                    raise ValueError(
+                        f"gaussian() requires first dimension chunked as 1, got chunks {chunks[0]}. "
+                        f"Data should already have date=1 chunks from load()."
+                    )
                 dask_data = data_arr.data
 
-                # Build dimension string based on ndim (e.g., 'ayx' for 3D)
-                dim_str = ''.join(chr(ord('a') + i) for i in range(dask_data.ndim))
-                # Weight dimension string is always 'yx' (2D, broadcast over first dim)
-                weight_dim_str = dim_str[-2:]  # last two chars, e.g., 'yx' from 'ayx'
+                # Calculate overlap depth from sigmas (truncate=4.0 is used in gaussian_numpy)
+                truncate = 4.0
+                depth_y = int(np.ceil(sigmas[0] * truncate)) if sigmas is not None else 0
+                depth_x = int(np.ceil(sigmas[1] * truncate)) if sigmas is not None else 0
+
+                if debug:
+                    print(f'DEBUG: gaussian map_overlap depth=({depth_y}, {depth_x})')
+
+                # Ensure weight is a dask array (not numpy) for map_overlap
+                #if weight_dask is not None and not isinstance(weight_dask, da.Array):
+                #    weight_dask = da.from_array(weight_dask, chunks=weight_dask.shape)
 
                 with dask.annotate(resources=task_resources):
-                    meta = np.empty((0,) * dask_data.ndim, dtype=out_dtype)
-                    if weight_dask is not None:
-                        # Ensure weight is a dask array (not numpy) for blockwise
-                        if not isinstance(weight_dask, da.Array):
-                            weight_dask = da.from_array(weight_dask, chunks=weight_dask.shape)
-                        # Pass scalars directly with None as dimension indicator
-                        result_dask = da.blockwise(
-                            _apply_gaussian_for_dask, dim_str,
-                            dask_data, dim_str,
-                            weight_dask, weight_dim_str,
-                            sigmas, None,
-                            threshold, None,
-                            device, None,
-                            (dy, dx), None,
-                            out_dtype, None,
-                            dtype=out_dtype,
-                            meta=meta,
-                        )
+                    if data_arr.ndim == 3:
+                        depth_3d = {0: 0, 1: depth_y, 2: depth_x}
+                        depth_2d = {0: depth_y, 1: depth_x}
+                        if weight_dask is not None and weight_dask.ndim == 2:
+                            # 3D data with 2D weight: loop approach (process each date separately)
+                            slices = []
+                            for i in range(dask_data.shape[0]):
+                                data_slice = dask_data[i]  # 2D
+                                # Align weight chunks to data spatial chunks
+                                #weight_aligned = weight_dask.rechunk(data_slice.chunks)
+                                if weight_dask.chunks != data_slice.chunks:
+                                    raise ValueError(
+                                        f"gaussian() weight chunks {weight_dask.chunks} must match data chunks {data_slice.chunks}"
+                                    )
+                                result_slice = da.map_overlap(
+                                    _apply_gaussian_2d_for_dask,
+                                    data_slice,
+                                    weight_dask,
+                                    depth=depth_2d,
+                                    boundary='nearest',
+                                    dtype=out_dtype,
+                                    sigmas=sigmas,
+                                    threshold=threshold,
+                                    device=device,
+                                    pixel_sizes=(dy, dx),
+                                    out_dtype=out_dtype,
+                                )
+                                slices.append(result_slice)
+                            result_dask = da.stack(slices, axis=0)
+                        elif weight_dask is not None:
+                            # 3D data with 3D weight: require matching shape/chunks
+                            if weight_dask.shape != dask_data.shape:
+                                raise ValueError(
+                                    f"gaussian() weight shape {weight_dask.shape} must match data shape {dask_data.shape}"
+                                )
+                            if weight_dask.chunks != dask_data.chunks:
+                                raise ValueError(
+                                    f"gaussian() weight chunks {weight_dask.chunks} must match data chunks {dask_data.chunks}"
+                                )
+                            result_dask = da.map_overlap(
+                                _apply_gaussian_2d_for_dask,
+                                dask_data,
+                                weight_dask,
+                                depth=depth_3d,
+                                boundary='nearest',
+                                dtype=out_dtype,
+                                sigmas=sigmas,
+                                threshold=threshold,
+                                device=device,
+                                pixel_sizes=(dy, dx),
+                                out_dtype=out_dtype,
+                            )
+                        else:
+                            # No weight: single map_overlap on 3D data
+                            result_dask = da.map_overlap(
+                                _apply_gaussian_2d_for_dask,
+                                dask_data,
+                                depth=depth_3d,
+                                boundary='nearest',
+                                dtype=out_dtype,
+                                weight_block=None,
+                                sigmas=sigmas,
+                                threshold=threshold,
+                                device=device,
+                                pixel_sizes=(dy, dx),
+                                out_dtype=out_dtype,
+                            )
                     else:
-                        # No weight - pass None directly
-                        result_dask = da.blockwise(
-                            _apply_gaussian_for_dask, dim_str,
-                            dask_data, dim_str,
-                            None, None,
-                            sigmas, None,
-                            threshold, None,
-                            device, None,
-                            (dy, dx), None,
-                            out_dtype, None,
-                            dtype=out_dtype,
-                            meta=meta,
-                        )
+                        # 2D data (y, x)
+                        depth_2d = {0: depth_y, 1: depth_x}
+                        if weight_dask is not None:
+                            #weight_aligned = weight_dask.rechunk(dask_data.chunks)
+                            if weight_dask.chunks != dask_data.chunks:
+                                raise ValueError(
+                                    f"gaussian() weight chunks {weight_dask.chunks} must match data chunks {dask_data.chunks}"
+                                )
+                            result_dask = da.map_overlap(
+                                _apply_gaussian_2d_for_dask,
+                                dask_data,
+                                weight_dask,
+                                depth=depth_2d,
+                                boundary='nearest',
+                                dtype=out_dtype,
+                                sigmas=sigmas,
+                                threshold=threshold,
+                                device=device,
+                                pixel_sizes=(dy, dx),
+                                out_dtype=out_dtype,
+                            )
+                        else:
+                            result_dask = da.map_overlap(
+                                _apply_gaussian_2d_for_dask,
+                                dask_data,
+                                depth=depth_2d,
+                                boundary='nearest',
+                                dtype=out_dtype,
+                                weight_block=None,
+                                sigmas=sigmas,
+                                threshold=threshold,
+                                device=device,
+                                pixel_sizes=(dy, dx),
+                                out_dtype=out_dtype,
+                            )
 
                 new_vars[var] = xr.DataArray(
                     result_dask,
@@ -4468,6 +5023,12 @@ class BatchCore(dict):
 
                 # Check if 3D (has stack dimension like 'pair')
                 if len(da_current.dims) > 2:
+                    # Require first dim chunked as 1 for efficient per-slice processing
+                    if hasattr(da_current.data, 'chunks') and da_current.data.chunks[0][0] != 1:
+                        raise ValueError(
+                            f"dissolve() requires first dimension chunked as 1, got chunks {da_current.data.chunks[0]}. "
+                            f"Data should already have date=1 chunks from load()."
+                        )
                     stackvar = da_current.dims[0]
                     n_stack = da_current.sizes[stackvar]
                     shape_2d = da_current.shape[1:]
@@ -4490,8 +5051,8 @@ class BatchCore(dict):
                         delayed_slices.append(delayed_slice)
 
                     # Concatenate along axis 0 - each slice is already (1, y, x)
-                    # Rechunk to ensure (1, -1, -1) chunking is preserved
-                    delayed_array = da.concatenate(delayed_slices, axis=0).rechunk({0: 1, 1: -1, 2: -1})
+                    # Rechunk to date=1 only (preserve user's spatial chunks)
+                    delayed_array = da.concatenate(delayed_slices, axis=0).rechunk({0: 1})
                 else:
                     # 2D case - single delayed array
                     # Use module-level function to avoid dask serialization issues

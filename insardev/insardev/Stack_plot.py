@@ -17,7 +17,7 @@ class Stack_plot(Stack_export):
     import pandas as pd
     import matplotlib
 
-    def plot(self, cmap='turbo', alpha=1):
+    def plot(self, cmap='turbo', alpha=1, ax=None, figsize=None):
         import pandas as pd
         import matplotlib
         import matplotlib.pyplot as plt
@@ -37,7 +37,8 @@ class Stack_plot(Stack_export):
         colormap = matplotlib.cm.get_cmap(cmap, n)
         color_map = {op: colormap(i) for i, op in enumerate(unique_orbit_paths)}
 
-        fig, ax = plt.subplots()
+        if ax is None:
+            fig, ax = plt.subplots(figsize=figsize)
 
         # Plot each burst with color based on orbit/path
         for orbit_path, group in df.groupby('orbit_path'):

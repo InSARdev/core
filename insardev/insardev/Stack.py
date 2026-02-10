@@ -796,7 +796,7 @@ class Stack(Stack_plot, BatchCore):
 
                 pbar.update(1)
 
-    def compute(self, *batches: BatchCore) -> tuple:
+    def compute(self, *batches: BatchCore, allow_rechunk: bool = False) -> tuple:
         """Compute multiple Batch objects together efficiently.
 
         This method materializes multiple dependent Batch objects in a single
@@ -810,6 +810,11 @@ class Stack(Stack_plot, BatchCore):
         ----------
         *batches : BatchCore
             One or more Batch objects to compute together.
+        allow_rechunk : bool, optional
+            If True (default), auto-rechunk output for efficient further processing:
+            - 3D data: chunk size 1 for first dim (date/pair), auto for y,x
+            - 2D data: auto for y,x based on dask.config['array.chunk-size']
+            If False, use single spatial chunk (-1 for y,x).
 
         Returns
         -------
@@ -822,7 +827,7 @@ class Stack(Stack_plot, BatchCore):
         >>> mintf, mcorr = Stack().compute(mintf.downsample(20), mcorr.downsample(20))
         """
         from .Batch import Batches
-        return Batches(batches).compute()
+        return Batches(batches).compute(allow_rechunk=allow_rechunk)
 
     def snapshot(self, *args, store: str | None = None, storage_options: dict[str, str] | None = None,
                 caption: str | None = None, n_jobs: int = -1, debug=False):
@@ -1057,14 +1062,16 @@ class Stack(Stack_plot, BatchCore):
             for date_idx, date in enumerate(ds.date.values):
                 processed_attr = {}
                 for attr in attrs[:attr_start_idx+1]:
-                    #NotImplementedError: 'item' is not yet a valid method on dask arrays
-                    value = ds[attr].item(date_idx)
-                    #value = ds[attr].values[date_idx]
-                    #print (attr, date_idx, date, value)
-                    #processed_attr['date'] = date
+                    # Use isel + values to handle both numpy and dask arrays
+                    value = ds[attr].isel(date=date_idx).values
+                    # Compute if dask array
+                    if hasattr(value, 'compute'):
+                        value = value.compute()
+                    # Extract scalar from 0-d array
                     if hasattr(value, 'item'):
-                        processed_attr[attr] = value.item()
-                    elif attr == 'geometry':
+                        value = value.item()
+                    # Parse geometry WKT string
+                    if attr == 'geometry':
                         processed_attr[attr] = wkt.loads(value)
                     else:
                         processed_attr[attr] = value
@@ -1155,6 +1162,7 @@ class Stack(Stack_plot, BatchCore):
         scale_factor = np.float32(attrs.get('scale_factor', 1.0))
         fill_value = attrs.get('_FillValue')
 
+        # Single chunk only - for multi-chunk use _load_zarr_array_chunk
         chunk_suffix = '/'.join(['0'] * len(shape))
         chunk_path = f"{base_path}/{name}/c/{chunk_suffix}"
         codec = Zstd()
@@ -1169,35 +1177,116 @@ class Stack(Stack_plot, BatchCore):
         return arr_f32
 
     @staticmethod
+    def _load_zarr_array_chunk(zarr_path, group_path, name, chunk_idx, chunk_shape,
+                                disk_chunk_shape, scale_factor, fill_value, dtype, storage_options=None):
+        """Load ONE chunk of a zarr array. Returns NaN array if chunk file doesn't exist."""
+        import numpy as np
+        from numcodecs import Zstd
+        import fsspec
+
+        fs, root = fsspec.core.url_to_fs(zarr_path, **(storage_options or {}))
+        base_path = f"{root}/{group_path}".rstrip('/')
+
+        iy, ix = chunk_idx
+        chunk_path = f"{base_path}/{name}/c/{iy}/{ix}"
+
+        # Check if chunk exists - return NaN array if not (like native zarr)
+        if not fs.exists(chunk_path):
+            return np.full(chunk_shape, np.nan, dtype=np.float32)
+
+        codec = Zstd()
+        with fs.open(chunk_path, 'rb') as f:
+            raw = codec.decode(f.read())
+        # Zarr pads edge chunks to full disk_chunk_shape
+        arr_full = np.frombuffer(raw, dtype=dtype).reshape(disk_chunk_shape)
+        arr_chunk = arr_full[:chunk_shape[0], :chunk_shape[1]].copy()
+        del arr_full
+
+        arr_f32 = np.empty(chunk_shape, dtype=np.float32)
+        np.multiply(arr_chunk, scale_factor, out=arr_f32, casting='unsafe')
+        if fill_value is not None:
+            np.putmask(arr_f32, arr_chunk == fill_value, np.nan)
+        return arr_f32
+
+    @staticmethod
+    def _get_zarr_array_meta(zarr_path, group_path, name, storage_options=None):
+        """Get zarr array metadata: shape, chunks, scale, fill_value, dtype."""
+        import numpy as np
+        import json
+        import fsspec
+
+        fs, root = fsspec.core.url_to_fs(zarr_path, **(storage_options or {}))
+        base_path = f"{root}/{group_path}".rstrip('/')
+
+        with fs.open(f"{base_path}/{name}/zarr.json", 'r') as f:
+            meta = json.load(f)
+
+        shape = tuple(meta['shape'])
+        chunks = tuple(meta.get('chunk_grid', {}).get('configuration', {}).get('chunk_shape', shape))
+        attrs = meta.get('attributes', {})
+        scale_factor = np.float32(attrs.get('scale_factor', 1.0))
+        fill_value = attrs.get('_FillValue')
+        dtype = meta['data_type']
+
+        return shape, chunks, scale_factor, fill_value, dtype
+
+    @staticmethod
+    def _load_zarr_complex_chunk(zarr_path, group_path, chunk_idx, chunk_shape,
+                                  disk_chunk_shape, scale, fill_value, storage_options=None):
+        """
+        Load ONE zarr chunk of complex64 data. Returns NaN array if chunk files don't exist.
+
+        Called separately for each chunk - one reader call per chunk.
+        Handles edge chunks where disk_chunk_shape > chunk_shape (zarr pads edges).
+        """
+        import numpy as np
+        from numcodecs import Zstd
+        import fsspec
+
+        fs, root = fsspec.core.url_to_fs(zarr_path, **(storage_options or {}))
+        base_path = f"{root}/{group_path}".rstrip('/')
+        codec = Zstd()
+        iy, ix = chunk_idx
+
+        re_path = f"{base_path}/re/c/{iy}/{ix}"
+        im_path = f"{base_path}/im/c/{iy}/{ix}"
+
+        # Check if chunk exists - return NaN array if not (like native zarr)
+        if not fs.exists(re_path) or not fs.exists(im_path):
+            return np.full(chunk_shape, np.nan + 0j, dtype=np.complex64)
+
+        # Read real part (disk has full chunk size, slice to logical size)
+        with fs.open(re_path, 'rb') as f:
+            re_full = np.frombuffer(codec.decode(f.read()), dtype=np.int16).reshape(disk_chunk_shape)
+        re_int16 = re_full[:chunk_shape[0], :chunk_shape[1]]
+        del re_full
+
+        # Read imaginary part
+        with fs.open(im_path, 'rb') as f:
+            im_full = np.frombuffer(codec.decode(f.read()), dtype=np.int16).reshape(disk_chunk_shape)
+        im_int16 = im_full[:chunk_shape[0], :chunk_shape[1]]
+        del im_full
+
+        # Build complex output
+        data = np.empty(chunk_shape, dtype=np.complex64)
+        if fill_value is not None:
+            mask = (re_int16 == fill_value) | (im_int16 == fill_value)
+
+        np.multiply(re_int16, scale, out=data.real, casting='unsafe')
+        del re_int16
+        np.multiply(im_int16, scale, out=data.imag, casting='unsafe')
+        del im_int16
+
+        if fill_value is not None:
+            np.putmask(data, mask, np.nan + 0j)
+
+        return data
+
+    @staticmethod
     def _load_zarr_complex(zarr_path, group_path, storage_options=None):
         """
-        Load complex64 array from zarr re/im pair with direct file reading.
-
-        Reads 're' and 'im' int16 arrays and combines into complex64 using
-        np.multiply with out= to write directly into real/imag views
-        without intermediate arrays. Masks fill_value as NaN.
-
-        Performance vs naive loading (3711x32766 burst, 973 MB):
-        - Time: 0.64s vs 0.77s (1.2x faster)
-        - Memory: 1.54 GB vs 2.43 GB (1.6x vs 2.5x data size)
-
-        Concurrent loading (20 arrays, 8 workers):
-        - Custom: std=11%, max=0.83s, 0% outliers
-        - Naive: std=84%, max=4.86s, 9% outliers (random stalls)
-
-        Parameters
-        ----------
-        zarr_path : str
-            Path to zarr store (local or remote via fsspec).
-        group_path : str
-            Relative path to burst group within zarr store.
-        storage_options : dict, optional
-            Options passed to fsspec filesystem.
-
-        Returns
-        -------
-        np.ndarray
-            Complex64 array with NaN for masked values.
+        Load complex64 array from zarr - single chunk case only (S1 format).
+        For multi-chunk NISAR, use _load_zarr_complex_chunk per chunk instead.
         """
         import numpy as np
         import json
@@ -1217,21 +1306,15 @@ class Stack(Stack_plot, BatchCore):
         codec = Zstd()
         data = np.empty(shape, dtype=np.complex64)
 
-        re_chunk_path = f"{base_path}/re/c/0/0"
-        with fs.open(re_chunk_path, 'rb') as f:
-            re_bytes = codec.decode(f.read())
-        re_int16 = np.frombuffer(re_bytes, dtype=np.int16).reshape(shape)
-        del re_bytes
+        with fs.open(f"{base_path}/re/c/0/0", 'rb') as f:
+            re_int16 = np.frombuffer(codec.decode(f.read()), dtype=np.int16).reshape(shape)
         if fill_value is not None:
             mask = (re_int16 == fill_value)
         np.multiply(re_int16, scale, out=data.real, casting='unsafe')
         del re_int16
 
-        im_chunk_path = f"{base_path}/im/c/0/0"
-        with fs.open(im_chunk_path, 'rb') as f:
-            im_bytes = codec.decode(f.read())
-        im_int16 = np.frombuffer(im_bytes, dtype=np.int16).reshape(shape)
-        del im_bytes
+        with fs.open(f"{base_path}/im/c/0/0", 'rb') as f:
+            im_int16 = np.frombuffer(codec.decode(f.read()), dtype=np.int16).reshape(shape)
         if fill_value is not None:
             mask |= (im_int16 == fill_value)
         np.multiply(im_int16, scale, out=data.imag, casting='unsafe')
@@ -1239,11 +1322,31 @@ class Stack(Stack_plot, BatchCore):
 
         if fill_value is not None:
             np.putmask(data, mask, np.nan + 0j)
-            del mask
 
         return data
 
-    def load(self, urls:str | list | dict[str, str], storage_options:dict[str, str]|None=None, debug:bool=False):
+    @staticmethod
+    def _get_zarr_slc_meta(zarr_path, group_path, storage_options=None):
+        """Get SLC zarr metadata: shape, chunks, scale, fill_value."""
+        import numpy as np
+        import json
+        import fsspec
+
+        fs, root = fsspec.core.url_to_fs(zarr_path, **(storage_options or {}))
+        base_path = f"{root}/{group_path}".rstrip('/')
+
+        with fs.open(f"{base_path}/re/zarr.json", 'r') as f:
+            meta = json.load(f)
+
+        shape = tuple(meta['shape'])
+        chunks = tuple(meta.get('chunk_grid', {}).get('configuration', {}).get('chunk_shape', shape))
+        scale = np.float32(meta['attributes']['scale_factor'])
+        fill_value = meta['attributes'].get('_FillValue')
+
+        return shape, chunks, scale, fill_value
+
+    def load(self, urls:str | list | dict[str, str], storage_options:dict[str, str]|None=None,
+             allow_rechunk:bool=False, debug:bool=False):
         import numpy as np
         import dask
         import dask.array as da
@@ -1275,6 +1378,24 @@ class Stack(Stack_plot, BatchCore):
                 )
         client = get_client()
         client.register_plugin(IgnoreDaskDivide(), name='ignore_divide')
+
+        # Whitelist of scalar attrs actually used by insardev processing
+        # Alignment params (sub_int_*, stretch_*, a_stretch_*, ashift, rshift) are
+        # excluded - they're only needed for debugging alignment quality in insardev_pygmtsar
+        _USED_SCALAR_ATTRS = {
+            # Mission/acquisition metadata
+            'startTime', 'polarization', 'burst', 'flightDirection',
+            'pathNumber', 'subswath', 'mission', 'beamModeType',
+            'fullBurstID', 'geometry',  # Used in to_dataframe()
+            # Radar parameters for phase2elevation, LOS calculations
+            'radar_wavelength', 'near_range', 'PRF',
+            'SC_height_start', 'SC_height_end', 'earth_radius',
+            'rng_samp_rate', 'num_lines',
+            # Baseline
+            'BPR', 'BPT', 'B_perpendicular', 'B_parallel',
+            # align_elevation() parameters
+            'linesPerBurst', 'clock_start', 'ksr', 'ker',
+        }
 
         def store_open_group_delayed(zarr_path, group):
             """
@@ -1311,7 +1432,7 @@ class Stack(Stack_plot, BatchCore):
                 if spatial_ref is None and ds.attrs.get('BPR', 1) == 0:
                     spatial_ref = ds.attrs.get('spatial_ref')
 
-                # Extract all scalar attrs (excluding system attrs)
+                # Extract scalar attrs (only whitelisted keys used by insardev)
                 scalar_attrs = {}
                 array_attrs = {}
                 skip_attrs = {'Conventions', 'spatial_ref'}
@@ -1320,10 +1441,12 @@ class Stack(Stack_plot, BatchCore):
                         continue
                     if isinstance(v, (list, tuple)):
                         array_attrs[k] = np.array(v)
-                    elif isinstance(v, str):
-                        scalar_attrs[k] = v
-                    else:
-                        scalar_attrs[k] = float(v) if isinstance(v, (int, float)) else v
+                    elif k in _USED_SCALAR_ATTRS:
+                        # Only include whitelisted scalar attrs
+                        if isinstance(v, str):
+                            scalar_attrs[k] = v
+                        else:
+                            scalar_attrs[k] = float(v) if isinstance(v, (int, float)) else v
 
                 # Store only what we need (not the full dataset!)
                 burst_infos.append({
@@ -1354,11 +1477,42 @@ class Stack(Stack_plot, BatchCore):
                 # Workers must be configured with resources={'load': N} to limit concurrency
                 delayed_arrays = []
                 for info in pol_infos:
-                    with dask.annotate(resources={'load': 1}):
-                        delayed_load = dask.delayed(Stack._load_zarr_complex)(
-                            zarr_path, info['burst_path'], storage_options
-                        )
-                    arr = da.from_delayed(delayed_load, shape=info['shape'], dtype=np.complex64)
+                    shape = info['shape']
+                    # Get chunk metadata
+                    _, zarr_chunks, scale, fill_value = Stack._get_zarr_slc_meta(
+                        zarr_path, info['burst_path'], storage_options
+                    )
+                    n_chunks_y = (shape[0] + zarr_chunks[0] - 1) // zarr_chunks[0]
+                    n_chunks_x = (shape[1] + zarr_chunks[1] - 1) // zarr_chunks[1]
+
+                    if n_chunks_y == 1 and n_chunks_x == 1:
+                        # Single chunk (S1): one reader for entire array
+                        with dask.annotate(resources={'load': 1}):
+                            delayed_load = dask.delayed(Stack._load_zarr_complex)(
+                                zarr_path, info['burst_path'], storage_options
+                            )
+                        arr = da.from_delayed(delayed_load, shape=shape, dtype=np.complex64)
+                    else:
+                        # Multi-chunk (NISAR): one reader call per chunk
+                        chunk_rows = []
+                        for iy in range(n_chunks_y):
+                            chunk_cols = []
+                            for ix in range(n_chunks_x):
+                                # Logical chunk shape (may be smaller at edges)
+                                y0, y1 = iy * zarr_chunks[0], min((iy + 1) * zarr_chunks[0], shape[0])
+                                x0, x1 = ix * zarr_chunks[1], min((ix + 1) * zarr_chunks[1], shape[1])
+                                chunk_shape = (y1 - y0, x1 - x0)
+
+                                with dask.annotate(resources={'load': 1}):
+                                    delayed_chunk = dask.delayed(Stack._load_zarr_complex_chunk)(
+                                        zarr_path, info['burst_path'], (iy, ix),
+                                        chunk_shape, zarr_chunks, scale, fill_value, storage_options
+                                    )
+                                chunk_arr = da.from_delayed(delayed_chunk, shape=chunk_shape, dtype=np.complex64)
+                                chunk_cols.append(chunk_arr)
+                            chunk_rows.append(chunk_cols)
+                        arr = da.block(chunk_rows)
+
                     arr = arr[np.newaxis, :, :]  # Add date dim: (y, x) -> (1, y, x)
                     delayed_arrays.append(arr)
 
@@ -1425,16 +1579,41 @@ class Stack(Stack_plot, BatchCore):
             ds = ds.assign_coords(x=transform.x.values, y=transform.y.values)
 
             # 2D vars as lazy dask arrays via custom reader (no persistent file descriptors)
+            # One reader call per chunk for memory efficiency
             transform_path = f"{group}/transform"
             for var in transform.data_vars:
-                shape = transform[var].shape
-                delayed_load = dask.delayed(Stack._load_zarr_array)(
+                shape, zarr_chunks, scale_factor, fill_value, dtype = Stack._get_zarr_array_meta(
                     zarr_path, transform_path, var, storage_options
                 )
-                ds[var] = xr.DataArray(
-                    da.from_delayed(delayed_load, shape=shape, dtype=np.float32),
-                    dims=['y', 'x']
-                )
+                n_chunks_y = (shape[0] + zarr_chunks[0] - 1) // zarr_chunks[0]
+                n_chunks_x = (shape[1] + zarr_chunks[1] - 1) // zarr_chunks[1]
+
+                if n_chunks_y == 1 and n_chunks_x == 1:
+                    # Single chunk: one reader for entire array
+                    delayed_load = dask.delayed(Stack._load_zarr_array)(
+                        zarr_path, transform_path, var, storage_options
+                    )
+                    arr = da.from_delayed(delayed_load, shape=shape, dtype=np.float32)
+                else:
+                    # Multi-chunk: one reader per chunk
+                    chunk_rows = []
+                    for iy in range(n_chunks_y):
+                        chunk_cols = []
+                        for ix in range(n_chunks_x):
+                            y0, y1 = iy * zarr_chunks[0], min((iy + 1) * zarr_chunks[0], shape[0])
+                            x0, x1 = ix * zarr_chunks[1], min((ix + 1) * zarr_chunks[1], shape[1])
+                            chunk_shape = (y1 - y0, x1 - x0)
+
+                            delayed_chunk = dask.delayed(Stack._load_zarr_array_chunk)(
+                                zarr_path, transform_path, var, (iy, ix),
+                                chunk_shape, zarr_chunks, scale_factor, fill_value, dtype, storage_options
+                            )
+                            chunk_arr = da.from_delayed(delayed_chunk, shape=chunk_shape, dtype=np.float32)
+                            chunk_cols.append(chunk_arr)
+                        chunk_rows.append(chunk_cols)
+                    arr = da.block(chunk_rows)
+
+                ds[var] = xr.DataArray(arr, dims=['y', 'x'])
 
             # Set spatial_ref
             if spatial_ref is None:
@@ -1508,6 +1687,7 @@ class Stack(Stack_plot, BatchCore):
                     if spatial_ref is None and bds.attrs.get('BPR', 1) == 0:
                         spatial_ref = bds.attrs.get('spatial_ref')
 
+                    # Extract scalar attrs (only whitelisted keys used by insardev)
                     scalar_attrs = {}
                     array_attrs = {}
                     for k, v in bds.attrs.items():
@@ -1515,10 +1695,12 @@ class Stack(Stack_plot, BatchCore):
                             continue
                         if isinstance(v, (list, tuple)):
                             array_attrs[k] = np.array(v)
-                        elif isinstance(v, str):
-                            scalar_attrs[k] = v
-                        else:
-                            scalar_attrs[k] = float(v) if isinstance(v, (int, float)) else v
+                        elif k in _USED_SCALAR_ATTRS:
+                            # Only include whitelisted scalar attrs
+                            if isinstance(v, str):
+                                scalar_attrs[k] = v
+                            else:
+                                scalar_attrs[k] = float(v) if isinstance(v, (int, float)) else v
 
                     burst_infos.append({
                         'url': burst_url,
@@ -1629,6 +1811,39 @@ class Stack(Stack_plot, BatchCore):
                 raise ValueError(f'Burst {key} contains duplicate dates: {duplicates}. '
                                  'This may be caused by corrupted data or library issues. '
                                  'Try restarting the runtime and reloading the data.')
+
+        # Rechunk spatial variables only (non-spatial stay as-is)
+        from .utils_dask import get_dask_chunk_size_mb, rechunk2d
+        dask_chunk_mb = get_dask_chunk_size_mb()
+        note_printed = False
+
+        for key, ds in self.items():
+            rechunked_vars = {}
+            for var in ds.data_vars:
+                arr = ds[var]
+                # Only touch spatial variables (y, x dims)
+                if not (arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x')):
+                    continue
+                if allow_rechunk:
+                    # Use rechunk2d for uniform chunk sizes
+                    y_size, x_size = arr.shape[-2], arr.shape[-1]
+                    element_bytes = arr.dtype.itemsize
+                    optimal = rechunk2d((y_size, x_size), element_bytes)
+                    if arr.ndim == 3:
+                        chunks = {arr.dims[0]: 1, 'y': optimal['y'], 'x': optimal['x']}
+                    else:
+                        chunks = {'y': optimal['y'], 'x': optimal['x']}
+                    rechunked_vars[var] = arr.chunk(chunks)
+                # else: preserve existing zarr chunks (don't rechunk)
+            if rechunked_vars:
+                self[key] = ds.assign(rechunked_vars)
+            if not note_printed:
+                if allow_rechunk:
+                    print(f"NOTE load: rechunking to dask.config['array.chunk-size']={dask_chunk_mb} MB")
+                else:
+                    print(f"NOTE load: preserving zarr chunks (allow_rechunk=False)")
+                note_printed = True
+
         return self
 
 
@@ -2219,9 +2434,9 @@ class Stack(Stack_plot, BatchCore):
 
             new_ds = ds.copy()
 
-            # Apply elevation correction
+            # Apply elevation correction (preserve float32 dtype)
             if 'ele' in ds.data_vars:
-                new_ds['ele'] = ds['ele'] + ele_corr
+                new_ds['ele'] = ds['ele'] + np.float32(ele_corr)
 
             output[bid] = new_ds
 

@@ -9,11 +9,12 @@
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
 
-def goldstein_numpy(phase_np, corr_np, psize_y, psize_x, threshold=0.5, chunk_memory_mb=256):
+def goldstein_numpy(phase_np, corr_np, psize_y, psize_x, threshold=0.5):
     """
     Goldstein adaptive filter using NumPy with batched FFT.
 
-    Memory-optimized with in-place operations. Requires complex64/float32 input.
+    Memory usage is controlled by dask chunk size (set via .chunk()).
+    Uses scipy.fft for memory-efficient processing. Requires complex64/float32 input.
 
     Parameters
     ----------
@@ -28,8 +29,6 @@ def goldstein_numpy(phase_np, corr_np, psize_y, psize_x, threshold=0.5, chunk_me
     threshold : float
         Minimum fraction of valid (non-NaN) pixels required to process a patch.
         Default 0.5 means at least 50% of pixels must be valid.
-    chunk_memory_mb : int
-        Target memory per chunk in MB (default 256).
 
     Returns
     -------
@@ -38,7 +37,7 @@ def goldstein_numpy(phase_np, corr_np, psize_y, psize_x, threshold=0.5, chunk_me
     """
     import numpy as np
     from numpy.lib.stride_tricks import sliding_window_view
-    from scipy import fft as scipy_fft  # scipy.fft has much lower memory overhead than numpy.fft
+    from scipy import fft as scipy_fft
 
     # Enforce input types
     assert phase_np.dtype == np.complex64, f"phase must be complex64, got {phase_np.dtype}"
@@ -51,19 +50,14 @@ def goldstein_numpy(phase_np, corr_np, psize_y, psize_x, threshold=0.5, chunk_me
     nan_mask = np.isnan(phase_np)
 
     # Pad input to ensure all pixels are covered by at least one patch
-    pad_y = psize_y - step_y  # Need to cover bottom edge
-    pad_x = psize_x - step_x  # Need to cover right edge
+    pad_y = psize_y - step_y
+    pad_x = psize_x - step_x
     phase_np = np.pad(phase_np, ((0, pad_y), (0, pad_x)), mode='constant', constant_values=np.nan)
     corr_np = np.pad(corr_np, ((0, pad_y), (0, pad_x)), mode='constant', constant_values=np.nan)
     padded_ny, padded_nx = phase_np.shape
 
     # Create valid mask before filling NaN with zeros
     valid_input = ~np.isnan(phase_np)
-
-    # Calculate adaptive chunk_rows based on target memory
-    n_patches_x = (padded_nx - psize_x) // step_x + 1
-    bytes_per_row = n_patches_x * psize_y * psize_x * (8 + 4 + 8 + 8 + 8)  # ~36 bytes per element
-    chunk_rows = max(1, int(chunk_memory_mb * 1e6 / bytes_per_row))
 
     # Create triangular weight matrix
     wx = 1.0 - np.abs(np.arange(psize_x // 2) - (psize_x / 2.0 - 1.0)) / (psize_x / 2.0 - 1.0)
@@ -74,90 +68,75 @@ def goldstein_numpy(phase_np, corr_np, psize_y, psize_x, threshold=0.5, chunk_me
     wgt_sum = wgt.sum()
     del quadrant, wx, wy
 
-    # Output arrays
-    out = np.zeros((padded_ny, padded_nx), dtype=np.complex64)
-    count = np.zeros((padded_ny, padded_nx), dtype=np.float32)
-
-    # Fill NaN with 0 in-place (np.pad already created copies, no need to copy again)
+    # Fill NaN with 0 (np.pad already created copies)
     np.copyto(phase_np, 0.0, where=~valid_input)
     np.copyto(corr_np, 0.0, where=np.isnan(corr_np))
 
     # Threshold for valid patches
     min_valid_pixels = int(psize_y * psize_x * threshold)
 
-    # Process in row chunks for memory efficiency
-    y = 0
-    while y <= padded_ny - psize_y:
-        # Determine chunk bounds
-        chunk_end_patch = min(y + chunk_rows * step_y, padded_ny - psize_y + 1)
-        chunk_n_rows = (chunk_end_patch - y) // step_y
-        if chunk_n_rows == 0:
-            break
-        chunk_end_y = y + (chunk_n_rows - 1) * step_y + psize_y
+    # Extract all patches using sliding_window_view
+    phase_windows = sliding_window_view(phase_np, (psize_y, psize_x))
+    corr_windows = sliding_window_view(corr_np, (psize_y, psize_x))
+    valid_windows = sliding_window_view(valid_input, (psize_y, psize_x))
 
-        # Extract all patches in chunk using sliding_window_view
-        phase_chunk = phase_np[y:chunk_end_y]
-        corr_chunk = corr_np[y:chunk_end_y]
-        valid_chunk = valid_input[y:chunk_end_y]
+    # Subsample to get patches at step intervals: (n_patches_y, n_patches_x, psize_y, psize_x)
+    n_patches_y = (padded_ny - psize_y) // step_y + 1
+    n_patches_x = (padded_nx - psize_x) // step_x + 1
+    phase_patches = phase_windows[::step_y, ::step_x].reshape(-1, psize_y, psize_x).copy()
+    corr_patches = corr_windows[::step_y, ::step_x].reshape(-1, psize_y, psize_x).copy()
+    valid_patches = valid_windows[::step_y, ::step_x].reshape(-1, psize_y, psize_x)
+    del phase_windows, corr_windows, valid_windows
 
-        phase_windows = sliding_window_view(phase_chunk, (psize_y, psize_x))
-        corr_windows = sliding_window_view(corr_chunk, (psize_y, psize_x))
-        valid_windows = sliding_window_view(valid_chunk, (psize_y, psize_x))
+    # Compute alpha for each patch: alpha = 1 - weighted_corr / wgt_sum
+    alpha = np.einsum('ij,kij->k', wgt, corr_patches)
+    del corr_patches
+    alpha /= -wgt_sum
+    alpha += 1.0
 
-        # Subsample to get patches at step intervals: (n_patches, psize_y, psize_x)
-        phase_patches = phase_windows[::step_y, ::step_x].reshape(-1, psize_y, psize_x).copy()
-        corr_patches = corr_windows[::step_y, ::step_x].reshape(-1, psize_y, psize_x).copy()
-        valid_patches = valid_windows[::step_y, ::step_x].reshape(-1, psize_y, psize_x)
+    # Valid mask: at least threshold fraction of valid pixels
+    valid_mask = valid_patches.sum(axis=(1, 2)) >= min_valid_pixels
+    del valid_patches
 
-        # Compute alpha for each patch: alpha = 1 - weighted_corr / wgt_sum
-        alpha = np.einsum('ij,kij->k', wgt, corr_patches)
-        del corr_patches
-        alpha /= -wgt_sum
-        alpha += 1.0
+    # Batched FFT2 on all patches (scipy.fft is memory-efficient)
+    fft_patches = scipy_fft.fft2(phase_patches, axes=(1, 2), workers=1, overwrite_x=True)
+    del phase_patches
 
-        # Valid mask: at least threshold fraction of valid pixels
-        valid_mask = valid_patches.sum(axis=(1, 2)) >= min_valid_pixels
-        del valid_patches
+    # Power spectrum filter: magnitude^alpha
+    pspec_weight = np.abs(fft_patches, out=np.empty_like(fft_patches, dtype=np.float32))
+    np.clip(pspec_weight, 1e-10, None, out=pspec_weight)
+    np.power(pspec_weight, alpha[:, np.newaxis, np.newaxis], out=pspec_weight)
+    del alpha
 
-        # Batched FFT2 on all patches at once (scipy.fft has much lower memory overhead)
-        fft_patches = scipy_fft.fft2(phase_patches, axes=(1, 2), workers=1, overwrite_x=True)
-        del phase_patches
+    # Batched IFFT2
+    fft_patches *= pspec_weight
+    del pspec_weight
+    filtered = scipy_fft.ifft2(fft_patches, axes=(1, 2), workers=1, overwrite_x=True)
+    del fft_patches
 
-        # Power spectrum filter: magnitude^alpha (in-place chain)
-        pspec_weight = np.abs(fft_patches, out=np.empty_like(fft_patches, dtype=np.float32))
-        np.clip(pspec_weight, 1e-10, None, out=pspec_weight)
-        np.power(pspec_weight, alpha[:, np.newaxis, np.newaxis], out=pspec_weight)
-        del alpha
+    # Apply triangular weight and mask invalid patches
+    filtered *= wgt[np.newaxis, :, :]
+    filtered[~valid_mask] = 0
+    n_patches = filtered.shape[0]
+    wgt_expanded = np.zeros((n_patches, psize_y, psize_x), dtype=np.float32)
+    np.copyto(wgt_expanded, wgt, where=valid_mask[:, np.newaxis, np.newaxis])
+    del valid_mask
 
-        # Batched IFFT2 (in-place multiply first)
-        fft_patches *= pspec_weight
-        del pspec_weight
-        filtered = scipy_fft.ifft2(fft_patches, axes=(1, 2), workers=1, overwrite_x=True)
-        del fft_patches
+    # Accumulate: fold patches back into output
+    out = np.zeros((padded_ny, padded_nx), dtype=np.complex64)
+    count = np.zeros((padded_ny, padded_nx), dtype=np.float32)
+    patch_idx = 0
+    for i in range(n_patches_y):
+        y_start = i * step_y
+        for j in range(n_patches_x):
+            x_start = j * step_x
+            out[y_start:y_start+psize_y, x_start:x_start+psize_x] += filtered[patch_idx]
+            count[y_start:y_start+psize_y, x_start:x_start+psize_x] += wgt_expanded[patch_idx]
+            patch_idx += 1
 
-        # Apply triangular weight and mask invalid patches (in-place)
-        filtered *= wgt[np.newaxis, :, :]
-        filtered[~valid_mask] = 0
-        n_patches = filtered.shape[0]
-        wgt_expanded = np.zeros((n_patches, psize_y, psize_x), dtype=np.float32)
-        np.copyto(wgt_expanded, wgt, where=valid_mask[:, np.newaxis, np.newaxis])
-        del valid_mask
-
-        # Accumulate: fold patches back into output
-        patch_idx = 0
-        for i in range(chunk_n_rows):
-            y_start = y + i * step_y
-            for j in range(n_patches_x):
-                x_start = j * step_x
-                out[y_start:y_start+psize_y, x_start:x_start+psize_x] += filtered[patch_idx]
-                count[y_start:y_start+psize_y, x_start:x_start+psize_x] += wgt_expanded[patch_idx]
-                patch_idx += 1
-
-        del filtered, wgt_expanded
-        y += chunk_n_rows * step_y
+    del filtered, wgt_expanded
 
     # Mark pixels with no valid contribution as invalid
-    # Use small epsilon to catch pixels that only received negligible weight
     insufficient_weight = count < 1e-6
 
     # Normalize by accumulated weights
@@ -179,6 +158,7 @@ def goldstein_pytorch(phase_np, corr_np, psize_y, psize_x, device, threshold=0.5
     """
     Goldstein adaptive filter using PyTorch with vectorized unfold/fold.
 
+    Memory usage is controlled by dask chunk size (set via .chunk()).
     Optimized for GPU (MPS/CUDA). Requires complex64/float32 input.
 
     Parameters
@@ -233,20 +213,20 @@ def goldstein_pytorch(phase_np, corr_np, psize_y, psize_x, device, threshold=0.5
 
     with torch.no_grad():
         # Pad to ensure all pixels are covered and dimensions work with unfold/fold
-        pad_y = psize_y - step_y  # Need to cover bottom edge
-        pad_x = psize_x - step_x  # Need to cover right edge
+        pad_y = psize_y - step_y
+        pad_x = psize_x - step_x
         # Additional padding to make dimensions divisible by step
         extra_pad_h = (step_y - ((ny + pad_y - psize_y) % step_y)) % step_y
         extra_pad_w = (step_x - ((nx + pad_x - psize_x) % step_x)) % step_x
         total_pad_y = pad_y + extra_pad_h
         total_pad_x = pad_x + extra_pad_w
 
-        # Pad with 0 (creates copies - no need for separate .copy())
+        # Pad with 0 (creates copies)
         phase_np = np.pad(phase_np, ((0, total_pad_y), (0, total_pad_x)), mode='constant', constant_values=0)
         corr_np = np.pad(corr_np, ((0, total_pad_y), (0, total_pad_x)), mode='constant', constant_values=0)
         valid_input = np.pad(valid_input, ((0, total_pad_y), (0, total_pad_x)), mode='constant', constant_values=False)
 
-        # Fill NaN with 0 in-place (np.pad already created copies)
+        # Fill NaN with 0 (np.pad already created copies)
         np.copyto(phase_np, 0.0, where=~valid_input)
         np.copyto(corr_np, 0.0, where=np.isnan(corr_np))
 
