@@ -14,13 +14,15 @@ Pure numpy implementation without disk I/O or external binaries.
 import numpy as np
 
 
-def get_geoid(grid=None):
+def get_geoid(grid=None, netcdf_engine='netcdf4'):
     """Get EGM96 geoid heights, optionally interpolated to grid.
 
     Parameters
     ----------
     grid : xarray.DataArray, optional
         If provided, interpolate geoid to this grid's lat/lon coordinates.
+    netcdf_engine : str, optional
+        NetCDF engine to use: 'netcdf4' or 'h5netcdf'. Default is 'netcdf4'.
 
     Returns
     -------
@@ -31,7 +33,7 @@ def get_geoid(grid=None):
     import importlib.resources as resources
 
     with resources.as_file(resources.files('insardev_pygmtsar.data') / 'geoid_egm96_icgem.grd') as geoid_filename:
-        geoid = xr.open_dataarray(geoid_filename, engine='netcdf4')\
+        geoid = xr.open_dataarray(geoid_filename, engine=netcdf_engine)\
             .rename({'y': 'lat', 'x': 'lon'})\
             .astype(np.float32).transpose('lat', 'lon').rename('geoid')
     if grid is not None:
@@ -39,7 +41,7 @@ def get_geoid(grid=None):
     return geoid
 
 
-def get_geoid_correction(lat, lon):
+def get_geoid_correction(lat, lon, netcdf_engine='netcdf4'):
     """Get EGM96 geoid correction for given coordinates.
 
     Memory-efficient version using scipy interpolation on numpy arrays.
@@ -51,6 +53,8 @@ def get_geoid_correction(lat, lon):
         Latitude coordinates (can be 1D flattened array).
     lon : array-like
         Longitude coordinates (same shape as lat).
+    netcdf_engine : str, optional
+        NetCDF engine to use: 'netcdf4' or 'h5netcdf'. Default is 'netcdf4'.
 
     Returns
     -------
@@ -58,19 +62,26 @@ def get_geoid_correction(lat, lon):
         Geoid heights in meters (same shape as input).
     """
     from scipy.interpolate import RegularGridInterpolator
-    from netCDF4 import Dataset
     import importlib.resources as resources
 
     lat = np.asarray(lat)
     lon = np.asarray(lon)
 
     with resources.as_file(resources.files('insardev_pygmtsar.data') / 'geoid_egm96_icgem.grd') as geoid_filename:
-        with Dataset(str(geoid_filename), 'r') as nc:
+        if netcdf_engine == 'h5netcdf':
+            import h5netcdf
+            nc = h5netcdf.File(str(geoid_filename), 'r')
+        else:
+            from netCDF4 import Dataset
+            nc = Dataset(str(geoid_filename), 'r')
+        try:
             # Read coordinate arrays (small 1D)
             geoid_lat = nc.variables['y'][:]
             geoid_lon = nc.variables['x'][:]
             # Read geoid data
             geoid_z = nc.variables['z'][:].astype(np.float32)
+        finally:
+            nc.close()
 
     # Create interpolator (lat increasing required)
     if geoid_lat[0] > geoid_lat[-1]:
@@ -89,7 +100,7 @@ def get_geoid_correction(lat, lon):
     return result.reshape(lat.shape) if lat.ndim > 0 else result
 
 
-def get_dem_wgs84ellipsoid(dem_path, geometry, buffer_degrees=0.04):
+def get_dem_wgs84ellipsoid(dem_path, geometry, buffer_degrees=0.04, netcdf_engine='netcdf4'):
     """Load ellipsoid-corrected DEM cropped to geometry bounds.
 
     Reads only the needed tile directly from disk using netCDF4 slicing.
@@ -103,6 +114,8 @@ def get_dem_wgs84ellipsoid(dem_path, geometry, buffer_degrees=0.04):
         Geometry for cropping (uses bounds).
     buffer_degrees : float, optional
         Buffer around geometry bounds in degrees. Default is 0.04.
+    netcdf_engine : str, optional
+        NetCDF engine to use: 'netcdf4' or 'h5netcdf'. Default is 'netcdf4'.
 
     Returns
     -------
@@ -120,9 +133,14 @@ def get_dem_wgs84ellipsoid(dem_path, geometry, buffer_degrees=0.04):
     lat_max += buffer_degrees
 
     if dem_path.endswith(('.nc', '.netcdf', '.grd')):
-        # Use netCDF4 for direct tile slicing - no full load, no dask
-        from netCDF4 import Dataset
-        with Dataset(dem_path, 'r') as nc:
+        # Use configured engine for direct tile slicing - no full load, no dask
+        if netcdf_engine == 'h5netcdf':
+            import h5netcdf
+            nc = h5netcdf.File(dem_path, 'r')
+        else:
+            from netCDF4 import Dataset
+            nc = Dataset(dem_path, 'r')
+        try:
             # Get coordinate arrays
             lat_var = nc.variables.get('lat') or nc.variables.get('y')
             lon_var = nc.variables.get('lon') or nc.variables.get('x')
@@ -134,6 +152,7 @@ def get_dem_wgs84ellipsoid(dem_path, geometry, buffer_degrees=0.04):
             lon_idx = np.where((lon_coords >= lon_min) & (lon_coords <= lon_max))[0]
 
             if len(lat_idx) == 0 or len(lon_idx) == 0:
+                nc.close()
                 return None
 
             lat_start, lat_end = lat_idx[0], lat_idx[-1] + 1
@@ -152,6 +171,8 @@ def get_dem_wgs84ellipsoid(dem_path, geometry, buffer_degrees=0.04):
             ortho_vals = data_var[lat_start:lat_end, lon_start:lon_end].astype(np.float32)
             ortho_lat = lat_coords[lat_start:lat_end]
             ortho_lon = lon_coords[lon_start:lon_end]
+        finally:
+            nc.close()
 
         # Create xarray for geoid interpolation
         ortho = xr.DataArray(
@@ -175,7 +196,7 @@ def get_dem_wgs84ellipsoid(dem_path, geometry, buffer_degrees=0.04):
         return None
 
     # Apply geoid correction (convert orthometric to ellipsoidal heights)
-    geoid = get_geoid(ortho)
+    geoid = get_geoid(ortho, netcdf_engine=netcdf_engine)
     dem_ellipsoid = ortho + geoid
 
     return dem_ellipsoid.astype(np.float32)
@@ -205,7 +226,7 @@ def _process_tile_worker(args):
      orbit_dict, clock_start_days, prf,
      near_range, rng_samp_rate, num_lines, earth_radius,
      n_azi, n_rng, ra, e2,
-     scale_factor, fill_value, row_batch, lookdir) = args
+     scale_factor, fill_value, row_batch, lookdir, netcdf_engine) = args
 
     iy, jy, ix, jx = tile_bounds
     tile_height = jy - iy
@@ -371,7 +392,7 @@ def _process_tile_worker(args):
             float(np.nanmax(batch_lon)) + buffer_deg,
             float(np.nanmax(batch_lat)) + buffer_deg
         )
-        dem_tile = get_dem_wgs84ellipsoid(dem_path, batch_geom, buffer_degrees=0.01)
+        dem_tile = get_dem_wgs84ellipsoid(dem_path, batch_geom, buffer_degrees=0.01, netcdf_engine=netcdf_engine)
 
         if dem_tile is None or dem_tile.size == 0:
             batch_ele = np.zeros(batch_shape, dtype=np.float32)
@@ -547,7 +568,7 @@ def _process_topo_worker(args):
     # Unpack arguments
     (topo_dir, dem_path, tile_bounds, azi_coords_tile, rng_coords_tile,
      orbit_dict, clock_start_days, prf, near_range, rng_samp_rate, earth_radius,
-     ra, e2, scale_factor, fill_value, row_batch, lookdir) = args
+     ra, e2, scale_factor, fill_value, row_batch, lookdir, netcdf_engine) = args
 
     ia, ja, ir, jr = tile_bounds
     tile_height = ja - ia
@@ -596,7 +617,7 @@ def _process_topo_worker(args):
             float(np.nanmax(lon)) + buffer_deg,
             float(np.nanmax(lat)) + buffer_deg
         )
-        dem_chunk = get_dem_wgs84ellipsoid(dem_path, batch_geom, buffer_degrees=0.01)
+        dem_chunk = get_dem_wgs84ellipsoid(dem_path, batch_geom, buffer_degrees=0.01, netcdf_engine=netcdf_engine)
 
         if dem_chunk is None or dem_chunk.size == 0:
             ele = np.zeros(lat.shape, dtype=np.float32).ravel()
@@ -658,7 +679,7 @@ def _process_boundary_worker(args):
     # Unpack arguments - chunk_azi and chunk_rng are already sliced
     (chunk_azi, chunk_rng, dem_path,
      orbit_time, orbit_pos, orbit_vel, clock_start, prf,
-     near_range, rng_samp_rate, earth_radius, epsg, lookdir) = args
+     near_range, rng_samp_rate, earth_radius, epsg, lookdir, netcdf_engine) = args
 
     # Fast ellipsoid transform to get approximate lon/lat
     lon_approx, lat_approx, _ = satellite_rat2llt(
@@ -675,7 +696,7 @@ def _process_boundary_worker(args):
     lon_max = np.nanmax(lon_approx) + buffer_deg
 
     chunk_geom = box(lon_min, lat_min, lon_max, lat_max)
-    dem_chunk = get_dem_wgs84ellipsoid(dem_path, chunk_geom, buffer_degrees=0.01)
+    dem_chunk = get_dem_wgs84ellipsoid(dem_path, chunk_geom, buffer_degrees=0.01, netcdf_engine=netcdf_engine)
 
     if dem_chunk is None or dem_chunk.size == 0:
         y_proj, x_proj = proj(lat_approx.ravel(), lon_approx.ravel(), from_epsg=4326, to_epsg=epsg)
@@ -3333,6 +3354,7 @@ def compute_conversion_chunked(prm, dem_path, geometry, outdir,
                                chunk=(8192, 8192),
                                compute_topo=True,
                                n_jobs=-1,
+                               netcdf_engine='netcdf4',
                                debug=False):
     """
     Compute transform and topo tile-by-tile, writing directly to zarr.
@@ -3475,7 +3497,7 @@ def compute_conversion_chunked(prm, dem_path, geometry, outdir,
         worker_args.append((
             chunk_azi, chunk_rng, dem_path,
             orbit_time, orbit_pos, orbit_vel, clock_start, prf,
-            near_range, rng_samp_rate, earth_radius, epsg, lookdir
+            near_range, rng_samp_rate, earth_radius, epsg, lookdir, netcdf_engine
         ))
     del tasks
 
@@ -3582,7 +3604,7 @@ def compute_conversion_chunked(prm, dem_path, geometry, outdir,
                 orbit_dict, clock_start_days, prf,
                 near_range, rng_samp_rate, num_lines, earth_radius,
                 n_azi, n_rng, ra, e2,
-                scale_factor, fill_value, row_batch, lookdir
+                scale_factor, fill_value, row_batch, lookdir, netcdf_engine
             ))
 
     if debug:
@@ -3631,7 +3653,7 @@ def compute_conversion_chunked(prm, dem_path, geometry, outdir,
                     topo_dir, dem_path, (ia, ja, ir, jr),
                     azi_coords_tile, rng_coords_tile,
                     orbit_dict, clock_start_days, prf, near_range, rng_samp_rate, earth_radius,
-                    ra, e2, scale_factor, fill_value, row_batch, lookdir
+                    ra, e2, scale_factor, fill_value, row_batch, lookdir, netcdf_engine
                 ))
 
         if debug:

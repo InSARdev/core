@@ -11,7 +11,7 @@ from .S1_align import S1_align
 
 
 def _compute_transform_inverse_worker(prm_ref_df, prm_ref_orbit_df, dem_path, geometry_wkt, outdir,
-                               scale_factor, epsg, resolution, n_chunks, debug, result_queue):
+                               scale_factor, epsg, resolution, n_chunks, debug, netcdf_engine, result_queue):
     """Worker function for compute_transform_inverse in spawned subprocess.
 
     Must be at module level for multiprocessing spawn to pickle it.
@@ -31,7 +31,7 @@ def _compute_transform_inverse_worker(prm_ref_df, prm_ref_orbit_df, dem_path, ge
 
     # Parse geometry and load DEM
     geometry = wkt.loads(geometry_wkt)
-    dem = get_dem_wgs84ellipsoid(dem_path, geometry)
+    dem = get_dem_wgs84ellipsoid(dem_path, geometry, netcdf_engine=netcdf_engine)
 
     # Compute and save transform
     topo, transform = compute_transform_inverse(
@@ -788,7 +788,7 @@ class S1_transform(S1_align):
             # Load DEM and compute transform
             from .utils_satellite import compute_transform_inverse, get_dem_wgs84ellipsoid, save_transform
             record = self.get_record(ref_burst_name)
-            dem = get_dem_wgs84ellipsoid(self.DEM, record.geometry.iloc[0])
+            dem = get_dem_wgs84ellipsoid(self.DEM, record.geometry.iloc[0], netcdf_engine=self.netcdf_engine_read)
             topo, transform = compute_transform_inverse(prm_ref_main, dem, scale_factor=1/dem_vertical_accuracy, epsg=epsg, resolution=resolution, debug=debug)
 
             # Save transform to zarr
@@ -900,7 +900,7 @@ class S1_transform(S1_align):
             result_queue = ctx.Queue()
             p = ctx.Process(target=_compute_transform_inverse_worker, args=(
                 prm_ref_df, prm_ref_orbit_df, self.DEM, geometry_wkt, outdir,
-                1/dem_vertical_accuracy, epsg, resolution, 8, debug, result_queue
+                1/dem_vertical_accuracy, epsg, resolution, 8, debug, self.netcdf_engine_read, result_queue
             ))
             p.start()
             result = result_queue.get()  # wait for result

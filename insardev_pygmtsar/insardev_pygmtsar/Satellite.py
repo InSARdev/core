@@ -275,7 +275,7 @@ class Satellite(progressbar_joblib, datagrid):
         See EGM96 geoid heights on http://icgem.gfz-potsdam.de/tom_longtime
         """
         from .utils_satellite import get_geoid
-        return get_geoid(grid)
+        return get_geoid(grid, netcdf_engine=self.netcdf_engine_read)
 
     def get_dem(self, geometry: gpd.GeoDataFrame = None, buffer_degrees: float = 0):
         """
@@ -380,7 +380,6 @@ class Satellite(progressbar_joblib, datagrid):
         """
         import numpy as np
         import os
-        from netCDF4 import Dataset
 
         record = self.get_record(record_id)
         geometry = record.geometry
@@ -390,12 +389,20 @@ class Satellite(progressbar_joblib, datagrid):
         bounds = geometry.buffer(buffer_degrees).total_bounds  # [minx, miny, maxx, maxy]
         lon_min, lat_min, lon_max, lat_max = bounds
 
-        # Open DEM file directly with netCDF4 (never loads full array!)
+        # Open DEM file directly (never loads full array!)
         dem_path = self.DEM
         if not isinstance(dem_path, str) or not os.path.exists(dem_path):
             raise ValueError(f'DEM path must be a valid file: {dem_path}')
 
-        with Dataset(dem_path, 'r') as nc:
+        # Use configured netcdf engine for optimized strided access
+        if self.netcdf_engine_read == 'h5netcdf':
+            import h5netcdf
+            nc = h5netcdf.File(dem_path, 'r')
+        else:
+            from netCDF4 import Dataset
+            nc = Dataset(dem_path, 'r')
+
+        try:
             # Get coordinate arrays (these are small - just 1D indices)
             lat_var = nc.variables.get('lat') or nc.variables.get('y')
             lon_var = nc.variables.get('lon') or nc.variables.get('x')
@@ -432,11 +439,13 @@ class Satellite(progressbar_joblib, datagrid):
             z_vals = dem_var[lat_start:lat_end:dec_factor, lon_start:lon_end:dec_factor].astype(np.float32)
             lat_vals = lat_arr[lat_start:lat_end:dec_factor]
             lon_vals = lon_arr[lon_start:lon_end:dec_factor]
+        finally:
+            nc.close()
 
         # Apply geoid correction (EGM96 -> WGS84 ellipsoid)
         from .utils_satellite import get_geoid_correction
         lon_grid, lat_grid = np.meshgrid(lon_vals, lat_vals)
-        geoid = get_geoid_correction(lat_grid.ravel(), lon_grid.ravel())
+        geoid = get_geoid_correction(lat_grid.ravel(), lon_grid.ravel(), netcdf_engine=self.netcdf_engine_read)
         z_wgs84 = z_vals.ravel() + geoid.astype(np.float32)
         del geoid
 
