@@ -7,9 +7,11 @@
 #
 # See the LICENSE file in the insardev_pygmtsar directory for license terms.
 # ----------------------------------------------------------------------------
-__version__ = '2025.12.21.dev.1'
+__version__ = '2025.12.21.dev.2'
 
 # radar parameters management
 from .PRM import PRM
 # Sentinel-1 processing
 from .S1 import S1
+# NISAR processing
+from .Nisar import Nisar

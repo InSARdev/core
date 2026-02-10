@@ -39,10 +39,61 @@ def get_geoid(grid=None):
     return geoid
 
 
+def get_geoid_correction(lat, lon):
+    """Get EGM96 geoid correction for given coordinates.
+
+    Memory-efficient version using scipy interpolation on numpy arrays.
+    No xarray overhead - suitable for large point arrays.
+
+    Parameters
+    ----------
+    lat : array-like
+        Latitude coordinates (can be 1D flattened array).
+    lon : array-like
+        Longitude coordinates (same shape as lat).
+
+    Returns
+    -------
+    numpy.ndarray
+        Geoid heights in meters (same shape as input).
+    """
+    from scipy.interpolate import RegularGridInterpolator
+    from netCDF4 import Dataset
+    import importlib.resources as resources
+
+    lat = np.asarray(lat)
+    lon = np.asarray(lon)
+
+    with resources.as_file(resources.files('insardev_pygmtsar.data') / 'geoid_egm96_icgem.grd') as geoid_filename:
+        with Dataset(str(geoid_filename), 'r') as nc:
+            # Read coordinate arrays (small 1D)
+            geoid_lat = nc.variables['y'][:]
+            geoid_lon = nc.variables['x'][:]
+            # Read geoid data
+            geoid_z = nc.variables['z'][:].astype(np.float32)
+
+    # Create interpolator (lat increasing required)
+    if geoid_lat[0] > geoid_lat[-1]:
+        geoid_lat = geoid_lat[::-1]
+        geoid_z = geoid_z[::-1, :]
+
+    interp = RegularGridInterpolator(
+        (geoid_lat, geoid_lon), geoid_z,
+        method='linear', bounds_error=False, fill_value=0.0
+    )
+
+    # Interpolate to requested points
+    points = np.column_stack([lat.ravel(), lon.ravel()])
+    result = interp(points).astype(np.float32)
+
+    return result.reshape(lat.shape) if lat.ndim > 0 else result
+
+
 def get_dem_wgs84ellipsoid(dem_path, geometry, buffer_degrees=0.04):
     """Load ellipsoid-corrected DEM cropped to geometry bounds.
 
-    Loads orthometric DEM and applies EGM96 geoid correction to get WGS84 ellipsoidal heights.
+    Reads only the needed tile directly from disk using netCDF4 slicing.
+    No full load, no lazy/dask overhead.
 
     Parameters
     ----------
@@ -68,30 +119,576 @@ def get_dem_wgs84ellipsoid(dem_path, geometry, buffer_degrees=0.04):
     lon_max += buffer_degrees
     lat_max += buffer_degrees
 
-    # Load DEM
-    if dem_path.endswith(('.tiff', '.tif', '.TIF')):
+    if dem_path.endswith(('.nc', '.netcdf', '.grd')):
+        # Use netCDF4 for direct tile slicing - no full load, no dask
+        from netCDF4 import Dataset
+        with Dataset(dem_path, 'r') as nc:
+            # Get coordinate arrays
+            lat_var = nc.variables.get('lat') or nc.variables.get('y')
+            lon_var = nc.variables.get('lon') or nc.variables.get('x')
+            lat_coords = lat_var[:].astype(np.float64)
+            lon_coords = lon_var[:].astype(np.float64)
+
+            # Find indices for the requested bounds
+            lat_idx = np.where((lat_coords >= lat_min) & (lat_coords <= lat_max))[0]
+            lon_idx = np.where((lon_coords >= lon_min) & (lon_coords <= lon_max))[0]
+
+            if len(lat_idx) == 0 or len(lon_idx) == 0:
+                return None
+
+            lat_start, lat_end = lat_idx[0], lat_idx[-1] + 1
+            lon_start, lon_end = lon_idx[0], lon_idx[-1] + 1
+
+            # Find the data variable (first 2D variable that's not a coordinate)
+            data_var = None
+            for name, var in nc.variables.items():
+                if name not in ('lat', 'lon', 'x', 'y') and len(var.dimensions) == 2:
+                    data_var = var
+                    break
+            if data_var is None:
+                raise ValueError(f'No 2D data variable found in {dem_path}')
+
+            # Read only the needed tile from disk
+            ortho_vals = data_var[lat_start:lat_end, lon_start:lon_end].astype(np.float32)
+            ortho_lat = lat_coords[lat_start:lat_end]
+            ortho_lon = lon_coords[lon_start:lon_end]
+
+        # Create xarray for geoid interpolation
+        ortho = xr.DataArray(
+            ortho_vals,
+            coords={'lat': ortho_lat, 'lon': ortho_lon},
+            dims=['lat', 'lon']
+        )
+
+    elif dem_path.endswith(('.tiff', '.tif', '.TIF')):
         import rioxarray as rio
-        ortho = xr.open_dataarray(dem_path, engine='rasterio')\
-            .squeeze(drop=True)\
-            .rename({'y': 'lat', 'x': 'lon'})\
-            .drop_vars('spatial_ref', errors='ignore')
-        if ortho.lat.diff('lat')[0].item() < 0:
-            ortho = ortho.reindex(lat=ortho.lat[::-1])
-    elif dem_path.endswith(('.nc', '.netcdf', '.grd')):
-        ortho = xr.open_dataarray(dem_path)
+        # For GeoTIFF, use rioxarray with windowed reading
+        with xr.open_dataarray(dem_path, engine='rasterio') as da:
+            da = da.squeeze(drop=True).rename({'y': 'lat', 'x': 'lon'})
+            if da.lat.diff('lat')[0].item() < 0:
+                da = da.reindex(lat=da.lat[::-1])
+            ortho = da.sel(lat=slice(lat_min, lat_max), lon=slice(lon_min, lon_max)).load()
     else:
         raise ValueError(f'Unrecognized DEM file extension: {dem_path}')
 
-    ortho = ortho.transpose('lat', 'lon')
-
-    # Crop to geometry bounds
-    ortho = ortho.sel(lat=slice(lat_min, lat_max), lon=slice(lon_min, lon_max))
+    if ortho is None or ortho.size == 0:
+        return None
 
     # Apply geoid correction (convert orthometric to ellipsoidal heights)
     geoid = get_geoid(ortho)
     dem_ellipsoid = ortho + geoid
 
     return dem_ellipsoid.astype(np.float32)
+
+
+def _process_tile_worker(args):
+    """Worker function for processing a single tile in spawned subprocess.
+
+    Must be at module level for multiprocessing spawn to pickle it.
+    Each worker processes one tile then exits (max_tasks_per_child=1), releasing memory.
+
+    Like S1 burst processing: fully independent, reads DEM from disk, writes zarr chunks.
+    No full arrays from main process - computes coordinates locally from grid params.
+
+    OPTIMIZATION: Pre-computes orbit interpolation ONCE per tile (not per batch).
+    This eliminates 240x overhead from repeated Hermite interpolations.
+    """
+    import numpy as np
+    import cv2
+    import zarr
+    from scipy import constants
+
+    # Unpack arguments - grid_params instead of reading from zarr
+    (trans_dir, dem_path, epsg,
+     tile_bounds,  # (iy, jy, ix, jx) - indices into output grid
+     grid_params,  # (y_min, dy, x_min, dx) - compute coords locally
+     orbit_dict, clock_start_days, prf,
+     near_range, rng_samp_rate, num_lines, earth_radius,
+     n_azi, n_rng, ra, e2,
+     scale_factor, fill_value, row_batch, lookdir) = args
+
+    iy, jy, ix, jx = tile_bounds
+    tile_height = jy - iy
+    tile_width = jx - ix
+    y_min, dy, x_min, dx = grid_params
+
+    # Debug: verify grid_params are scalars (not arrays)
+    assert np.isscalar(y_min), f"y_min is not scalar: {type(y_min)}, shape={getattr(y_min, 'shape', 'N/A')}"
+    assert np.isscalar(dy), f"dy is not scalar: {type(dy)}, shape={getattr(dy, 'shape', 'N/A')}"
+    assert np.isscalar(x_min), f"x_min is not scalar: {type(x_min)}, shape={getattr(x_min, 'shape', 'N/A')}"
+    assert np.isscalar(dx), f"dx is not scalar: {type(dx)}, shape={getattr(dx, 'shape', 'N/A')}"
+
+    # Reconstruct orbit DataFrame
+    import pandas as pd
+    orbit_df = pd.DataFrame(orbit_dict)
+
+    # Open zarr store for writing
+    trans_store = zarr.storage.LocalStore(trans_dir)
+    trans_root = zarr.open(trans_store, mode='r+')
+
+    # Get zarr arrays for writing (no reading of full coordinate arrays!)
+    azi_arr = trans_root['azi']
+    rng_arr = trans_root['rng']
+    ele_arr = trans_root['ele']
+
+    def to_int32(arr):
+        scaled = (scale_factor * arr).round()
+        finite = np.isfinite(scaled)
+        # Suppress warning for NaN->int cast (handled by np.where with fill_value)
+        with np.errstate(invalid='ignore'):
+            return np.where(finite, scaled.astype(np.int32), fill_value)
+
+    # === PRE-COMPUTE ORBIT INTERPOLATION ONCE PER TILE ===
+    # This is the key optimization - avoids 16x repeated interpolation per tile
+    SOL = constants.speed_of_light
+    orbit_time = orbit_df['clock'].values
+    px = orbit_df['px'].values
+    py = orbit_df['py'].values
+    pz = orbit_df['pz'].values
+    vx = orbit_df['vx'].values
+    vy = orbit_df['vy'].values
+    vz = orbit_df['vz'].values
+
+    # Compute acceleration for Hermite interpolation
+    dt_orb = orbit_time[1] - orbit_time[0]
+    ax = np.gradient(vx, dt_orb)
+    ay = np.gradient(vy, dt_orb)
+    az_acc = np.gradient(vz, dt_orb)
+
+    # Time range for azimuth lines
+    t1 = 86400.0 * clock_start_days + (num_lines - num_lines) / (2.0 * prf)
+    npad = 100
+    azi_times = t1 + np.arange(-npad, num_lines + npad) / prf
+    n_azi_times = len(azi_times)
+
+    # Interpolate orbit at azimuth times - DONE ONCE PER TILE
+    orb_x = _hermite_interp(orbit_time, px, vx, azi_times, nval=6)
+    orb_y = _hermite_interp(orbit_time, py, vy, azi_times, nval=6)
+    orb_z = _hermite_interp(orbit_time, pz, vz, azi_times, nval=6)
+    orb_vx = _hermite_interp(orbit_time, vx, ax, azi_times, nval=6)
+    orb_vy = _hermite_interp(orbit_time, vy, ay, azi_times, nval=6)
+    orb_vz = _hermite_interp(orbit_time, vz, az_acc, azi_times, nval=6)
+
+    # Range conversion constants
+    range_pixel_size = SOL / (2.0 * rng_samp_rate)
+    e2_wgs = (ra**2 - 6356752.31424518**2) / ra**2
+
+    # === COMPUTE RADAR BOUNDARY POLYGON (once per tile) ===
+    # Forward transform radar edges to geocoded coords, build convex hull
+    # This allows skipping Doppler computation for pixels outside radar swath
+    from shapely.geometry import MultiPoint, Polygon
+
+    # Sample radar boundary: first/last azi rows, first/last rng cols
+    bnd_step = 100  # Sample every 100 pixels for speed
+    bnd_azi_list, bnd_rng_list = [], []
+
+    # Pre-compute coordinate sample arrays (to ensure matching lengths)
+    rng_samples = np.arange(0.5, n_rng, bnd_step, dtype=np.float32)
+    azi_samples = np.arange(0.5, n_azi, bnd_step, dtype=np.float32)
+
+    # First and last azimuth rows (all range)
+    for azi_val in [0.5, n_azi - 0.5]:
+        bnd_azi_list.append(np.full(len(rng_samples), azi_val, dtype=np.float32))
+        bnd_rng_list.append(rng_samples.copy())
+
+    # First and last range columns (all azimuth)
+    for rng_val in [0.5, n_rng - 0.5]:
+        bnd_azi_list.append(azi_samples.copy())
+        bnd_rng_list.append(np.full(len(azi_samples), rng_val, dtype=np.float32))
+
+    bnd_azi = np.concatenate(bnd_azi_list)
+    bnd_rng = np.concatenate(bnd_rng_list)
+    del bnd_azi_list, bnd_rng_list, rng_samples, azi_samples
+
+    # Forward transform boundary to geocoded coords using rat2llt
+    bnd_lon, bnd_lat, _ = satellite_rat2llt(
+        bnd_azi, bnd_rng,
+        orbit_df['clock'].values, orbit_df[['px', 'py', 'pz']].values,
+        orbit_df[['vx', 'vy', 'vz']].values,
+        86400.0 * clock_start_days, prf, near_range, rng_samp_rate,
+        earth_radius, dem=None, max_iter=1, tol=1.0, n_chunks=1, lookdir=lookdir
+    )
+
+    # Project to output CRS and build convex hull polygon
+    bnd_y, bnd_x = proj(bnd_lat, bnd_lon, from_epsg=4326, to_epsg=epsg)
+    bnd_valid = np.isfinite(bnd_y) & np.isfinite(bnd_x)
+    if bnd_valid.sum() > 3:
+        bnd_points = MultiPoint(np.column_stack([bnd_x[bnd_valid], bnd_y[bnd_valid]]))
+        radar_polygon = bnd_points.convex_hull.buffer(max(dy, dx) * 10)  # Buffer for safety
+    else:
+        radar_polygon = None  # Fallback: process all pixels
+    del bnd_azi, bnd_rng, bnd_lon, bnd_lat, bnd_y, bnd_x, bnd_valid
+
+    # Process tile in row batches to limit memory
+    for by in range(0, tile_height, row_batch):
+        ey = min(by + row_batch, tile_height)
+        batch_shape = (ey - by, tile_width)
+
+        # Compute coordinates locally from grid params (no full arrays!)
+        # Grid coords are pixel centers: coord[i] = origin + spacing * (i + 0.5)
+        _arr = np.arange(iy + by, iy + ey) + 0.5
+        if not np.isscalar(dy):
+            raise ValueError(f"dy is array! type={type(dy)}, shape={dy.shape}, by={by}, ey={ey}")
+        y_batch = (y_min + dy * _arr).astype(np.float32)
+        x_batch = (x_min + dx * (np.arange(ix, jx) + 0.5)).astype(np.float32)
+        x_grid, y_grid = np.meshgrid(x_batch, y_batch)
+
+        # Project batch to lon/lat
+        batch_lat, batch_lon = proj(y_grid.ravel(), x_grid.ravel(), from_epsg=epsg, to_epsg=4326)
+        batch_lat = np.asarray(batch_lat).reshape(batch_shape).astype(np.float32)
+        batch_lon = np.asarray(batch_lon).reshape(batch_shape).astype(np.float32)
+
+        # Check if batch intersects radar polygon - skip if entirely outside
+        if radar_polygon is not None:
+            from shapely.geometry import box as shapely_box
+            batch_box = shapely_box(
+                float(x_batch.min()), float(y_batch.min()),
+                float(x_batch.max()), float(y_batch.max())
+            )
+            if not radar_polygon.intersects(batch_box):
+                # Entire batch is outside radar coverage - skip
+                del x_grid, y_grid, batch_lat, batch_lon
+                continue
+
+            # Create pixel-level mask for pixels inside radar polygon
+            from shapely import vectorized
+            x_flat = (x_min + dx * (np.arange(ix, jx) + 0.5))
+            y_flat = (y_min + dy * (np.arange(iy + by, iy + ey) + 0.5))
+            xx, yy = np.meshgrid(x_flat, y_flat)
+            inside_mask = vectorized.contains(radar_polygon, xx.ravel(), yy.ravel()).reshape(batch_shape)
+            del xx, yy, x_flat, y_flat
+        else:
+            inside_mask = np.ones(batch_shape, dtype=bool)
+
+        del x_grid, y_grid
+
+        # Read DEM tile from file (netCDF4 direct slicing - no full load)
+        from shapely.geometry import box as shapely_box
+        buffer_deg = 0.02
+        batch_geom = shapely_box(
+            float(np.nanmin(batch_lon)) - buffer_deg,
+            float(np.nanmin(batch_lat)) - buffer_deg,
+            float(np.nanmax(batch_lon)) + buffer_deg,
+            float(np.nanmax(batch_lat)) + buffer_deg
+        )
+        dem_tile = get_dem_wgs84ellipsoid(dem_path, batch_geom, buffer_degrees=0.01)
+
+        if dem_tile is None or dem_tile.size == 0:
+            batch_ele = np.zeros(batch_shape, dtype=np.float32)
+        else:
+            # Interpolate DEM tile using cv2.remap
+            dem_lat = dem_tile.lat.values.astype(np.float64)
+            dem_lon = dem_tile.lon.values.astype(np.float64)
+            dem_vals = dem_tile.values.astype(np.float32)
+            dem_lat0, dem_dlat = dem_lat[0], dem_lat[1] - dem_lat[0]
+            dem_lon0, dem_dlon = dem_lon[0], dem_lon[1] - dem_lon[0]
+
+            map_row = ((batch_lat - dem_lat0) / dem_dlat).astype(np.float32)
+            map_col = ((batch_lon - dem_lon0) / dem_dlon).astype(np.float32)
+            batch_ele = cv2.remap(dem_vals, map_col, map_row,
+                                  interpolation=cv2.INTER_LINEAR,
+                                  borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
+            del dem_tile, dem_lat, dem_lon, dem_vals, map_row, map_col
+
+        # === INLINE LLT2RAT using pre-computed orbit (no function call overhead) ===
+        # Only process pixels inside radar polygon (skip pixels outside for performance)
+        inside_flat = inside_mask.ravel()
+        n_inside = inside_flat.sum()
+
+        if n_inside == 0:
+            # All pixels outside radar coverage - skip batch
+            del batch_lat, batch_lon, batch_ele, inside_mask, inside_flat
+            continue
+
+        # Extract only inside pixels for processing
+        lon_flat = batch_lon.ravel()[inside_flat]
+        lat_flat = batch_lat.ravel()[inside_flat]
+        ele_flat = batch_ele.ravel()[inside_flat]
+        n_points = n_inside
+
+        # Convert geodetic to ECEF
+        lon_rad = np.radians(lon_flat)
+        lat_rad = np.radians(lat_flat)
+        sin_lat = np.sin(lat_rad)
+        cos_lat = np.cos(lat_rad)
+        sin_lon = np.sin(lon_rad)
+        cos_lon = np.cos(lon_rad)
+        N = ra / np.sqrt(1 - e2_wgs * sin_lat**2)
+        xp = (N + ele_flat) * cos_lat * cos_lon
+        yp = (N + ele_flat) * cos_lat * sin_lon
+        zp = (N * (1 - e2_wgs) + ele_flat) * sin_lat
+        del lon_rad, lat_rad, sin_lat, cos_lat, sin_lon, cos_lon, N
+
+        # Find zero-Doppler using coarse sampling then refine
+        chunk_size = 50000
+        batch_azi_pix = np.zeros(n_points, dtype=np.float32)
+        batch_rng_pix = np.zeros(n_points, dtype=np.float32)
+
+        for ci in range(0, n_points, chunk_size):
+            cj = min(ci + chunk_size, n_points)
+            chunk_xp = xp[ci:cj]
+            chunk_yp = yp[ci:cj]
+            chunk_zp = zp[ci:cj]
+            n_chunk = cj - ci
+
+            # Coarse Doppler sampling
+            sample_step = max(1, n_azi_times // 20)
+            sample_idx = np.arange(0, n_azi_times, sample_step)
+            doppler_samples = np.zeros((n_chunk, len(sample_idx)), dtype=np.float32)
+            for j, idx in enumerate(sample_idx):
+                delta_x = chunk_xp - orb_x[idx]
+                delta_y = chunk_yp - orb_y[idx]
+                delta_z = chunk_zp - orb_z[idx]
+                doppler_samples[:, j] = delta_x * orb_vx[idx] + delta_y * orb_vy[idx] + delta_z * orb_vz[idx]
+
+            # Find zero crossing
+            sign_change = doppler_samples[:, :-1] * doppler_samples[:, 1:] < 0
+            first_crossing = np.argmax(sign_change, axis=1)
+            no_crossing = ~np.any(sign_change, axis=1)
+            # Points with no Doppler zero crossing are outside radar swath
+            # Don't use fallback - mark them as invalid (NaN) later
+            if no_crossing.any():
+                # Use index 0 as placeholder (will be marked NaN below)
+                first_crossing[no_crossing] = 0
+
+            bracket_lo = sample_idx[first_crossing]
+            bracket_hi = np.minimum(sample_idx[np.minimum(first_crossing + 1, len(sample_idx) - 1)], n_azi_times - 1)
+
+            # Vectorized Doppler refinement (no Python loop!)
+            dx_lo = chunk_xp - orb_x[bracket_lo]
+            dy_lo = chunk_yp - orb_y[bracket_lo]
+            dz_lo = chunk_zp - orb_z[bracket_lo]
+            doppler_lo = dx_lo * orb_vx[bracket_lo] + dy_lo * orb_vy[bracket_lo] + dz_lo * orb_vz[bracket_lo]
+
+            dx_hi = chunk_xp - orb_x[bracket_hi]
+            dy_hi = chunk_yp - orb_y[bracket_hi]
+            dz_hi = chunk_zp - orb_z[bracket_hi]
+            doppler_hi = dx_hi * orb_vx[bracket_hi] + dy_hi * orb_vy[bracket_hi] + dz_hi * orb_vz[bracket_hi]
+
+            denom = doppler_lo - doppler_hi
+            denom = np.where(np.abs(denom) < 1e-10, 1e-10, denom)
+            alpha = doppler_lo / denom
+            # Mark pixels where alpha is outside [0,1] as invalid (zero crossing outside bracket)
+            invalid_alpha = (alpha < 0) | (alpha > 1)
+            alpha = np.clip(alpha, 0, 1)
+            azi_idx_float = bracket_lo + alpha * (bracket_hi - bracket_lo)
+            # Mark invalid pixels as NaN
+            azi_idx_float[no_crossing] = np.nan
+            azi_idx_float[invalid_alpha] = np.nan
+            batch_azi_pix[ci:cj] = azi_idx_float - npad
+
+            # Compute slant range (only for valid azi pixels)
+            invalid_azi = np.isnan(azi_idx_float)
+            # Use 0 as placeholder for invalid pixels (will be marked NaN later)
+            azi_idx_safe = np.where(invalid_azi, 0.0, azi_idx_float)
+            azi_idx_int = np.clip(np.floor(azi_idx_safe).astype(np.int32), 0, n_azi_times - 2)
+            azi_frac = azi_idx_safe - azi_idx_int
+            sat_x = orb_x[azi_idx_int] * (1 - azi_frac) + orb_x[azi_idx_int + 1] * azi_frac
+            sat_y = orb_y[azi_idx_int] * (1 - azi_frac) + orb_y[azi_idx_int + 1] * azi_frac
+            sat_z = orb_z[azi_idx_int] * (1 - azi_frac) + orb_z[azi_idx_int + 1] * azi_frac
+            range_m = np.sqrt((chunk_xp - sat_x)**2 + (chunk_yp - sat_y)**2 + (chunk_zp - sat_z)**2)
+            rng_pix = (range_m - near_range) / range_pixel_size
+            # Mark range as NaN where azi is invalid
+            rng_pix[invalid_azi] = np.nan
+            batch_rng_pix[ci:cj] = rng_pix
+
+        del xp, yp, zp
+
+        # Mark out-of-bounds as NaN (in the flat inside arrays)
+        out_of_bounds = ((batch_azi_pix < 0.5) | (batch_azi_pix > n_azi - 0.5) |
+                        (batch_rng_pix < 0.5) | (batch_rng_pix > n_rng - 0.5))
+        batch_azi_pix[out_of_bounds] = np.nan
+        batch_rng_pix[out_of_bounds] = np.nan
+
+        # Compute ele_gmtsar for inside pixels only
+        sin_lat = np.sin(np.float32(np.pi / 180) * lat_flat)
+        cos_lat = np.cos(np.float32(np.pi / 180) * lat_flat)
+        sin_lon = np.sin(np.float32(np.pi / 180) * lon_flat)
+        cos_lon = np.cos(np.float32(np.pi / 180) * lon_flat)
+        N = np.float32(ra) / np.sqrt(1 - np.float32(e2) * sin_lat**2)
+        Nh = N + ele_flat
+        xp = Nh * cos_lat * cos_lon
+        yp = Nh * cos_lat * sin_lon
+        zp = (N * np.float32(1 - e2) + ele_flat) * sin_lat
+        batch_ele_gmt_inside = np.sqrt(xp**2 + yp**2 + zp**2) - np.float32(earth_radius)
+        batch_ele_gmt_inside[out_of_bounds] = np.nan
+        del sin_lat, cos_lat, sin_lon, cos_lon, N, Nh, xp, yp, zp, out_of_bounds
+        del lat_flat, lon_flat, ele_flat
+
+        # Scatter inside results back to full batch arrays (NaN for outside pixels)
+        batch_azi = np.full(batch_shape, np.nan, dtype=np.float32)
+        batch_rng = np.full(batch_shape, np.nan, dtype=np.float32)
+        batch_ele_gmt = np.full(batch_shape, np.nan, dtype=np.float32)
+        batch_azi.ravel()[inside_flat] = batch_azi_pix
+        batch_rng.ravel()[inside_flat] = batch_rng_pix
+        batch_ele_gmt.ravel()[inside_flat] = batch_ele_gmt_inside
+        del batch_azi_pix, batch_rng_pix, batch_ele_gmt_inside, inside_flat, inside_mask
+        del batch_lat, batch_lon, batch_ele
+
+        # Write batch to zarr
+        azi_arr[iy + by:iy + ey, ix:jx] = to_int32(batch_azi)
+        rng_arr[iy + by:iy + ey, ix:jx] = to_int32(batch_rng)
+        ele_arr[iy + by:iy + ey, ix:jx] = to_int32(batch_ele_gmt)
+        del batch_azi, batch_rng, batch_ele_gmt
+
+    return True
+
+
+def _process_topo_worker(args):
+    """Worker function for computing topo (forward transform: radar → geo) for a single tile.
+
+    Must be at module level for multiprocessing spawn to pickle it.
+    Each worker processes one tile then exits (max_tasks_per_child=1), releasing memory.
+    """
+    import numpy as np
+    import cv2
+    import zarr
+
+    # Unpack arguments
+    (topo_dir, dem_path, tile_bounds, azi_coords_tile, rng_coords_tile,
+     orbit_dict, clock_start_days, prf, near_range, rng_samp_rate, earth_radius,
+     ra, e2, scale_factor, fill_value, row_batch, lookdir) = args
+
+    ia, ja, ir, jr = tile_bounds
+    tile_height = ja - ia
+    tile_width = jr - ir
+
+    # Reconstruct orbit DataFrame
+    import pandas as pd
+    orbit_df = pd.DataFrame(orbit_dict)
+    orbit_time = orbit_df['clock'].values
+    orbit_pos = orbit_df[['px', 'py', 'pz']].values
+    orbit_vel = orbit_df[['vx', 'vy', 'vz']].values
+    clock_start = 86400.0 * clock_start_days
+
+    # Open zarr store for writing
+    topo_store = zarr.storage.LocalStore(topo_dir)
+    topo_root = zarr.open(topo_store, mode='r+')
+    topo_arr = topo_root['topo']
+
+    # Process tile in row batches to limit memory
+    for ba in range(0, tile_height, row_batch):
+        ea = min(ba + row_batch, tile_height)
+        batch_shape = (ea - ba, tile_width)
+
+        # Create radar coordinate grids for this batch
+        batch_azi = azi_coords_tile[ba:ea]
+        batch_rng = rng_coords_tile
+        azi_grid, rng_grid = np.meshgrid(batch_azi, batch_rng, indexing='ij')
+
+        # Forward transform: radar → lon/lat
+        lon, lat, _ = satellite_rat2llt(
+            azi_grid, rng_grid,
+            orbit_time, orbit_pos, orbit_vel,
+            clock_start, prf, near_range, rng_samp_rate, earth_radius,
+            dem=None, max_iter=1, tol=0.5, n_chunks=1, lookdir=lookdir
+        )
+        lat = lat.astype(np.float32)
+        lon = lon.astype(np.float32)
+        del azi_grid, rng_grid
+
+        # Read DEM chunk from file for this batch
+        from shapely.geometry import box as shapely_box
+        buffer_deg = 0.02
+        batch_geom = shapely_box(
+            float(np.nanmin(lon)) - buffer_deg,
+            float(np.nanmin(lat)) - buffer_deg,
+            float(np.nanmax(lon)) + buffer_deg,
+            float(np.nanmax(lat)) + buffer_deg
+        )
+        dem_chunk = get_dem_wgs84ellipsoid(dem_path, batch_geom, buffer_degrees=0.01)
+
+        if dem_chunk is None or dem_chunk.size == 0:
+            ele = np.zeros(lat.shape, dtype=np.float32).ravel()
+        else:
+            dem_lat_arr = dem_chunk.lat.values.astype(np.float64)
+            dem_lon_arr = dem_chunk.lon.values.astype(np.float64)
+            dem_vals = dem_chunk.values.astype(np.float32)
+            dem_lat0, dem_dlat = dem_lat_arr[0], dem_lat_arr[1] - dem_lat_arr[0]
+            dem_lon0, dem_dlon = dem_lon_arr[0], dem_lon_arr[1] - dem_lon_arr[0]
+
+            map_row = ((lat - dem_lat0) / dem_dlat).astype(np.float32)
+            map_col = ((lon - dem_lon0) / dem_dlon).astype(np.float32)
+            ele = cv2.remap(dem_vals, map_col, map_row,
+                            interpolation=cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
+            ele = ele.ravel().astype(np.float32)
+            del dem_chunk, dem_lat_arr, dem_lon_arr, dem_vals, map_row, map_col
+
+        lat = lat.ravel()
+        lon = lon.ravel()
+
+        # Compute ele_gmtsar
+        lat_rad = np.float32(np.pi / 180) * lat
+        lon_rad = np.float32(np.pi / 180) * lon
+        sin_lat = np.sin(lat_rad)
+        cos_lat = np.cos(lat_rad)
+        sin_lon = np.sin(lon_rad)
+        cos_lon = np.cos(lon_rad)
+        N = np.float32(ra) / np.sqrt(1 - np.float32(e2) * sin_lat**2)
+        Nh = N + ele
+        xp = Nh * cos_lat * cos_lon
+        yp = Nh * cos_lat * sin_lon
+        zp = (N * np.float32(1 - e2) + ele) * sin_lat
+        ele_gmtsar = np.sqrt(xp**2 + yp**2 + zp**2) - np.float32(earth_radius)
+        del lat, lon, ele, lat_rad, lon_rad, sin_lat, cos_lat, sin_lon, cos_lon, N, Nh, xp, yp, zp
+
+        # Write batch to zarr
+        batch_topo = ele_gmtsar.reshape(batch_shape)
+        scaled = (scale_factor * batch_topo).round()
+        finite = np.isfinite(scaled)
+        int_data = np.where(finite, scaled.astype(np.int32), fill_value)
+        topo_arr[ia + ba:ia + ea, ir:jr] = int_data
+        del ele_gmtsar, batch_topo, scaled, finite, int_data
+
+    return True
+
+
+def _process_boundary_worker(args):
+    """Worker function for processing a boundary chunk in spawned subprocess.
+
+    Must be at module level for multiprocessing spawn to pickle it.
+    Each worker processes one chunk then exits (max_tasks_per_child=1), releasing memory.
+
+    Args now contain pre-sliced arrays (chunk_azi, chunk_rng) instead of full arrays.
+    """
+    import numpy as np
+    from shapely.geometry import box
+
+    # Unpack arguments - chunk_azi and chunk_rng are already sliced
+    (chunk_azi, chunk_rng, dem_path,
+     orbit_time, orbit_pos, orbit_vel, clock_start, prf,
+     near_range, rng_samp_rate, earth_radius, epsg, lookdir) = args
+
+    # Fast ellipsoid transform to get approximate lon/lat
+    lon_approx, lat_approx, _ = satellite_rat2llt(
+        chunk_azi, chunk_rng, orbit_time, orbit_pos, orbit_vel,
+        clock_start, prf, near_range, rng_samp_rate, earth_radius,
+        dem=None, max_iter=1, tol=1.0, n_chunks=1, lookdir=lookdir
+    )
+
+    # Read narrow DEM chunk from file
+    buffer_deg = 0.02
+    lat_min = np.nanmin(lat_approx) - buffer_deg
+    lat_max = np.nanmax(lat_approx) + buffer_deg
+    lon_min = np.nanmin(lon_approx) - buffer_deg
+    lon_max = np.nanmax(lon_approx) + buffer_deg
+
+    chunk_geom = box(lon_min, lat_min, lon_max, lat_max)
+    dem_chunk = get_dem_wgs84ellipsoid(dem_path, chunk_geom, buffer_degrees=0.01)
+
+    if dem_chunk is None or dem_chunk.size == 0:
+        y_proj, x_proj = proj(lat_approx.ravel(), lon_approx.ravel(), from_epsg=4326, to_epsg=epsg)
+        return np.asarray(y_proj).ravel().astype(np.float32), np.asarray(x_proj).ravel().astype(np.float32)
+
+    # Refine with DEM chunk
+    lon, lat, _ = satellite_rat2llt(
+        chunk_azi, chunk_rng, orbit_time, orbit_pos, orbit_vel,
+        clock_start, prf, near_range, rng_samp_rate, earth_radius,
+        dem=dem_chunk, max_iter=10, tol=0.5, n_chunks=1, lookdir=lookdir
+    )
+    y_proj, x_proj = proj(lat.ravel(), lon.ravel(), from_epsg=4326, to_epsg=epsg)
+    return np.asarray(y_proj).ravel().astype(np.float32), np.asarray(x_proj).ravel().astype(np.float32)
 
 
 def get_utm_epsg(lat, lon):
@@ -296,7 +893,8 @@ def _geodetic_to_ecef(lon, lat, height):
 
 def satellite_rat2llt(azi, rng, orbit_time, orbit_pos, orbit_vel,
                       clock_start, prf, near_range, rng_samp_rate,
-                      earth_radius, dem=None, max_iter=50, tol=0.01, n_chunks=1):
+                      earth_radius, dem=None, max_iter=50, tol=0.01, n_chunks=1,
+                      lookdir='R'):
     """
     Direct radar-to-geographic coordinate transform with optional DEM.
 
@@ -387,7 +985,8 @@ def satellite_rat2llt(azi, rng, orbit_time, orbit_pos, orbit_vel,
                 azi[start:end], rng[start:end],
                 orbit_time, orbit_pos, orbit_vel,
                 clock_start, prf, near_range, rng_samp_rate,
-                earth_radius, dem=dem, max_iter=max_iter, tol=tol, n_chunks=1
+                earth_radius, dem=dem, max_iter=max_iter, tol=tol, n_chunks=1,
+                lookdir=lookdir
             )
             lon_chunks.append(lon_c)
             lat_chunks.append(lat_c)
@@ -466,7 +1065,6 @@ def satellite_rat2llt(azi, rng, orbit_time, orbit_pos, orbit_vel,
     vx_u = (Vx / v_mag).astype(np.float32)
     vy_u = (Vy / v_mag).astype(np.float32)
     vz_u = (Vz / v_mag).astype(np.float32)
-    descending = np.mean(Vz) < 0  # Check before deleting Vz
     del v_mag, Vx, Vy, Vz  # Free velocity arrays
 
     # Radial unit vector (from Earth center to satellite)
@@ -490,16 +1088,37 @@ def satellite_rat2llt(azi, rng, orbit_time, orbit_pos, orbit_vel,
     cx = (uy_zd * vz_u - uz_zd * vy_u).astype(np.float32)
     cy = (uz_zd * vx_u - ux_zd * vz_u).astype(np.float32)
     cz = (ux_zd * vy_u - uy_zd * vx_u).astype(np.float32)
-    del vx_u, vy_u, vz_u  # Free velocity unit vectors
     c_mag = np.sqrt(cx**2 + cy**2 + cz**2).astype(np.float32)
     cx /= c_mag
     cy /= c_mag
     cz /= c_mag
     del c_mag
 
-    # Flip for descending orbit (right-looking geometry)
-    if descending:
+    # Determine cross-track sign using GMTSAR's geometric approach:
+    # det = (cross_track × velocity) · satellite_pos
+    # For right-looking radar, det should be positive (cross_track points away from Earth center
+    # when crossed with velocity). If negative, flip cross_track.
+    # This works for any satellite (ascending/descending, left/right looking).
+    # Reference: GMTSAR SAT_llt2rat.c lines 262-270
+    # Use first element for arrays (all elements have same orbit geometry)
+    vx0 = float(vx_u.flat[0]) if hasattr(vx_u, 'flat') else float(vx_u)
+    vy0 = float(vy_u.flat[0]) if hasattr(vy_u, 'flat') else float(vy_u)
+    vz0 = float(vz_u.flat[0]) if hasattr(vz_u, 'flat') else float(vz_u)
+    sx0 = float(Sx.flat[0]) if hasattr(Sx, 'flat') else float(Sx)
+    sy0 = float(Sy.flat[0]) if hasattr(Sy, 'flat') else float(Sy)
+    sz0 = float(Sz.flat[0]) if hasattr(Sz, 'flat') else float(Sz)
+    cx0 = float(cx.flat[0]) if hasattr(cx, 'flat') else float(cx)
+    cy0 = float(cy.flat[0]) if hasattr(cy, 'flat') else float(cy)
+    cz0 = float(cz.flat[0]) if hasattr(cz, 'flat') else float(cz)
+    det_x = cy0 * vz0 - cz0 * vy0
+    det_y = cz0 * vx0 - cx0 * vz0
+    det_z = cx0 * vy0 - cy0 * vx0
+    det = det_x * sx0 + det_y * sy0 + det_z * sz0
+    # lookdir_sign: 1 for right-looking, -1 for left-looking
+    lookdir_sign = -1 if lookdir.upper() == 'L' else 1
+    if det * lookdir_sign < 0:
         cx, cy, cz = -cx, -cy, -cz
+    del vx_u, vy_u, vz_u  # Free velocity unit vectors
 
     # Initial estimate using spherical Earth approximation
     cos_look = ((r_sat**2 + slant_range**2 - earth_radius**2) / (2.0 * r_sat * slant_range)).astype(np.float32)
@@ -538,38 +1157,66 @@ def satellite_rat2llt(azi, rng, orbit_time, orbit_pos, orbit_vel,
     # Handle both ascending and descending lat coordinates
     lat_ascending = dem_lat[1] > dem_lat[0]
 
-    def fast_dem_interp(lat_pts, lon_pts):
-        """Fast cubic interpolation using cv2.remap."""
-        # Save original shape - cv2.remap can change array shape for 1D inputs
-        original_shape = lat_pts.shape
+    # Chunk size aligned with HDF5 chunks (512x512) - 8192 = 16x512
+    CHUNK_SIZE = 8192
 
-        # Convert geographic coords to pixel indices (cv2.remap uses x=col, y=row)
+    def fast_dem_interp(lat_pts, lon_pts):
+        """Fast cubic interpolation using cv2.remap with 2D chunking for large grids."""
+        original_shape = lat_pts.shape
+        is_1d = lat_pts.ndim == 1
+
+        # Convert geographic coords to pixel indices
         if lat_ascending:
             map_y = ((lat_pts - lat_min) / lat_step).astype(np.float32)
         else:
             map_y = ((lat_max - lat_pts) / lat_step).astype(np.float32)
         map_x = ((lon_pts - lon_min) / lon_step).astype(np.float32)
 
-        # Mark out-of-bounds before interpolation (NaN coords cause issues)
+        # Mark out-of-bounds
         out_of_bounds = (map_y < 0) | (map_y >= n_lat - 1) | \
                         (map_x < 0) | (map_x >= n_lon - 1) | \
                         ~np.isfinite(map_y) | ~np.isfinite(map_x)
 
-        # Clamp out-of-bounds to valid range for cv2.remap (will be NaN'd later)
         map_y_safe = np.where(out_of_bounds, 0, map_y)
         map_x_safe = np.where(out_of_bounds, 0, map_x)
 
-        # cv2.remap with cubic interpolation (better for DEM)
-        result = cv2.remap(dem_values, map_x_safe, map_y_safe,
-                           interpolation=cv2.INTER_CUBIC,
-                           borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        if is_1d:
+            n_rows, n_cols = lat_pts.size, 1
+        else:
+            n_rows, n_cols = original_shape
 
-        # Reshape to original input shape (cv2.remap returns (N,1) for 1D inputs)
-        result = result.reshape(original_shape)
+        needs_chunking = n_rows > CHUNK_SIZE or n_cols > CHUNK_SIZE
 
-        # Mark out-of-bounds coordinates as NaN
+        if not needs_chunking:
+            # Fast path: small grid
+            result = cv2.remap(dem_values, map_x_safe, map_y_safe,
+                               interpolation=cv2.INTER_CUBIC,
+                               borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+            # Reshape to original input shape (cv2.remap returns (N,1) for 1D inputs)
+            result = result.reshape(original_shape)
+        else:
+            result = np.empty(original_shape, dtype=np.float32)
+
+            # 2D chunking for large grids
+            for iy in range(0, n_rows, CHUNK_SIZE):
+                jy = min(iy + CHUNK_SIZE, n_rows)
+                if is_1d:
+                    chunk_result = cv2.remap(dem_values,
+                                             map_x_safe[iy:jy], map_y_safe[iy:jy],
+                                             interpolation=cv2.INTER_CUBIC,
+                                             borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+                    result[iy:jy] = chunk_result.ravel()
+                else:
+                    for ix in range(0, n_cols, CHUNK_SIZE):
+                        jx = min(ix + CHUNK_SIZE, n_cols)
+                        chunk_result = cv2.remap(dem_values,
+                                                 map_x_safe[iy:jy, ix:jx],
+                                                 map_y_safe[iy:jy, ix:jx],
+                                                 interpolation=cv2.INTER_CUBIC,
+                                                 borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+                        result[iy:jy, ix:jx] = chunk_result
+
         result[out_of_bounds] = np.nan
-
         return result
 
     # Damped iteration to converge on slant range
@@ -1065,14 +1712,17 @@ def satellite_baseline(orbit_df1: "pd.DataFrame", orbit_df2: "pd.DataFrame",
             f"(center={baseline_center:.2f}m, end={baseline_end:.2f}m)"
         )
 
-    # SC_height should vary smoothly (< 100m variation for ~2.5s burst at ~7km/s)
+    # SC_height should vary smoothly
+    # For S1 bursts (~2.5s): <100m variation
+    # For NISAR scenes (~35s): allow more variation (up to 250m for longer acquisitions)
     sc_height_var_sc = abs(sc_height_start - sc_height_center)
     sc_height_var_ce = abs(sc_height_center - sc_height_end)
-    assert sc_height_var_sc < 100.0, (
+    sc_height_threshold = 250.0  # meters
+    assert sc_height_var_sc < sc_height_threshold, (
         f"SC_height varies too much between start and center: {sc_height_var_sc:.1f}m "
         f"(start={sc_height_start:.1f}m, center={sc_height_center:.1f}m)"
     )
-    assert sc_height_var_ce < 100.0, (
+    assert sc_height_var_ce < sc_height_threshold, (
         f"SC_height varies too much between center and end: {sc_height_var_ce:.1f}m "
         f"(center={sc_height_center:.1f}m, end={sc_height_end:.1f}m)"
     )
@@ -1121,7 +1771,8 @@ def satellite_llt2rat(lon: np.ndarray, lat: np.ndarray, elevation: np.ndarray,
                       ashift: int = 0,
                       sub_int_r: float = 0.0,
                       sub_int_a: float = 0.0,
-                      chirp_ext: int = 0) -> np.ndarray:
+                      chirp_ext: int = 0,
+                      debug: bool = False) -> np.ndarray:
     """
     Convert geographic coordinates (LLT) to radar coordinates (RAT).
 
@@ -1291,20 +1942,17 @@ def satellite_llt2rat(lon: np.ndarray, lat: np.ndarray, elevation: np.ndarray,
         bracket_hi = np.minimum(sample_idx[np.minimum(first_crossing + 1, len(sample_idx) - 1)], n_azi - 1)
 
         # Refine within bracket using linear interpolation on Doppler
-        # Compute exact Doppler at bracket bounds
-        doppler_lo = np.zeros(n_chunk, dtype=np.float64)
-        doppler_hi = np.zeros(n_chunk, dtype=np.float64)
-        for k in range(n_chunk):
-            lo, hi = bracket_lo[k], bracket_hi[k]
-            dx_lo = chunk_xp[k] - orb_x[lo]
-            dy_lo = chunk_yp[k] - orb_y[lo]
-            dz_lo = chunk_zp[k] - orb_z[lo]
-            doppler_lo[k] = dx_lo * orb_vx[lo] + dy_lo * orb_vy[lo] + dz_lo * orb_vz[lo]
+        # Compute exact Doppler at bracket bounds - VECTORIZED (no Python loop!)
+        dx_lo = chunk_xp - orb_x[bracket_lo]
+        dy_lo = chunk_yp - orb_y[bracket_lo]
+        dz_lo = chunk_zp - orb_z[bracket_lo]
+        doppler_lo = dx_lo * orb_vx[bracket_lo] + dy_lo * orb_vy[bracket_lo] + dz_lo * orb_vz[bracket_lo]
 
-            dx_hi = chunk_xp[k] - orb_x[hi]
-            dy_hi = chunk_yp[k] - orb_y[hi]
-            dz_hi = chunk_zp[k] - orb_z[hi]
-            doppler_hi[k] = dx_hi * orb_vx[hi] + dy_hi * orb_vy[hi] + dz_hi * orb_vz[hi]
+        dx_hi = chunk_xp - orb_x[bracket_hi]
+        dy_hi = chunk_yp - orb_y[bracket_hi]
+        dz_hi = chunk_zp - orb_z[bracket_hi]
+        doppler_hi = dx_hi * orb_vx[bracket_hi] + dy_hi * orb_vy[bracket_hi] + dz_hi * orb_vz[bracket_hi]
+        del dx_lo, dy_lo, dz_lo, dx_hi, dy_hi, dz_hi
 
         # Linear interpolation to find zero crossing
         denom = doppler_lo - doppler_hi
@@ -1405,9 +2053,14 @@ def save_transform(transform, outdir, scale_factor=2.0):
             trans_int[varname].attrs['scale_factor'] = 1/look_scale
             trans_int[varname].attrs['add_offset'] = 0
 
-    shape = (transform.y.size, transform.x.size)
+    # Use 8192 chunk size for memory-efficient reading
+    CHUNK_SIZE = 8192
+    n_y, n_x = transform.y.size, transform.x.size
+    chunk_y = min(CHUNK_SIZE, n_y)
+    chunk_x = min(CHUNK_SIZE, n_x)
+
     all_vars = ['rng', 'azi', 'ele'] + [v for v in ['look_E', 'look_N', 'look_U'] if v in trans_int]
-    encoding = {var: {'chunks': shape, '_FillValue': fill_value} for var in all_vars}
+    encoding = {var: {'chunks': (chunk_y, chunk_x), '_FillValue': fill_value} for var in all_vars}
     trans_int.to_zarr(
         store=os.path.join(outdir, 'transform'),
         mode='w',
@@ -1417,10 +2070,519 @@ def save_transform(transform, outdir, scale_factor=2.0):
     )
 
 
+def save_topo(topo, outdir, scale_factor=2.0):
+    """Save topo DataArray to zarr with int32 encoding.
+
+    Parameters
+    ----------
+    topo : xarray.DataArray
+        Topo array in radar coordinates (a, r).
+    outdir : str
+        Output directory for the zarr store.
+    scale_factor : float, optional
+        Scale factor for encoding. Default is 2.0.
+    """
+    import xarray as xr
+    import os
+
+    if topo is None:
+        return
+
+    fill_value = np.iinfo(np.int32).max
+
+    # Scale elevation values
+    scaled = (scale_factor * topo).round()
+    finite_mask = np.isfinite(scaled)
+    int_data = scaled.fillna(0).astype(np.int32)
+    int_data = int_data.where(finite_mask, fill_value)
+    int_data.attrs['scale_factor'] = 1/scale_factor
+    int_data.attrs['add_offset'] = 0
+
+    # Use 8192 chunk size for memory-efficient reading
+    CHUNK_SIZE = 8192
+    n_a, n_r = topo.a.size, topo.r.size
+    chunk_a = min(CHUNK_SIZE, n_a)
+    chunk_r = min(CHUNK_SIZE, n_r)
+
+    ds = xr.Dataset({'topo': int_data})
+    encoding = {'topo': {'chunks': (chunk_a, chunk_r), '_FillValue': fill_value}}
+    ds.to_zarr(
+        store=os.path.join(outdir, 'topo'),
+        mode='w',
+        zarr_format=3,
+        consolidated=True,
+        encoding=encoding
+    )
+
+
+def load_topo(outdir):
+    """Load topo from zarr with lazy loading.
+
+    Parameters
+    ----------
+    outdir : str
+        Directory containing the topo zarr store.
+
+    Returns
+    -------
+    xarray.DataArray
+        Topo array in radar coordinates (a, r) with lazy loading.
+    """
+    import xarray as xr
+    import os
+
+    topo_path = os.path.join(outdir, 'topo')
+    if not os.path.exists(topo_path):
+        return None
+
+    ds = xr.open_zarr(store=topo_path, consolidated=True, zarr_format=3, chunks='auto')
+
+    # Decode int32 to float32
+    topo = ds['topo']
+    fill_value = topo.attrs.get('_FillValue')
+    scale_factor = topo.attrs.get('scale_factor', 1.0)
+    if fill_value is not None:
+        data = topo.astype('float32')
+        data = data.where(ds['topo'] != fill_value)
+        topo = data * scale_factor
+    else:
+        topo = topo.astype('float32')
+
+    return topo
+
+
+def load_transform(outdir):
+    """Load transform from zarr with lazy loading.
+
+    Parameters
+    ----------
+    outdir : str
+        Directory containing the transform zarr store.
+
+    Returns
+    -------
+    xarray.Dataset
+        Transform dataset with rng, azi, ele variables (lazy loaded).
+    """
+    import xarray as xr
+    import os
+
+    trans_path = os.path.join(outdir, 'transform')
+    ds = xr.open_zarr(store=trans_path, consolidated=True, zarr_format=3, chunks='auto')
+
+    # Decode int32 to float32 for each variable
+    for v in ('rng', 'azi', 'ele'):
+        if v not in ds:
+            continue
+        fill_value = ds[v].attrs.get('_FillValue')
+        scale_factor = ds[v].attrs.get('scale_factor', 1.0)
+        if fill_value is not None:
+            data = ds[v].astype('float32')
+            data = data.where(ds[v] != fill_value)
+            ds[v] = data * scale_factor
+        else:
+            data = ds[v].astype('float32')
+            ds[v] = data.where(np.abs(data) < 1e8)
+
+    return ds
+
+
+def remap_radar_to_geo(data, azi_map, rng_map, out_y, out_x):
+    """Remap data from radar coordinates to geographic coordinates using cv2.remap.
+
+    Takes radar-coordinate data and pre-computed coordinate maps, and resamples
+    to a geographic grid using Lanczos interpolation. Handles both real and
+    complex data, and works around OpenCV's 32k pixel limit via chunking.
+
+    Parameters
+    ----------
+    data : xr.DataArray
+        Input data in radar coordinates with dims ['a', 'r'] (azimuth, range).
+    azi_map : np.ndarray
+        Azimuth coordinates for each output pixel (float32, 2D).
+        Maps each (y, x) output pixel to its source azimuth in radar coords.
+    rng_map : np.ndarray
+        Range coordinates for each output pixel (float32, 2D).
+        Maps each (y, x) output pixel to its source range in radar coords.
+    out_y : np.ndarray
+        Output grid Y coordinates (1D, typically northing or latitude).
+    out_x : np.ndarray
+        Output grid X coordinates (1D, typically easting or longitude).
+
+    Returns
+    -------
+    xr.DataArray
+        Geocoded data with dims ['y', 'x'] and the same name as input.
+
+    Notes
+    -----
+    - Uses cv2.INTER_LANCZOS4 for high-quality resampling
+    - Pixels outside the radar coverage are filled with NaN
+    - For grids wider than 32766 pixels, processes in x-chunks
+    """
+    import cv2
+    import numpy as np
+    import xarray as xr
+
+    data_vals = data.values
+    coord_a = data.a.values
+    coord_r = data.r.values
+
+    # Convert geographic pixel coordinates to radar array indices
+    inv_map_a = ((azi_map - coord_a[0]) / (coord_a[1] - coord_a[0])).astype(np.float32)
+    inv_map_r = ((rng_map - coord_r[0]) / (coord_r[1] - coord_r[0])).astype(np.float32)
+
+    n_y, n_x = inv_map_a.shape
+    OPENCV_MAX = 32766
+
+    if n_x <= OPENCV_MAX:
+        # Fast path: single cv2.remap call
+        if np.iscomplexobj(data_vals):
+            grid_proj_re = cv2.remap(data_vals.real.astype(np.float32), inv_map_r, inv_map_a,
+                                     interpolation=cv2.INTER_LANCZOS4,
+                                     borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
+            grid_proj_im = cv2.remap(data_vals.imag.astype(np.float32), inv_map_r, inv_map_a,
+                                     interpolation=cv2.INTER_LANCZOS4,
+                                     borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
+            grid_proj = (grid_proj_re + 1j * grid_proj_im).astype(data.dtype)
+        else:
+            grid_proj = cv2.remap(data_vals.astype(np.float32), inv_map_r, inv_map_a,
+                                  interpolation=cv2.INTER_LANCZOS4,
+                                  borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
+    else:
+        # Chunked path: work around OpenCV's 32k pixel limit
+        n_chunks = (n_x + OPENCV_MAX - 1) // OPENCV_MAX
+        x_indices = np.arange(n_x)
+        chunk_indices = np.array_split(x_indices, n_chunks)
+
+        if np.iscomplexobj(data_vals):
+            grid_proj = np.empty((n_y, n_x), dtype=data.dtype)
+            data_re = data_vals.real.astype(np.float32)
+            data_im = data_vals.imag.astype(np.float32)
+            for idx in chunk_indices:
+                x_slice = slice(idx[0], idx[-1] + 1)
+                re_chunk = cv2.remap(data_re, inv_map_r[:, x_slice], inv_map_a[:, x_slice],
+                                     interpolation=cv2.INTER_LANCZOS4,
+                                     borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
+                im_chunk = cv2.remap(data_im, inv_map_r[:, x_slice], inv_map_a[:, x_slice],
+                                     interpolation=cv2.INTER_LANCZOS4,
+                                     borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
+                grid_proj[:, x_slice] = (re_chunk + 1j * im_chunk).astype(data.dtype)
+            del data_re, data_im
+        else:
+            grid_proj = np.empty((n_y, n_x), dtype=np.float32)
+            data_f32 = data_vals.astype(np.float32)
+            for idx in chunk_indices:
+                x_slice = slice(idx[0], idx[-1] + 1)
+                grid_proj[:, x_slice] = cv2.remap(data_f32, inv_map_r[:, x_slice], inv_map_a[:, x_slice],
+                                                  interpolation=cv2.INTER_LANCZOS4,
+                                                  borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
+            del data_f32
+
+    coords = {'y': out_y, 'x': out_x}
+    return xr.DataArray(grid_proj, coords=coords, dims=['y', 'x']).rename(data.name)
+
+
+def compute_merged_transform(transform, prm_rep):
+    """Compute merged transform by adding PRM bilinear offsets to ref transform.
+
+    Parameters
+    ----------
+    transform : xr.Dataset
+        Reference scene/burst transform with azi, rng variables.
+    prm_rep : PRM
+        Repeat scene/burst PRM with fitoffset parameters (rshift, stretch_r, etc.).
+
+    Returns
+    -------
+    azi_rep, rng_rep : np.ndarray
+        Repeat scene/burst radar coordinates for each output pixel (float32, 2D).
+    """
+    azi_ref = transform.azi.values
+    rng_ref = transform.rng.values
+
+    # Bilinear offset model from fitoffset:
+    # dr(a, r) = (rshift + sub_int_r) + stretch_r * r + a_stretch_r * a
+    # da(a, r) = (ashift + sub_int_a) + stretch_a * r + a_stretch_a * a
+    rshift = prm_rep.get('rshift') + prm_rep.get('sub_int_r')
+    ashift = prm_rep.get('ashift') + prm_rep.get('sub_int_a')
+    stretch_r = prm_rep.get('stretch_r')
+    a_stretch_r = prm_rep.get('a_stretch_r')
+    stretch_a = prm_rep.get('stretch_a')
+    a_stretch_a = prm_rep.get('a_stretch_a')
+
+    rng_rep = (rng_ref + rshift + stretch_r * rng_ref + a_stretch_r * azi_ref).astype(np.float32)
+    azi_rep = (azi_ref + ashift + stretch_a * rng_ref + a_stretch_a * azi_ref).astype(np.float32)
+
+    return azi_rep, rng_rep
+
+
+def tidal_phase_radar(topo, prm, dt):
+    """Compute solid Earth tidal phase correction on the radar coordinate grid.
+
+    Uses 2×2 radar-grid corners: computes tidal E,N,U and look vectors at the
+    4 corner points, bilinearly interpolates each component separately onto the
+    full topo grid, then dot-products to LOS and converts to phase.
+
+    Satellite-agnostic: works for both S1 and NISAR.
+
+    Parameters
+    ----------
+    topo : xr.DataArray
+        Topographic elevation with radar coordinates (a, r).
+    prm : PRM
+        Reference scene PRM (has orbit_df, clock_start, PRF, etc.).
+    dt : datetime.datetime
+        Acquisition UTC time.
+
+    Returns
+    -------
+    xr.DataArray
+        Tidal phase correction in radians, same coords as topo.
+    """
+    import numpy as np
+    import xarray as xr
+    import cv2
+    from .utils_tidal import solid_tide
+
+    n_azi = len(topo.a)
+    n_rng = len(topo.r)
+
+    # --- (a) 4 radar corner coordinates ---
+    azi_corners = np.array([topo.a.values[0], topo.a.values[0],
+                            topo.a.values[-1], topo.a.values[-1]])
+    rng_corners = np.array([topo.r.values[0], topo.r.values[-1],
+                            topo.r.values[0], topo.r.values[-1]])
+
+    # --- (b) Geocode 4 corners -> lat/lon ---
+    orbit_df = prm.orbit_df
+    orbit_time = orbit_df['isec'].values
+    orbit_pos = orbit_df[['px', 'py', 'pz']].values
+    orbit_vel = orbit_df[['vx', 'vy', 'vz']].values
+
+    clock_start = (prm.get('clock_start') % 1.0) * 86400
+    prf = prm.get('PRF')
+    near_range = prm.get('near_range')
+    rng_samp_rate = prm.get('rng_samp_rate')
+    earth_radius = prm.get('earth_radius')
+    lookdir = prm.get('lookdir') if 'lookdir' in prm.df.index else 'R'
+
+    lon_corners, lat_corners, _ = satellite_rat2llt(
+        azi_corners, rng_corners,
+        orbit_time, orbit_pos, orbit_vel,
+        clock_start, prf, near_range, rng_samp_rate, earth_radius,
+        lookdir=lookdir
+    )
+
+    # --- (c) Compute tidal E, N, U at 4 corners ---
+    tide_e, tide_n, tide_u = solid_tide(lon_corners, lat_corners, dt)
+
+    # --- (d) Compute look vectors at 4 corners from orbit ---
+    sat_time = np.float64(clock_start) + azi_corners / np.float64(prf)
+    sat_x = _hermite_interp(orbit_time, orbit_pos[:, 0], orbit_vel[:, 0], sat_time)
+    sat_y = _hermite_interp(orbit_time, orbit_pos[:, 1], orbit_vel[:, 1], sat_time)
+    sat_z = _hermite_interp(orbit_time, orbit_pos[:, 2], orbit_vel[:, 2], sat_time)
+
+    # Ground ECEF from corner lat/lon (WGS84 ellipsoid, height=0)
+    ra = 6378137.0
+    e2 = 6.69437999014e-3
+    lat_rad = np.deg2rad(lat_corners)
+    lon_rad = np.deg2rad(lon_corners)
+    sin_lat = np.sin(lat_rad)
+    cos_lat = np.cos(lat_rad)
+    N_wgs = ra / np.sqrt(1 - e2 * sin_lat**2)
+    gx = N_wgs * cos_lat * np.cos(lon_rad)
+    gy = N_wgs * cos_lat * np.sin(lon_rad)
+    gz = N_wgs * (1 - e2) * sin_lat
+
+    # Look vector (ground -> satellite), normalized
+    lx = sat_x - gx
+    ly = sat_y - gy
+    lz = sat_z - gz
+    dist = np.sqrt(lx**2 + ly**2 + lz**2)
+    lx /= dist;  ly /= dist;  lz /= dist
+
+    # ECEF look -> ENU
+    b = lat_rad - np.pi / 2
+    g = lon_rad + np.pi / 2
+    cos_b = np.cos(b);  sin_b = np.sin(b)
+    cos_g = np.cos(g);  sin_g = np.sin(g)
+    look_E = cos_g * lx + sin_g * ly
+    look_N = -sin_g * cos_b * lx + cos_g * cos_b * ly - sin_b * lz
+    look_U = -sin_g * sin_b * lx + cos_g * sin_b * ly + cos_b * lz
+
+    # --- (e) Bilinear interpolation + LOS ---
+    def _to_2x2(arr):
+        return np.array([[arr[0], arr[1]], [arr[2], arr[3]]], dtype=np.float32)
+
+    W, H = n_rng, n_azi  # cv2.resize takes (width, height)
+    los = cv2.resize(_to_2x2(tide_e), (W, H), interpolation=cv2.INTER_LINEAR) \
+        * cv2.resize(_to_2x2(look_E), (W, H), interpolation=cv2.INTER_LINEAR)
+    tmp = cv2.resize(_to_2x2(tide_n), (W, H), interpolation=cv2.INTER_LINEAR)
+    tmp *= cv2.resize(_to_2x2(look_N), (W, H), interpolation=cv2.INTER_LINEAR)
+    los += tmp
+    tmp = cv2.resize(_to_2x2(tide_u), (W, H), interpolation=cv2.INTER_LINEAR)
+    tmp *= cv2.resize(_to_2x2(look_U), (W, H), interpolation=cv2.INTER_LINEAR)
+    los += tmp
+    del tmp
+
+    # --- (f) Convert to phase ---
+    wavelength = prm.get('radar_wavelength')
+    cnst = -4.0 * np.pi / wavelength
+    tidal_phase = (cnst * los).astype(np.float32)
+
+    return xr.DataArray(tidal_phase, coords=topo.coords, dims=topo.dims).rename('tidal_phase')
+
+
+def flat_earth_topo_phase(topo, prm_rep, prm_ref, baseline_params=None, sc_height_params=None):
+    """Compute the combined earth curvature and topographic phase correction.
+
+    Uses the full GMTSAR algorithm with time-varying baseline geometry.
+    Satellite-agnostic: works for both S1 and NISAR.
+
+    Parameters
+    ----------
+    topo : xr.DataArray or None
+        Topographic elevation in radar coordinates (meters). If None, uses zero topo.
+    prm_rep : PRM
+        Repeat scene PRM object.
+    prm_ref : PRM
+        Reference scene PRM object.
+    baseline_params : dict, optional
+        Pre-computed baseline parameters.
+    sc_height_params : dict, optional
+        Pre-computed SC_height parameters.
+
+    Returns
+    -------
+    xr.DataArray
+        Combined flat earth and topo phase (radians).
+    """
+    import numpy as np
+    import xarray as xr
+    from scipy import constants
+    from .PRM import PRM
+
+    is_reference = (prm_rep is prm_ref)
+
+    if topo is None:
+        xdim = prm_ref.get('num_rng_bins')
+        ydim = prm_ref.get('num_patches') * prm_ref.get('num_valid_az')
+        azis = np.arange(0.5, ydim, 1)
+        rngs = np.arange(0.5, xdim, 1)
+        topo = xr.DataArray(np.zeros((len(azis), len(rngs)), dtype=np.float32),
+                            dims=['a', 'r'], coords={'a': azis, 'r': rngs}).rename('topo')
+
+    def calc_drho(rho, topo_vals, earth_radius, height, b, alpha, Bx):
+        sina = np.sin(alpha)
+        cosa = np.cos(alpha)
+        c = earth_radius + height
+        ret = earth_radius + topo_vals
+        cost = ((rho**2 + c**2 - ret**2) / (2. * rho * c))
+        sint = np.sqrt(1. - cost**2)
+        term1 = rho**2 + b**2 - 2 * rho * b * (sint * cosa - cost * sina) - Bx**2
+        drho = -rho + np.sqrt(term1)
+        return drho
+
+    prm1 = PRM().set(prm_ref)
+    prm1.orbit_df = prm_ref.orbit_df
+    prm2 = PRM().set(prm_rep)
+    prm2.orbit_df = prm_rep.orbit_df
+
+    if is_reference:
+        prm2.set(
+            baseline_start=0, baseline_center=0, baseline_end=0,
+            alpha_start=0, alpha_center=0, alpha_end=0,
+            B_offset_start=0, B_offset_center=0, B_offset_end=0
+        ).fix_aligned()
+    elif baseline_params is not None:
+        prm2.set(**baseline_params).fix_aligned()
+    else:
+        prm2.set(prm1.SAT_baseline(prm2).sel(
+            'baseline_start', 'baseline_center', 'baseline_end',
+            'alpha_start', 'alpha_center', 'alpha_end',
+            'B_offset_start', 'B_offset_center', 'B_offset_end'
+        )).fix_aligned()
+
+    if sc_height_params is not None:
+        prm1.set(**sc_height_params).fix_aligned()
+    else:
+        prm1.set(prm1.SAT_baseline(prm1).sel('SC_height', 'SC_height_start', 'SC_height_end')).fix_aligned()
+
+    topo_vals = topo.values.copy()
+    np.copyto(topo_vals, 0, where=np.isnan(topo_vals))
+    y_coords = topo.a.values
+    x_coords = topo.r.values
+
+    xdim = prm1.get('num_rng_bins')
+    ydim = prm1.get('num_patches') * prm1.get('num_valid_az')
+
+    htc = prm1.get('SC_height')
+    ht0 = prm1.get('SC_height_start')
+    htf = prm1.get('SC_height_end')
+
+    tspan = 86400 * abs(prm2.get('SC_clock_stop') - prm2.get('SC_clock_start'))
+
+    drange = constants.speed_of_light / (2 * prm2.get('rng_samp_rate'))
+    alpha = prm2.get('alpha_start') * np.pi / 180
+    cnst = -4 * np.pi / prm2.get('radar_wavelength')
+
+    Bh0 = prm2.get('baseline_start') * np.cos(prm2.get('alpha_start') * np.pi / 180)
+    Bv0 = prm2.get('baseline_start') * np.sin(prm2.get('alpha_start') * np.pi / 180)
+    Bhf = prm2.get('baseline_end') * np.cos(prm2.get('alpha_end') * np.pi / 180)
+    Bvf = prm2.get('baseline_end') * np.sin(prm2.get('alpha_end') * np.pi / 180)
+    Bx0 = prm2.get('B_offset_start')
+    Bxf = prm2.get('B_offset_end')
+
+    if prm2.get('baseline_center') != 0 or prm2.get('alpha_center') != 0 or prm2.get('B_offset_center') != 0:
+        Bhc = prm2.get('baseline_center') * np.cos(prm2.get('alpha_center') * np.pi / 180)
+        Bvc = prm2.get('baseline_center') * np.sin(prm2.get('alpha_center') * np.pi / 180)
+        Bxc = prm2.get('B_offset_center')
+
+        dBh = (-3 * Bh0 + 4 * Bhc - Bhf) / tspan
+        dBv = (-3 * Bv0 + 4 * Bvc - Bvf) / tspan
+        ddBh = (2 * Bh0 - 4 * Bhc + 2 * Bhf) / (tspan * tspan)
+        ddBv = (2 * Bv0 - 4 * Bvc + 2 * Bvf) / (tspan * tspan)
+
+        dBx = (-3 * Bx0 + 4 * Bxc - Bxf) / tspan
+        ddBx = (2 * Bx0 - 4 * Bxc + 2 * Bxf) / (tspan * tspan)
+    else:
+        dBh = (Bhf - Bh0) / tspan
+        dBv = (Bvf - Bv0) / tspan
+        dBx = (Bxf - Bx0) / tspan
+        ddBh = ddBv = ddBx = 0
+
+    dht = (-3 * ht0 + 4 * htc - htf) / tspan
+    ddht = (2 * ht0 - 4 * htc + 2 * htf) / (tspan * tspan)
+
+    x_coords_f64 = x_coords.astype(np.float64)
+    y_coords_f64 = y_coords.astype(np.float64)
+    near_range = (prm1.get('near_range') + \
+        x_coords_f64.reshape(1, -1) * (1 + prm1.get('stretch_r')) * drange) + \
+        y_coords_f64.reshape(-1, 1) * prm1.get('a_stretch_r') * drange
+
+    t_arr = y_coords_f64 * tspan / (ydim - 1)
+    Bh = Bh0 + dBh * t_arr + ddBh * t_arr**2
+    Bv = Bv0 + dBv * t_arr + ddBv * t_arr**2
+    Bx = Bx0 + dBx * t_arr + ddBx * t_arr**2
+    B = np.sqrt(Bh * Bh + Bv * Bv)
+    alpha = np.arctan2(Bv, Bh)
+    height = ht0 + dht * t_arr + ddht * t_arr**2
+
+    drho = calc_drho(near_range, topo_vals, prm1.get('earth_radius'),
+                     height.reshape(-1, 1), B.reshape(-1, 1), alpha.reshape(-1, 1), Bx.reshape(-1, 1))
+
+    phase_shift = (cnst * drho).astype(np.float32)
+    topo_phase = xr.DataArray(phase_shift, topo.coords)
+    topo_phase = topo_phase.where(np.isfinite(topo)).rename('phase')
+
+    return topo_phase
+
+
 def compute_transform(prm, dem,
                       scale_factor=2.0,
                       epsg=None,
-                      resolution=(20.0, 5.0),
+                      resolution=(16.0, 4.0),
                       n_chunks=8,
                       debug=False):
     """
@@ -1442,7 +2604,7 @@ def compute_transform(prm, dem,
     epsg : int, optional
         Target EPSG code. If None, auto-detect UTM zone.
     resolution : tuple[float, float], optional
-        Output resolution (dy, dx) in meters. Default is (20.0, 5.0).
+        Output resolution (dy, dx) in meters. Default is (16.0, 4.0).
     n_chunks : int, optional
         Number of azimuth chunks for memory-efficient processing. Default is 8.
     debug : bool, optional
@@ -1477,6 +2639,7 @@ def compute_transform(prm, dem,
     near_range = prm.get('near_range')
     rng_samp_rate = prm.get('rng_samp_rate')
     earth_radius = prm.get('earth_radius')
+    lookdir = prm.get('lookdir') if 'lookdir' in prm.df.index else 'R'
     a_max, r_max = prm.bounds()
 
     # Create radar grid coordinates
@@ -1508,7 +2671,7 @@ def compute_transform(prm, dem,
                 azi_grid, rng_grid,
                 orbit_time, orbit_pos, orbit_vel,
                 clock_start, prf, near_range, rng_samp_rate, earth_radius,
-                dem=dem, max_iter=20, tol=0.1, n_chunks=1
+                dem=dem, max_iter=20, tol=0.1, n_chunks=1, lookdir=lookdir
             )
             # ECEF conversion → ele_gmtsar
             lon_rad = np.radians(lon).astype(np.float32)
@@ -1555,7 +2718,7 @@ def compute_transform(prm, dem,
         azi_grid_c, rng_grid_c,
         orbit_time, orbit_pos, orbit_vel,
         clock_start, prf, near_range, rng_samp_rate, earth_radius,
-        dem=dem, max_iter=2, tol=1.0, n_chunks=1
+        dem=dem, max_iter=2, tol=1.0, n_chunks=1, lookdir=lookdir
     )
     y_c, x_c = proj(lat_c, lon_c, from_epsg=4326, to_epsg=epsg)
     del azi_grid_c, rng_grid_c, lon_c, lat_c
@@ -1603,7 +2766,7 @@ def compute_transform(prm, dem,
             azi_grid, rng_grid,
             orbit_time, orbit_pos, orbit_vel,
             clock_start, prf, near_range, rng_samp_rate, earth_radius,
-            dem=dem, max_iter=20, tol=0.1, n_chunks=1
+            dem=dem, max_iter=20, tol=0.1, n_chunks=1, lookdir=lookdir
         )
 
         # ECEF conversion → ele_gmtsar
@@ -1727,7 +2890,7 @@ def compute_transform(prm, dem,
 def compute_transform_inverse(prm, dem,
                               scale_factor=2.0,
                               epsg=None,
-                              resolution=(20.0, 5.0),
+                              resolution=(16.0, 4.0),
                               n_chunks=8,
                               compute_topo=True,
                               debug=False):
@@ -1748,7 +2911,7 @@ def compute_transform_inverse(prm, dem,
     epsg : int, optional
         Target EPSG code. If None, auto-detect UTM zone.
     resolution : tuple[float, float], optional
-        Output resolution (dy, dx) in meters. Default is (20.0, 5.0).
+        Output resolution (dy, dx) in meters. Default is (16.0, 4.0).
     n_chunks : int, optional
         Number of azimuth chunks for memory-efficient processing. Default is 8.
     compute_topo : bool, optional
@@ -1793,6 +2956,7 @@ def compute_transform_inverse(prm, dem,
     near_range = prm.get('near_range')
     rng_samp_rate = prm.get('rng_samp_rate')
     earth_radius = prm.get('earth_radius')
+    lookdir = prm.get('lookdir') if 'lookdir' in prm.df.index else 'R'
     a_max, r_max = prm.bounds()
     num_lines = int(a_max)
     num_rng = int(r_max)
@@ -1828,7 +2992,7 @@ def compute_transform_inverse(prm, dem,
             azi_row, rng_coords,
             orbit_time, orbit_pos, orbit_vel,
             clock_start, prf, near_range, rng_samp_rate, earth_radius,
-            dem=dem, max_iter=10, tol=0.5, n_chunks=1
+            dem=dem, max_iter=10, tol=0.5, n_chunks=1, lookdir=lookdir
         )
         y_proj, x_proj = proj(lat, lon, from_epsg=4326, to_epsg=epsg)
         if row_azi == azi_coords[0]:
@@ -1887,7 +3051,7 @@ def compute_transform_inverse(prm, dem,
             bnd_azi, bnd_rng,
             orbit_time, orbit_pos, orbit_vel,
             clock_start, prf, near_range, rng_samp_rate, earth_radius,
-            dem=dem, max_iter=10, tol=0.5, n_chunks=1
+            dem=dem, max_iter=10, tol=0.5, n_chunks=1, lookdir=lookdir
         )
         y_b, x_b = proj(lat_b, lon_b, from_epsg=4326, to_epsg=epsg)
         y_bnd_all.append(y_b)
@@ -1973,7 +3137,8 @@ def compute_transform_inverse(prm, dem,
         orbit_df=orbit_df, clock_start=clock_start_days, prf=prf,
         near_range=near_range, rng_samp_rate=rng_samp_rate,
         num_valid_az=num_lines, num_patches=1, nrows=num_lines,
-        earth_radius=earth_radius, precise=1, fd1=0.0
+        earth_radius=earth_radius, precise=1, fd1=0.0,
+        debug=debug
     )
     inv_rng_valid = result[:, 0].astype(np.float32)
     inv_azi_valid = result[:, 1].astype(np.float32)
@@ -2159,3 +3324,624 @@ def compute_transform_inverse(prm, dem,
         topo = None
 
     return topo, trans
+
+
+def compute_conversion_chunked(prm, dem_path, geometry, outdir,
+                               scale_factor=2.0,
+                               epsg=None,
+                               resolution=(16.0, 4.0),
+                               chunk=(8192, 8192),
+                               compute_topo=True,
+                               n_jobs=-1,
+                               debug=False):
+    """
+    Compute transform and topo tile-by-tile, writing directly to zarr.
+
+    Memory-efficient version that never builds full arrays in memory.
+    Workers read DEM chunks directly from file - no full DEM in memory.
+    Suitable for large NISAR data on limited RAM systems (e.g., 12GB Colab).
+
+    Directory structure:
+    - outdir/transform/   : Persistent transform zarr (azi, rng, ele) for geocoding
+    - outdir/conversion/topo/ : Temporary topo zarr for conversion phase only
+
+    Parameters
+    ----------
+    prm : PRM
+        The reference PRM object with orbit_df attached.
+    dem_path : str
+        Path to DEM file (GeoTIFF, NetCDF, etc.)
+    geometry : shapely.geometry
+        Scene geometry for DEM bounds estimation.
+    outdir : str
+        Scene output directory.
+    scale_factor : float, optional
+        Scale factor for integer compression. Default is 2.0.
+    epsg : int, optional
+        Target EPSG code. If None, auto-detect UTM zone.
+    resolution : tuple[float, float], optional
+        Output resolution (dy, dx) in meters. Default is (16.0, 4.0).
+    chunk : tuple[int, int], optional
+        Tile size (y, x) for chunked processing. Default is (8192, 8192).
+    compute_topo : bool, optional
+        If True, compute topo array in radar coords. Default is True.
+    n_jobs : int, optional
+        Number of parallel workers. Default is -1 (use all cores).
+    debug : bool, optional
+        If True, prints timing information. Default is False.
+    """
+    import os
+    import time
+    import zarr
+    import xarray as xr
+    import joblib
+    import cv2
+    import warnings
+    warnings.filterwarnings('ignore')
+
+    t0_total = time.perf_counter()
+
+    # Handle n_jobs=-1 (use all cores) - joblib convention
+    if n_jobs is None or n_jobs == -1:
+        n_jobs = os.cpu_count()
+    if debug:
+        print(f'Parallel tile processing: n_jobs={n_jobs}')
+
+    # Get orbit data from PRM
+    orbit_df = prm.orbit_df
+    if orbit_df is None:
+        raise ValueError("PRM object has no orbit_df attached")
+
+    orbit_df = orbit_df.copy()
+    orbit_df['clock'] = orbit_df['isec']
+    orbit_time = orbit_df['isec'].values
+    orbit_pos = orbit_df[['px', 'py', 'pz']].values
+    orbit_vel = orbit_df[['vx', 'vy', 'vz']].values
+
+    # Get PRM parameters
+    clock_start = (prm.get('clock_start') % 1.0) * 86400
+    clock_start_days = prm.get('clock_start') % 1.0
+    prf = prm.get('PRF')
+    near_range = prm.get('near_range')
+    rng_samp_rate = prm.get('rng_samp_rate')
+    earth_radius = prm.get('earth_radius')
+    lookdir = prm.get('lookdir') if 'lookdir' in prm.df.index else 'R'
+    a_max, r_max = prm.bounds()
+    num_lines = int(a_max)
+    num_rng = int(r_max)
+
+    # Radar grid coordinates
+    azi_coords = np.arange(0.5, a_max, 1, dtype=np.float32)
+    rng_coords = np.arange(0.5, r_max, 1, dtype=np.float32)
+    n_azi = len(azi_coords)
+    n_rng = len(rng_coords)
+
+    # WGS84 constants
+    ra = 6378137.0
+    rc = 6356752.31424518
+    e2 = np.float32((ra**2 - rc**2) / ra**2)
+
+    # Auto-detect EPSG from geometry centroid
+    if epsg is None:
+        centroid = geometry.centroid
+        epsg = get_utm_epsg(centroid.y, centroid.x)
+
+    dy, dx = resolution
+
+    if debug:
+        print(f'Radar grid: {n_azi} x {n_rng} = {n_azi * n_rng:,} points')
+
+    # Step 1: Compute output grid bounds from full boundary (parallel per chunk)
+    # Workers read DEM chunks directly from file - NO full DEM in memory
+    t0 = time.perf_counter()
+
+    # Boundary task definitions (just indices, no data)
+    # line_type: 0=first_row, 1=last_row, 2=first_col, 3=last_col
+    bnd_chunk_size = 1000
+    tasks = []
+    # First row: azi=0, rng varies
+    for start in range(0, n_rng, bnd_chunk_size):
+        tasks.append((0, start, min(start + bnd_chunk_size, n_rng)))
+    # Last row: azi=n_azi-1, rng varies
+    for start in range(0, n_rng, bnd_chunk_size):
+        tasks.append((1, start, min(start + bnd_chunk_size, n_rng)))
+    # First col: azi varies, rng=0
+    for start in range(0, n_azi, bnd_chunk_size):
+        tasks.append((2, start, min(start + bnd_chunk_size, n_azi)))
+    # Last col: azi varies, rng=n_rng-1
+    for start in range(0, n_azi, bnd_chunk_size):
+        tasks.append((3, start, min(start + bnd_chunk_size, n_azi)))
+
+    # Build worker arguments with PRE-SLICED arrays (not full arrays)
+    # This prevents massive memory duplication when pickling for spawn workers
+    worker_args = []
+    n_bnd = 0
+    for line_type, start, end in tasks:
+        n_bnd += end - start
+        # Pre-slice based on line_type - pass only what each worker needs
+        if line_type == 0:  # first row: azi=const, rng varies
+            chunk_azi = np.full(end - start, azi_coords[0], dtype=np.float32)
+            chunk_rng = rng_coords[start:end].astype(np.float32)
+        elif line_type == 1:  # last row: azi=const, rng varies
+            chunk_azi = np.full(end - start, azi_coords[-1], dtype=np.float32)
+            chunk_rng = rng_coords[start:end].astype(np.float32)
+        elif line_type == 2:  # first col: azi varies, rng=const
+            chunk_azi = azi_coords[start:end].astype(np.float32)
+            chunk_rng = np.full(end - start, rng_coords[0], dtype=np.float32)
+        else:  # last col: azi varies, rng=const
+            chunk_azi = azi_coords[start:end].astype(np.float32)
+            chunk_rng = np.full(end - start, rng_coords[-1], dtype=np.float32)
+
+        worker_args.append((
+            chunk_azi, chunk_rng, dem_path,
+            orbit_time, orbit_pos, orbit_vel, clock_start, prf,
+            near_range, rng_samp_rate, earth_radius, epsg, lookdir
+        ))
+    del tasks
+
+    # Parallel execution using subprocess pool with memory isolation
+    # Each worker processes one chunk then exits (max_tasks_per_child=1), releasing memory
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor
+
+    with ProcessPoolExecutor(max_workers=n_jobs, mp_context=mp.get_context('spawn'),
+                             max_tasks_per_child=1) as executor:
+        results = list(executor.map(_process_boundary_worker, worker_args))
+    del worker_args
+
+    # Concatenate results
+    bnd_y = np.concatenate([r[0] for r in results])
+    bnd_x = np.concatenate([r[1] for r in results])
+    del results
+
+    # Compute bounds with margin - ensure scalars (not 0-d arrays)
+    margin = 100
+    valid_bnd = np.isfinite(bnd_y) & np.isfinite(bnd_x)
+    y_min = float(dy * (np.floor(np.nanmin(bnd_y[valid_bnd]) / dy) - margin))
+    y_max = float(dy * (np.ceil(np.nanmax(bnd_y[valid_bnd]) / dy) + margin))
+    x_min = float(dx * (np.floor(np.nanmin(bnd_x[valid_bnd]) / dx) - margin))
+    x_max = float(dx * (np.ceil(np.nanmax(bnd_x[valid_bnd]) / dx) + margin))
+    dy = float(dy)
+    dx = float(dx)
+
+    # Compute grid dimensions without creating full arrays (memory-efficient)
+    n_y = int((y_max - y_min) / dy)
+    n_x = int((x_max - x_min) / dx)
+
+    if debug:
+        print(f'Output grid: {n_y} x {n_x}, bounds from {n_bnd} boundary points in {time.perf_counter() - t0:.1f}s')
+
+    # Free boundary arrays - workers will determine tile validity internally
+    del bnd_y, bnd_x, valid_bnd
+
+    # Step 2: Pre-create zarr arrays (lazy - no memory allocation)
+    fill_value = np.iinfo(np.int32).max
+    chunk_y, chunk_x = chunk
+    zarr_chunks = (min(chunk_y, n_y), min(chunk_x, n_x))
+    radar_chunks = (min(chunk_y, n_azi), min(chunk_x, n_rng))
+
+    # Transform zarr - persistent at scene level for geocoding
+    transform_dir = os.path.join(outdir, 'transform')
+    os.makedirs(transform_dir, exist_ok=True)
+    trans_store = zarr.storage.LocalStore(transform_dir)
+    trans_root = zarr.group(store=trans_store, zarr_format=3, overwrite=True)
+
+    azi_arr = trans_root.create_array('azi', shape=(n_y, n_x), chunks=zarr_chunks,
+                                       dtype=np.int32, fill_value=fill_value, overwrite=True,
+                                       dimension_names=['y', 'x'])
+    rng_arr = trans_root.create_array('rng', shape=(n_y, n_x), chunks=zarr_chunks,
+                                       dtype=np.int32, fill_value=fill_value, overwrite=True,
+                                       dimension_names=['y', 'x'])
+    ele_arr = trans_root.create_array('ele', shape=(n_y, n_x), chunks=zarr_chunks,
+                                       dtype=np.int32, fill_value=fill_value, overwrite=True,
+                                       dimension_names=['y', 'x'])
+
+    # Topo zarr - temporary in conversion dir for phase correction only
+    if compute_topo:
+        conversion_dir = os.path.join(outdir, 'conversion')
+        topo_dir = os.path.join(conversion_dir, 'topo')
+        os.makedirs(topo_dir, exist_ok=True)
+        topo_store = zarr.storage.LocalStore(topo_dir)
+        topo_root = zarr.group(store=topo_store, zarr_format=3, overwrite=True)
+        topo_arr = topo_root.create_array('topo', shape=(n_azi, n_rng), chunks=radar_chunks,
+                                           dtype=np.int32, fill_value=fill_value, overwrite=True,
+                                           dimension_names=['a', 'r'])
+
+    # Step 4: Compute transform tile-by-tile using subprocess pool
+    # Each worker processes one tile then exits (max_tasks_per_child=1), releasing memory
+    # This pattern matches S1 processing to prevent memory accumulation
+    t0 = time.perf_counter()
+    n_tiles = ((n_y + chunk_y - 1) // chunk_y) * ((n_x + chunk_x - 1) // chunk_x)
+    row_batch = 512  # Process 512 rows at a time to limit memory
+
+    # Write coordinate arrays (compute directly, don't keep in memory)
+    out_y_coords = (y_min + dy * (np.arange(n_y) + 0.5)).astype(np.float64)
+    out_x_coords = (x_min + dx * (np.arange(n_x) + 0.5)).astype(np.float64)
+    y_arr = trans_root.create_array('y', data=out_y_coords, chunks=(n_y,), overwrite=True,
+                                     dimension_names=['y'])
+    x_arr = trans_root.create_array('x', data=out_x_coords, chunks=(n_x,), overwrite=True,
+                                     dimension_names=['x'])
+    y_arr.attrs['_ARRAY_DIMENSIONS'] = ['y']
+    x_arr.attrs['_ARRAY_DIMENSIONS'] = ['x']
+    del out_y_coords, out_x_coords  # Free immediately after writing to zarr
+
+    # Serialize orbit_df for subprocess pickling
+    orbit_dict = orbit_df.to_dict()
+
+    # Build tile arguments - workers determine validity internally
+    # No polygon check in main process - workers skip tiles with no valid data
+    tile_args = []
+    for iy in range(0, n_y, chunk_y):
+        jy = min(iy + chunk_y, n_y)
+        for ix in range(0, n_x, chunk_x):
+            jx = min(ix + chunk_x, n_x)
+            tile_args.append((
+                transform_dir, dem_path, epsg,
+                (iy, jy, ix, jx),  # tile_bounds
+                (y_min, dy, x_min, dx),  # grid_params - worker computes coords locally
+                orbit_dict, clock_start_days, prf,
+                near_range, rng_samp_rate, num_lines, earth_radius,
+                n_azi, n_rng, ra, e2,
+                scale_factor, fill_value, row_batch, lookdir
+            ))
+
+    if debug:
+        print(f'Computing transform: {len(tile_args)} tiles (row_batch={row_batch})...')
+
+    # Process tiles using subprocess pool with memory isolation
+    # Each worker processes one tile then exits, releasing all memory
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor
+
+    with ProcessPoolExecutor(max_workers=n_jobs, mp_context=mp.get_context('spawn'),
+                             max_tasks_per_child=1) as executor:
+        list(executor.map(_process_tile_worker, tile_args))
+
+    del tile_args
+
+    # Add transform metadata
+    for arr in [azi_arr, rng_arr, ele_arr]:
+        arr.attrs['scale_factor'] = 1/scale_factor
+        arr.attrs['add_offset'] = 0
+        arr.attrs['_FillValue'] = int(fill_value)
+        arr.attrs['_ARRAY_DIMENSIONS'] = ['y', 'x']
+
+    from pyproj import CRS
+    trans_root.attrs['spatial_ref'] = CRS.from_epsg(epsg).to_wkt()
+    zarr.consolidate_metadata(trans_store)
+
+    if debug:
+        print(f'Transform done: {time.perf_counter() - t0:.1f}s')
+
+    # Step 5: Compute topo tile-by-tile using forward transform (radar → geo)
+    # Process tiles in parallel with subprocess pool (like transform tiles)
+    if compute_topo:
+        t0 = time.perf_counter()
+
+        # Build tile arguments for parallel processing
+        topo_tile_args = []
+        for ia in range(0, n_azi, chunk_y):
+            ja = min(ia + chunk_y, n_azi)
+            for ir in range(0, n_rng, chunk_x):
+                jr = min(ir + chunk_x, n_rng)
+                # Pass coordinate slices for this tile (not full arrays!)
+                azi_coords_tile = azi_coords[ia:ja].copy()
+                rng_coords_tile = rng_coords[ir:jr].copy()
+                topo_tile_args.append((
+                    topo_dir, dem_path, (ia, ja, ir, jr),
+                    azi_coords_tile, rng_coords_tile,
+                    orbit_dict, clock_start_days, prf, near_range, rng_samp_rate, earth_radius,
+                    ra, e2, scale_factor, fill_value, row_batch, lookdir
+                ))
+
+        if debug:
+            print(f'Computing topo: {len(topo_tile_args)} tiles (row_batch={row_batch})...')
+
+        # Process tiles using subprocess pool with memory isolation
+        with ProcessPoolExecutor(max_workers=n_jobs, mp_context=mp.get_context('spawn'),
+                                 max_tasks_per_child=1) as executor:
+            list(executor.map(_process_topo_worker, topo_tile_args))
+
+        del topo_tile_args
+
+        # Add topo metadata
+        topo_arr.attrs['scale_factor'] = 1/scale_factor
+        topo_arr.attrs['add_offset'] = 0
+        topo_arr.attrs['_FillValue'] = int(fill_value)
+        topo_arr.attrs['_ARRAY_DIMENSIONS'] = ['a', 'r']
+
+        a_arr = topo_root.create_array('a', data=azi_coords.astype(np.float64), chunks=(len(azi_coords),), overwrite=True,
+                                        dimension_names=['a'])
+        r_arr = topo_root.create_array('r', data=rng_coords.astype(np.float64), chunks=(len(rng_coords),), overwrite=True,
+                                        dimension_names=['r'])
+        a_arr.attrs['_ARRAY_DIMENSIONS'] = ['a']
+        r_arr.attrs['_ARRAY_DIMENSIONS'] = ['r']
+        zarr.consolidate_metadata(topo_store)
+
+        if debug:
+            print(f'Topo done: {time.perf_counter() - t0:.1f}s')
+
+    if debug:
+        print(f'Total conversion: {time.perf_counter() - t0_total:.1f}s')
+
+
+# =============================================================================
+# XCORR REFINEMENT UTILITIES
+# =============================================================================
+
+def xcorr_patch(patch1: np.ndarray, patch2: np.ndarray, hann: np.ndarray,
+                min_valid_fraction: float = 0.5, min_response: float = 0.2) -> dict | None:
+    """
+    Compute amplitude cross-correlation offset between two patches.
+
+    Parameters
+    ----------
+    patch1 : np.ndarray
+        Reference patch (complex64).
+    patch2 : np.ndarray
+        Repeat patch (complex64).
+    hann : np.ndarray
+        Hanning window (float32), same size as patches.
+    min_valid_fraction : float
+        Minimum fraction of non-zero pixels required.
+    min_response : float
+        Minimum correlation response to accept result.
+
+    Returns
+    -------
+    dict or None
+        {'dy': float, 'dx': float, 'response': float} or None if invalid.
+    """
+    import cv2
+
+    # Check valid data
+    valid = (patch1 != 0) & (patch2 != 0)
+    if valid.sum() < min_valid_fraction * valid.size:
+        return None
+
+    # Normalize amplitudes
+    amp1 = np.abs(patch1).astype(np.float32)
+    amp2 = np.abs(patch2).astype(np.float32)
+    amp1_norm = ((amp1 - amp1.mean()) / (amp1.std() + 1e-10)).astype(np.float32)
+    amp2_norm = ((amp2 - amp2.mean()) / (amp2.std() + 1e-10)).astype(np.float32)
+
+    # Phase correlation
+    (dx, dy), response = cv2.phaseCorrelate(amp1_norm * hann, amp2_norm * hann)
+
+    if response < min_response:
+        return None
+
+    return {'dy': dy, 'dx': dx, 'response': response}
+
+
+def xcorr_fitoffset(results: list, nx: int, ny: int, debug: bool = False) -> dict | None:
+    """
+    Fit bilinear model to xcorr offsets using PRM.fitoffset (robust IRLS with MAD).
+
+    Converts xcorr results to the matrix format expected by PRM.fitoffset,
+    which uses iteratively reweighted least squares with MAD-based outlier
+    downweighting - proven and consistent with geometry fitting.
+
+    Parameters
+    ----------
+    results : list
+        List of dicts with 'cy1', 'cx1', 'dy', 'dx', 'response'.
+    nx : int
+        Image width (num_rng_bins) - unused, kept for API compatibility.
+    ny : int
+        Image height (num_lines) - unused, kept for API compatibility.
+    debug : bool
+        Print debug info.
+
+    Returns
+    -------
+    dict or None
+        Correction parameters in same format as PRM alignment:
+        {
+            'rshift': float, 'stretch_r': float, 'a_stretch_r': float,
+            'ashift': float, 'stretch_a': float, 'a_stretch_a': float,
+        }
+        Returns None if insufficient valid patches (xcorr failed).
+    """
+    from .PRM import PRM
+
+    n_initial = len(results)
+    if n_initial < 8:
+        if debug:
+            print(f"  xcorr_fitoffset: only {n_initial} patches, need >= 8")
+        return None  # Insufficient patches - xcorr failed
+
+    # Filter out zero offsets (invalid/failed correlations)
+    n_before_zero = len(results)
+    results = [r for r in results if abs(r['dx']) > 0.01 or abs(r['dy']) > 0.01]
+    n_zeros = n_before_zero - len(results)
+
+    if len(results) < 8:
+        if debug:
+            print(f"  xcorr_fitoffset: {n_zeros} zero offsets filtered, only {len(results)} remain")
+        return None  # Insufficient patches after zero filtering
+
+    # Convert to PRM.fitoffset matrix format: [r, dr, a, da, SNR]
+    # r = cx1 (range position), dr = dx (range offset)
+    # a = cy1 (azimuth position), da = dy (azimuth offset)
+    # SNR = response * 100 (scale to match expected range)
+    matrix = np.array([
+        [r['cx1'], r['dx'], r['cy1'], r['dy'], r['response'] * 100]
+        for r in results
+    ])
+
+    if debug:
+        dx = matrix[:, 1]
+        dy = matrix[:, 3]
+        print(f"  xcorr_fitoffset: {n_initial} initial, {n_zeros} zeros, {len(results)} final")
+        print(f"  offset range: dx=[{dx.min():.2f}, {dx.max():.2f}], dy=[{dy.min():.2f}, {dy.max():.2f}]")
+
+    # Use PRM.fitoffset - robust IRLS with MAD-based outlier downweighting
+    # rank=3 for bilinear model: offset = c0 + c1*r + c2*a
+    try:
+        prm_result = PRM.fitoffset(3, 3, matrix, SNR=20)
+    except Exception as e:
+        if debug:
+            print(f"  PRM.fitoffset failed: {e}")
+        return None
+
+    # Extract coefficients from PRM result
+    return {
+        'rshift': prm_result.get('rshift') + prm_result.get('sub_int_r'),
+        'stretch_r': prm_result.get('stretch_r'),
+        'a_stretch_r': prm_result.get('a_stretch_r'),
+        'ashift': prm_result.get('ashift') + prm_result.get('sub_int_a'),
+        'stretch_a': prm_result.get('stretch_a'),
+        'a_stretch_a': prm_result.get('a_stretch_a'),
+    }
+
+
+def _read_slc_patch(src, cy: int, cx: int, half: int) -> np.ndarray:
+    """
+    Read a complex SLC patch from an open rasterio dataset.
+
+    Handles both formats:
+    - 1 band complex (S1 geotiffs: complex_int16 → complex64)
+    - 2 bands real/imag (NISAR: int16 pairs)
+
+    Parameters
+    ----------
+    src : rasterio.DatasetReader
+        Open rasterio dataset.
+    cy, cx : int
+        Center coordinates of patch.
+    half : int
+        Half patch size.
+
+    Returns
+    -------
+    np.ndarray
+        Complex64 patch of shape (2*half, 2*half).
+    """
+    from rasterio.windows import Window
+    window = Window(cx - half, cy - half, 2 * half, 2 * half)
+    data = src.read(window=window)
+    if src.count == 1:
+        # Single band complex (S1)
+        return data[0].astype(np.complex64)
+    else:
+        # Two bands: real, imag (NISAR)
+        return (data[0] + 1j * data[1]).astype(np.complex64)
+
+
+def xcorr_refine_slc(ref_path: str, rep_path: str,
+                     ashift: float, rshift: float,
+                     stretch_a: float = 0.0, stretch_r: float = 0.0,
+                     a_stretch_a: float = 0.0, a_stretch_r: float = 0.0,
+                     patch_size: int = 256,
+                     min_response: float = 0.1, debug: bool = False) -> dict | None:
+    """
+    Run xcorr refinement by reading patches directly from geotiff files.
+
+    Reads only the required patches from disk, avoiding full image load.
+    Handles both S1 (1 band complex) and NISAR (2 bands real/imag) formats.
+
+    Parameters
+    ----------
+    ref_path : str
+        Path to reference SLC geotiff.
+    rep_path : str
+        Path to repeat SLC geotiff.
+    ashift, rshift : float
+        Geometry-based azimuth and range shifts.
+    stretch_a, stretch_r, a_stretch_a, a_stretch_r : float
+        Geometry-based stretch parameters.
+    patch_size : int
+        Xcorr patch size. Default 256.
+    min_response : float
+        Minimum correlation response.
+    debug : bool
+        Print debug info.
+
+    Returns
+    -------
+    dict or None
+        Correction coefficients (same as xcorr_fitoffset output).
+        Returns None if xcorr failed (insufficient valid patches).
+    """
+    import rasterio
+
+    half = patch_size // 2
+    hann = np.outer(np.hanning(patch_size), np.hanning(patch_size)).astype(np.float32)
+    results = []
+
+    with rasterio.open(ref_path) as src_ref, rasterio.open(rep_path) as src_rep:
+        ny_ref, nx_ref = src_ref.height, src_ref.width
+        ny_rep, nx_rep = src_rep.height, src_rep.width
+
+        # Auto-compute grid: ~2x patch spacing, minimum 4 patches per dimension
+        n_rows = max(4, (ny_ref - patch_size) // (2 * patch_size) + 1)
+        n_cols = max(4, (nx_ref - patch_size) // (2 * patch_size) + 1)
+        grid = (n_rows, n_cols)
+
+        if debug:
+            print(f"Xcorr refinement: {grid[0]}×{grid[1]} = {grid[0]*grid[1]} patches, size {patch_size}")
+            print(f"Image sizes: ref={ny_ref}×{nx_ref}, rep={ny_rep}×{nx_rep}")
+            print(f"Geometry params: ashift={ashift:.2f}, rshift={rshift:.2f}")
+
+        n_rows, n_cols = grid
+        for row in range(n_rows):
+            cy1 = int((row + 0.5) * ny_ref / n_rows)
+            for col in range(n_cols):
+                cx1 = int((col + 0.5) * nx_ref / n_cols)
+
+                # Apply geometry offset - compute float position first
+                cy2_float = cy1 + ashift + stretch_a * cx1 + a_stretch_a * cy1
+                cx2_float = cx1 + rshift + stretch_r * cx1 + a_stretch_r * cy1
+
+                # Truncate to integer for patch reading
+                cy2 = int(cy2_float)
+                cx2 = int(cx2_float)
+
+                # Track truncation artifact - phaseCorrelate will "find" this sub-pixel
+                # and we need to subtract it to get the TRUE residual
+                frac_a = cy2_float - cy2
+                frac_r = cx2_float - cx2
+
+                # Bounds check
+                if cy1 < half or cy1 > ny_ref - half:
+                    continue
+                if cy2 < half or cy2 > ny_rep - half:
+                    continue
+                if cx1 < half or cx1 > nx_ref - half:
+                    continue
+                if cx2 < half or cx2 > nx_rep - half:
+                    continue
+
+                # Read and correlate patches
+                patch1 = _read_slc_patch(src_ref, cy1, cx1, half)
+                patch2 = _read_slc_patch(src_rep, cy2, cx2, half)
+
+                result = xcorr_patch(patch1, patch2, hann, min_response=min_response)
+                if result is not None:
+                    # Compensate for int() truncation artifact
+                    # phaseCorrelate "finds" the sub-pixel that was lost by truncation
+                    # Subtract it to get the TRUE residual beyond the geometry
+                    result['dy'] -= frac_a
+                    result['dx'] -= frac_r
+                    result['cy1'] = cy1
+                    result['cx1'] = cx1
+                    results.append(result)
+
+    if debug:
+        print(f"Xcorr results: {len(results)} with response > {min_response}")
+
+    # Fit bilinear using full radar extent for normalization
+    corrections = xcorr_fitoffset(results, nx=nx_ref, ny=ny_ref, debug=debug)
+
+    if corrections is None:
+        if debug:
+            print("Xcorr fitoffset failed - insufficient valid patches")
+        return None
+
+    if debug:
+        print(f"Xcorr fitoffset result:")
+        print(f"  ashift={corrections['ashift']:.4f}, stretch_a={corrections['stretch_a']:.8f}, a_stretch_a={corrections['a_stretch_a']:.8f}")
+        print(f"  rshift={corrections['rshift']:.4f}, stretch_r={corrections['stretch_r']:.8f}, a_stretch_r={corrections['a_stretch_r']:.8f}")
+
+    return corrections

@@ -7,52 +7,51 @@
 #
 # See the LICENSE file in the insardev_pygmtsar directory for license terms.
 # ----------------------------------------------------------------------------
-from .S1_dem import S1_dem
+from .S1_gmtsar import S1_gmtsar
 from .PRM import PRM
 
 
-class S1_align(S1_dem):
+class S1_align(S1_gmtsar):
     import numpy as np
     import xarray as xr
     import pandas as pd
 
     @staticmethod
-    def _offset2shift(xyz: np.ndarray, rmax: int, amax: int, method: str = 'linear') -> xr.DataArray:
+    def _get_k_start(xml_path: str) -> int:
         """
-        Convert offset coordinates to shift values on a grid.
+        Get k_start (first valid line in TIFF) from burst XML annotation.
+
+        k_start is the offset between TIFF row 0 and PRM azimuth 0.
+        This is needed to convert geometry offsets (computed in PRM space)
+        to TIFF offsets (for xcorr which reads from TIFF).
 
         Parameters
         ----------
-        xyz : numpy.ndarray
-            Array containing the offset coordinates (x, y, z) = (range, azimuth, shift).
-        rmax : int
-            Maximum range bin.
-        amax : int
-            Maximum azimuth line.
-        method : str, optional
-            Interpolation method. Default is 'linear'.
+        xml_path : str
+            Path to burst XML annotation file.
 
         Returns
         -------
-        xarray.DataArray
-            Array containing the shift values on a grid.
+        int
+            First valid line index in the TIFF (k_start).
         """
-        import xarray as xr
-        import numpy as np
-        from scipy.interpolate import griddata
+        import xml.etree.ElementTree as ET
 
-        # use center pixel GMT registration mode
-        rngs = np.arange(8/2, rmax+8/2, 8)
-        azis = np.arange(4/2, amax+4/2, 4)
-        grid_r, grid_a = np.meshgrid(rngs, azis)
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
 
-        grid = griddata((xyz[:, 0], xyz[:, 1]), xyz[:, 2], (grid_r, grid_a), method=method)
-        # No flipud needed - grid row index directly corresponds to azimuth index
-        da = xr.DataArray(grid, coords={'y': azis, 'x': rngs}, name='z')
-        return da
+        first_valid = root.find('.//burstList/burst/firstValidSample')
+        if first_valid is None:
+            return 0
+
+        samples = [int(x) for x in first_valid.text.split()]
+        for i, s in enumerate(samples):
+            if s >= 0:
+                return i
+        return 0
 
     @staticmethod
-    def _offset2shift_combined(offset_dat: np.ndarray, rmax: int, amax: int) -> tuple:
+    def _offset2shift(offset_dat: np.ndarray, rmax: int, amax: int) -> tuple:
         """
         Convert offset coordinates to r and a shift grids in one interpolation.
 
@@ -102,58 +101,6 @@ class S1_align(S1_dem):
 
         return r_grd, a_grd
 
-    def _get_topo_llt(self, burst: str, degrees: float, debug: bool = False) -> tuple:
-        """
-        Get the topography coordinates (lon, lat, z) for decimated DEM.
-
-        Parameters
-        ----------
-        burst : str
-            Burst identifier.
-        degrees : float
-            Number of degrees for decimation.
-        debug : bool, optional
-            Enable debug mode. Default is False.
-
-        Returns
-        -------
-        numpy.ndarray
-            Array containing the topography coordinates (lon, lat, z), NaN filtered.
-        """
-        import numpy as np
-        import warnings
-        warnings.filterwarnings('ignore')
-
-        # add buffer around the cropped area for borders interpolation
-        record = self.get_record(burst)
-        dem_area = self.get_dem_wgs84ellipsoid(geometry=record.geometry)
-
-        ny = int(np.round(degrees/dem_area.lat.diff('lat')[0]))
-        nx = int(np.round(degrees/dem_area.lon.diff('lon')[0]))
-        if debug:
-            print('DEBUG: DEM decimation', 'ny', ny, 'nx', nx)
-        dem_area = dem_area.coarsen({'lat': ny, 'lon': nx}, boundary='pad').mean()
-
-        # Extract values directly using meshgrid instead of xr.broadcast
-        lat_vals = dem_area.lat.values
-        lon_vals = dem_area.lon.values
-        z_vals = dem_area.values
-
-        # Create coordinate arrays using meshgrid (keep float64 for lon/lat precision)
-        lon_grid, lat_grid = np.meshgrid(lon_vals, lat_vals)
-        topo_llt = np.column_stack([
-            lon_grid.ravel(),
-            lat_grid.ravel(),
-            z_vals.ravel()
-        ])
-        del lon_grid, lat_grid, dem_area, lat_vals, lon_vals, z_vals
-
-        # Filter out records where the elevation (third column) is NaN
-        valid_mask = ~np.isnan(topo_llt[:, 2])
-        result = topo_llt[valid_mask]
-        del topo_llt, valid_mask
-        return result
-
     def align_ref(self, burst: str, debug: bool = False, return_slc: bool = True) -> tuple:
         """
         Process reference burst - extract PRM, orbit, and optionally deramped SLC.
@@ -173,7 +120,7 @@ class S1_align(S1_dem):
         Returns
         -------
         tuple
-            (prm, slc_deramped, reramp_params) or (prm, None) if return_slc=False
+            (prm, slc_deramped, reramp_params) or (prm, None, None) if return_slc=False
         """
         if return_slc:
             from .PRM import PRM
@@ -186,10 +133,11 @@ class S1_align(S1_dem):
 
         prm, orbit_df = self._make_burst(burst, mode=0, debug=debug)
         prm.calc_dop_orb(inplace=True, debug=debug)
-        return prm, None
+        return prm, None, None
 
     def align_rep(self, burst_rep: str, burst_ref: str, prm_ref: "PRM",
-                  degrees: float = 12.0/3600, debug: bool = False) -> tuple:
+                  degrees: float = 12.0/3600, debug: bool = False,
+                  xcorr: tuple = (128, 128), xcorr_min_response: float = 0.2) -> tuple:
         """
         Process and align secondary burst to reference.
 
@@ -212,6 +160,12 @@ class S1_align(S1_dem):
             Degrees per pixel resolution for the coarse DEM. Default is 12.0/3600.
         debug : bool, optional
             Enable debug mode. Default is False.
+        xcorr : tuple or None, optional
+            Xcorr patch size as (height, width). Default (256, 256) for S1.
+            Set to None to disable xcorr refinement. Grid is auto-computed
+            to cover the image with ~2x patch spacing.
+        xcorr_min_response : float, optional
+            Minimum correlation response. Default 0.2 matches GMTSAR's SNR=20.
 
         Returns
         -------
@@ -258,10 +212,15 @@ class S1_align(S1_dem):
         prm_rep.calc_dop_orb(earth_radius, inplace=True, debug=debug)
         tmp1_dat = prm_rep.SAT_llt2rat(coords=topo_llt, precise=1, debug=debug)
 
-        # Compute r, dr, a, da, SNR table for fitoffset
+        # Compute r, dr, a, da, SNR table for fitoffset (vectorized)
         offset_dat0 = np.hstack([tmpm_dat, tmp1_dat])
-        func = lambda row: [row[0], row[5] - row[0], row[1], row[6] - row[1], 100]
-        offset_dat = np.apply_along_axis(func, 1, offset_dat0)
+        offset_dat = np.column_stack([
+            offset_dat0[:, 0],                      # r_ref
+            offset_dat0[:, 5] - offset_dat0[:, 0],  # dr = r_rep - r_ref
+            offset_dat0[:, 1],                      # a_ref
+            offset_dat0[:, 6] - offset_dat0[:, 1],  # da = a_rep - a_ref
+            np.full(len(offset_dat0), 100.0)        # SNR
+        ])
 
         # Get radar coordinates extent
         rmax = prm_rep.get('num_rng_bins')
@@ -288,6 +247,112 @@ class S1_align(S1_dem):
 
         # Apply fitoffset parameters (bilinear offset model stored in PRM)
         prm_rep.set(PRM.fitoffset(3, 3, par_tmp))
+
+        # Xcorr refinement: measure actual offsets and correct geometry alignment
+        if xcorr is not None:
+            from .utils_satellite import xcorr_refine_slc
+            import os
+            import math
+
+            # Extract patch size from tuple
+            xcorr_patch_size = xcorr[0] if isinstance(xcorr, tuple) else int(xcorr)
+
+            if debug:
+                print(f"Running xcorr refinement (patch_size={xcorr_patch_size})...")
+
+            # Get tiff file paths (read patches directly, don't load full images)
+            prefix_ref = self.fullBurstId(burst_ref)
+            prefix_rep = self.fullBurstId(burst_rep)
+            ref_tiff = os.path.join(self.datadir, prefix_ref, 'measurement', f'{burst_ref}.tiff')
+            rep_tiff = os.path.join(self.datadir, prefix_rep, 'measurement', f'{burst_rep}.tiff')
+
+            # Check files exist
+            if not os.path.exists(ref_tiff) or not os.path.exists(rep_tiff):
+                if debug:
+                    print(f"  WARNING: Xcorr skipped - files not found:")
+                    print(f"    ref: {ref_tiff} (exists: {os.path.exists(ref_tiff)})")
+                    print(f"    rep: {rep_tiff} (exists: {os.path.exists(rep_tiff)})")
+            else:
+                if debug:
+                    print(f"  ref_tiff: {ref_tiff}")
+                    print(f"  rep_tiff: {rep_tiff}")
+
+                # Get geometry alignment from prm_rep (computed by fitoffset above)
+                # This is in PRM coordinate space (valid lines only)
+                geom_ashift = prm_rep.get('ashift') + prm_rep.get('sub_int_a')
+                geom_rshift = prm_rep.get('rshift') + prm_rep.get('sub_int_r')
+                geom_stretch_a = prm_rep.get('stretch_a')
+                geom_stretch_r = prm_rep.get('stretch_r')
+                geom_a_stretch_a = prm_rep.get('a_stretch_a')
+                geom_a_stretch_r = prm_rep.get('a_stretch_r')
+
+                # Get k_start values to convert PRM coords to TIFF coords
+                # TIFF row 0 = PRM azimuth -k_start, so TIFF row = PRM azi + k_start
+                # For xcorr which reads from TIFF, we need to correct the offset:
+                # TIFF_offset = PRM_offset + (k_start_rep - k_start_ref)
+                ref_xml = os.path.join(self.datadir, prefix_ref, 'annotation', f'{burst_ref}.xml')
+                rep_xml = os.path.join(self.datadir, prefix_rep, 'annotation', f'{burst_rep}.xml')
+                k_start_ref = self._get_k_start(ref_xml)
+                k_start_rep = self._get_k_start(rep_xml)
+                k_start_correction = k_start_rep - k_start_ref
+
+                # Convert geometry to TIFF space for xcorr
+                geom_ashift_tiff = geom_ashift + k_start_correction
+
+                if debug:
+                    print(f"  Geometry (PRM): ashift={geom_ashift:.2f}, rshift={geom_rshift:.2f}")
+                    print(f"  k_start: ref={k_start_ref}, rep={k_start_rep}, correction={k_start_correction}")
+                    print(f"  Geometry (TIFF): ashift={geom_ashift_tiff:.2f}")
+
+                # Run xcorr WITH geometry pre-applied (in TIFF space) to find small residuals
+                xcorr_params = xcorr_refine_slc(
+                    ref_tiff, rep_tiff,
+                    ashift=geom_ashift_tiff, rshift=geom_rshift,
+                    stretch_a=geom_stretch_a, stretch_r=geom_stretch_r,
+                    a_stretch_a=geom_a_stretch_a, a_stretch_r=geom_a_stretch_r,
+                    patch_size=xcorr_patch_size,
+                    min_response=xcorr_min_response, debug=debug
+                )
+
+                # Check if xcorr succeeded
+                if xcorr_params is None:
+                    # Xcorr failed - keep geometry alignment
+                    print(f"WARNING: Xcorr FAILED for {burst_rep} - using geometry")
+                    ashift_new = geom_ashift
+                    stretch_a_new = geom_stretch_a
+                    a_stretch_a_new = geom_a_stretch_a
+                    rshift_new = geom_rshift
+                    stretch_r_new = geom_stretch_r
+                    a_stretch_r_new = geom_a_stretch_r
+                else:
+                    # xcorr found residuals - ADD to geometry
+                    ashift_new = geom_ashift + xcorr_params['ashift']
+                    stretch_a_new = geom_stretch_a + xcorr_params['stretch_a']
+                    a_stretch_a_new = geom_a_stretch_a + xcorr_params['a_stretch_a']
+                    rshift_new = geom_rshift + xcorr_params['rshift']
+                    stretch_r_new = geom_stretch_r + xcorr_params['stretch_r']
+                    a_stretch_r_new = geom_a_stretch_r + xcorr_params['a_stretch_r']
+
+                    if debug:
+                        print(f"  Xcorr residuals: da={xcorr_params['ashift']:.4f}, dr={xcorr_params['rshift']:.4f}")
+
+                # Update PRM (split into integer and fractional parts)
+                prm_rep.set(
+                    ashift=int(ashift_new) if ashift_new >= 0 else int(ashift_new) - 1,
+                    sub_int_a=math.fmod(ashift_new, 1) if ashift_new >= 0 else math.fmod(ashift_new, 1) + 1,
+                    stretch_a=stretch_a_new,
+                    a_stretch_a=a_stretch_a_new,
+                    rshift=int(rshift_new) if rshift_new >= 0 else int(rshift_new) - 1,
+                    sub_int_r=math.fmod(rshift_new, 1) if rshift_new >= 0 else math.fmod(rshift_new, 1) + 1,
+                    stretch_r=stretch_r_new,
+                    a_stretch_r=a_stretch_r_new,
+                )
+
+                if debug:
+                    print(f"Xcorr alignment:")
+                    print(f"  ashift={ashift_new:.4f}, rshift={rshift_new:.4f}")
+                    print(f"  stretch_a={stretch_a_new:.8f}, stretch_r={stretch_r_new:.8f}")
+                    print(f"  a_stretch_a={a_stretch_a_new:.8f}, a_stretch_r={a_stretch_r_new:.8f}")
 
         # Recompute Doppler with earth_radius
         prm_rep.calc_dop_orb(earth_radius, inplace=True, debug=debug)

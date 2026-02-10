@@ -7,9 +7,10 @@
 #
 # See the LICENSE file in the insardev_pygmtsar directory for license terms.
 # ----------------------------------------------------------------------------
-from .S1_base import S1_base
+from .Satellite import Satellite
 
-class S1_slc(S1_base):
+
+class S1_slc(Satellite):
     import xarray as xr
 
     pattern_prefix: str = '[0-9]*_[0-9]*_IW?'
