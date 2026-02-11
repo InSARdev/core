@@ -3617,60 +3617,17 @@ class BatchCore(dict):
             da_copol, da_xpol = dask.persist(da_copol, da_xpol)
             progressbar([da_copol, da_xpol], desc='Computing RGB composite'.ljust(25))
 
-            # Get values
-            copol = da_copol.values  # Co-pol (HH or VV)
-            xpol = da_xpol.values    # Cross-pol (HV or VH)
+            # Compute RGB using shared method from Batch
+            from .Batch import Batch
+            copol = da_copol.values
+            xpol = da_xpol.values
+            rgb_float = Batch._compute_rgb(copol, xpol, gamma=gamma,
+                                           brightness=brightness, quantile=quantile)
 
-            # Standard dual-pol RGB decomposition
-            # R=copol, G=xpol, B=copol produces:
-            # - Magenta/pink: high co-pol, low cross-pol (surface scattering, urban)
-            # - Green: high cross-pol (volume scattering, vegetation)
-            # - White/gray: both high (mixed scattering)
-            # - Dark: both low (smooth surfaces, water)
-            r_data = copol
-            g_data = xpol
-            b_data = copol
-
-            # Normalize each channel to [0, 1] using quantile stretch
-            def normalize_channel(data):
-                valid = data[np.isfinite(data)]
-                if len(valid) == 0:
-                    return np.zeros_like(data)
-                # Use quantile arg or default 2-98%
-                q_vals = quantile if quantile is not None else [0.02, 0.98]
-                if np.isscalar(q_vals):
-                    q_vals = [q_vals, 1 - q_vals] if q_vals < 0.5 else [1 - q_vals, q_vals]
-                q = np.nanquantile(valid, q_vals)
-                vmin_ch, vmax_ch = q[0], q[-1]
-                if vmax_ch <= vmin_ch:
-                    vmax_ch = vmin_ch + 1e-10
-                normalized = (data - vmin_ch) / (vmax_ch - vmin_ch)
-                return np.clip(normalized, 0, 1)
-
-            r_norm = normalize_channel(r_data)
-            g_norm = normalize_channel(g_data)
-            b_norm = normalize_channel(b_data)
-
-            # Apply gamma correction for brightness adjustment
-            if gamma != 1.0:
-                r_norm = np.power(r_norm, 1.0 / gamma)
-                g_norm = np.power(g_norm, 1.0 / gamma)
-                b_norm = np.power(b_norm, 1.0 / gamma)
-
-            # Stack into RGBA array: shape (n_stack, ny, nx, 4)
-            # Alpha channel: 0 for NaN (transparent), 1 for valid pixels
-            nan_mask = ~np.isfinite(r_data) | ~np.isfinite(g_data) | ~np.isfinite(b_data)
+            # Add alpha channel for transparent NaN pixels
+            nan_mask = ~np.isfinite(copol) | ~np.isfinite(xpol)
             alpha_channel = np.where(nan_mask, 0.0, 1.0)
-            # Set NaN pixels to 0 in RGB channels (they'll be transparent anyway)
-            r_norm = np.where(nan_mask, 0, r_norm)
-            g_norm = np.where(nan_mask, 0, g_norm)
-            b_norm = np.where(nan_mask, 0, b_norm)
-            rgba_array = np.stack([r_norm, g_norm, b_norm, alpha_channel], axis=-1)
-
-            # Apply linear brightness (preserves color ratios unlike gamma)
-            if brightness != 1.0:
-                rgba_array[..., :3] = rgba_array[..., :3] * brightness
-                rgba_array[..., :3] = np.clip(rgba_array[..., :3], 0, 1)
+            rgba_array = np.concatenate([rgb_float, alpha_channel[..., np.newaxis]], axis=-1)
 
             # Create figure with subplots
             n_panels = rgba_array.shape[0]

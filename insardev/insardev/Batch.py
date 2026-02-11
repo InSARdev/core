@@ -116,7 +116,74 @@ class Batch(BatchCore):
         used for correlation in [0,1] range
         """
         return BatchUnit(super().clip(min=min, max=max, **kwargs))
-    
+
+    @staticmethod
+    def _compute_rgb(copol: np.ndarray, xpol: np.ndarray,
+                     gamma: float = 1.0, brightness: float = 2.0,
+                     quantile: list = None) -> np.ndarray:
+        """
+        Compute RGB composite from co-pol and cross-pol arrays.
+
+        Parameters
+        ----------
+        copol : np.ndarray
+            Co-polarization data (HH or VV), shape (..., y, x)
+        xpol : np.ndarray
+            Cross-polarization data (HV or VH), shape (..., y, x)
+        gamma : float
+            Gamma correction (>1 brightens dark areas)
+        brightness : float
+            Linear brightness multiplier
+        quantile : list
+            Quantile range for normalization, default [0.02, 0.98]
+
+        Returns
+        -------
+        np.ndarray
+            RGB array as float32 [0-1], shape (..., y, x, 3)
+        """
+        # Normalize each channel to [0, 1] using quantile stretch
+        def normalize_channel(data):
+            valid = data[np.isfinite(data)]
+            if len(valid) == 0:
+                return np.zeros_like(data)
+            q_vals = quantile if quantile is not None else [0.02, 0.98]
+            if np.isscalar(q_vals):
+                q_vals = [q_vals, 1 - q_vals] if q_vals < 0.5 else [1 - q_vals, q_vals]
+            q = np.nanquantile(valid, q_vals)
+            vmin_ch, vmax_ch = q[0], q[-1]
+            if vmax_ch <= vmin_ch:
+                vmax_ch = vmin_ch + 1e-10
+            normalized = (data - vmin_ch) / (vmax_ch - vmin_ch)
+            return np.clip(normalized, 0, 1)
+
+        # R=copol, G=xpol, B=copol
+        r_norm = normalize_channel(copol)
+        g_norm = normalize_channel(xpol)
+        b_norm = normalize_channel(copol)
+
+        # Apply gamma correction
+        if gamma != 1.0:
+            r_norm = np.power(r_norm, 1.0 / gamma)
+            g_norm = np.power(g_norm, 1.0 / gamma)
+            b_norm = np.power(b_norm, 1.0 / gamma)
+
+        # Handle NaN (set to 0)
+        nan_mask = ~np.isfinite(copol) | ~np.isfinite(xpol)
+        r_norm = np.where(nan_mask, 0, r_norm)
+        g_norm = np.where(nan_mask, 0, g_norm)
+        b_norm = np.where(nan_mask, 0, b_norm)
+
+        # Stack to RGB
+        rgb_float = np.stack([r_norm, g_norm, b_norm], axis=-1)
+
+        # Apply brightness
+        if brightness != 1.0:
+            rgb_float = rgb_float * brightness
+            rgb_float = np.clip(rgb_float, 0, 1)
+
+        return rgb_float.astype(np.float32)
+
     def plot(
         self,
         cmap = 'turbo',
@@ -145,6 +212,106 @@ class Batch(BatchCore):
         """
         kwargs["composite"] = True
         return self.plot(*args, **kwargs)
+
+    def rgb(self, gamma: float = 1.0, brightness: float = 2.0, quantile: list = None):
+        """
+        Create RGB composite from dual-pol data as xarray DataArray.
+
+        Standard dual-pol RGB decomposition: R=co-pol, G=cross-pol, B=co-pol
+        - Magenta/pink: high co-pol, low cross-pol (surface scattering, urban)
+        - Green: high cross-pol (volume scattering, vegetation)
+        - White/gray: both high (mixed scattering)
+        - Dark: both low (smooth surfaces, water)
+
+        Parameters
+        ----------
+        gamma : float, optional
+            Gamma correction for brightness. Default 1.0.
+            Values > 1 brighten dark areas, < 1 increase contrast.
+        brightness : float, optional
+            Linear brightness multiplier. Default 2.0.
+        quantile : list, optional
+            Quantile range for normalization. Default [0.02, 0.98].
+
+        Returns
+        -------
+        xr.DataArray
+            RGB array with dims (band, y, x) or (date/pair, band, y, x).
+            Values are uint8 [0-255]. NaN pixels have value 0.
+
+        Examples
+        --------
+        >>> rgb = stack[['HH','HV']].isel(date=[0]).power().gaussian(60).rgb()
+        >>> rgb.shape  # (3, y, x) - band first for rasterio compatibility
+
+        >>> # Save as GeoTIFF (direct - no transpose needed)
+        >>> import rasterio
+        >>> from rasterio.transform import from_bounds
+        >>> transform = from_bounds(float(rgb.x.min()), float(rgb.y.min()),
+        ...                         float(rgb.x.max()), float(rgb.y.max()),
+        ...                         rgb.sizes['x'], rgb.sizes['y'])
+        >>> with rasterio.open('polsar.tif', 'w', driver='GTiff',
+        ...                    height=rgb.sizes['y'], width=rgb.sizes['x'],
+        ...                    count=3, dtype='uint8', crs=stack.crs,
+        ...                    transform=transform) as dst:
+        ...     dst.write(rgb.values)  # Already (3, H, W)
+        """
+        import numpy as np
+        import xarray as xr
+        import dask
+        from insardev_toolkit import progressbar
+
+        # Check for exactly 2 polarizations
+        sample = next(iter(self.values()))
+        polarizations = [v for v in sample.data_vars
+                        if sample[v].dims[-2:] == ('y', 'x')]
+        if len(polarizations) != 2:
+            raise ValueError(f"rgb() requires exactly 2 polarizations, found {len(polarizations)}: {polarizations}")
+
+        pol1, pol2 = polarizations[0], polarizations[1]
+
+        # Get stack variable (date or pair)
+        stackvar = list(sample[pol1].dims)[0] if len(sample[pol1].dims) > 2 else None
+
+        # Merge to single dataset
+        ds = self.to_dataset()
+        da_copol = ds[pol1]
+        da_xpol = ds[pol2]
+
+        if stackvar is None:
+            stackvar = 'fake'
+            da_copol = da_copol.expand_dims({stackvar: [0]})
+            da_xpol = da_xpol.expand_dims({stackvar: [0]})
+
+        # Materialize
+        da_copol, da_xpol = dask.persist(da_copol, da_xpol)
+        progressbar([da_copol, da_xpol], desc='Computing RGB composite'.ljust(25))
+
+        # Compute RGB using shared method from BatchCore
+        copol = da_copol.values
+        xpol = da_xpol.values
+        rgb_float = Batch._compute_rgb(copol, xpol, gamma=gamma,
+                                       brightness=brightness, quantile=quantile)
+        rgb_uint8 = (rgb_float * 255).astype(np.uint8)
+
+        # Create DataArray with band-first order for rasterio compatibility
+        if stackvar == 'fake':
+            # Remove fake dimension: (1, y, x, 3) -> (y, x, 3) -> (3, y, x)
+            rgb_uint8 = rgb_uint8[0]
+            rgb_da = xr.DataArray(
+                rgb_uint8,
+                dims=['y', 'x', 'band'],
+                coords={'y': da_copol.y, 'x': da_copol.x, 'band': ['R', 'G', 'B']}
+            ).transpose('band', 'y', 'x')
+        else:
+            rgb_da = xr.DataArray(
+                rgb_uint8,
+                dims=[stackvar, 'y', 'x', 'band'],
+                coords={stackvar: da_copol[stackvar], 'y': da_copol.y, 'x': da_copol.x, 'band': ['R', 'G', 'B']}
+            ).transpose(stackvar, 'band', 'y', 'x')
+
+        rgb_da.attrs['crs'] = self.crs
+        return rgb_da
 
     def lee(self, *args, **kwargs):
         """
