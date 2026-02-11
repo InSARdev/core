@@ -72,6 +72,7 @@ For funded academic, institutional, or professional use of the insardev package,
 ## Contact
 
 - Author: Aleksei (Alexey) Pechnikov
+- Website [pechnikov.dev](https://pechnikov.dev)
 - Email: alexey@pechnikov.dev
 - ORCID: https://orcid.org/0000-0001-9626-8615
 
