@@ -7,7 +7,7 @@
 #
 # See the LICENSE file in the insardev_toolkit directory for license terms.
 # ----------------------------------------------------------------------------
-__version__ = '2025.12.21.dev'
+__version__ = '2026.2.11'
 
 # unified progress indicators
 from .progressbar_joblib import progressbar_joblib
