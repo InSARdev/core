@@ -15,6 +15,8 @@ The previous-generation [PyGMTSAR](https://github.com/AlexeyPechnikov/pygmtsar) 
 | [insardev_pygmtsar](./insardev_pygmtsar/) | Sentinel-1 and NISAR SLC preprocessing | BSD 3-Clause |
 | [insardev_toolkit](./insardev_toolkit/) | Utility functions and helper tools | BSD 3-Clause |
 
+For funded academic, institutional, or professional use of the insardev package, see [insardev/SUBSCRIBE](https://github.com/AlexeyPechnikov/InSARdev/blob/main/insardev/SUBSCRIBE). The BSD-licensed insardev_pygmtsar and insardev_toolkit do not require subscription.
+
 ## Features
 
 - **Per-burst/swath processing** — each Sentinel-1 TOPS burst and NISAR swaths processed independently on a geocoded grid, no frame stitching required
@@ -58,16 +60,6 @@ For a $10/month Google Colab subscription, you get approximately 60 hours of L4 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/12oss994Pabq_8JDv4Dj-R6iqfGEalHCe?usp=sharing) **Erzincan Elevation, Türkiye (2019).** DEM generation from a single Sentinel-1 interferometric pair. Reproduces the ESA tutorial [DEM generation with Sentinel-1 IW](https://step.esa.int/docs/tutorials/S1TBX%20DEM%20generation%20with%20Sentinel-1%20IW%20Tutorial.pdf).
 
 <img src="assets/Türkiye_Elevation_2019_ele.jpg" />
-
-## License
-
-This repository contains components with different licenses:
-
-- **insardev/** - InSAR.dev Source-Available License (see [insardev/LICENSE](./insardev/LICENSE))
-- **insardev_pygmtsar/** - BSD 3-Clause License (see [insardev_pygmtsar/LICENSE](./insardev_pygmtsar/LICENSE))
-- **insardev_toolkit/** - BSD 3-Clause License (see [insardev_toolkit/LICENSE](./insardev_toolkit/LICENSE))
-
-For funded academic, institutional, or professional use of the insardev package, see [insardev/SUBSCRIBE](./insardev/SUBSCRIBE).
 
 ## Contact
 
