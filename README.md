@@ -13,20 +13,28 @@
 
 ## Features
 
-- **Per-burst processing** — each Sentinel-1 TOPS burst processed independently on a geocoded grid, no frame stitching required
-- **Geometric coregistration** — bursts aligned to a reference via radar-to-geographic transforms with differential topo phase correction between reference and repeat geometries
+- **Per-burst/scene processing** — each Sentinel-1 TOPS burst and NISAR swaths processed independently on a geocoded grid, no frame stitching required
+- **Geometric coregistration** — bursts and swaths aligned to a reference via radar-to-geographic transforms with differential topo phase correction between reference and repeat geometries
 - **Cloud-native storage** — Zarr v3 with chunked arrays, works with local disk or GCS/S3 via fsspec
 - **GPU-accelerated** — interferogram generation, filtering, detrending, phase unwrapping (1D and 2D) on Apple MPS and NVIDIA CUDA
 - **Time series analysis** — SBAS and PSI with least-squares and STL decomposition
-- **Dual-polarization support** — all polarization channels (VV+VH or HH+HV) processed together for PolSAR analysis
+- **Dual-polarization support** — all polarization channels (VV+VH or HH+HV) processed separately or together for PolSAR analysis
 - **Ascending and descending on the same grid** — both orbit directions processed in common geocoded coordinates for straightforward vertical and east-west displacement decomposition
 - **Per-pixel incidence geometry** — elevation-corrected incidence from spherical Earth model, no central-point approximation
-- **Integrated data access** — download Sentinel-1 bursts, precise orbits, DEM, land mask, and map tiles
+- **Integrated data access** — download Sentinel-1 bursts and NISAR polarizations and frequencies, Sentinel-1 orbits, DEM, land mask, and map tiles
 - **Runs anywhere** — Colab, GitHub runners, Docker containers, and even Raspberry Pi 4 & 5
 
 ## Examples
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1pz4QkvJmqagVuLmuLMlfGOSrZLFnJWBw?usp=sharing) **Central Türkiye Earthquakes (2023).** Interferogram covering two consecutive Sentinel-1 scenes (56 bursts) with GPU-accelerated phase unwrapping.
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/156sHUllAORmb3LmZoHz3YPecG7HWdie-?usp=sharing) NISAR L-Band HH/HV RGB composite, HH interferogram, and unwrapped phase.
+
+<img src="assets/NisarLB.jpg" />
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1QBOu2_KHjgKEJTtEeQI0wQ7MbNoHUCJ9?usp=sharing) **Iran–Iraq Earthquake (2017)**. The results compared to outputs from GMTSAR, SNAP, and GAMMA software. Illustrates bursts search by area, date, and attributes.
+
+<img src="assets/Iran–Iraq_Earthquake_2017.jpg" />
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1pz4QkvJmqagVuLmuLMlfGOSrZLFnJWBw?usp=sharing) **Central Türkiye Earthquakes (2023).** Interferogram covering two consecutive Sentinel-1 scenes (56 bursts).
 
 <img src="assets/Türkiye_Earthquakes_2023_intf.jpg" />
 
@@ -55,7 +63,7 @@ For Commercial Use of the insardev package, see [insardev/SUBSCRIBE](./insardev/
 
 ## Contact
 
-- Author: Aleksei Pechnikov
+- Author: Aleksei (Alexey) Pechnikov
 - Email: alexey@pechnikov.dev
 - ORCID: https://orcid.org/0000-0001-9626-8615
 
