@@ -387,7 +387,7 @@ class ASF(progressbar_joblib):
         return os.path.exists(out_path)
 
     # https://asf.alaska.edu/datasets/data-sets/derived-data-sets/sentinel-1-bursts/
-    def download(self, basedir, bursts, polarization=None, frequency=None, session=None, n_jobs=4, joblib_backend='loky', skip_exist=True,
+    def download(self, basedir, bursts, polarization=None, frequency=None, session=None, n_jobs=4, joblib_backend='threading', skip_exist=True,
                         retries=30, timeout_second=3, debug=False):
         """
         Download SAR data from ASF.
@@ -419,7 +419,7 @@ class ASF(progressbar_joblib):
         n_jobs : int, optional
             Parallel download jobs. Default 8.
         joblib_backend : str, optional
-            Backend for parallel processing. Default 'loky'.
+            Backend for parallel processing. Default 'threading' (optimal for I/O-bound downloads).
         skip_exist : bool, optional
             Skip already downloaded data. Default True.
         retries : int, optional
@@ -705,26 +705,16 @@ class ASF(progressbar_joblib):
                 import rasterio
                 from rasterio.io import MemoryFile
 
-                # Download TIFF to memory
+                # Download TIFF to memory (brotli compression - faster than uncompressed)
                 tiff_url = get_burst_url(properties['url'])
                 response = session.get(tiff_url, stream=True)
                 response.raise_for_status()
-                cache_status = response.headers.get('x-cache', 'N/A')
-                cache_enc = response.headers.get('content-encoding', 'none')
-                # Read raw compressed bytes to measure transfer size
-                if debug and cache_enc in ('br', 'gzip', 'deflate'):
-                    # Read compressed bytes directly
-                    compressed_bytes = response.raw.read()
-                    transfer_mb = len(compressed_bytes) / 1024 / 1024
-                    # Decompress manually
-                    import brotli
-                    tiff_bytes = brotli.decompress(compressed_bytes)
-                    print(f'  TIFF {cache_status:4} {cache_enc:4} {transfer_mb:5.1f}MB {burst}')
-                else:
-                    tiff_bytes = response.content
-                    if debug:
-                        size_mb = len(tiff_bytes) / 1024 / 1024
-                        print(f'  TIFF {cache_status:4} {cache_enc:4} {size_mb:5.1f}MB {burst}')
+                tiff_bytes = b''.join(response.iter_content(chunk_size=1024*1024))
+                if debug:
+                    cache_status = response.headers.get('x-cache', 'N/A')
+                    cache_enc = response.headers.get('content-encoding', 'none')
+                    size_mb = len(tiff_bytes) / 1024 / 1024
+                    print(f'  TIFF {cache_status:4} {cache_enc:4} {size_mb:5.1f}MB {burst}')
                 if len(tiff_bytes) == 0:
                     raise Exception(f'ERROR: Downloaded TIFF is empty: {tiff_url}')
 
