@@ -57,7 +57,6 @@ setup(
                       'netCDF4',
                       'nc-time-axis',
                       'remotezip',
-                      'asf_search',
                       'matplotlib',
                       'imageio'
                       ],
