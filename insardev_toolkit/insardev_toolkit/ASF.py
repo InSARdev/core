@@ -387,7 +387,7 @@ class ASF(progressbar_joblib):
         return os.path.exists(out_path)
 
     # https://asf.alaska.edu/datasets/data-sets/derived-data-sets/sentinel-1-bursts/
-    def download(self, basedir, bursts, polarization=None, frequency=None, session=None, n_jobs=4, joblib_backend='threading', skip_exist=True,
+    def download(self, basedir, bursts, polarization=None, frequency=None, session=None, n_jobs=8, joblib_backend='loky', skip_exist=True,
                         retries=30, timeout_second=3, debug=False):
         """
         Download SAR data from ASF.
@@ -419,7 +419,7 @@ class ASF(progressbar_joblib):
         n_jobs : int, optional
             Parallel download jobs. Default 8.
         joblib_backend : str, optional
-            Backend for parallel processing. Default 'threading' (optimal for I/O-bound downloads).
+            Backend for parallel processing. Default 'loky' (multiprocessing, faster on Colab).
         skip_exist : bool, optional
             Skip already downloaded data. Default True.
         retries : int, optional
