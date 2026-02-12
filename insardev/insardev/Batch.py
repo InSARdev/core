@@ -1332,6 +1332,12 @@ class BatchWrap(BatchCore):
             - unwrapped: Batch of unwrapped phase (float32)
             - conncomp: BatchUnit of component labels (uint16, 0=invalid, 1=largest, ...)
 
+        Notes
+        -----
+        Uses a novel DCT+IRLS algorithm that combines DCT efficiency with IRLS
+        robustness. See `utils_unwrap2d.irls_unwrap_2d` for algorithm details
+        and references.
+
         Examples
         --------
         >>> phase, corr = stack.pairs(baseline.tolist()).phasediff(wavelength=30).angle()

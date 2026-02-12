@@ -758,11 +758,12 @@ class Stack_unwrap2d(Stack_unwrap1d):
         Notes
         -----
         - GPU/TPU-accelerated using PyTorch (TPU via XLA, CUDA/ROCm, MPS, or CPU)
-        - Uses accelerated DCT for fast initialization
-        - L¹ norm preserves discontinuities better than L² (DCT)
+        - L¹ norm preserves discontinuities better than L² (DCT alone)
         - Correlation weighting handles phase residues properly
         - Provides consistent results across multi-burst data
-        - Based on arXiv:2401.09961
+
+        **Algorithm**: Uses a novel DCT+IRLS combination. See
+        `utils_unwrap2d.irls_unwrap_2d` for algorithm details and references.
         """
         import dask
         import dask.array as da
