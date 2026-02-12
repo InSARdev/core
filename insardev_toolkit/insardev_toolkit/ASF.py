@@ -206,21 +206,48 @@ class _asf_search_module:
 asf_search = _asf_search_module()
 # ============================================================================
 
+# Cloudflare Worker cache proxy for S1 bursts (handles auth internally)
+_S1_CACHE_PROXY = 'https://s1-cache-asf.insar.dev'
+_ASF_BURST_HOST = 'https://sentinel1-burst.asf.alaska.edu'
+
+
 class ASF(progressbar_joblib):
     import pandas as pd
     from datetime import timedelta
 
     def __init__(self, username=None, password=None):
-        import getpass
-        if username is None:
-            username = getpass.getpass('Please enter your ASF username and press Enter key:')
-        if password is None:
-            password = getpass.getpass('Please enter your ASF password and press Enter key:')
+        """Initialize ASF downloader.
+
+        Parameters
+        ----------
+        username : str, optional
+            Earthdata Login username. If not provided, uses cache proxy.
+        password : str, optional
+            Earthdata Login password. If not provided, uses cache proxy.
+
+        Notes
+        -----
+        When no credentials provided, downloads use Cloudflare cache proxy
+        at s1-cache-asf.insar.dev which handles authentication internally.
+        """
         self.username = username
         self.password = password
 
     def _get_asf_session(self):
+        """Get authenticated session for ASF downloads.
+
+        Returns plain requests.Session if no credentials (uses cache proxy).
+        """
+        if self.username is None:
+            # Cache proxy handles auth - just need a plain session
+            return requests.Session()
         return asf_search.ASFSession().auth_with_creds(self.username, self.password)
+
+    def _get_burst_url(self, original_url):
+        """Convert ASF burst URL to cache proxy URL if no credentials."""
+        if self.username is None and original_url.startswith(_ASF_BURST_HOST):
+            return original_url.replace(_ASF_BURST_HOST, _S1_CACHE_PROXY)
+        return original_url
 
     @staticmethod
     def _detect_mission(granule_name):
@@ -360,7 +387,7 @@ class ASF(progressbar_joblib):
         return os.path.exists(out_path)
 
     # https://asf.alaska.edu/datasets/data-sets/derived-data-sets/sentinel-1-bursts/
-    def download(self, basedir, bursts, polarization=None, frequency=None, session=None, n_jobs=8, joblib_backend='loky', skip_exist=True,
+    def download(self, basedir, bursts, polarization=None, frequency=None, session=None, n_jobs=4, joblib_backend='loky', skip_exist=True,
                         retries=30, timeout_second=3, debug=False):
         """
         Download SAR data from ASF.
@@ -556,6 +583,10 @@ class ASF(progressbar_joblib):
         if len(bursts_missed) == 0:
             return None
 
+        # URL transformer for cache proxy
+        def get_burst_url(url):
+            return self._get_burst_url(url)
+
         def download_burst(result, basedir, session):
             properties = result.geojson()['properties']
             #print ('result properties', properties)
@@ -606,10 +637,23 @@ class ASF(progressbar_joblib):
                 return
 
             # download manifest to memory to get dimensions for TIFF validation
-            manifest_url = properties['additionalUrls'][0]
-            response = session.get(manifest_url)
+            manifest_url = get_burst_url(properties['additionalUrls'][0])
+            response = session.get(manifest_url, stream=True)
             response.raise_for_status()
-            xml_content = response.text
+            cache_status = response.headers.get('x-cache', 'N/A')
+            cache_enc = response.headers.get('content-encoding', 'none')
+            # Read and decompress for debug logging
+            if debug and cache_enc in ('br', 'gzip', 'deflate'):
+                import brotli
+                compressed_bytes = response.raw.read()
+                transfer_mb = len(compressed_bytes) / 1024 / 1024
+                xml_content = brotli.decompress(compressed_bytes).decode('utf-8')
+                print(f'  XML  {cache_status:4} {cache_enc:4} {transfer_mb:5.1f}MB {burst}')
+            else:
+                xml_content = response.text
+                if debug:
+                    size_mb = len(xml_content.encode()) / 1024 / 1024
+                    print(f'  XML  {cache_status:4} {cache_enc:4} {size_mb:5.1f}MB {burst}')
             if len(xml_content) == 0:
                 raise Exception(f'ERROR: Downloaded manifest is empty: {manifest_url}')
             # check if server returned JSON error instead of XML
@@ -662,10 +706,25 @@ class ASF(progressbar_joblib):
                 from rasterio.io import MemoryFile
 
                 # Download TIFF to memory
-                tiff_url = properties['url']
-                response = session.get(tiff_url)
+                tiff_url = get_burst_url(properties['url'])
+                response = session.get(tiff_url, stream=True)
                 response.raise_for_status()
-                tiff_bytes = response.content
+                cache_status = response.headers.get('x-cache', 'N/A')
+                cache_enc = response.headers.get('content-encoding', 'none')
+                # Read raw compressed bytes to measure transfer size
+                if debug and cache_enc in ('br', 'gzip', 'deflate'):
+                    # Read compressed bytes directly
+                    compressed_bytes = response.raw.read()
+                    transfer_mb = len(compressed_bytes) / 1024 / 1024
+                    # Decompress manually
+                    import brotli
+                    tiff_bytes = brotli.decompress(compressed_bytes)
+                    print(f'  TIFF {cache_status:4} {cache_enc:4} {transfer_mb:5.1f}MB {burst}')
+                else:
+                    tiff_bytes = response.content
+                    if debug:
+                        size_mb = len(tiff_bytes) / 1024 / 1024
+                        print(f'  TIFF {cache_status:4} {cache_enc:4} {size_mb:5.1f}MB {burst}')
                 if len(tiff_bytes) == 0:
                     raise Exception(f'ERROR: Downloaded TIFF is empty: {tiff_url}')
 
