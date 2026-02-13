@@ -23,6 +23,7 @@ For funded academic, institutional, or professional use of the insardev package,
 - **Geometric and xcorr coregistration** — bursts and swaths aligned to a reference via radar-to-geographic transforms and refined by xcorr with differential topo phase correction between reference and repeat geometries
 - **Cloud-native storage** — Zarr v3 with chunked arrays, works with local disk or GCS/S3 via fsspec
 - **GPU-accelerated** — interferogram generation, filtering, detrending, phase unwrapping (1D and 2D) on Apple MPS and NVIDIA CUDA
+- **Fast 2D phase unwrapping** — DCT+IRLS L1-norm solver handles grids up to 40,000×40,000 pixels, robust to phase discontinuities and noise
 - **Time series analysis** — SBAS and PSI with least-squares and STL decomposition
 - **Dual-polarization support** — all polarization channels (VV+VH or HH+HV) processed separately or together for PolSAR analysis
 - **Ascending and descending on the same grid** — both orbit directions processed in common geocoded coordinates for straightforward vertical and east-west displacement decomposition
