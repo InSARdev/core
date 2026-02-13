@@ -7,7 +7,7 @@
 #
 # See the LICENSE file in the insardev_toolkit directory for license terms.
 # ----------------------------------------------------------------------------
-__version__ = '2026.2.11'
+__version__ = '2026.2.13'
 
 # unified progress indicators
 from .progressbar_joblib import progressbar_joblib
@@ -20,6 +20,8 @@ from .EOF import EOF
 from .NCubeVTK import NCubeVTK
 # ASF, AWS, ESA, GMT downloading functions
 from .ASF import ASF
+# Copernicus Data Space Ecosystem (CDSE) burst access
+from .CDSE import CDSE
 # tiles downloading
 from .Tiles import Tiles
 # XYZ map tiles downloading
