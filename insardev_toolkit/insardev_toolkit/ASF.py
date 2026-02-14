@@ -210,6 +210,11 @@ asf_search = _asf_search_module()
 _S1_CACHE_PROXY = 'https://s1-cache-asf.insar.dev'
 _ASF_BURST_HOST = 'https://sentinel1-burst.asf.alaska.edu'
 
+# Cloudflare Worker cache proxy for NISAR (handles auth internally)
+# API: /GRANULE_ID/OFFSET.bin → 128MB block at OFFSET
+_NISAR_CACHE_PROXY = 'https://nisar-cache-asf.insar.dev'
+_NISAR_BLOCK_SIZE = 128 * 1024 * 1024  # 128 MB blocks
+
 
 class ASF(progressbar_joblib):
     import pandas as pd
@@ -387,7 +392,7 @@ class ASF(progressbar_joblib):
         return os.path.exists(out_path)
 
     # https://asf.alaska.edu/datasets/data-sets/derived-data-sets/sentinel-1-bursts/
-    def download(self, basedir, bursts, polarization=None, frequency=None, session=None, n_jobs=8, joblib_backend='loky', skip_exist=True,
+    def download(self, basedir, bursts, polarization=None, frequency=None, session=None, n_jobs=None, joblib_backend='loky', skip_exist=True,
                         retries=30, timeout_second=3, debug=False):
         """
         Download SAR data from ASF.
@@ -416,8 +421,8 @@ class ASF(progressbar_joblib):
             - 'B': Only frequencyB (4x less data, quick look or iono correction)
         session : asf_search.ASFSession, optional
             Authenticated session. Created automatically if None.
-        n_jobs : int, optional
-            Parallel download jobs. Default 8.
+        n_jobs : int or None, optional
+            Parallel download jobs. None uses mission-specific defaults (S1: 8, NISAR: 2).
         joblib_backend : str, optional
             Backend for parallel processing. Default 'loky' (multiprocessing, faster on Colab).
         skip_exist : bool, optional
@@ -539,6 +544,10 @@ class ASF(progressbar_joblib):
             If None, use polarization from burst name.
             If list, replace polarization in burst name with each requested pol.
         """
+        # S1-specific default: 8 parallel jobs
+        if n_jobs is None:
+            n_jobs = 8
+
         import rioxarray as rio
         from tifffile import TiffFile
         import xmltodict
@@ -988,6 +997,10 @@ class ASF(progressbar_joblib):
             If 'A', download only frequencyA (20 MHz, high resolution).
             If 'B', download only frequencyB (5 MHz, 4x less data, for quick look).
         """
+        # NISAR-specific default: 4 parallel jobs (optimal for Colab with decompression)
+        if n_jobs is None:
+            n_jobs = 4
+
         import h5py
         import fsspec
         import aiohttp
@@ -1000,6 +1013,13 @@ class ASF(progressbar_joblib):
         import os
         import time
         import threading
+
+        # Use cache proxy when no credentials provided
+        if self.username is None:
+            return self._download_nisar_via_cache(
+                basedir, granules, polarizations, frequency,
+                n_jobs, skip_exist, retries, timeout_second, debug
+            )
 
         # Initialize tqdm lock for thread-safe progress bars
         tqdm.set_lock(threading.RLock())
@@ -1066,20 +1086,53 @@ class ASF(progressbar_joblib):
                 'n_rg': n_rg
             }
 
-        def download_byte_range(url, start, end, auth_tuple, pbar=None, http_session=None):
+        def extract_signed_url(url, auth_tuple, http_session=None):
+            """Extract signed CloudFront URL by following OAuth redirects.
+
+            Makes a small Range request to trigger OAuth flow and capture
+            the final signed URL for direct reuse.
+            """
+            headers = {'Range': 'bytes=0-0'}  # Minimal request
+
+            if http_session:
+                # Follow redirects manually to capture final URL
+                resp = http_session.get(url, headers=headers, allow_redirects=False)
+                while resp.status_code in (301, 302, 303, 307, 308):
+                    location = resp.headers.get('Location')
+                    if not location:
+                        break
+                    resp = http_session.get(location, headers=headers, allow_redirects=False)
+                # Final URL after all redirects
+                if 'cloudfront.net' in resp.url:
+                    return resp.url
+            return None
+
+        def download_byte_range(url, start, end, auth_tuple, pbar=None, http_session=None, signed_url=None):
             """Download byte range using single HTTP Range request.
 
+            If signed_url is provided, uses it directly (skipping OAuth).
             If pbar is provided, updates it instead of creating a new one.
             If http_session is provided, reuses the connection.
+
+            Returns: (bytes, signed_url) - signed_url for reuse in subsequent requests
             """
             size = end - start
             headers = {'Range': f'bytes={start}-{end-1}'}  # HTTP Range is inclusive
 
             chunks_data = []
-            if http_session:
+            returned_signed_url = signed_url
+
+            if signed_url:
+                # Use signed URL directly (much faster - no OAuth redirects)
+                r = requests.get(signed_url, headers=headers, stream=True)
+            elif http_session:
                 r = http_session.get(url, headers=headers, stream=True)
+                # Capture signed URL from redirect chain
+                if 'cloudfront.net' in r.url:
+                    returned_signed_url = r.url
             else:
                 r = requests.get(url, headers=headers, auth=auth_tuple, stream=True)
+
             with r:
                 r.raise_for_status()
                 for chunk in r.iter_content(chunk_size=1024*1024):
@@ -1087,7 +1140,7 @@ class ASF(progressbar_joblib):
                     if pbar:
                         pbar.update(len(chunk))
 
-            return b''.join(chunks_data)
+            return b''.join(chunks_data), returned_signed_url
 
         def parse_nisar_granule_id(granule_id):
             """Parse NISAR granule ID to extract track, frame, and datetime.
@@ -1244,8 +1297,8 @@ class ASF(progressbar_joblib):
                 metadata_end = int(slc_min * 1.05)
 
                 if debug and position is None:
-                    print(f"  File size: {file_size/1e9:.2f} GB, Layout: {layout}")
-                    print(f"  Metadata size: {metadata_end/1e6:.1f} MB")
+                    print(f"  File size: {file_size/(1024**3):.2f} GB, Layout: {layout}")
+                    print(f"  Metadata size: {metadata_end/(1024**2):.1f} MB")
 
                 # Download metadata block with progress bar
                 with tqdm(total=metadata_end, unit='B', unit_scale=True,
@@ -1283,15 +1336,15 @@ class ASF(progressbar_joblib):
                         span_size = chunk_info_a['max_end'] - chunk_info_a['min_offset']
                         overhead = (span_size - total_data) / total_data * 100
                         print(f"    FreqA: {len(chunk_info_a['chunks'])} chunks, "
-                              f"Data: {total_data/1e9:.2f} GB, "
-                              f"Span: {span_size/1e9:.2f} GB ({overhead:.1f}% overhead)")
+                              f"Data: {total_data/(1024**3):.2f} GB, "
+                              f"Span: {span_size/(1024**3):.2f} GB ({overhead:.1f}% overhead)")
                     if chunk_info_b:
                         total_data_b = sum(c['size'] for c in chunk_info_b['chunks'])
                         span_size_b = chunk_info_b['max_end'] - chunk_info_b['min_offset']
                         overhead_b = (span_size_b - total_data_b) / total_data_b * 100
                         print(f"    FreqB: {len(chunk_info_b['chunks'])} chunks, "
-                              f"Data: {total_data_b/1e9:.2f} GB, "
-                              f"Span: {span_size_b/1e9:.2f} GB ({overhead_b:.1f}% overhead)")
+                              f"Data: {total_data_b/(1024**3):.2f} GB, "
+                              f"Span: {span_size_b/(1024**3):.2f} GB ({overhead_b:.1f}% overhead)")
 
             # Create progress bar for SLC download
             desc = f"{short_name}"
@@ -1302,6 +1355,7 @@ class ASF(progressbar_joblib):
                 # Download and write each polarization
                 downloaded_files = []
                 os.makedirs(out_dir, exist_ok=True)
+                signed_url = None  # Will be extracted from first request and reused
 
                 for pol in pols_to_download:
                     out_name = f"NSR_{track:03d}_{frame:03d}_{datetime_str}_{pol}.h5"
@@ -1315,41 +1369,45 @@ class ASF(progressbar_joblib):
                             span_size = chunk_info_a['max_end'] - chunk_info_a['min_offset']
                             overhead = (span_size - total_data) / total_data * 100
                             print(f"    FreqA: {len(chunk_info_a['chunks'])} chunks, "
-                                  f"Data: {total_data/1e9:.2f} GB, "
-                                  f"Span: {span_size/1e9:.2f} GB ({overhead:.1f}% overhead)")
+                                  f"Data: {total_data/(1024**3):.2f} GB, "
+                                  f"Span: {span_size/(1024**3):.2f} GB ({overhead:.1f}% overhead)")
                         if chunk_info_b:
                             total_data_b = sum(c['size'] for c in chunk_info_b['chunks'])
                             span_size_b = chunk_info_b['max_end'] - chunk_info_b['min_offset']
                             overhead_b = (span_size_b - total_data_b) / total_data_b * 100
                             print(f"    FreqB: {len(chunk_info_b['chunks'])} chunks, "
-                                  f"Data: {total_data_b/1e9:.2f} GB, "
-                                  f"Span: {span_size_b/1e9:.2f} GB ({overhead_b:.1f}% overhead)")
+                                  f"Data: {total_data_b/(1024**3):.2f} GB, "
+                                  f"Span: {span_size_b/(1024**3):.2f} GB ({overhead_b:.1f}% overhead)")
 
                     # Read metadata from pre-downloaded buffer (no remote access)
                     metadata = self._read_nisar_metadata_direct(pol, metadata_buffer)
 
                     # Download frequencyA byte span if needed
+                    # First request extracts signed URL for reuse
                     downloaded_data_a = None
                     if chunk_info_a is not None:
-                        downloaded_data_a = download_byte_range(
+                        downloaded_data_a, signed_url = download_byte_range(
                             url,
                             chunk_info_a['min_offset'],
                             chunk_info_a['max_end'],
                             auth_tuple,
                             pbar=pbar,
-                            http_session=http_session
+                            http_session=http_session,
+                            signed_url=signed_url  # Reuse if already extracted
                         )
 
                     # Download frequencyB byte span if needed
+                    # Reuses signed URL from frequencyA request
                     downloaded_data_b = None
                     if chunk_info_b is not None:
-                        downloaded_data_b = download_byte_range(
+                        downloaded_data_b, signed_url = download_byte_range(
                             url,
                             chunk_info_b['min_offset'],
                             chunk_info_b['max_end'],
                             auth_tuple,
                             pbar=pbar,
-                            http_session=http_session
+                            http_session=http_session,
+                            signed_url=signed_url
                         )
 
                     # Write output HDF5 (suppress debug output in parallel mode)
@@ -1379,9 +1437,9 @@ class ASF(progressbar_joblib):
                         raise
                     time.sleep(timeout_second)
 
-        # Process granules in parallel using joblib
-        if n_jobs == 1 or len(granules) == 1:
-            # Sequential processing (no position needed)
+        # Process granules (sequential when n_jobs=1, single granule, or debug=True)
+        if n_jobs == 1 or len(granules) == 1 or debug:
+            # Sequential processing (also when debug=True for easier debugging)
             all_downloaded = []
             for granule in granules:
                 files = download_with_retry(granule)
@@ -1394,6 +1452,576 @@ class ASF(progressbar_joblib):
             for i, granule in enumerate(granules):
                 files = download_with_retry(granule)  # No position = clean single bar
                 all_downloaded.extend(files)
+
+        if all_downloaded:
+            return pd.DataFrame({'file': all_downloaded})
+        return None
+
+    def _download_nisar_via_cache(self, basedir, granules, polarizations, frequency,
+                                   n_jobs, skip_exist, retries, timeout_second, debug):
+        """Download NISAR via Cloudflare cache proxy (no credentials required).
+
+        Uses cache proxy at nisar-cache-asf.insar.dev with 128MB block API:
+        - /GRANULE_ID/0.bin → 128MB metadata block
+        - /GRANULE_ID/OFFSET.bin → 128MB block at OFFSET
+
+        Parameters
+        ----------
+        granules : list
+            List of NISAR granule IDs.
+        polarizations : list or None
+            If None, download all available polarizations.
+        frequency : str or None
+            If None, download both frequencyA and frequencyB.
+            If 'A', download only frequencyA. If 'B', download only frequencyB.
+        n_jobs : int
+            Number of parallel granule downloads (uses loky backend).
+        """
+        # NISAR-specific default: 4 parallel jobs (optimal for Colab with decompression)
+        if n_jobs is None:
+            n_jobs = 4
+
+        import h5py
+        import requests
+        import numpy as np
+        import pandas as pd
+        from tqdm.auto import tqdm
+        from io import BytesIO
+        import os
+        import struct
+        import time
+        from joblib import Parallel, delayed
+
+        MIN_BLOCK = 64 * 1024 * 1024   # 64 MB min block
+        MAX_BLOCK = 128 * 1024 * 1024  # 128 MB max block
+
+        def parse_nisar_granule_id(granule_id):
+            """Parse NISAR granule ID to extract track, frame, and datetime."""
+            parts = granule_id.replace('.h5', '').split('_')
+            track = int(parts[5])
+            frame = int(parts[7])
+            datetime_str = parts[11]
+            return track, frame, datetime_str
+
+        def get_chunk_info(h5_file, pol, freq='A'):
+            """Query chunk byte offsets from HDF5 metadata."""
+            slc = h5_file[f'science/LSAR/RSLC/swaths/frequency{freq}/{pol}']
+            shape = slc.shape
+            chunk_shape = slc.chunks
+
+            n_az = (shape[0] + chunk_shape[0] - 1) // chunk_shape[0]
+            n_rg = (shape[1] + chunk_shape[1] - 1) // chunk_shape[1]
+
+            chunks = []
+            for row in range(n_az):
+                for col in range(n_rg):
+                    coord = (row * chunk_shape[0], col * chunk_shape[1])
+                    info = slc.id.get_chunk_info_by_coord(coord)
+                    chunks.append({
+                        'offset': info.byte_offset,
+                        'size': info.size,
+                        'row': row,
+                        'col': col,
+                        'coord': coord
+                    })
+
+            min_offset = min(c['offset'] for c in chunks)
+            max_end = max(c['offset'] + c['size'] for c in chunks)
+
+            return {
+                'chunks': chunks,
+                'min_offset': min_offset,
+                'max_end': max_end,
+                'shape': shape,
+                'chunk_shape': chunk_shape,
+                'dtype': slc.dtype,
+                'compression': slc.compression,
+                'compression_opts': slc.compression_opts,
+                'shuffle': slc.shuffle,
+                'n_az': n_az,
+                'n_rg': n_rg
+            }
+
+        def split_range_to_blocks(start, end):
+            """Split byte range into deterministic 64-128MB blocks.
+
+            All clients requesting the same range get identical blocks,
+            ensuring consistent cache hits.
+            """
+            total = end - start
+            if total <= MAX_BLOCK:
+                return [(start, total)]
+
+            # Calculate number of chunks so each is 64-128MB
+            n_blocks = (total + MAX_BLOCK - 1) // MAX_BLOCK
+            block_size = total // n_blocks
+
+            # Ensure blocks are >= MIN_BLOCK
+            while n_blocks > 1 and block_size < MIN_BLOCK:
+                n_blocks -= 1
+                block_size = total // n_blocks
+
+            blocks = []
+            offset = start
+            for i in range(n_blocks):
+                if i == n_blocks - 1:
+                    # Last block gets remainder
+                    blocks.append((offset, end - offset))
+                else:
+                    blocks.append((offset, block_size))
+                    offset += block_size
+            return blocks
+
+        # Cache statistics for debug mode
+        cache_stats = {'hits': 0, 'misses': 0, 'bytes_hit': 0, 'bytes_miss': 0}
+
+        def fetch_cache_range(granule_id, offset, length, session=None):
+            """Fetch range from cache proxy using new API.
+
+            Returns (content, cache_hit) tuple.
+            """
+            url = f"{_NISAR_CACHE_PROXY}/{granule_id}/{offset}/{length}.bin"
+            sess = session or requests.Session()
+            resp = sess.get(url)
+            resp.raise_for_status()
+            cache_hit = resp.headers.get('X-Cache', '').upper() == 'HIT'
+            return resp.content, cache_hit
+
+        def fetch_region_via_cache(granule_id, start, end, pbar=None, session=None):
+            """Fetch byte region using deterministic 64-128MB blocks.
+
+            Splits large regions into cacheable blocks.
+            Returns contiguous bytes from start to end.
+            """
+            sess = session or requests.Session()
+            blocks = split_range_to_blocks(start, end)
+
+            all_data = bytearray()
+            for block_offset, block_length in blocks:
+                block_data, cache_hit = fetch_cache_range(granule_id, block_offset, block_length, session=sess)
+                all_data.extend(block_data)
+
+                # Track cache stats
+                if cache_hit:
+                    cache_stats['hits'] += 1
+                    cache_stats['bytes_hit'] += block_length
+                else:
+                    cache_stats['misses'] += 1
+                    cache_stats['bytes_miss'] += block_length
+                    # Log missed blocks for debugging
+                    if debug:
+                        print(f"    MISS: offset={block_offset} len={block_length/(1024**2):.0f}MB")
+
+                if pbar:
+                    pbar.update(block_length)
+                    # Update postfix with cache stats only in debug mode
+                    if debug:
+                        pbar.set_postfix_str(f"H{cache_stats['hits']}M{cache_stats['misses']}")
+
+            return bytes(all_data)
+
+        def fetch_chunks_via_cache(granule_id, chunks, pbar=None, session=None):
+            """Fetch HDF5 chunks by downloading their containing regions.
+
+            Groups adjacent chunks into contiguous regions, then fetches
+            each region using deterministic 64-128MB blocks.
+
+            Returns dict: {chunk_offset: chunk_bytes}
+            """
+            sess = session or requests.Session()
+
+            # Sort chunks by offset
+            sorted_chunks = sorted(chunks, key=lambda c: c['offset'])
+
+            # Group into contiguous regions (gap threshold: 1MB)
+            GAP_THRESHOLD = 16 * 1024 * 1024  # 16MB gap threshold
+            regions = []
+            region_start = sorted_chunks[0]['offset']
+            region_end = sorted_chunks[0]['offset'] + sorted_chunks[0]['size']
+            region_chunks = [sorted_chunks[0]]
+
+            for chunk in sorted_chunks[1:]:
+                if chunk['offset'] <= region_end + GAP_THRESHOLD:
+                    # Extend current region
+                    region_end = max(region_end, chunk['offset'] + chunk['size'])
+                    region_chunks.append(chunk)
+                else:
+                    # Save current region and start new one
+                    regions.append((region_start, region_end, region_chunks))
+                    region_start = chunk['offset']
+                    region_end = chunk['offset'] + chunk['size']
+                    region_chunks = [chunk]
+
+            regions.append((region_start, region_end, region_chunks))
+
+            # Download each region and extract chunks
+            chunk_data = {}
+            for region_start, region_end, region_chunks in regions:
+                region_bytes = fetch_region_via_cache(
+                    granule_id, region_start, region_end, pbar=pbar, session=sess
+                )
+
+                for chunk in region_chunks:
+                    rel_offset = chunk['offset'] - region_start
+                    chunk_data[chunk['offset']] = region_bytes[rel_offset:rel_offset + chunk['size']]
+
+            return chunk_data
+
+        def patch_hdf5_superblock(data):
+            """Patch HDF5 superblock EOF to match buffer size."""
+            data = bytearray(data)
+            version = data[8]
+            if version == 0:
+                data[40:48] = struct.pack('<Q', len(data))
+            else:
+                data[28:36] = struct.pack('<Q', len(data))
+                data[44:48] = struct.pack('<I', self._hdf5_lookup3_hash(bytes(data[0:44])))
+            return data
+
+        def download_granule_via_cache(granule_id, position=None, shared_pbar=None, shared_progress=None):
+            """Download single NISAR granule via cache proxy.
+
+            shared_pbar: optional (pbar_list, lock) tuple for threading parallel mode
+            shared_progress: optional (counter, lock) tuple for loky parallel mode
+            """
+            track, frame, datetime_str = parse_nisar_granule_id(granule_id)
+
+            # Output directory
+            subdir = f"{track:03d}_{frame:03d}"
+            out_dir = os.path.join(basedir, subdir)
+
+            # Check what pols to download
+            pols_to_download = polarizations if polarizations else ['HH', 'HV', 'VH', 'VV']
+
+            # Check existing files
+            if skip_exist:
+                existing_files = []
+                for pol in pols_to_download:
+                    out_name = f"NSR_{track:03d}_{frame:03d}_{datetime_str}_{pol}.h5"
+                    out_path = os.path.join(out_dir, out_name)
+                    if os.path.exists(out_path):
+                        existing_files.append(out_name)
+                if len(existing_files) == len(pols_to_download):
+                    if debug:
+                        print(f"NISAR {track}_{frame}: all files exist, skipping")
+                    return existing_files
+
+            # Create session for connection reuse
+            session = requests.Session()
+
+            # Fetch metadata block (offset 0, 128MB for NISAR metadata)
+            short_name = f"NSR_{track:03d}_{frame:03d}_{datetime_str}"
+
+            metadata_raw, meta_cache_hit = fetch_cache_range(granule_id, 0, MAX_BLOCK, session=session)
+            # Track metadata block in cache stats
+            if meta_cache_hit:
+                cache_stats['hits'] += 1
+                cache_stats['bytes_hit'] += MAX_BLOCK
+            else:
+                cache_stats['misses'] += 1
+                cache_stats['bytes_miss'] += MAX_BLOCK
+            if debug:
+                print(f"  {short_name}: metadata {MAX_BLOCK/(1024*1024):.0f}MB {'HIT' if meta_cache_hit else 'MISS'}")
+            metadata_buffer = patch_hdf5_superblock(metadata_raw)
+
+            # Parse metadata to get available pols and chunk info
+            with h5py.File(BytesIO(bytes(metadata_buffer)), 'r') as h5_meta:
+                swaths_path = 'science/LSAR/RSLC/swaths'
+                if swaths_path not in h5_meta:
+                    raise ValueError(f"Unsupported NISAR format: {swaths_path} not found")
+
+                swaths_grp = h5_meta[swaths_path]
+                if 'frequencyA' not in swaths_grp:
+                    raise ValueError(f"Unsupported NISAR format: frequencyA not found")
+
+                available_pols = [k for k in swaths_grp['frequencyA'].keys()
+                                  if k in ['HH', 'HV', 'VH', 'VV']]
+                has_freq_b = 'frequencyB' in swaths_grp
+                freq_b_pols = ([k for k in swaths_grp['frequencyB'].keys()
+                               if k in ['HH', 'HV', 'VH', 'VV']] if has_freq_b else [])
+
+                # Filter to requested pols
+                if polarizations is None:
+                    pols_to_download = available_pols
+                else:
+                    pols_to_download = [p for p in polarizations if p in available_pols]
+                    missing = set(polarizations) - set(available_pols)
+                    if missing:
+                        print(f"WARNING: Polarizations {missing} not available")
+
+                # Frequency flags
+                download_freq_a = frequency is None or frequency == 'A'
+                download_freq_b = (frequency is None or frequency == 'B') and has_freq_b
+
+                # Get chunk info for all pols
+                all_chunk_info = {}
+                for pol in pols_to_download:
+                    chunk_info_a = None
+                    chunk_info_b = None
+                    if download_freq_a:
+                        chunk_info_a = get_chunk_info(h5_meta, pol, 'A')
+                    if download_freq_b and pol in freq_b_pols:
+                        chunk_info_b = get_chunk_info(h5_meta, pol, 'B')
+                    all_chunk_info[pol] = (chunk_info_a, chunk_info_b)
+
+            # Calculate total SLC size (actual chunk bytes, not span)
+            total_slc_size = 0
+            for pol, (chunk_info_a, chunk_info_b) in all_chunk_info.items():
+                if chunk_info_a:
+                    total_slc_size += sum(c['size'] for c in chunk_info_a['chunks'])
+                if chunk_info_b:
+                    total_slc_size += sum(c['size'] for c in chunk_info_b['chunks'])
+
+            if total_slc_size == 0:
+                raise ValueError(f"No SLC data found in {granule_id}")
+
+            if debug:
+                print(f"  Downloading {total_slc_size/(1024**3):.2f} GB SLC data via cache...")
+
+            # Setup progress bar (shared or own)
+            if shared_pbar:
+                pbar_list, pbar_lock = shared_pbar
+                with pbar_lock:
+                    if pbar_list[0] is None:
+                        # First worker initializes shared bar
+                        pbar_list[0] = tqdm(total=0, unit='B', unit_scale=True,
+                                           desc=f"Downloading {len(granule_ids)} granules",
+                                           dynamic_ncols=False, ncols=80, mininterval=0.3)
+                    pbar_list[0].total += total_slc_size
+                    pbar_list[0].refresh()
+                pbar = pbar_list[0]
+                own_pbar = False
+            else:
+                pbar = tqdm(total=total_slc_size, unit='B', unit_scale=True, desc=short_name,
+                           position=position, leave=True,
+                           dynamic_ncols=False, ncols=80, mininterval=0.3)
+                own_pbar = True
+
+            downloaded_files = []
+            os.makedirs(out_dir, exist_ok=True)
+
+            for pol in pols_to_download:
+                out_name = f"NSR_{track:03d}_{frame:03d}_{datetime_str}_{pol}.h5"
+                out_path = os.path.join(out_dir, out_name)
+
+                chunk_info_a, chunk_info_b = all_chunk_info[pol]
+
+                # Read metadata from buffer
+                metadata = self._read_nisar_metadata_direct(pol, metadata_buffer)
+
+                # Download frequencyA chunks
+                downloaded_data_a = None
+                if chunk_info_a is not None:
+                    downloaded_data_a = fetch_chunks_via_cache(
+                        granule_id,
+                        chunk_info_a['chunks'],
+                        pbar=pbar if own_pbar else None,
+                        session=session
+                    )
+                    if shared_pbar:
+                        size = sum(c['size'] for c in chunk_info_a['chunks'])
+                        with pbar_lock:
+                            pbar.update(size)
+
+                # Download frequencyB chunks
+                downloaded_data_b = None
+                if chunk_info_b is not None:
+                    downloaded_data_b = fetch_chunks_via_cache(
+                        granule_id,
+                        chunk_info_b['chunks'],
+                        pbar=pbar if own_pbar else None,
+                        session=session
+                    )
+                    if shared_pbar:
+                        size = sum(c['size'] for c in chunk_info_b['chunks'])
+                        with pbar_lock:
+                            pbar.update(size)
+
+                # Write output HDF5
+                self._write_nisar_pol_h5_from_bytes(
+                    downloaded_data_a, chunk_info_a, metadata, pol, out_path,
+                    track, frame, datetime_str, debug and (position is None),
+                    downloaded_data_b=downloaded_data_b, chunk_info_b=chunk_info_b
+                )
+
+                downloaded_files.append(out_name)
+
+            if own_pbar:
+                pbar.close()
+
+            # Print cache stats in debug mode
+            if debug and (cache_stats['hits'] > 0 or cache_stats['misses'] > 0):
+                total_blocks = cache_stats['hits'] + cache_stats['misses']
+                hit_pct = 100 * cache_stats['hits'] / total_blocks if total_blocks > 0 else 0
+                print(f"  Cache: {cache_stats['hits']} HIT / {cache_stats['misses']} MISS "
+                      f"({hit_pct:.0f}% hit rate, {cache_stats['bytes_hit']/(1024**2):.0f} MB cached)")
+
+            return downloaded_files
+
+        def download_with_retry(granule, position=None):
+            """Download single granule with retry logic."""
+            for retry in range(retries):
+                try:
+                    return download_granule_via_cache(granule, position=position)
+                except ValueError:
+                    raise  # Format errors are permanent
+                except Exception as e:
+                    print(f"ERROR downloading {granule} (attempt {retry+1}/{retries}): {e}")
+                    if retry + 1 == retries:
+                        raise
+                    time.sleep(timeout_second)
+
+        # Process granules
+        granule_ids = [g.replace('.h5', '') for g in granules]
+        print(f"Downloading {len(granule_ids)} NISAR granule(s) via cache proxy...")
+
+        if n_jobs == 1 or len(granule_ids) == 1 or debug:
+            # Sequential processing
+            all_downloaded = []
+            for granule in granule_ids:
+                files = download_with_retry(granule)
+                all_downloaded.extend(files)
+        else:
+            # Parallel cache block download with loky backend
+            # Process one granule at a time to bound memory usage
+            import joblib
+
+            GAP_THRESHOLD = 16 * 1024 * 1024  # 16MB gap threshold
+
+            def chunks_to_blocks(chunks):
+                """Group chunks into regions, split into blocks."""
+                if not chunks:
+                    return []
+                sorted_chunks = sorted(chunks, key=lambda c: c['offset'])
+
+                # Group into contiguous regions
+                regions = []
+                region_start = sorted_chunks[0]['offset']
+                region_end = sorted_chunks[0]['offset'] + sorted_chunks[0]['size']
+
+                for chunk in sorted_chunks[1:]:
+                    if chunk['offset'] <= region_end + GAP_THRESHOLD:
+                        region_end = max(region_end, chunk['offset'] + chunk['size'])
+                    else:
+                        regions.append((region_start, region_end))
+                        region_start = chunk['offset']
+                        region_end = chunk['offset'] + chunk['size']
+                regions.append((region_start, region_end))
+
+                # Split regions into blocks
+                blocks = []
+                for start, end in regions:
+                    blocks.extend(split_range_to_blocks(start, end))
+                return blocks
+
+            def download_block(gid, offset, length):
+                """Download single cache block (no closures - all args passed)."""
+                import requests
+                url = f"{_NISAR_CACHE_PROXY}/{gid}/{offset}/{length}.bin"
+                resp = requests.get(url)
+                resp.raise_for_status()
+                return (offset, length, resp.content)
+
+            all_downloaded = []
+
+            for gid in granule_ids:
+
+                # 1. Fetch metadata for this granule (no session needed for cache proxy)
+                meta_raw, _ = fetch_cache_range(gid, 0, MAX_BLOCK)
+                meta_buf = patch_hdf5_superblock(meta_raw)
+
+                with h5py.File(BytesIO(bytes(meta_buf)), 'r') as h5:
+                    swaths = h5['science/LSAR/RSLC/swaths']
+                    avail_pols = [k for k in swaths['frequencyA'].keys() if k in ['HH','HV','VH','VV']]
+                    pols = [p for p in (polarizations or avail_pols) if p in avail_pols]
+                    has_freq_b = 'frequencyB' in swaths
+                    freq_b_pols = [k for k in swaths['frequencyB'].keys() if k in ['HH','HV','VH','VV']] if has_freq_b else []
+                    dl_a = frequency is None or frequency == 'A'
+                    dl_b = (frequency is None or frequency == 'B') and has_freq_b
+
+                    # Collect blocks for this granule only
+                    granule_blocks = []  # [(offset, length), ...]
+                    block_set = set()
+                    chunk_info = {}
+
+                    for pol in pols:
+                        ci_a, ci_b = None, None
+                        if dl_a:
+                            ci_a = get_chunk_info(h5, pol, 'A')
+                            if ci_a:
+                                for blk_off, blk_len in chunks_to_blocks(ci_a['chunks']):
+                                    if (blk_off, blk_len) not in block_set:
+                                        block_set.add((blk_off, blk_len))
+                                        granule_blocks.append((blk_off, blk_len))
+                        if dl_b and pol in freq_b_pols:
+                            ci_b = get_chunk_info(h5, pol, 'B')
+                            if ci_b:
+                                for blk_off, blk_len in chunks_to_blocks(ci_b['chunks']):
+                                    if (blk_off, blk_len) not in block_set:
+                                        block_set.add((blk_off, blk_len))
+                                        granule_blocks.append((blk_off, blk_len))
+                        chunk_info[pol] = (ci_a, ci_b)
+
+                # 2. Download blocks for this granule in parallel
+                total_size = sum(blk[1] for blk in granule_blocks)
+                block_data = {}
+
+                track, frame, datetime_str = parse_nisar_granule_id(gid)
+
+                with tqdm(desc=f"NSR_{track:03d}_{frame:03d}_{datetime_str}",
+                          total=total_size, unit='B', unit_scale=True, unit_divisor=1024) as pbar:
+                    results = joblib.Parallel(n_jobs=n_jobs, backend='loky', return_as='generator')(
+                        joblib.delayed(download_block)(gid, offset, length)
+                        for offset, length in granule_blocks
+                    )
+                    for offset, length, data in results:
+                        pbar.update(length)
+                        block_data[(offset, length)] = data
+
+                # 3. Extract chunks and write files for this granule
+                subdir = f"{track:03d}_{frame:03d}"
+                out_dir = os.path.join(basedir, subdir)
+                os.makedirs(out_dir, exist_ok=True)
+
+                for pol in pols:
+                    out_name = f"NSR_{track:03d}_{frame:03d}_{datetime_str}_{pol}.h5"
+                    out_path = os.path.join(out_dir, out_name)
+
+                    ci_a, ci_b = chunk_info[pol]
+                    metadata = self._read_nisar_metadata_direct(pol, meta_buf)
+
+                    def extract_chunks(ci):
+                        if not ci:
+                            return None
+                        result = {}
+                        blocks_for_chunks = chunks_to_blocks(ci['chunks'])
+
+                        for c in ci['chunks']:
+                            chunk_data = bytearray()
+                            for blk_off, blk_len in blocks_for_chunks:
+                                blk_end = blk_off + blk_len
+                                chunk_end = c['offset'] + c['size']
+                                if blk_off < chunk_end and blk_end > c['offset']:
+                                    blk = block_data[(blk_off, blk_len)]
+                                    start_in_blk = max(0, c['offset'] - blk_off)
+                                    end_in_blk = min(blk_len, chunk_end - blk_off)
+                                    chunk_data.extend(blk[start_in_blk:end_in_blk])
+                            result[c['offset']] = bytes(chunk_data)
+                        return result
+
+                    data_a = extract_chunks(ci_a)
+                    data_b = extract_chunks(ci_b)
+
+                    self._write_nisar_pol_h5_from_bytes(
+                        data_a, ci_a, metadata, pol, out_path,
+                        track, frame, datetime_str, False,
+                        downloaded_data_b=data_b, chunk_info_b=ci_b
+                    )
+                    all_downloaded.append(out_name)
+
+                # 4. Free memory before next granule
+                del block_data
+                del meta_buf
 
         if all_downloaded:
             return pd.DataFrame({'file': all_downloaded})
@@ -1859,8 +2487,8 @@ class ASF(progressbar_joblib):
         # Add 1% buffer
         download_size = int(max_offset * 1.01)
         if debug:
-            print(f"    Metadata requires {max_offset:,} bytes ({max_offset/1e6:.1f} MB)")
-            print(f"    Downloading {download_size:,} bytes ({download_size/1e6:.1f} MB)...")
+            print(f"    Metadata requires {max_offset:,} bytes ({max_offset/(1024**2):.1f} MB)")
+            print(f"    Downloading {download_size:,} bytes ({download_size/(1024**2):.1f} MB)...")
 
         # Step 2: Download metadata block in single Range request
         headers = {'Range': f'bytes=0-{download_size-1}'}
@@ -1983,20 +2611,23 @@ class ASF(progressbar_joblib):
 
         Parameters
         ----------
-        downloaded_data : bytes or None
-            Raw bytes from HTTP Range request covering frequencyA chunks.
+        downloaded_data : bytes, dict, or None
+            Raw bytes from HTTP Range request covering frequencyA chunks,
+            OR dict mapping chunk_offset -> chunk_bytes (for cache proxy).
         chunk_info : dict or None
             Chunk metadata from get_chunk_info() for frequencyA.
         metadata : dict
             ALL metadata from _read_nisar_metadata().
-        downloaded_data_b : bytes, optional
-            Raw bytes for frequencyB (ionospheric correction / quick look).
+        downloaded_data_b : bytes, dict, or None
+            Raw bytes or dict for frequencyB (ionospheric correction / quick look).
         chunk_info_b : dict, optional
             Chunk metadata for frequencyB.
         """
         import h5py
         from io import BytesIO
         from tqdm.auto import tqdm
+
+        import os
 
         # Determine which frequencies are being written
         has_freq_a = downloaded_data is not None and chunk_info is not None
@@ -2034,9 +2665,13 @@ class ASF(progressbar_joblib):
                 )
 
                 chunk_iter = tqdm(chunk_info['chunks'], desc='    Writing freqA SLC', leave=False) if debug else chunk_info['chunks']
+                is_dict = isinstance(downloaded_data, dict)
                 for chunk in chunk_iter:
-                    offset_in_data = chunk['offset'] - min_offset
-                    chunk_bytes = downloaded_data[offset_in_data:offset_in_data + chunk['size']]
+                    if is_dict:
+                        chunk_bytes = downloaded_data[chunk['offset']]
+                    else:
+                        offset_in_data = chunk['offset'] - min_offset
+                        chunk_bytes = downloaded_data[offset_in_data:offset_in_data + chunk['size']]
                     dst_slc.id.write_direct_chunk(chunk['coord'], chunk_bytes)
 
             # 2. Write frequencyB SLC if available (ionospheric correction / quick look)
@@ -2057,9 +2692,13 @@ class ASF(progressbar_joblib):
                 )
 
                 chunk_iter_b = tqdm(chunk_info_b['chunks'], desc='    Writing freqB SLC', leave=False) if debug else chunk_info_b['chunks']
+                is_dict_b = isinstance(downloaded_data_b, dict)
                 for chunk in chunk_iter_b:
-                    offset_in_data = chunk['offset'] - min_offset_b
-                    chunk_bytes = downloaded_data_b[offset_in_data:offset_in_data + chunk['size']]
+                    if is_dict_b:
+                        chunk_bytes = downloaded_data_b[chunk['offset']]
+                    else:
+                        offset_in_data = chunk['offset'] - min_offset_b
+                        chunk_bytes = downloaded_data_b[offset_in_data:offset_in_data + chunk['size']]
                     dst_slc_b.id.write_direct_chunk(chunk['coord'], chunk_bytes)
 
             # 3. Write metadata datasets (filter by frequency if needed)
@@ -2112,14 +2751,15 @@ class ASF(progressbar_joblib):
                 for key, value in metadata['_root_attrs'].items():
                     h5_mem.attrs[key] = value
 
-        # Single disk write
-        with open(out_path, 'wb') as f:
+        # Single disk write to temp file, then atomic rename
+        tmp_path = out_path + '.tmp'
+        with open(tmp_path, 'wb') as f:
             f.write(mem_buffer.getvalue())
+        os.rename(tmp_path, out_path)
 
         if debug:
-            import os
             file_size = os.path.getsize(out_path)
-            print(f"    Done: {file_size / 1e9:.2f} GB written")
+            print(f"    Done: {file_size / (1024**3):.2f} GB written")
 
     @staticmethod
     def search(geometry, startTime=None, stopTime=None, flightDirection=None,
