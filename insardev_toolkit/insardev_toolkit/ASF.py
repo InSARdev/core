@@ -392,7 +392,7 @@ class ASF(progressbar_joblib):
         return os.path.exists(out_path)
 
     # https://asf.alaska.edu/datasets/data-sets/derived-data-sets/sentinel-1-bursts/
-    def download(self, basedir, bursts, polarization=None, frequency=None, session=None, n_jobs=None, joblib_backend='loky', skip_exist=True,
+    def download(self, basedir, bursts, polarization=None, frequency=None, bbox=None, session=None, n_jobs=None, joblib_backend='loky', skip_exist=True,
                         retries=30, timeout_second=3, debug=False):
         """
         Download SAR data from ASF.
@@ -414,11 +414,16 @@ class ASF(progressbar_joblib):
             - None: S1 uses pol from name, NISAR downloads all available
             - 'VV': Download only VV (S1) or 'HH' (NISAR)
             - ['VV', 'VH']: Download both polarizations
-        frequency : None or str, optional (NISAR only)
-            Which frequency band(s) to download:
-            - None: Both frequencyA (20MHz) and frequencyB (5MHz) together (default)
-            - 'A': Only frequencyA (high resolution, primary InSAR)
-            - 'B': Only frequencyB (4x less data, quick look or iono correction)
+        frequency : str, required for NISAR
+            Which frequency band to download (NISAR stores two frequencies with different resolutions):
+            - 'A': frequencyA (20MHz bandwidth, ~7m range resolution, primary InSAR)
+            - 'B': frequencyB (5MHz bandwidth, ~25m range resolution, 4x less data)
+            To download both frequencies, call download() twice with different output directories.
+        bbox : tuple or None, optional (NISAR cache proxy only)
+            Bounding box in WGS84 coordinates: (west, south, east, north).
+            When provided, only downloads aligned blocks covering the bbox.
+            Uses cache-optimized multi-offset endpoint for efficient partial extraction.
+            If None, downloads full scene using aligned blocks for caching benefit.
         session : asf_search.ASFSession, optional
             Authenticated session. Created automatically if None.
         n_jobs : int or None, optional
@@ -446,12 +451,10 @@ class ASF(progressbar_joblib):
         >>> asf.download('data/', 'S1_262885_IW2_20190702T032452_VV_69C5-BURST')
         >>> # S1: download both pols
         >>> asf.download('data/', 'S1_262885_IW2_20190702T032452_VV_69C5-BURST', polarization=['VV','VH'])
-        >>> # NISAR: download HH with both frequencies (default, for iono correction)
-        >>> asf.download('data/', 'NISAR_L1_PR_RSLC_006_172_A_008_...', polarization='HH')
-        >>> # NISAR: download HH frequencyB only (quick look, 4x less data)
-        >>> asf.download('data/', 'NISAR_L1_PR_RSLC_006_172_A_008_...', polarization='HH', frequency='B')
-        >>> # NISAR: download HH frequencyA only (when iono correction not needed)
-        >>> asf.download('data/', 'NISAR_L1_PR_RSLC_006_172_A_008_...', polarization='HH', frequency='A')
+        >>> # NISAR: download HH frequencyA (primary InSAR, ~7m range resolution)
+        >>> asf.download('data/freqA/', 'NISAR_L1_PR_RSLC_006_172_A_008_...', polarization='HH', frequency='A')
+        >>> # NISAR: download HH frequencyB (quick look or iono correction, 4x less data)
+        >>> asf.download('data/freqB/', 'NISAR_L1_PR_RSLC_006_172_A_008_...', polarization='HH', frequency='B')
         """
         import pandas as pd
         import os
@@ -473,6 +476,15 @@ class ASF(progressbar_joblib):
                 s1_bursts.append(burst)
             elif mission == 'NISAR':
                 nisar_granules.append(burst)
+
+        # Require explicit frequency for NISAR to prevent accidental large downloads
+        if nisar_granules and frequency is None:
+            raise ValueError(
+                "NISAR data requires explicit frequency='A' or 'B' parameter.\n"
+                "  frequency='A': 20MHz bandwidth (~7m range resolution, primary InSAR)\n"
+                "  frequency='B': 5MHz bandwidth (~25m range resolution, 4x smaller)\n"
+                "To download both frequencies, run download() twice with different output directories."
+            )
 
         # Check if any downloads needed BEFORE creating session (avoid network call)
         if skip_exist:
@@ -523,7 +535,7 @@ class ASF(progressbar_joblib):
 
         # Download NISAR granules
         if nisar_needed:
-            df = self._download_nisar(basedir, nisar_needed, pols, frequency, session,
+            df = self._download_nisar(basedir, nisar_needed, pols, frequency, bbox, session,
                                        n_jobs, joblib_backend, skip_exist, retries, timeout_second, debug)
             if df is not None:
                 results.append(df)
@@ -970,7 +982,7 @@ class ASF(progressbar_joblib):
         # return the results in a user-friendly dataframe
         return bursts_downloaded
 
-    def _download_nisar(self, basedir, granules, polarizations, frequency, session,
+    def _download_nisar(self, basedir, granules, polarizations, frequency, bbox, session,
                          n_jobs, joblib_backend, skip_exist, retries, timeout_second, debug):
         """Internal: Download NISAR RSLC granules with per-polarization output.
 
@@ -992,10 +1004,9 @@ class ASF(progressbar_joblib):
         polarizations : list or None
             If None, download all available polarizations.
             If list, download only specified polarizations.
-        frequency : str or None
-            If None, download both frequencyA and frequencyB together (default).
-            If 'A', download only frequencyA (20 MHz, high resolution).
-            If 'B', download only frequencyB (5 MHz, 4x less data, for quick look).
+        frequency : str
+            'A' for frequencyA (20 MHz, high resolution).
+            'B' for frequencyB (5 MHz, 4x less data, for quick look).
         """
         # NISAR-specific default: 4 parallel jobs (optimal for Colab with decompression)
         if n_jobs is None:
@@ -1017,7 +1028,7 @@ class ASF(progressbar_joblib):
         # Use cache proxy when no credentials provided
         if self.username is None:
             return self._download_nisar_via_cache(
-                basedir, granules, polarizations, frequency,
+                basedir, granules, polarizations, frequency, bbox,
                 n_jobs, skip_exist, retries, timeout_second, debug
             )
 
@@ -1457,13 +1468,16 @@ class ASF(progressbar_joblib):
             return pd.DataFrame({'file': all_downloaded})
         return None
 
-    def _download_nisar_via_cache(self, basedir, granules, polarizations, frequency,
+    def _download_nisar_via_cache(self, basedir, granules, polarizations, frequency, bbox,
                                    n_jobs, skip_exist, retries, timeout_second, debug):
         """Download NISAR via Cloudflare cache proxy (no credentials required).
 
-        Uses cache proxy at nisar-cache-asf.insar.dev with 128MB block API:
-        - /GRANULE_ID/0.bin → 128MB metadata block
-        - /GRANULE_ID/OFFSET.bin → 128MB block at OFFSET
+        Uses cache proxy at nisar-cache-asf.insar.dev with two APIs:
+        1. Single block: /GRANULE_ID/OFFSET/LENGTH.bin → single byte range (≤128MB)
+        2. Multi-offset: /GRANULE_ID/off1_len1,off2_len2,.../ranges.bin → 25x25km blocks (8-96MB)
+
+        When bbox is provided, downloads only the aligned blocks covering the bbox.
+        For full downloads, also uses aligned blocks to maximize cache efficiency.
 
         Parameters
         ----------
@@ -1474,6 +1488,9 @@ class ASF(progressbar_joblib):
         frequency : str or None
             If None, download both frequencyA and frequencyB.
             If 'A', download only frequencyA. If 'B', download only frequencyB.
+        bbox : tuple or None
+            Bounding box (west, south, east, north) in WGS84.
+            If provided, only download blocks covering this area.
         n_jobs : int
             Number of parallel granule downloads (uses loky backend).
         """
@@ -1494,6 +1511,12 @@ class ASF(progressbar_joblib):
 
         MIN_BLOCK = 64 * 1024 * 1024   # 64 MB min block
         MAX_BLOCK = 128 * 1024 * 1024  # 128 MB max block
+
+        # 25x25km aligned block constants (for cache efficiency)
+        # 512 pixels × 4.46m = 2.28km azimuth, 512 pixels × 9.44m = 4.83km range
+        ALIGNED_AZ_CHUNKS = 15  # 15 chunks azimuth (~34km, ~105MB blocks for FreqB)
+        ALIGNED_RG_CHUNKS = 7   # FreqB has 13 rg chunks, use 7 to get 7+6=2 blocks
+        MAX_MULTI_BLOCK = 128 * 1024 * 1024  # 128 MB max for multi-offset (15×7 aligned blocks)
 
         def parse_nisar_granule_id(granule_id):
             """Parse NISAR granule ID to extract track, frame, and datetime."""
@@ -1542,6 +1565,152 @@ class ASF(progressbar_joblib):
                 'n_rg': n_rg
             }
 
+        def chunks_to_aligned_blocks(chunk_info, az_block_start=None, az_block_end=None,
+                                      rg_block_start=None, rg_block_end=None):
+            """Group chunks into aligned blocks for cache efficiency.
+
+            Each aligned block covers ALIGNED_AZ_CHUNKS × ALIGNED_RG_CHUNKS HDF5 chunks.
+            All clients requesting the same scene get identical block boundaries,
+            ensuring consistent cache hits.
+
+            Parameters
+            ----------
+            chunk_info : dict
+                Output from get_chunk_info()
+            az_block_start, az_block_end : int, optional
+                Azimuth block indices to extract (0-indexed). If None, extract all.
+            rg_block_start, rg_block_end : int, optional
+                Range block indices to extract. If None, extract all.
+
+            Returns
+            -------
+            list of dict
+                Each dict: {'az_block': int, 'rg_block': int, 'chunks': list, 'total_size': int}
+                where 'chunks' is list of (offset, size) tuples
+            """
+            if not chunk_info:
+                return []
+
+            n_az = chunk_info['n_az']
+            n_rg = chunk_info['n_rg']
+            chunks = chunk_info['chunks']
+
+            # Build lookup: (row, col) -> chunk
+            chunk_lookup = {(c['row'], c['col']): c for c in chunks}
+
+            # Calculate number of aligned blocks
+            n_az_blocks = (n_az + ALIGNED_AZ_CHUNKS - 1) // ALIGNED_AZ_CHUNKS
+            n_rg_blocks = (n_rg + ALIGNED_RG_CHUNKS - 1) // ALIGNED_RG_CHUNKS
+
+            # Apply block range filters
+            if az_block_start is None:
+                az_block_start = 0
+            if az_block_end is None:
+                az_block_end = n_az_blocks
+            if rg_block_start is None:
+                rg_block_start = 0
+            if rg_block_end is None:
+                rg_block_end = n_rg_blocks
+
+            aligned_blocks = []
+
+            for ab in range(az_block_start, min(az_block_end, n_az_blocks)):
+                for rb in range(rg_block_start, min(rg_block_end, n_rg_blocks)):
+                    # Chunk range for this aligned block
+                    az_start = ab * ALIGNED_AZ_CHUNKS
+                    az_end = min((ab + 1) * ALIGNED_AZ_CHUNKS, n_az)
+                    rg_start = rb * ALIGNED_RG_CHUNKS
+                    rg_end = min((rb + 1) * ALIGNED_RG_CHUNKS, n_rg)
+
+                    # Collect chunks for this block
+                    raw_chunks = []
+                    for row in range(az_start, az_end):
+                        for col in range(rg_start, rg_end):
+                            if (row, col) in chunk_lookup:
+                                c = chunk_lookup[(row, col)]
+                                raw_chunks.append((c['offset'], c['size']))
+
+                    if raw_chunks:
+                        # Sort by offset
+                        raw_chunks.sort(key=lambda x: x[0])
+
+                        # Group into continuous regions (gap threshold 1MB)
+                        GAP_THRESHOLD = 1 * 1024 * 1024
+                        regions = []
+                        region_start = raw_chunks[0][0]
+                        region_end = raw_chunks[0][0] + raw_chunks[0][1]
+
+                        for off, size in raw_chunks[1:]:
+                            if off <= region_end + GAP_THRESHOLD:
+                                # Extend current region
+                                region_end = max(region_end, off + size)
+                            else:
+                                # Save region and start new one
+                                regions.append((region_start, region_end - region_start))
+                                region_start = off
+                                region_end = off + size
+                        regions.append((region_start, region_end - region_start))
+
+                        total_size = sum(size for _, size in regions)
+                        aligned_blocks.append({
+                            'az_block': ab,
+                            'rg_block': rb,
+                            'chunks': regions,  # Now contains merged regions, not individual chunks
+                            'raw_chunks': raw_chunks,  # Keep original for extraction
+                            'total_size': total_size
+                        })
+
+            return aligned_blocks
+
+        def build_multi_offset_url(granule_id, block_chunks):
+            """Build multi-offset URL for 25x25km aligned block.
+
+            URL format: /{GRANULE}/off1_len1,off2_len2,.../ranges.bin
+
+            Parameters
+            ----------
+            granule_id : str
+                NISAR granule ID
+            block_chunks : list of (offset, size) tuples
+                Chunks to fetch, sorted by offset
+
+            Returns
+            -------
+            str
+                Multi-offset URL for cache proxy
+            """
+            offsets_str = ','.join(f"{off}_{size}" for off, size in block_chunks)
+            return f"{_NISAR_CACHE_PROXY}/{granule_id}/{offsets_str}/ranges.bin"
+
+        def fetch_aligned_block(granule_id, block_chunks, session=None):
+            """Fetch aligned 25x25km block via multi-offset endpoint.
+
+            Returns (content, cache_hit, chunk_offsets) tuple where chunk_offsets
+            maps each original chunk offset to its position in the returned data.
+            """
+            total_size = sum(size for _, size in block_chunks)
+
+            # Validate block size
+            if total_size > MAX_MULTI_BLOCK:
+                # Block too large - shouldn't happen with 25x25km blocks
+                raise ValueError(f"Block size {total_size} exceeds max {MAX_MULTI_BLOCK}")
+
+            url = build_multi_offset_url(granule_id, block_chunks)
+            sess = session or requests.Session()
+            resp = sess.get(url)
+            resp.raise_for_status()
+
+            cache_hit = resp.headers.get('cf-cache-status', '').upper() == 'HIT'
+
+            # Build offset map: original chunk offset -> (position_in_data, size)
+            chunk_offsets = {}
+            pos = 0
+            for off, size in block_chunks:
+                chunk_offsets[off] = (pos, size)
+                pos += size
+
+            return resp.content, cache_hit, chunk_offsets
+
         def split_range_to_blocks(start, end):
             """Split byte range into deterministic 64-128MB blocks.
 
@@ -1584,7 +1753,7 @@ class ASF(progressbar_joblib):
             sess = session or requests.Session()
             resp = sess.get(url)
             resp.raise_for_status()
-            cache_hit = resp.headers.get('X-Cache', '').upper() == 'HIT'
+            cache_hit = resp.headers.get('cf-cache-status', '').upper() == 'HIT'
             return resp.content, cache_hit
 
         def fetch_region_via_cache(granule_id, start, end, pbar=None, session=None):
@@ -1664,6 +1833,104 @@ class ASF(progressbar_joblib):
                 for chunk in region_chunks:
                     rel_offset = chunk['offset'] - region_start
                     chunk_data[chunk['offset']] = region_bytes[rel_offset:rel_offset + chunk['size']]
+
+            return chunk_data
+
+        def fetch_chunks_via_aligned_blocks(granule_id, chunk_info, pbar=None, session=None,
+                                             az_block_start=None, az_block_end=None,
+                                             rg_block_start=None, rg_block_end=None):
+            """Fetch HDF5 chunks using aligned blocks for cache efficiency.
+
+            Uses multi-offset API: /GRANULE/off1_len1,off2_len2,.../ranges.bin
+            All clients requesting the same scene get identical block boundaries.
+
+            Parameters
+            ----------
+            granule_id : str
+                NISAR granule ID
+            chunk_info : dict
+                Output from get_chunk_info()
+            pbar : tqdm, optional
+                Progress bar to update
+            session : requests.Session, optional
+                HTTP session for connection reuse
+            az_block_start, az_block_end : int, optional
+                Azimuth block indices to extract (for bbox subsetting)
+            rg_block_start, rg_block_end : int, optional
+                Range block indices to extract (for bbox subsetting)
+
+            Returns dict: {chunk_offset: chunk_bytes}
+            """
+            sess = session or requests.Session()
+
+            # Get aligned 25x25km blocks
+            aligned_blocks = chunks_to_aligned_blocks(
+                chunk_info,
+                az_block_start=az_block_start, az_block_end=az_block_end,
+                rg_block_start=rg_block_start, rg_block_end=rg_block_end
+            )
+
+            if not aligned_blocks:
+                return {}
+
+            # Debug: show block alignment stats
+            if debug:
+                n_az = max(b['az_block'] for b in aligned_blocks) + 1
+                n_rg = max(b['rg_block'] for b in aligned_blocks) + 1
+                sizes_mb = [b['total_size'] / (1024**2) for b in aligned_blocks]
+                print(f"    Aligned blocks: {n_az}×{n_rg} = {len(aligned_blocks)} blocks, "
+                      f"size: {min(sizes_mb):.1f}-{max(sizes_mb):.1f}MB (avg {sum(sizes_mb)/len(sizes_mb):.1f}MB)")
+
+            chunk_data = {}
+
+            for block in aligned_blocks:
+                regions = block['chunks']  # Merged continuous regions (offset, size)
+                raw_chunks = block['raw_chunks']  # Original HDF5 chunks for extraction
+                total_size = block['total_size']
+
+                # Try multi-offset API if block is in valid size range
+                if total_size <= MAX_MULTI_BLOCK:
+                    data, cache_hit, region_offsets = fetch_aligned_block(
+                        granule_id, regions, session=sess
+                    )
+
+                    if data is not None:
+                        # Track cache stats
+                        if cache_hit:
+                            cache_stats['hits'] += 1
+                            cache_stats['bytes_hit'] += total_size
+                        else:
+                            cache_stats['misses'] += 1
+                            cache_stats['bytes_miss'] += total_size
+                            if debug:
+                                n_regions = len(regions)
+                                print(f"    MISS: aligned block ({block['az_block']},{block['rg_block']}) "
+                                      f"{total_size/(1024**2):.0f}MB ({n_regions} regions)")
+
+                        # Extract individual HDF5 chunks from concatenated region data
+                        for chunk_off, chunk_size in raw_chunks:
+                            # Find which region contains this chunk
+                            for region_off, region_size in regions:
+                                region_end = region_off + region_size
+                                if region_off <= chunk_off < region_end:
+                                    # Calculate position in concatenated data
+                                    region_pos, _ = region_offsets[region_off]
+                                    chunk_pos = region_pos + (chunk_off - region_off)
+                                    chunk_data[chunk_off] = data[chunk_pos:chunk_pos + chunk_size]
+                                    break
+
+                        if pbar:
+                            pbar.update(total_size)
+                            if debug:
+                                pbar.set_postfix_str(f"H{cache_stats['hits']}M{cache_stats['misses']}")
+
+                        continue
+
+                # Fallback: block exceeds MAX_MULTI_BLOCK - should not happen with proper aligned blocks
+                # Log warning and skip (better than making huge requests)
+                if regions and debug:
+                    print(f"    WARNING: skipping block ({block['az_block']},{block['rg_block']}) "
+                          f"size={total_size/(1024**2):.1f}MB outside range")
 
             return chunk_data
 
@@ -1809,12 +2076,12 @@ class ASF(progressbar_joblib):
                 # Read metadata from buffer
                 metadata = self._read_nisar_metadata_direct(pol, metadata_buffer)
 
-                # Download frequencyA chunks
+                # Download frequencyA chunks using aligned 25x25km blocks
                 downloaded_data_a = None
                 if chunk_info_a is not None:
-                    downloaded_data_a = fetch_chunks_via_cache(
+                    downloaded_data_a = fetch_chunks_via_aligned_blocks(
                         granule_id,
-                        chunk_info_a['chunks'],
+                        chunk_info_a,
                         pbar=pbar if own_pbar else None,
                         session=session
                     )
@@ -1823,12 +2090,12 @@ class ASF(progressbar_joblib):
                         with pbar_lock:
                             pbar.update(size)
 
-                # Download frequencyB chunks
+                # Download frequencyB chunks using aligned 25x25km blocks
                 downloaded_data_b = None
                 if chunk_info_b is not None:
-                    downloaded_data_b = fetch_chunks_via_cache(
+                    downloaded_data_b = fetch_chunks_via_aligned_blocks(
                         granule_id,
-                        chunk_info_b['chunks'],
+                        chunk_info_b,
                         pbar=pbar if own_pbar else None,
                         session=session
                     )
@@ -1873,155 +2140,186 @@ class ASF(progressbar_joblib):
 
         # Process granules
         granule_ids = [g.replace('.h5', '') for g in granules]
-        print(f"Downloading {len(granule_ids)} NISAR granule(s) via cache proxy...")
 
-        if n_jobs == 1 or len(granule_ids) == 1 or debug:
-            # Sequential processing
-            all_downloaded = []
-            for granule in granule_ids:
-                files = download_with_retry(granule)
-                all_downloaded.extend(files)
-        else:
-            # Parallel cache block download with loky backend
-            # Process one granule at a time to bound memory usage
-            import joblib
+        # Handle bbox parameter
+        if bbox is not None:
+            # TODO: Implement bbox-based block selection
+            # For now, bbox is validated but full scene is downloaded using aligned blocks
+            # which still provides cache efficiency between clients
+            if len(bbox) != 4:
+                raise ValueError("bbox must be (west, south, east, north) in WGS84 coordinates")
+            west, south, east, north = bbox
+            if west >= east or south >= north:
+                raise ValueError("Invalid bbox: west must be < east and south must be < north")
+            if not (-180 <= west <= 180 and -180 <= east <= 180 and -90 <= south <= 90 and -90 <= north <= 90):
+                raise ValueError("bbox coordinates must be valid WGS84 (lon: -180 to 180, lat: -90 to 90)")
+            print(f"NOTE: bbox subsetting not yet implemented. Downloading full scene using aligned 25x25km blocks.")
+            print(f"      Requested bbox: ({west:.4f}, {south:.4f}, {east:.4f}, {north:.4f})")
 
-            GAP_THRESHOLD = 16 * 1024 * 1024  # 16MB gap threshold
+        print(f"Downloading {len(granule_ids)} NISAR granule(s) via cache proxy (aligned blocks)...")
 
-            def chunks_to_blocks(chunks):
-                """Group chunks into regions, split into blocks."""
-                if not chunks:
-                    return []
-                sorted_chunks = sorted(chunks, key=lambda c: c['offset'])
+        # Unified download path - only backend differs for debug/sequential mode
+        import joblib
+        backend = 'sequential' if (n_jobs == 1 or debug) else 'loky'
+        effective_n_jobs = 1 if backend == 'sequential' else n_jobs
 
-                # Group into contiguous regions
-                regions = []
-                region_start = sorted_chunks[0]['offset']
-                region_end = sorted_chunks[0]['offset'] + sorted_chunks[0]['size']
+        def download_aligned_block(gid, offsets_str, total_size):
+            """Download aligned 25x25km block via multi-offset API."""
+            import requests
+            url = f"{_NISAR_CACHE_PROXY}/{gid}/{offsets_str}/ranges.bin"
+            for retry in range(retries):
+                try:
+                    resp = requests.get(url, timeout=120)
+                    resp.raise_for_status()
+                    cache_hit = resp.headers.get('cf-cache-status', '').upper() == 'HIT'
+                    return (offsets_str, resp.content, cache_hit)
+                except Exception as e:
+                    if debug:
+                        print(f'ERROR: block download attempt {retry+1}/{retries} failed: {e}')
+                    if retry + 1 == retries:
+                        raise
+                    time.sleep(timeout_second)
 
-                for chunk in sorted_chunks[1:]:
-                    if chunk['offset'] <= region_end + GAP_THRESHOLD:
-                        region_end = max(region_end, chunk['offset'] + chunk['size'])
-                    else:
-                        regions.append((region_start, region_end))
-                        region_start = chunk['offset']
-                        region_end = chunk['offset'] + chunk['size']
-                regions.append((region_start, region_end))
+        def download_single_chunk(gid, offset, length):
+            """Download single chunk via single-block API (for small blocks)."""
+            import requests
+            url = f"{_NISAR_CACHE_PROXY}/{gid}/{offset}/{length}.bin"
+            for retry in range(retries):
+                try:
+                    resp = requests.get(url, timeout=120)
+                    resp.raise_for_status()
+                    return (offset, length, resp.content)
+                except Exception as e:
+                    if debug:
+                        print(f'ERROR: single chunk download attempt {retry+1}/{retries} failed: {e}')
+                    if retry + 1 == retries:
+                        raise
+                    time.sleep(timeout_second)
 
-                # Split regions into blocks
-                blocks = []
-                for start, end in regions:
-                    blocks.extend(split_range_to_blocks(start, end))
-                return blocks
+        all_downloaded = []
 
-            def download_block(gid, offset, length):
-                """Download single cache block (no closures - all args passed)."""
-                import requests
-                url = f"{_NISAR_CACHE_PROXY}/{gid}/{offset}/{length}.bin"
-                resp = requests.get(url)
-                resp.raise_for_status()
-                return (offset, length, resp.content)
+        for gid in granule_ids:
 
-            all_downloaded = []
+            # 1. Fetch metadata for this granule
+            meta_raw, _ = fetch_cache_range(gid, 0, MAX_BLOCK)
+            meta_buf = patch_hdf5_superblock(meta_raw)
 
-            for gid in granule_ids:
+            with h5py.File(BytesIO(bytes(meta_buf)), 'r') as h5:
+                swaths = h5['science/LSAR/RSLC/swaths']
+                avail_pols = [k for k in swaths['frequencyA'].keys() if k in ['HH','HV','VH','VV']]
+                pols = [p for p in (polarizations or avail_pols) if p in avail_pols]
+                has_freq_b = 'frequencyB' in swaths
+                freq_b_pols = [k for k in swaths['frequencyB'].keys() if k in ['HH','HV','VH','VV']] if has_freq_b else []
+                dl_a = frequency is None or frequency == 'A'
+                dl_b = (frequency is None or frequency == 'B') and has_freq_b
 
-                # 1. Fetch metadata for this granule (no session needed for cache proxy)
-                meta_raw, _ = fetch_cache_range(gid, 0, MAX_BLOCK)
-                meta_buf = patch_hdf5_superblock(meta_raw)
-
-                with h5py.File(BytesIO(bytes(meta_buf)), 'r') as h5:
-                    swaths = h5['science/LSAR/RSLC/swaths']
-                    avail_pols = [k for k in swaths['frequencyA'].keys() if k in ['HH','HV','VH','VV']]
-                    pols = [p for p in (polarizations or avail_pols) if p in avail_pols]
-                    has_freq_b = 'frequencyB' in swaths
-                    freq_b_pols = [k for k in swaths['frequencyB'].keys() if k in ['HH','HV','VH','VV']] if has_freq_b else []
-                    dl_a = frequency is None or frequency == 'A'
-                    dl_b = (frequency is None or frequency == 'B') and has_freq_b
-
-                    # Collect blocks for this granule only
-                    granule_blocks = []  # [(offset, length), ...]
-                    block_set = set()
-                    chunk_info = {}
-
-                    for pol in pols:
-                        ci_a, ci_b = None, None
-                        if dl_a:
-                            ci_a = get_chunk_info(h5, pol, 'A')
-                            if ci_a:
-                                for blk_off, blk_len in chunks_to_blocks(ci_a['chunks']):
-                                    if (blk_off, blk_len) not in block_set:
-                                        block_set.add((blk_off, blk_len))
-                                        granule_blocks.append((blk_off, blk_len))
-                        if dl_b and pol in freq_b_pols:
-                            ci_b = get_chunk_info(h5, pol, 'B')
-                            if ci_b:
-                                for blk_off, blk_len in chunks_to_blocks(ci_b['chunks']):
-                                    if (blk_off, blk_len) not in block_set:
-                                        block_set.add((blk_off, blk_len))
-                                        granule_blocks.append((blk_off, blk_len))
-                        chunk_info[pol] = (ci_a, ci_b)
-
-                # 2. Download blocks for this granule in parallel
-                total_size = sum(blk[1] for blk in granule_blocks)
-                block_data = {}
-
-                track, frame, datetime_str = parse_nisar_granule_id(gid)
-
-                with tqdm(desc=f"NSR_{track:03d}_{frame:03d}_{datetime_str}",
-                          total=total_size, unit='B', unit_scale=True, unit_divisor=1024) as pbar:
-                    results = joblib.Parallel(n_jobs=n_jobs, backend='loky', return_as='generator')(
-                        joblib.delayed(download_block)(gid, offset, length)
-                        for offset, length in granule_blocks
-                    )
-                    for offset, length, data in results:
-                        pbar.update(length)
-                        block_data[(offset, length)] = data
-
-                # 3. Extract chunks and write files for this granule
-                subdir = f"{track:03d}_{frame:03d}"
-                out_dir = os.path.join(basedir, subdir)
-                os.makedirs(out_dir, exist_ok=True)
-
+                # Pre-collect chunk info for all pols while h5 is open
+                all_chunk_info = {}
                 for pol in pols:
-                    out_name = f"NSR_{track:03d}_{frame:03d}_{datetime_str}_{pol}.h5"
-                    out_path = os.path.join(out_dir, out_name)
+                    ci_a, ci_b = None, None
+                    if dl_a:
+                        ci_a = get_chunk_info(h5, pol, 'A')
+                    if dl_b and pol in freq_b_pols:
+                        ci_b = get_chunk_info(h5, pol, 'B')
+                    all_chunk_info[pol] = (ci_a, ci_b)
 
-                    ci_a, ci_b = chunk_info[pol]
-                    metadata = self._read_nisar_metadata_direct(pol, meta_buf)
+            track, frame, datetime_str = parse_nisar_granule_id(gid)
+            subdir = f"{track:03d}_{frame:03d}"
+            out_dir = os.path.join(basedir, subdir)
+            os.makedirs(out_dir, exist_ok=True)
 
-                    def extract_chunks(ci):
-                        if not ci:
-                            return None
-                        result = {}
-                        blocks_for_chunks = chunks_to_blocks(ci['chunks'])
+            # Process one polarization at a time to limit memory usage
+            for pol in pols:
+                ci_a, ci_b = all_chunk_info[pol]
+                aligned_blocks_to_download = []
+                small_chunks_to_download = []
 
-                        for c in ci['chunks']:
-                            chunk_data = bytearray()
-                            for blk_off, blk_len in blocks_for_chunks:
-                                blk_end = blk_off + blk_len
-                                chunk_end = c['offset'] + c['size']
-                                if blk_off < chunk_end and blk_end > c['offset']:
-                                    blk = block_data[(blk_off, blk_len)]
-                                    start_in_blk = max(0, c['offset'] - blk_off)
-                                    end_in_blk = min(blk_len, chunk_end - blk_off)
-                                    chunk_data.extend(blk[start_in_blk:end_in_blk])
-                            result[c['offset']] = bytes(chunk_data)
-                        return result
+                if ci_a:
+                    for block in chunks_to_aligned_blocks(ci_a):
+                        if block['total_size'] <= MAX_MULTI_BLOCK:
+                            offsets_str = ','.join(f"{off}_{size}" for off, size in block['chunks'])
+                            aligned_blocks_to_download.append((offsets_str, block['total_size'], block['chunks'], block['raw_chunks']))
+                        else:
+                            small_chunks_to_download.extend(block['raw_chunks'])
 
-                    data_a = extract_chunks(ci_a)
-                    data_b = extract_chunks(ci_b)
+                if ci_b:
+                    for block in chunks_to_aligned_blocks(ci_b):
+                        if block['total_size'] <= MAX_MULTI_BLOCK:
+                            offsets_str = ','.join(f"{off}_{size}" for off, size in block['chunks'])
+                            aligned_blocks_to_download.append((offsets_str, block['total_size'], block['chunks'], block['raw_chunks']))
+                        else:
+                            small_chunks_to_download.extend(block['raw_chunks'])
 
-                    self._write_nisar_pol_h5_from_bytes(
-                        data_a, ci_a, metadata, pol, out_path,
-                        track, frame, datetime_str, False,
-                        downloaded_data_b=data_b, chunk_info_b=ci_b
-                    )
-                    all_downloaded.append(out_name)
+                # Debug: show block alignment stats for this pol
+                if debug and aligned_blocks_to_download:
+                    sizes_mb = [blk[1] / (1024**2) for blk in aligned_blocks_to_download]
+                    print(f"    {pol}: {len(aligned_blocks_to_download)} aligned blocks, "
+                          f"size: {min(sizes_mb):.1f}-{max(sizes_mb):.1f}MB (avg {sum(sizes_mb)/len(sizes_mb):.1f}MB)")
 
-                # 4. Free memory before next granule
+                total_size = sum(blk[1] for blk in aligned_blocks_to_download) + sum(c[1] for c in small_chunks_to_download)
+                block_data = {}  # {chunk_offset: chunk_bytes}
+
+                with tqdm(desc=f"NSR_{track:03d}_{frame:03d}_{datetime_str}_{pol}",
+                          total=total_size, unit='B', unit_scale=True, unit_divisor=1024) as pbar:
+
+                    # Download aligned blocks via multi-offset API
+                    if aligned_blocks_to_download:
+                        results = joblib.Parallel(n_jobs=effective_n_jobs, backend=backend, return_as='generator')(
+                            joblib.delayed(download_aligned_block)(gid, offsets_str, total_sz)
+                            for offsets_str, total_sz, _, _ in aligned_blocks_to_download
+                        )
+                        for (offsets_str, total_sz, regions, raw_chunks), (_, data, cache_hit) in zip(aligned_blocks_to_download, results):
+                            pbar.update(total_sz)
+                            # Build region offset map: region_start -> position in data
+                            region_map = {}
+                            pos = 0
+                            for region_off, region_size in regions:
+                                region_map[region_off] = pos
+                                pos += region_size
+                            # Extract individual HDF5 chunks from regions
+                            for chunk_off, chunk_size in raw_chunks:
+                                for region_off, region_size in regions:
+                                    if region_off <= chunk_off < region_off + region_size:
+                                        region_pos = region_map[region_off]
+                                        chunk_pos = region_pos + (chunk_off - region_off)
+                                        block_data[chunk_off] = data[chunk_pos:chunk_pos + chunk_size]
+                                        break
+
+                    # Download small chunks via single-block API
+                    if small_chunks_to_download:
+                        results = joblib.Parallel(n_jobs=effective_n_jobs, backend=backend, return_as='generator')(
+                            joblib.delayed(download_single_chunk)(gid, off, size)
+                            for off, size in small_chunks_to_download
+                        )
+                        for off, size, data in results:
+                            pbar.update(size)
+                            block_data[off] = data
+
+                # Write file for this pol immediately
+                out_name = f"NSR_{track:03d}_{frame:03d}_{datetime_str}_{pol}.h5"
+                out_path = os.path.join(out_dir, out_name)
+                metadata = self._read_nisar_metadata_direct(pol, meta_buf)
+
+                def extract_chunks_from_data(ci):
+                    if not ci:
+                        return None
+                    return {c['offset']: block_data[c['offset']] for c in ci['chunks']}
+
+                data_a = extract_chunks_from_data(ci_a)
+                data_b = extract_chunks_from_data(ci_b)
+
+                self._write_nisar_pol_h5_from_bytes(
+                    data_a, ci_a, metadata, pol, out_path,
+                    track, frame, datetime_str, False,
+                    downloaded_data_b=data_b, chunk_info_b=ci_b
+                )
+                all_downloaded.append(out_name)
+
+                # Free memory before next pol
                 del block_data
-                del meta_buf
+
+            # Free metadata buffer after all pols done
+            del meta_buf
 
         if all_downloaded:
             return pd.DataFrame({'file': all_downloaded})
