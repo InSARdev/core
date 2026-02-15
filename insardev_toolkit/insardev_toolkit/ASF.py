@@ -3419,11 +3419,8 @@ class ASF(progressbar_joblib):
                 if crop_info:
                     out_shape_b = (min(crop_az_end, orig_shape_b[0]) - crop_az_start,
                                    min(crop_rg_end_b, orig_shape_b[1]) - crop_rg_start_b)
-                    # DEBUG
-                    print(f"DEBUG B: orig={orig_shape_b}, crop_az=[{crop_az_start}:{crop_az_end}], crop_rg_b=[{crop_rg_start_b}:{crop_rg_end_b}], out={out_shape_b}")
                 else:
                     out_shape_b = orig_shape_b
-                    print(f"DEBUG B: NO CROP! crop_info={crop_info}, orig={orig_shape_b}")
 
                 dst_slc_b = h5_mem.create_dataset(
                     f'science/LSAR/RSLC/swaths/frequencyB/{pol}',
@@ -3492,9 +3489,22 @@ class ASF(progressbar_joblib):
                     elif 'validSamplesSubSwath' in ds_path and len(data.shape) == 2:
                         az_end = min(crop_az_end, data.shape[0]) if crop_az_end else data.shape[0]
                         data = data[crop_az_start:az_end, :]
-                # Create dataset with attributes
+
+                # GeolocationGrid: select sea level height layer (index 1 = 0m)
+                # Keep 3D shape (1, az, rg) for compatibility - saves ~162MB (20 layers -> 1 layer)
+                if 'geolocationGrid' in ds_path and len(data.shape) == 3:
+                    data = data[1:2, :, :]
+                # GeolocationGrid 1D height coordinate: keep only sea level value
+                elif 'geolocationGrid' in ds_path and len(data.shape) == 1 and 'height' in ds_path.lower():
+                    data = data[1:2]
+
+                # Create dataset with compression for metadata (matches source HDF5)
                 try:
-                    ds = h5_mem.create_dataset(ds_path, data=data)
+                    # Use gzip compression for arrays, skip for scalars
+                    if hasattr(data, 'shape') and len(data.shape) > 0 and data.size > 100:
+                        ds = h5_mem.create_dataset(ds_path, data=data, compression='gzip', compression_opts=4)
+                    else:
+                        ds = h5_mem.create_dataset(ds_path, data=data)
                     # Copy dataset attributes (description, units, etc.)
                     if 'attrs' in ds_info:
                         for attr_key, attr_val in ds_info['attrs'].items():
