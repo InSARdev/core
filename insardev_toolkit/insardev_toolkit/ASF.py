@@ -982,6 +982,256 @@ class ASF(progressbar_joblib):
         # return the results in a user-friendly dataframe
         return bursts_downloaded
 
+    # =========================================================================
+    # NISAR Helper Methods (shared between direct and cache downloads)
+    # =========================================================================
+
+    @staticmethod
+    def _nisar_get_chunk_info(h5, pol, frequency='A'):
+        """Query chunk byte offsets from HDF5 file.
+
+        Parameters
+        ----------
+        h5 : h5py.File
+            Open HDF5 file handle
+        pol : str
+            Polarization ('HH', 'HV', 'VH', 'VV')
+        frequency : str
+            Frequency band ('A' or 'B')
+
+        Returns
+        -------
+        dict with keys:
+            'chunks': list of {'offset', 'size', 'row', 'col', 'coord'}
+            'min_offset', 'max_end': byte range span
+            'shape', 'chunk_shape': array dimensions
+            'dtype', 'compression', 'compression_opts', 'shuffle': HDF5 dataset properties
+            'n_az', 'n_rg': number of chunks in each dimension
+        """
+        slc = h5[f'science/LSAR/RSLC/swaths/frequency{frequency}/{pol}']
+        shape = slc.shape
+        chunk_shape = slc.chunks
+
+        n_az = (shape[0] + chunk_shape[0] - 1) // chunk_shape[0]
+        n_rg = (shape[1] + chunk_shape[1] - 1) // chunk_shape[1]
+
+        chunks = []
+        for row in range(n_az):
+            for col in range(n_rg):
+                coord = (row * chunk_shape[0], col * chunk_shape[1])
+                info = slc.id.get_chunk_info_by_coord(coord)
+                chunks.append({
+                    'offset': info.byte_offset,
+                    'size': info.size,
+                    'row': row,
+                    'col': col,
+                    'coord': coord
+                })
+
+        min_offset = min(c['offset'] for c in chunks)
+        max_end = max(c['offset'] + c['size'] for c in chunks)
+
+        return {
+            'chunks': chunks,
+            'min_offset': min_offset,
+            'max_end': max_end,
+            'shape': shape,
+            'chunk_shape': chunk_shape,
+            'dtype': slc.dtype,
+            'compression': slc.compression,
+            'compression_opts': slc.compression_opts,
+            'shuffle': slc.shuffle,
+            'n_az': n_az,
+            'n_rg': n_rg
+        }
+
+    @staticmethod
+    def _nisar_parse_granule_id(granule_id):
+        """Parse NISAR granule ID to extract track, frame, and datetime.
+
+        Format: NISAR_L1_PR_RSLC_006_172_A_008_2005_DHDH_A_20251204T024618_20251204T024653_X05007_N_F_J_001.h5
+                ^product^     ^cycle^track^dir^frame^...^pols^..^start_time^     ^end_time^
+        """
+        parts = granule_id.replace('.h5', '').split('_')
+        track = int(parts[5])
+        frame = int(parts[7])
+        datetime_str = parts[11]
+        return track, frame, datetime_str
+
+    @staticmethod
+    def _nisar_merge_chunks_to_regions(chunks, gap_threshold=1024*1024):
+        """Merge adjacent chunks into contiguous regions allowing small gaps.
+
+        Parameters
+        ----------
+        chunks : list
+            List of {'offset': int, 'size': int, ...} dicts, or (offset, size) tuples
+        gap_threshold : int
+            Maximum gap in bytes to merge (default 1MB)
+
+        Returns
+        -------
+        list of (region_start, region_size, chunk_list)
+            chunk_list contains the original chunks in this region
+        """
+        if not chunks:
+            return []
+
+        # Normalize to list of dicts
+        if isinstance(chunks[0], tuple):
+            chunks = [{'offset': off, 'size': sz} for off, sz in chunks]
+
+        # Sort by offset
+        sorted_chunks = sorted(chunks, key=lambda c: c['offset'])
+
+        regions = []
+        region_start = sorted_chunks[0]['offset']
+        region_end = sorted_chunks[0]['offset'] + sorted_chunks[0]['size']
+        region_chunks = [sorted_chunks[0]]
+
+        for chunk in sorted_chunks[1:]:
+            if chunk['offset'] <= region_end + gap_threshold:
+                # Extend current region
+                region_end = max(region_end, chunk['offset'] + chunk['size'])
+                region_chunks.append(chunk)
+            else:
+                # Save current region and start new one
+                regions.append((region_start, region_end - region_start, region_chunks))
+                region_start = chunk['offset']
+                region_end = chunk['offset'] + chunk['size']
+                region_chunks = [chunk]
+
+        regions.append((region_start, region_end - region_start, region_chunks))
+        return regions
+
+    @staticmethod
+    def _nisar_bbox_to_pixel_indices(h5, bbox, chunk_info_a, chunk_info_b=None):
+        """Convert WGS84 bbox to pixel indices using geolocationGrid.
+
+        Parameters
+        ----------
+        h5 : h5py.File
+            Open HDF5 file with geolocationGrid
+        bbox : tuple
+            (west, south, east, north) in WGS84 degrees
+        chunk_info_a : dict
+            Chunk info for frequencyA (has shape)
+        chunk_info_b : dict, optional
+            Chunk info for frequencyB
+
+        Returns
+        -------
+        dict with keys:
+            'az_start', 'az_end': azimuth pixel range
+            'rg_start_a', 'rg_end_a': range pixel range for freqA
+            'rg_start_b', 'rg_end_b': range pixel range for freqB (if provided)
+        """
+        import numpy as np
+
+        # Bbox format: (west, south, east, north) = (lon_min, lat_min, lon_max, lat_max)
+        west, south, east, north = bbox
+        geo = h5['science/LSAR/RSLC/metadata/geolocationGrid']
+
+        # Get geolocation coordinates (use height=0 layer, index 10 of 20)
+        # NISAR EPSG 4326 convention: coordinateX = longitude, coordinateY = latitude
+        lon = geo['coordinateX'][10, :, :]  # (n_az_geo, n_rg_geo) - longitude
+        lat = geo['coordinateY'][10, :, :]  # latitude
+        geo_az_time = geo['zeroDopplerTime'][:]
+        geo_slant_range = geo['slantRange'][:]
+
+        # Get full grid coordinates
+        swaths = h5['science/LSAR/RSLC/swaths']
+        full_az_time = swaths['zeroDopplerTime'][:]
+        full_slant_range_a = swaths['frequencyA/slantRange'][:]
+
+        # Find geolocation grid cells inside bbox
+        in_bbox = ((lon >= west) & (lon <= east) &
+                   (lat >= south) & (lat <= north))
+
+        if not np.any(in_bbox):
+            raise ValueError(f"Bbox {bbox} does not intersect scene")
+
+        # Get azimuth and range indices in geolocation grid
+        az_geo_idx, rg_geo_idx = np.where(in_bbox)
+        az_geo_min, az_geo_max = az_geo_idx.min(), az_geo_idx.max()
+        rg_geo_min, rg_geo_max = rg_geo_idx.min(), rg_geo_idx.max()
+
+        # Convert to full grid indices via time/range interpolation
+        az_time_min = geo_az_time[az_geo_min]
+        az_time_max = geo_az_time[az_geo_max]
+        rg_min = geo_slant_range[rg_geo_min]
+        rg_max = geo_slant_range[rg_geo_max]
+
+        # Find full grid indices
+        az_start = int(np.searchsorted(full_az_time, az_time_min))
+        az_end = int(np.searchsorted(full_az_time, az_time_max)) + 1
+        rg_start_a = int(np.searchsorted(full_slant_range_a, rg_min))
+        rg_end_a = int(np.searchsorted(full_slant_range_a, rg_max)) + 1
+
+        # Clamp to valid range
+        n_az_pixels = chunk_info_a['shape'][0]
+        n_rg_a_pixels = chunk_info_a['shape'][1]
+        az_start = max(0, az_start)
+        az_end = min(n_az_pixels, az_end)
+        rg_start_a = max(0, rg_start_a)
+        rg_end_a = min(n_rg_a_pixels, rg_end_a)
+
+        result = {
+            'az_start': az_start,
+            'az_end': az_end,
+            'rg_start_a': rg_start_a,
+            'rg_end_a': rg_end_a,
+        }
+
+        # Handle frequencyB if present
+        if chunk_info_b:
+            full_slant_range_b = swaths['frequencyB/slantRange'][:]
+            n_rg_b_pixels = chunk_info_b['shape'][1]
+
+            rg_start_b = int(np.searchsorted(full_slant_range_b, rg_min))
+            rg_end_b = int(np.searchsorted(full_slant_range_b, rg_max)) + 1
+            rg_start_b = max(0, rg_start_b)
+            rg_end_b = min(n_rg_b_pixels, rg_end_b)
+
+            result['rg_start_b'] = rg_start_b
+            result['rg_end_b'] = rg_end_b
+
+        return result
+
+    @staticmethod
+    def _nisar_filter_chunks_by_pixel_range(chunk_info, az_start, az_end, rg_start, rg_end):
+        """Filter chunks to only those overlapping the given pixel range.
+
+        Parameters
+        ----------
+        chunk_info : dict
+            Output from _nisar_get_chunk_info()
+        az_start, az_end : int
+            Azimuth pixel range (start inclusive, end exclusive)
+        rg_start, rg_end : int
+            Range pixel range (start inclusive, end exclusive)
+
+        Returns
+        -------
+        list of chunk dicts that overlap the pixel range
+        """
+        chunk_shape = chunk_info['chunk_shape']
+        filtered = []
+
+        for chunk in chunk_info['chunks']:
+            # Chunk covers pixels [row*chunk_az, (row+1)*chunk_az) in azimuth
+            chunk_az_start = chunk['row'] * chunk_shape[0]
+            chunk_az_end = (chunk['row'] + 1) * chunk_shape[0]
+            chunk_rg_start = chunk['col'] * chunk_shape[1]
+            chunk_rg_end = (chunk['col'] + 1) * chunk_shape[1]
+
+            # Check overlap
+            if (chunk_az_end > az_start and chunk_az_start < az_end and
+                chunk_rg_end > rg_start and chunk_rg_start < rg_end):
+                filtered.append(chunk)
+
+        return filtered
+
     def _download_nisar(self, basedir, granules, polarizations, frequency, bbox, session,
                          n_jobs, joblib_backend, skip_exist, retries, timeout_second, debug):
         """Internal: Download NISAR RSLC granules with per-polarization output.
@@ -1055,47 +1305,8 @@ class ASF(progressbar_joblib):
         if missing:
             raise ValueError(f"Granules not found in ASF: {missing}")
 
-        def get_chunk_info(h5_remote, pol, frequency='A'):
-            """Query chunk byte offsets from remote HDF5.
-
-            Returns dict with chunk info and byte range.
-            """
-            slc = h5_remote[f'science/LSAR/RSLC/swaths/frequency{frequency}/{pol}']
-            shape = slc.shape
-            chunk_shape = slc.chunks
-
-            n_az = (shape[0] + chunk_shape[0] - 1) // chunk_shape[0]
-            n_rg = (shape[1] + chunk_shape[1] - 1) // chunk_shape[1]
-
-            chunks = []
-            for row in range(n_az):
-                for col in range(n_rg):
-                    coord = (row * chunk_shape[0], col * chunk_shape[1])
-                    info = slc.id.get_chunk_info_by_coord(coord)
-                    chunks.append({
-                        'offset': info.byte_offset,
-                        'size': info.size,
-                        'row': row,
-                        'col': col,
-                        'coord': coord
-                    })
-
-            min_offset = min(c['offset'] for c in chunks)
-            max_end = max(c['offset'] + c['size'] for c in chunks)
-
-            return {
-                'chunks': chunks,
-                'min_offset': min_offset,
-                'max_end': max_end,
-                'shape': shape,
-                'chunk_shape': chunk_shape,
-                'dtype': slc.dtype,
-                'compression': slc.compression,
-                'compression_opts': slc.compression_opts,
-                'shuffle': slc.shuffle,  # Important: shuffle filter must match for write_direct_chunk
-                'n_az': n_az,
-                'n_rg': n_rg
-            }
+        # Use shared helper for chunk info
+        get_chunk_info = ASF._nisar_get_chunk_info
 
         def extract_signed_url(url, auth_tuple, http_session=None):
             """Extract signed CloudFront URL by following OAuth redirects.
@@ -1153,19 +1364,64 @@ class ASF(progressbar_joblib):
 
             return b''.join(chunks_data), returned_signed_url
 
-        def parse_nisar_granule_id(granule_id):
-            """Parse NISAR granule ID to extract track, frame, and datetime.
+        def download_filtered_chunks(url, chunk_info, bbox_info, freq, auth_tuple, pbar=None,
+                                      http_session=None, signed_url=None, gap_threshold=16*1024*1024):
+            """Download only chunks overlapping bbox, merging with 16MB gap threshold.
 
-            Format: NISAR_L1_PR_RSLC_006_172_A_008_2005_DHDH_A_20251204T024618_20251204T024653_X05007_N_F_J_001.h5
-                    ^product^     ^cycle^track^dir^frame^...^pols^..^start_time^     ^end_time^
+            Uses larger gap threshold (16MB) to reduce HTTP requests while still
+            skipping large gaps between chunk regions.
+
+            Parameters
+            ----------
+            chunk_info : dict
+                Output from _nisar_get_chunk_info()
+            bbox_info : dict
+                Output from _nisar_bbox_to_pixel_indices()
+            freq : str
+                'A' or 'B' (to look up correct rg_start/rg_end keys)
+            gap_threshold : int
+                Maximum gap in bytes to merge (default 16MB)
+
+            Returns
+            -------
+            tuple: (chunk_data_dict, signed_url)
+                chunk_data_dict maps chunk byte offset -> chunk bytes
             """
-            parts = granule_id.replace('.h5', '').split('_')
-            # parts[5] = track (172), parts[7] = frame (008), parts[11] = start datetime
-            track = int(parts[5])
-            frame = int(parts[7])
-            # Start time: 20251204T024618 -> 20251204T024618
-            datetime_str = parts[11]
-            return track, frame, datetime_str
+            # Filter chunks to bbox
+            rg_start_key = f'rg_start_{freq.lower()}'
+            rg_end_key = f'rg_end_{freq.lower()}'
+            filtered_chunks = ASF._nisar_filter_chunks_by_pixel_range(
+                chunk_info,
+                bbox_info['az_start'], bbox_info['az_end'],
+                bbox_info[rg_start_key], bbox_info[rg_end_key]
+            )
+
+            if not filtered_chunks:
+                return {}, signed_url
+
+            # Merge into regions with 16MB gap threshold
+            regions = ASF._nisar_merge_chunks_to_regions(filtered_chunks, gap_threshold)
+
+            # Download each region
+            chunk_data = {}
+            current_signed_url = signed_url
+
+            for region_start, region_size, region_chunks in regions:
+                region_end = region_start + region_size
+                region_bytes, current_signed_url = download_byte_range(
+                    url, region_start, region_end, auth_tuple,
+                    pbar=pbar, http_session=http_session, signed_url=current_signed_url
+                )
+
+                # Extract individual chunks from region
+                for chunk in region_chunks:
+                    rel_offset = chunk['offset'] - region_start
+                    chunk_data[chunk['offset']] = region_bytes[rel_offset:rel_offset + chunk['size']]
+
+            return chunk_data, current_signed_url
+
+        # Use shared helper for granule ID parsing
+        parse_nisar_granule_id = ASF._nisar_parse_granule_id
 
         def download_nisar_granule(granule_id, basedir, polarizations, skip_exist, debug, position=None):
             """Download single NISAR granule, split by polarization.
@@ -1209,23 +1465,33 @@ class ASF(progressbar_joblib):
             auth_tuple = (self.username, self.password)
             http_session = self._get_asf_session()
 
-            # Get file size (HEAD request) and detect layout
+            # Get file size (HEAD request)
             head_resp = http_session.head(url, allow_redirects=True)
             file_size = int(head_resp.headers['Content-Length'])
 
-            # Fast layout detection (8MB download) - also returns probe buffer for reuse
-            layout, probe_buffer = self._detect_nisar_layout_fast(url, auth_tuple, file_size, http_session=http_session)
+            # Download 128MB metadata block (same as cache path) with progress bar
+            with tqdm(total=128*1024*1024, unit='B', unit_scale=True,
+                      desc=f"{short_name} metadata", leave=False,
+                      dynamic_ncols=False, ncols=80, mininterval=0.3, smoothing=0,
+                      disable=(position is not None)) as meta_pbar:
+                layout, metadata_buffer = self._detect_nisar_layout_fast(
+                    url, auth_tuple, file_size, http_session=http_session,
+                    pbar=meta_pbar if position is None else None
+                )
 
-            # Get available polarizations from probe buffer (no remote access)
+            if debug and position is None:
+                print(f"  File size: {file_size/(1024**3):.2f} GB, Layout: {layout}, Metadata: 128MB")
+
+            # Get available polarizations from metadata buffer (no remote access)
             from io import BytesIO
-            with h5py.File(BytesIO(bytes(probe_buffer)), 'r') as h5_probe:
+            with h5py.File(BytesIO(bytes(metadata_buffer)), 'r') as h5_meta:
                 swaths_path = 'science/LSAR/RSLC/swaths'
-                if swaths_path not in h5_probe:
+                if swaths_path not in h5_meta:
                     raise ValueError(
                         f"Unsupported NISAR file format: '{swaths_path}' not found in {granule_id}. "
                         f"This may be an older simulated scene with incompatible structure."
                     )
-                swaths_grp = h5_probe[swaths_path]
+                swaths_grp = h5_meta[swaths_path]
 
                 # Check for frequencyA (required for current implementation)
                 if 'frequencyA' not in swaths_grp:
@@ -1273,64 +1539,60 @@ class ASF(progressbar_joblib):
                     freq_str = frequency
                 print(f"NISAR {track}_{frame}: downloading {pols_to_download} (frequency{freq_str})")
 
-            if layout == 'A':
-                # Layout A: metadata at start - NO FSSPEC NEEDED
-                # Get chunk info from 8MB probe
-                from io import BytesIO
-                with h5py.File(BytesIO(bytes(probe_buffer)), 'r') as h5_probe:
-                    # Find where ANY SLC starts (to determine metadata boundary)
-                    slc_min = float('inf')
-                    for freq in ['A', 'B']:
-                        freq_path = f'science/LSAR/RSLC/swaths/frequency{freq}'
-                        if freq_path not in h5_probe:
-                            continue
-                        for p in ['HH', 'HV', 'VH', 'VV']:
-                            slc_path = f'{freq_path}/{p}'
-                            if slc_path in h5_probe:
-                                slc = h5_probe[slc_path]
-                                if slc.chunks:
-                                    info = slc.id.get_chunk_info(0)  # First chunk
-                                    slc_min = min(slc_min, info.byte_offset)
-
-                    # Get chunk info for pols we're actually downloading
-                    all_chunk_info = {}
-                    for pol in pols_to_download:
-                        chunk_info_a = None
-                        chunk_info_b = None
-                        if download_freq_a:
-                            chunk_info_a = get_chunk_info(h5_probe, pol, 'A')
-                        if download_freq_b and pol in freq_b_pols:
-                            chunk_info_b = get_chunk_info(h5_probe, pol, 'B')
-                        all_chunk_info[pol] = (chunk_info_a, chunk_info_b)
-
-                # Use slc_min with small 5% margin for HDF5 internal structures
-                # (safe because _read_nisar_metadata_direct skips other-pol paths)
-                metadata_end = int(slc_min * 1.05)
-
-                if debug and position is None:
-                    print(f"  File size: {file_size/(1024**3):.2f} GB, Layout: {layout}")
-                    print(f"  Metadata size: {metadata_end/(1024**2):.1f} MB")
-
-                # Download metadata block with progress bar
-                with tqdm(total=metadata_end, unit='B', unit_scale=True,
-                          desc=f"{short_name} metadata", leave=False,
-                          dynamic_ncols=False, ncols=80, mininterval=0.3,
-                          disable=(position is not None)) as meta_pbar:
-                    metadata_buffer = self._download_nisar_metadata_start(
-                        url, auth_tuple, metadata_end, pbar=meta_pbar if position is None else None,
-                        http_session=http_session)
-
-            else:
-                # Layout B not supported yet
+            if layout != 'A':
                 raise NotImplementedError(f"NISAR Layout B (metadata at end) not supported: {granule_id}")
 
-            # Calculate total SLC size
+            # Layout A: metadata at start - use 128MB buffer for everything
+            with h5py.File(BytesIO(bytes(metadata_buffer)), 'r') as h5_meta:
+                # Get chunk info for pols we're actually downloading
+                all_chunk_info = {}
+                for pol in pols_to_download:
+                    chunk_info_a = None
+                    chunk_info_b = None
+                    if download_freq_a:
+                        chunk_info_a = get_chunk_info(h5_meta, pol, 'A')
+                    if download_freq_b and pol in freq_b_pols:
+                        chunk_info_b = get_chunk_info(h5_meta, pol, 'B')
+                    all_chunk_info[pol] = (chunk_info_a, chunk_info_b)
+
+                # Calculate bbox pixel indices if bbox provided (uses geolocationGrid from 128MB buffer)
+                bbox_info = None
+                if bbox is not None:
+                    first_ci_a = next((ci_a for ci_a, _ in all_chunk_info.values() if ci_a), None)
+                    first_ci_b = next((ci_b for _, ci_b in all_chunk_info.values() if ci_b), None)
+                    if first_ci_a or first_ci_b:
+                        bbox_info = ASF._nisar_bbox_to_pixel_indices(
+                            h5_meta, bbox, first_ci_a or first_ci_b, first_ci_b
+                        )
+                        if debug and position is None:
+                            print(f"  Bbox {bbox} -> pixels az[{bbox_info['az_start']}:{bbox_info['az_end']}], "
+                                  f"rg_a[{bbox_info.get('rg_start_a', 'N/A')}:{bbox_info.get('rg_end_a', 'N/A')}]")
+
+            # Calculate total SLC size (filtered by bbox if provided)
             total_slc_size = 0
+            GAP_THRESHOLD = 16 * 1024 * 1024  # 16MB - same as download_filtered_chunks
             for pol, (chunk_info_a, chunk_info_b) in all_chunk_info.items():
                 if chunk_info_a:
-                    total_slc_size += chunk_info_a['max_end'] - chunk_info_a['min_offset']
+                    if bbox_info is not None:
+                        # Calculate size of merged regions (16MB gap threshold)
+                        filtered = ASF._nisar_filter_chunks_by_pixel_range(
+                            chunk_info_a, bbox_info['az_start'], bbox_info['az_end'],
+                            bbox_info['rg_start_a'], bbox_info['rg_end_a']
+                        )
+                        regions = ASF._nisar_merge_chunks_to_regions(filtered, GAP_THRESHOLD)
+                        total_slc_size += sum(r[1] for r in regions)
+                    else:
+                        total_slc_size += chunk_info_a['max_end'] - chunk_info_a['min_offset']
                 if chunk_info_b:
-                    total_slc_size += chunk_info_b['max_end'] - chunk_info_b['min_offset']
+                    if bbox_info is not None:
+                        filtered = ASF._nisar_filter_chunks_by_pixel_range(
+                            chunk_info_b, bbox_info['az_start'], bbox_info['az_end'],
+                            bbox_info['rg_start_b'], bbox_info['rg_end_b']
+                        )
+                        regions = ASF._nisar_merge_chunks_to_regions(filtered, GAP_THRESHOLD)
+                        total_slc_size += sum(r[1] for r in regions)
+                    else:
+                        total_slc_size += chunk_info_b['max_end'] - chunk_info_b['min_offset']
 
             # Check for empty SLC data (incompatible format)
             if total_slc_size == 0:
@@ -1361,7 +1623,7 @@ class ASF(progressbar_joblib):
             desc = f"{short_name}"
             with tqdm(total=total_slc_size, unit='B', unit_scale=True, desc=desc,
                       position=position, leave=True,
-                      dynamic_ncols=False, ncols=80, mininterval=0.3) as pbar:
+                      dynamic_ncols=False, ncols=80, mininterval=0.3, smoothing=0) as pbar:
 
                 # Download and write each polarization
                 downloaded_files = []
@@ -1393,39 +1655,54 @@ class ASF(progressbar_joblib):
                     # Read metadata from pre-downloaded buffer (no remote access)
                     metadata = self._read_nisar_metadata_direct(pol, metadata_buffer)
 
-                    # Download frequencyA byte span if needed
-                    # First request extracts signed URL for reuse
+                    # Download frequencyA data
                     downloaded_data_a = None
                     if chunk_info_a is not None:
-                        downloaded_data_a, signed_url = download_byte_range(
-                            url,
-                            chunk_info_a['min_offset'],
-                            chunk_info_a['max_end'],
-                            auth_tuple,
-                            pbar=pbar,
-                            http_session=http_session,
-                            signed_url=signed_url  # Reuse if already extracted
-                        )
+                        if bbox_info is not None:
+                            # Bbox mode: merged regions with 16MB gap threshold
+                            downloaded_data_a, signed_url = download_filtered_chunks(
+                                url, chunk_info_a, bbox_info, 'A', auth_tuple,
+                                pbar=pbar, http_session=http_session, signed_url=signed_url
+                            )
+                        else:
+                            # Full download: single Range request for entire span
+                            downloaded_data_a, signed_url = download_byte_range(
+                                url,
+                                chunk_info_a['min_offset'],
+                                chunk_info_a['max_end'],
+                                auth_tuple,
+                                pbar=pbar,
+                                http_session=http_session,
+                                signed_url=signed_url
+                            )
 
-                    # Download frequencyB byte span if needed
-                    # Reuses signed URL from frequencyA request
+                    # Download frequencyB data
                     downloaded_data_b = None
                     if chunk_info_b is not None:
-                        downloaded_data_b, signed_url = download_byte_range(
-                            url,
-                            chunk_info_b['min_offset'],
-                            chunk_info_b['max_end'],
-                            auth_tuple,
-                            pbar=pbar,
-                            http_session=http_session,
-                            signed_url=signed_url
-                        )
+                        if bbox_info is not None:
+                            # Bbox mode: merged regions with 16MB gap threshold
+                            downloaded_data_b, signed_url = download_filtered_chunks(
+                                url, chunk_info_b, bbox_info, 'B', auth_tuple,
+                                pbar=pbar, http_session=http_session, signed_url=signed_url
+                            )
+                        else:
+                            # Full download: single Range request for entire span
+                            downloaded_data_b, signed_url = download_byte_range(
+                                url,
+                                chunk_info_b['min_offset'],
+                                chunk_info_b['max_end'],
+                                auth_tuple,
+                                pbar=pbar,
+                                http_session=http_session,
+                                signed_url=signed_url
+                            )
 
                     # Write output HDF5 (suppress debug output in parallel mode)
                     self._write_nisar_pol_h5_from_bytes(
                         downloaded_data_a, chunk_info_a, metadata, pol, out_path,
                         track, frame, datetime_str, debug and (position is None),
-                        downloaded_data_b=downloaded_data_b, chunk_info_b=chunk_info_b
+                        downloaded_data_b=downloaded_data_b, chunk_info_b=chunk_info_b,
+                        crop_info=bbox_info
                     )
 
                     downloaded_files.append(out_name)
@@ -1518,52 +1795,125 @@ class ASF(progressbar_joblib):
         ALIGNED_RG_CHUNKS = 7   # FreqB has 13 rg chunks, use 7 to get 7+6=2 blocks
         MAX_MULTI_BLOCK = 128 * 1024 * 1024  # 128 MB max for multi-offset (15×7 aligned blocks)
 
-        def parse_nisar_granule_id(granule_id):
-            """Parse NISAR granule ID to extract track, frame, and datetime."""
-            parts = granule_id.replace('.h5', '').split('_')
-            track = int(parts[5])
-            frame = int(parts[7])
-            datetime_str = parts[11]
-            return track, frame, datetime_str
+        # Use shared helpers
+        parse_nisar_granule_id = ASF._nisar_parse_granule_id
+        get_chunk_info = ASF._nisar_get_chunk_info
 
-        def get_chunk_info(h5_file, pol, freq='A'):
-            """Query chunk byte offsets from HDF5 metadata."""
-            slc = h5_file[f'science/LSAR/RSLC/swaths/frequency{freq}/{pol}']
-            shape = slc.shape
-            chunk_shape = slc.chunks
+        # Note: get_chunk_info already returns dict with keys:
+        # 'chunks', 'min_offset', 'max_end', 'shape', 'chunk_shape',
+        # 'dtype', 'compression', 'compression_opts', 'shuffle', 'n_az', 'n_rg'
 
-            n_az = (shape[0] + chunk_shape[0] - 1) // chunk_shape[0]
-            n_rg = (shape[1] + chunk_shape[1] - 1) // chunk_shape[1]
+        def bbox_to_block_indices(h5, bbox, chunk_info_a, chunk_info_b=None):
+            """Convert WGS84 bbox to chunk indices for bbox-optimized download.
 
-            chunks = []
-            for row in range(n_az):
-                for col in range(n_rg):
-                    coord = (row * chunk_shape[0], col * chunk_shape[1])
-                    info = slc.id.get_chunk_info_by_coord(coord)
-                    chunks.append({
-                        'offset': info.byte_offset,
-                        'size': info.size,
-                        'row': row,
-                        'col': col,
-                        'coord': coord
+            Uses shared _nisar_bbox_to_pixel_indices for pixel conversion,
+            then calculates exact chunk indices (not aligned blocks) for minimal traffic.
+
+            Returns dict with pixel indices + chunk indices for bbox area.
+            """
+            # Get pixel indices from shared helper
+            result = ASF._nisar_bbox_to_pixel_indices(h5, bbox, chunk_info_a, chunk_info_b)
+
+            # Calculate exact chunk indices for bbox (not aligned blocks)
+            chunk_az = chunk_info_a['chunk_shape'][0]
+            chunk_rg = chunk_info_a['chunk_shape'][1]
+
+            result['az_chunk_start'] = result['az_start'] // chunk_az
+            result['az_chunk_end'] = (result['az_end'] + chunk_az - 1) // chunk_az
+            result['rg_chunk_start_a'] = result['rg_start_a'] // chunk_rg
+            result['rg_chunk_end_a'] = (result['rg_end_a'] + chunk_rg - 1) // chunk_rg
+
+            # Handle frequencyB chunk indices if present
+            if chunk_info_b and 'rg_start_b' in result:
+                chunk_rg_b = chunk_info_b['chunk_shape'][1]
+                result['rg_chunk_start_b'] = result['rg_start_b'] // chunk_rg_b
+                result['rg_chunk_end_b'] = (result['rg_end_b'] + chunk_rg_b - 1) // chunk_rg_b
+
+            return result
+
+        def chunks_to_bbox_blocks(chunk_info, az_chunk_start, az_chunk_end, rg_chunk_start, rg_chunk_end):
+            """Create optimized blocks for bbox download - only exact chunks needed.
+
+            Groups chunks into ~10MB blocks for efficient HTTP requests while
+            downloading only the chunks that cover the bbox area.
+
+            Returns list of dicts with 'chunks' (merged regions) and 'raw_chunks'.
+            """
+            if not chunk_info:
+                return []
+
+            chunks = chunk_info['chunks']
+            chunk_lookup = {(c['row'], c['col']): c for c in chunks}
+
+            # Collect only chunks within bbox range
+            raw_chunks = []
+            for row in range(az_chunk_start, az_chunk_end):
+                for col in range(rg_chunk_start, rg_chunk_end):
+                    if (row, col) in chunk_lookup:
+                        c = chunk_lookup[(row, col)]
+                        raw_chunks.append((c['offset'], c['size']))
+
+            if not raw_chunks:
+                return []
+
+            # Merge into regions with 1MB gap threshold
+            merged_regions = ASF._nisar_merge_chunks_to_regions(raw_chunks, gap_threshold=1024*1024)
+            regions = [(r[0], r[1]) for r in merged_regions]
+            total_size = sum(size for _, size in regions)
+
+            # Return as single block (or split if too large)
+            if total_size <= MAX_MULTI_BLOCK:
+                return [{
+                    'az_block': 0,
+                    'rg_block': 0,
+                    'chunks': regions,
+                    'raw_chunks': raw_chunks,
+                    'total_size': total_size
+                }]
+            else:
+                # Split into multiple blocks if too large
+                # Group by azimuth rows
+                blocks = []
+                current_chunks = []
+                current_size = 0
+                BLOCK_TARGET = 64 * 1024 * 1024  # 64MB target per block
+
+                for row in range(az_chunk_start, az_chunk_end):
+                    row_chunks = []
+                    for col in range(rg_chunk_start, rg_chunk_end):
+                        if (row, col) in chunk_lookup:
+                            c = chunk_lookup[(row, col)]
+                            row_chunks.append((c['offset'], c['size']))
+
+                    row_size = sum(s for _, s in row_chunks)
+                    if current_size + row_size > BLOCK_TARGET and current_chunks:
+                        # Flush current block
+                        merged = ASF._nisar_merge_chunks_to_regions(current_chunks, gap_threshold=1024*1024)
+                        blocks.append({
+                            'az_block': len(blocks),
+                            'rg_block': 0,
+                            'chunks': [(r[0], r[1]) for r in merged],
+                            'raw_chunks': current_chunks,
+                            'total_size': sum(r[1] for r in merged)
+                        })
+                        current_chunks = []
+                        current_size = 0
+
+                    current_chunks.extend(row_chunks)
+                    current_size += row_size
+
+                # Flush remaining
+                if current_chunks:
+                    merged = ASF._nisar_merge_chunks_to_regions(current_chunks, gap_threshold=1024*1024)
+                    blocks.append({
+                        'az_block': len(blocks),
+                        'rg_block': 0,
+                        'chunks': [(r[0], r[1]) for r in merged],
+                        'raw_chunks': current_chunks,
+                        'total_size': sum(r[1] for r in merged)
                     })
 
-            min_offset = min(c['offset'] for c in chunks)
-            max_end = max(c['offset'] + c['size'] for c in chunks)
-
-            return {
-                'chunks': chunks,
-                'min_offset': min_offset,
-                'max_end': max_end,
-                'shape': shape,
-                'chunk_shape': chunk_shape,
-                'dtype': slc.dtype,
-                'compression': slc.compression,
-                'compression_opts': slc.compression_opts,
-                'shuffle': slc.shuffle,
-                'n_az': n_az,
-                'n_rg': n_rg
-            }
+                return blocks
 
         def chunks_to_aligned_blocks(chunk_info, az_block_start=None, az_block_end=None,
                                       rg_block_start=None, rg_block_end=None):
@@ -1631,31 +1981,16 @@ class ASF(progressbar_joblib):
                                 raw_chunks.append((c['offset'], c['size']))
 
                     if raw_chunks:
-                        # Sort by offset
-                        raw_chunks.sort(key=lambda x: x[0])
-
-                        # Group into continuous regions (gap threshold 1MB)
-                        GAP_THRESHOLD = 1 * 1024 * 1024
-                        regions = []
-                        region_start = raw_chunks[0][0]
-                        region_end = raw_chunks[0][0] + raw_chunks[0][1]
-
-                        for off, size in raw_chunks[1:]:
-                            if off <= region_end + GAP_THRESHOLD:
-                                # Extend current region
-                                region_end = max(region_end, off + size)
-                            else:
-                                # Save region and start new one
-                                regions.append((region_start, region_end - region_start))
-                                region_start = off
-                                region_end = off + size
-                        regions.append((region_start, region_end - region_start))
+                        # Use shared helper to merge chunks with 1MB gap threshold
+                        merged_regions = ASF._nisar_merge_chunks_to_regions(raw_chunks, gap_threshold=1024*1024)
+                        # Convert to (offset, size) tuples without chunk list
+                        regions = [(r[0], r[1]) for r in merged_regions]
 
                         total_size = sum(size for _, size in regions)
                         aligned_blocks.append({
                             'az_block': ab,
                             'rg_block': rb,
-                            'chunks': regions,  # Now contains merged regions, not individual chunks
+                            'chunks': regions,  # Merged regions as (offset, size) tuples
                             'raw_chunks': raw_chunks,  # Keep original for extraction
                             'total_size': total_size
                         })
@@ -1753,7 +2088,9 @@ class ASF(progressbar_joblib):
             sess = session or requests.Session()
             resp = sess.get(url)
             resp.raise_for_status()
-            cache_hit = resp.headers.get('cf-cache-status', '').upper() == 'HIT'
+            # Check both X-Cache (proxy) and cf-cache-status (CDN) headers
+            cache_hit = (resp.headers.get('X-Cache', '').upper() == 'HIT' or
+                        resp.headers.get('cf-cache-status', '').upper() == 'HIT')
             return resp.content, cache_hit
 
         def fetch_region_via_cache(granule_id, start, end, pbar=None, session=None):
@@ -1783,49 +2120,28 @@ class ASF(progressbar_joblib):
 
                 if pbar:
                     pbar.update(block_length)
-                    # Update postfix with cache stats only in debug mode
-                    if debug:
-                        pbar.set_postfix_str(f"H{cache_stats['hits']}M{cache_stats['misses']}")
+                    # Show cache stats in progress bar
+                    pbar.set_postfix_str(f"H{cache_stats['hits']}M{cache_stats['misses']}")
 
             return bytes(all_data)
 
         def fetch_chunks_via_cache(granule_id, chunks, pbar=None, session=None):
             """Fetch HDF5 chunks by downloading their containing regions.
 
-            Groups adjacent chunks into contiguous regions, then fetches
-            each region using deterministic 64-128MB blocks.
+            Groups adjacent chunks into contiguous regions (1MB gap threshold),
+            then fetches each region using deterministic 64-128MB blocks.
 
             Returns dict: {chunk_offset: chunk_bytes}
             """
             sess = session or requests.Session()
 
-            # Sort chunks by offset
-            sorted_chunks = sorted(chunks, key=lambda c: c['offset'])
-
-            # Group into contiguous regions (gap threshold: 1MB)
-            GAP_THRESHOLD = 16 * 1024 * 1024  # 16MB gap threshold
-            regions = []
-            region_start = sorted_chunks[0]['offset']
-            region_end = sorted_chunks[0]['offset'] + sorted_chunks[0]['size']
-            region_chunks = [sorted_chunks[0]]
-
-            for chunk in sorted_chunks[1:]:
-                if chunk['offset'] <= region_end + GAP_THRESHOLD:
-                    # Extend current region
-                    region_end = max(region_end, chunk['offset'] + chunk['size'])
-                    region_chunks.append(chunk)
-                else:
-                    # Save current region and start new one
-                    regions.append((region_start, region_end, region_chunks))
-                    region_start = chunk['offset']
-                    region_end = chunk['offset'] + chunk['size']
-                    region_chunks = [chunk]
-
-            regions.append((region_start, region_end, region_chunks))
+            # Use shared helper to merge chunks with 1MB gap threshold (consistent with aligned blocks)
+            regions = ASF._nisar_merge_chunks_to_regions(chunks, gap_threshold=1024*1024)
 
             # Download each region and extract chunks
             chunk_data = {}
-            for region_start, region_end, region_chunks in regions:
+            for region_start, region_size, region_chunks in regions:
+                region_end = region_start + region_size
                 region_bytes = fetch_region_via_cache(
                     granule_id, region_start, region_end, pbar=pbar, session=sess
                 )
@@ -2053,7 +2369,7 @@ class ASF(progressbar_joblib):
                         # First worker initializes shared bar
                         pbar_list[0] = tqdm(total=0, unit='B', unit_scale=True,
                                            desc=f"Downloading {len(granule_ids)} granules",
-                                           dynamic_ncols=False, ncols=80, mininterval=0.3)
+                                           dynamic_ncols=False, ncols=80, mininterval=0.3, smoothing=0)
                     pbar_list[0].total += total_slc_size
                     pbar_list[0].refresh()
                 pbar = pbar_list[0]
@@ -2061,7 +2377,7 @@ class ASF(progressbar_joblib):
             else:
                 pbar = tqdm(total=total_slc_size, unit='B', unit_scale=True, desc=short_name,
                            position=position, leave=True,
-                           dynamic_ncols=False, ncols=80, mininterval=0.3)
+                           dynamic_ncols=False, ncols=80, mininterval=0.3, smoothing=0)
                 own_pbar = True
 
             downloaded_files = []
@@ -2143,9 +2459,6 @@ class ASF(progressbar_joblib):
 
         # Handle bbox parameter
         if bbox is not None:
-            # TODO: Implement bbox-based block selection
-            # For now, bbox is validated but full scene is downloaded using aligned blocks
-            # which still provides cache efficiency between clients
             if len(bbox) != 4:
                 raise ValueError("bbox must be (west, south, east, north) in WGS84 coordinates")
             west, south, east, north = bbox
@@ -2153,8 +2466,6 @@ class ASF(progressbar_joblib):
                 raise ValueError("Invalid bbox: west must be < east and south must be < north")
             if not (-180 <= west <= 180 and -180 <= east <= 180 and -90 <= south <= 90 and -90 <= north <= 90):
                 raise ValueError("bbox coordinates must be valid WGS84 (lon: -180 to 180, lat: -90 to 90)")
-            print(f"NOTE: bbox subsetting not yet implemented. Downloading full scene using aligned 25x25km blocks.")
-            print(f"      Requested bbox: ({west:.4f}, {south:.4f}, {east:.4f}, {north:.4f})")
 
         print(f"Downloading {len(granule_ids)} NISAR granule(s) via cache proxy (aligned blocks)...")
 
@@ -2171,7 +2482,9 @@ class ASF(progressbar_joblib):
                 try:
                     resp = requests.get(url, timeout=120)
                     resp.raise_for_status()
-                    cache_hit = resp.headers.get('cf-cache-status', '').upper() == 'HIT'
+                    # Check both X-Cache (proxy) and cf-cache-status (CDN) headers
+                    cache_hit = (resp.headers.get('X-Cache', '').upper() == 'HIT' or
+                                resp.headers.get('cf-cache-status', '').upper() == 'HIT')
                     return (offsets_str, resp.content, cache_hit)
                 except Exception as e:
                     if debug:
@@ -2201,8 +2514,12 @@ class ASF(progressbar_joblib):
         for gid in granule_ids:
 
             # 1. Fetch metadata for this granule
+            if debug:
+                print(f"Fetching metadata for {gid}...")
             meta_raw, _ = fetch_cache_range(gid, 0, MAX_BLOCK)
             meta_buf = patch_hdf5_superblock(meta_raw)
+            if debug:
+                print(f"  Metadata: {len(meta_buf)/(1024**2):.1f}MB")
 
             with h5py.File(BytesIO(bytes(meta_buf)), 'r') as h5:
                 swaths = h5['science/LSAR/RSLC/swaths']
@@ -2223,6 +2540,18 @@ class ASF(progressbar_joblib):
                         ci_b = get_chunk_info(h5, pol, 'B')
                     all_chunk_info[pol] = (ci_a, ci_b)
 
+                # Calculate bbox chunk indices if bbox provided
+                bbox_info = None
+                if bbox is not None:
+                    # Use first available chunk_info for bbox calculation
+                    first_ci_a = next((ci_a for ci_a, _ in all_chunk_info.values() if ci_a), None)
+                    first_ci_b = next((ci_b for _, ci_b in all_chunk_info.values() if ci_b), None)
+                    if first_ci_a or first_ci_b:
+                        bbox_info = bbox_to_block_indices(h5, bbox, first_ci_a or first_ci_b, first_ci_b)
+                        if debug:
+                            print(f"  Bbox {bbox} -> chunks az[{bbox_info['az_chunk_start']}:{bbox_info['az_chunk_end']}], "
+                                  f"rg_a[{bbox_info.get('rg_chunk_start_a', 'N/A')}:{bbox_info.get('rg_chunk_end_a', 'N/A')}]")
+
             track, frame, datetime_str = parse_nisar_granule_id(gid)
             subdir = f"{track:03d}_{frame:03d}"
             out_dir = os.path.join(basedir, subdir)
@@ -2231,45 +2560,81 @@ class ASF(progressbar_joblib):
             # Process one polarization at a time to limit memory usage
             for pol in pols:
                 ci_a, ci_b = all_chunk_info[pol]
-                aligned_blocks_to_download = []
+                blocks_to_download = []
                 small_chunks_to_download = []
 
-                if ci_a:
-                    for block in chunks_to_aligned_blocks(ci_a):
-                        if block['total_size'] <= MAX_MULTI_BLOCK:
-                            offsets_str = ','.join(f"{off}_{size}" for off, size in block['chunks'])
-                            aligned_blocks_to_download.append((offsets_str, block['total_size'], block['chunks'], block['raw_chunks']))
-                        else:
-                            small_chunks_to_download.extend(block['raw_chunks'])
+                # Use bbox-optimized blocks when bbox provided, otherwise aligned blocks
+                if bbox_info:
+                    # Bbox mode: download only exact chunks needed
+                    az_start = bbox_info['az_chunk_start']
+                    az_end = bbox_info['az_chunk_end']
 
-                if ci_b:
-                    for block in chunks_to_aligned_blocks(ci_b):
-                        if block['total_size'] <= MAX_MULTI_BLOCK:
-                            offsets_str = ','.join(f"{off}_{size}" for off, size in block['chunks'])
-                            aligned_blocks_to_download.append((offsets_str, block['total_size'], block['chunks'], block['raw_chunks']))
-                        else:
-                            small_chunks_to_download.extend(block['raw_chunks'])
+                    if ci_a:
+                        rg_start = bbox_info.get('rg_chunk_start_a', 0)
+                        rg_end = bbox_info.get('rg_chunk_end_a', ci_a['n_rg'])
+                        for block in chunks_to_bbox_blocks(ci_a, az_start, az_end, rg_start, rg_end):
+                            if block['total_size'] <= MAX_MULTI_BLOCK:
+                                offsets_str = ','.join(f"{off}_{size}" for off, size in block['chunks'])
+                                blocks_to_download.append((offsets_str, block['total_size'], block['chunks'], block['raw_chunks']))
+                            else:
+                                small_chunks_to_download.extend(block['raw_chunks'])
 
-                # Debug: show block alignment stats for this pol
-                if debug and aligned_blocks_to_download:
-                    sizes_mb = [blk[1] / (1024**2) for blk in aligned_blocks_to_download]
-                    print(f"    {pol}: {len(aligned_blocks_to_download)} aligned blocks, "
+                    if ci_b:
+                        rg_start = bbox_info.get('rg_chunk_start_b', 0)
+                        rg_end = bbox_info.get('rg_chunk_end_b', ci_b['n_rg'])
+                        for block in chunks_to_bbox_blocks(ci_b, az_start, az_end, rg_start, rg_end):
+                            if block['total_size'] <= MAX_MULTI_BLOCK:
+                                offsets_str = ','.join(f"{off}_{size}" for off, size in block['chunks'])
+                                blocks_to_download.append((offsets_str, block['total_size'], block['chunks'], block['raw_chunks']))
+                            else:
+                                small_chunks_to_download.extend(block['raw_chunks'])
+                else:
+                    # Full download: use cache-aligned blocks
+                    if ci_a:
+                        for block in chunks_to_aligned_blocks(ci_a):
+                            if block['total_size'] <= MAX_MULTI_BLOCK:
+                                offsets_str = ','.join(f"{off}_{size}" for off, size in block['chunks'])
+                                blocks_to_download.append((offsets_str, block['total_size'], block['chunks'], block['raw_chunks']))
+                            else:
+                                small_chunks_to_download.extend(block['raw_chunks'])
+
+                    if ci_b:
+                        for block in chunks_to_aligned_blocks(ci_b):
+                            if block['total_size'] <= MAX_MULTI_BLOCK:
+                                offsets_str = ','.join(f"{off}_{size}" for off, size in block['chunks'])
+                                blocks_to_download.append((offsets_str, block['total_size'], block['chunks'], block['raw_chunks']))
+                            else:
+                                small_chunks_to_download.extend(block['raw_chunks'])
+
+                # Debug: show block stats for this pol
+                if debug and blocks_to_download:
+                    sizes_mb = [blk[1] / (1024**2) for blk in blocks_to_download]
+                    mode = "bbox-optimized" if bbox_info else "aligned"
+                    print(f"    {pol}: {len(blocks_to_download)} {mode} blocks, "
                           f"size: {min(sizes_mb):.1f}-{max(sizes_mb):.1f}MB (avg {sum(sizes_mb)/len(sizes_mb):.1f}MB)")
 
-                total_size = sum(blk[1] for blk in aligned_blocks_to_download) + sum(c[1] for c in small_chunks_to_download)
+                total_size = sum(blk[1] for blk in blocks_to_download) + sum(c[1] for c in small_chunks_to_download)
                 block_data = {}  # {chunk_offset: chunk_bytes}
+                cache_hits = 0
+                cache_misses = 0
 
                 with tqdm(desc=f"NSR_{track:03d}_{frame:03d}_{datetime_str}_{pol}",
-                          total=total_size, unit='B', unit_scale=True, unit_divisor=1024) as pbar:
+                          total=total_size, unit='B', unit_scale=True, unit_divisor=1024,
+                          smoothing=0) as pbar:
 
-                    # Download aligned blocks via multi-offset API
-                    if aligned_blocks_to_download:
+                    # Download blocks via multi-offset API
+                    if blocks_to_download:
                         results = joblib.Parallel(n_jobs=effective_n_jobs, backend=backend, return_as='generator')(
                             joblib.delayed(download_aligned_block)(gid, offsets_str, total_sz)
-                            for offsets_str, total_sz, _, _ in aligned_blocks_to_download
+                            for offsets_str, total_sz, _, _ in blocks_to_download
                         )
-                        for (offsets_str, total_sz, regions, raw_chunks), (_, data, cache_hit) in zip(aligned_blocks_to_download, results):
+                        for (offsets_str, total_sz, regions, raw_chunks), (_, data, cache_hit) in zip(blocks_to_download, results):
+                            if cache_hit:
+                                cache_hits += 1
+                            else:
+                                cache_misses += 1
                             pbar.update(total_sz)
+                            pbar.set_postfix_str(f"H{cache_hits}M{cache_misses}")
                             # Build region offset map: region_start -> position in data
                             region_map = {}
                             pos = 0
@@ -2303,7 +2668,8 @@ class ASF(progressbar_joblib):
                 def extract_chunks_from_data(ci):
                     if not ci:
                         return None
-                    return {c['offset']: block_data[c['offset']] for c in ci['chunks']}
+                    # Only extract chunks that were actually downloaded (subset when bbox applied)
+                    return {c['offset']: block_data[c['offset']] for c in ci['chunks'] if c['offset'] in block_data}
 
                 data_a = extract_chunks_from_data(ci_a)
                 data_b = extract_chunks_from_data(ci_b)
@@ -2311,7 +2677,8 @@ class ASF(progressbar_joblib):
                 self._write_nisar_pol_h5_from_bytes(
                     data_a, ci_a, metadata, pol, out_path,
                     track, frame, datetime_str, False,
-                    downloaded_data_b=data_b, chunk_info_b=ci_b
+                    downloaded_data_b=data_b, chunk_info_b=ci_b,
+                    crop_info=bbox_info
                 )
                 all_downloaded.append(out_name)
 
@@ -2325,30 +2692,37 @@ class ASF(progressbar_joblib):
             return pd.DataFrame({'file': all_downloaded})
         return None
 
-    def _detect_nisar_layout_fast(self, url, auth_tuple, file_size, http_session=None):
-        """Fast layout detection by downloading 8MB and testing.
+    def _detect_nisar_layout_fast(self, url, auth_tuple, file_size, http_session=None, pbar=None):
+        """Download 128MB metadata block and detect layout.
 
-        Downloads first 8MB, patches HDF5 superblock, and tries to read metadata.
-        If successful, layout is A (metadata at start). If fails, layout is B.
+        Downloads first 128MB (same as cache path), patches HDF5 superblock,
+        and tries to read metadata. Contains all metadata including geolocationGrid.
 
-        Returns: (layout, probe_buffer) where layout is 'A' or 'B' and
-                 probe_buffer is the patched 8MB buffer for reuse.
+        Returns: (layout, metadata_buffer) where layout is 'A' or 'B' and
+                 metadata_buffer is the patched 128MB buffer for reuse.
         """
         import requests
         import struct
         import h5py
         from io import BytesIO
 
-        PROBE_SIZE = 8 * 1024 * 1024  # 8 MB - needed to reach attitude/time dataset
+        METADATA_SIZE = 128 * 1024 * 1024  # 128 MB - matches cache path
 
-        # Download first 8MB (reuse session if provided)
-        headers = {'Range': f'bytes=0-{PROBE_SIZE-1}'}
+        # Download first 128MB (reuse session if provided)
+        headers = {'Range': f'bytes=0-{METADATA_SIZE-1}'}
         if http_session:
-            response = http_session.get(url, headers=headers)
+            response = http_session.get(url, headers=headers, stream=True)
         else:
-            response = requests.get(url, headers=headers, auth=auth_tuple)
+            response = requests.get(url, headers=headers, auth=auth_tuple, stream=True)
         response.raise_for_status()
-        data = bytearray(response.content)
+
+        # Stream download with progress
+        chunks = []
+        for chunk in response.iter_content(chunk_size=1024*1024):
+            chunks.append(chunk)
+            if pbar:
+                pbar.update(len(chunk))
+        data = bytearray(b''.join(chunks))
 
         # Patch HDF5 superblock EOF
         version = data[8]
@@ -2798,7 +3172,7 @@ class ASF(progressbar_joblib):
         # out_name is like "NSR_172_008_20251204T024618_HH.h5"
         desc = f"{out_name[:-3]} metadata" if out_name else f"{pol} metadata"
         with tqdm(total=download_size, unit='B', unit_scale=True, desc=desc,
-                  position=position, leave=(position is None)) as pbar:
+                  position=position, leave=(position is None), smoothing=0) as pbar:
             for chunk in response.iter_content(chunk_size=1024*1024):
                 data.extend(chunk)
                 pbar.update(len(chunk))
@@ -2896,7 +3270,8 @@ class ASF(progressbar_joblib):
 
     def _write_nisar_pol_h5_from_bytes(self, downloaded_data, chunk_info, metadata, pol,
                                         out_path, track, frame, datetime_str, debug,
-                                        downloaded_data_b=None, chunk_info_b=None):
+                                        downloaded_data_b=None, chunk_info_b=None,
+                                        crop_info=None, data_offset_a=None, data_offset_b=None):
         """Write single-polarization NISAR HDF5 from downloaded byte data.
 
         Copies ALL metadata from source file (geolocationGrid, attitude, calibration,
@@ -2906,6 +3281,8 @@ class ASF(progressbar_joblib):
         - FrequencyA only: downloaded_data present, downloaded_data_b is None
         - FrequencyB only: downloaded_data is None, downloaded_data_b present
         - Both frequencies: both present
+
+        When crop_info is provided, crops SLC data and coordinate arrays to bbox extent.
 
         Parameters
         ----------
@@ -2920,8 +3297,13 @@ class ASF(progressbar_joblib):
             Raw bytes or dict for frequencyB (ionospheric correction / quick look).
         chunk_info_b : dict, optional
             Chunk metadata for frequencyB.
+        data_offset_a : int, optional
+            Override min_offset for bytes mode (for bbox-filtered downloads).
+        data_offset_b : int, optional
+            Override min_offset for frequencyB bytes.
         """
         import h5py
+        import numpy as np
         from io import BytesIO
         from tqdm.auto import tqdm
 
@@ -2941,23 +3323,58 @@ class ASF(progressbar_joblib):
         if debug:
             print(f"    Writing {n_chunks_total} chunks + {len(metadata)-1} metadata datasets...")
 
+        # Calculate chunk-aligned crop extents if cropping
+        crop_az_start, crop_az_end = 0, None
+        crop_rg_start_a, crop_rg_end_a = 0, None
+        crop_rg_start_b, crop_rg_end_b = 0, None
+
+        if crop_info:
+            # Get chunk-aligned bounds (full chunks, not pixels)
+            if has_freq_a:
+                chunk_az = chunk_info['chunk_shape'][0]
+                chunk_rg = chunk_info['chunk_shape'][1]
+                # Align to chunk boundaries
+                crop_az_start = (crop_info['az_start'] // chunk_az) * chunk_az
+                crop_az_end = ((crop_info['az_end'] + chunk_az - 1) // chunk_az) * chunk_az
+                # Only set freqA crop bounds if they exist in crop_info
+                if 'rg_start_a' in crop_info:
+                    crop_rg_start_a = (crop_info['rg_start_a'] // chunk_rg) * chunk_rg
+                    crop_rg_end_a = ((crop_info['rg_end_a'] + chunk_rg - 1) // chunk_rg) * chunk_rg
+            if has_freq_b:
+                chunk_az_b = chunk_info_b['chunk_shape'][0]
+                chunk_rg_b = chunk_info_b['chunk_shape'][1]
+                if crop_az_start == 0:  # Not set by freqA
+                    crop_az_start = (crop_info['az_start'] // chunk_az_b) * chunk_az_b
+                    crop_az_end = ((crop_info['az_end'] + chunk_az_b - 1) // chunk_az_b) * chunk_az_b
+                # Only set freqB crop bounds if they exist in crop_info
+                if 'rg_start_b' in crop_info:
+                    crop_rg_start_b = (crop_info['rg_start_b'] // chunk_rg_b) * chunk_rg_b
+                    crop_rg_end_b = ((crop_info['rg_end_b'] + chunk_rg_b - 1) // chunk_rg_b) * chunk_rg_b
+
         # Build HDF5 in memory
         mem_buffer = BytesIO()
 
         with h5py.File(mem_buffer, 'w') as h5_mem:
             # 1. Write frequencyA SLC if available
             if has_freq_a:
-                shape = chunk_info['shape']
+                orig_shape = chunk_info['shape']
                 chunk_shape = chunk_info['chunk_shape']
                 dtype = chunk_info['dtype']
                 compression = chunk_info['compression']
                 compression_opts = chunk_info['compression_opts']
-                shuffle = chunk_info.get('shuffle', False)  # Must match for write_direct_chunk
-                min_offset = chunk_info['min_offset']
+                shuffle = chunk_info.get('shuffle', False)
+                min_offset = data_offset_a if data_offset_a is not None else chunk_info['min_offset']
+
+                # Calculate output shape (cropped or full)
+                if crop_info:
+                    out_shape = (min(crop_az_end, orig_shape[0]) - crop_az_start,
+                                 min(crop_rg_end_a, orig_shape[1]) - crop_rg_start_a)
+                else:
+                    out_shape = orig_shape
 
                 dst_slc = h5_mem.create_dataset(
                     f'science/LSAR/RSLC/swaths/frequencyA/{pol}',
-                    shape=shape, dtype=dtype, chunks=chunk_shape,
+                    shape=out_shape, dtype=dtype, chunks=chunk_shape,
                     compression=compression, compression_opts=compression_opts,
                     shuffle=shuffle
                 )
@@ -2965,26 +3382,52 @@ class ASF(progressbar_joblib):
                 chunk_iter = tqdm(chunk_info['chunks'], desc='    Writing freqA SLC', leave=False) if debug else chunk_info['chunks']
                 is_dict = isinstance(downloaded_data, dict)
                 for chunk in chunk_iter:
+                    row, col = chunk['row'], chunk['col']
+                    orig_coord = chunk['coord']  # (row_idx * chunk_az, col_idx * chunk_rg)
+
+                    # Skip chunks outside crop area
+                    if crop_info:
+                        pixel_row = row * chunk_shape[0]
+                        pixel_col = col * chunk_shape[1]
+                        if pixel_row < crop_az_start or pixel_row >= crop_az_end:
+                            continue
+                        if pixel_col < crop_rg_start_a or pixel_col >= crop_rg_end_a:
+                            continue
+                        # Adjust coord for cropped output
+                        new_coord = (pixel_row - crop_az_start, pixel_col - crop_rg_start_a)
+                    else:
+                        new_coord = orig_coord
+
                     if is_dict:
                         chunk_bytes = downloaded_data[chunk['offset']]
                     else:
                         offset_in_data = chunk['offset'] - min_offset
                         chunk_bytes = downloaded_data[offset_in_data:offset_in_data + chunk['size']]
-                    dst_slc.id.write_direct_chunk(chunk['coord'], chunk_bytes)
+                    dst_slc.id.write_direct_chunk(new_coord, chunk_bytes)
 
-            # 2. Write frequencyB SLC if available (ionospheric correction / quick look)
+            # 2. Write frequencyB SLC if available
             if has_freq_b:
-                shape_b = chunk_info_b['shape']
+                orig_shape_b = chunk_info_b['shape']
                 chunk_shape_b = chunk_info_b['chunk_shape']
                 dtype_b = chunk_info_b['dtype']
                 compression_b = chunk_info_b['compression']
                 compression_opts_b = chunk_info_b['compression_opts']
-                shuffle_b = chunk_info_b.get('shuffle', False)  # Must match for write_direct_chunk
-                min_offset_b = chunk_info_b['min_offset']
+                shuffle_b = chunk_info_b.get('shuffle', False)
+                min_offset_b = data_offset_b if data_offset_b is not None else chunk_info_b['min_offset']
+
+                # Calculate output shape (cropped or full)
+                if crop_info:
+                    out_shape_b = (min(crop_az_end, orig_shape_b[0]) - crop_az_start,
+                                   min(crop_rg_end_b, orig_shape_b[1]) - crop_rg_start_b)
+                    # DEBUG
+                    print(f"DEBUG B: orig={orig_shape_b}, crop_az=[{crop_az_start}:{crop_az_end}], crop_rg_b=[{crop_rg_start_b}:{crop_rg_end_b}], out={out_shape_b}")
+                else:
+                    out_shape_b = orig_shape_b
+                    print(f"DEBUG B: NO CROP! crop_info={crop_info}, orig={orig_shape_b}")
 
                 dst_slc_b = h5_mem.create_dataset(
                     f'science/LSAR/RSLC/swaths/frequencyB/{pol}',
-                    shape=shape_b, dtype=dtype_b, chunks=chunk_shape_b,
+                    shape=out_shape_b, dtype=dtype_b, chunks=chunk_shape_b,
                     compression=compression_b, compression_opts=compression_opts_b,
                     shuffle=shuffle_b
                 )
@@ -2992,12 +3435,27 @@ class ASF(progressbar_joblib):
                 chunk_iter_b = tqdm(chunk_info_b['chunks'], desc='    Writing freqB SLC', leave=False) if debug else chunk_info_b['chunks']
                 is_dict_b = isinstance(downloaded_data_b, dict)
                 for chunk in chunk_iter_b:
+                    row, col = chunk['row'], chunk['col']
+                    orig_coord = chunk['coord']
+
+                    # Skip chunks outside crop area
+                    if crop_info:
+                        pixel_row = row * chunk_shape_b[0]
+                        pixel_col = col * chunk_shape_b[1]
+                        if pixel_row < crop_az_start or pixel_row >= crop_az_end:
+                            continue
+                        if pixel_col < crop_rg_start_b or pixel_col >= crop_rg_end_b:
+                            continue
+                        new_coord = (pixel_row - crop_az_start, pixel_col - crop_rg_start_b)
+                    else:
+                        new_coord = orig_coord
+
                     if is_dict_b:
                         chunk_bytes = downloaded_data_b[chunk['offset']]
                     else:
                         offset_in_data = chunk['offset'] - min_offset_b
                         chunk_bytes = downloaded_data_b[offset_in_data:offset_in_data + chunk['size']]
-                    dst_slc_b.id.write_direct_chunk(chunk['coord'], chunk_bytes)
+                    dst_slc_b.id.write_direct_chunk(new_coord, chunk_bytes)
 
             # 3. Write metadata datasets (filter by frequency if needed)
             for ds_path, ds_info in metadata.items():
@@ -3015,9 +3473,28 @@ class ASF(progressbar_joblib):
                 if parent_path and parent_path not in h5_mem:
                     h5_mem.create_group(parent_path)
 
+                # Get data, potentially cropping coordinate arrays
+                data = ds_info['data']
+                if crop_info:
+                    # Crop zeroDopplerTime (shared azimuth coordinate)
+                    if ds_path == 'science/LSAR/RSLC/swaths/zeroDopplerTime':
+                        az_end = min(crop_az_end, len(data)) if crop_az_end else len(data)
+                        data = data[crop_az_start:az_end]
+                    # Crop frequencyA slantRange
+                    elif ds_path == 'science/LSAR/RSLC/swaths/frequencyA/slantRange':
+                        rg_end = min(crop_rg_end_a, len(data)) if crop_rg_end_a else len(data)
+                        data = data[crop_rg_start_a:rg_end]
+                    # Crop frequencyB slantRange
+                    elif ds_path == 'science/LSAR/RSLC/swaths/frequencyB/slantRange':
+                        rg_end = min(crop_rg_end_b, len(data)) if crop_rg_end_b else len(data)
+                        data = data[crop_rg_start_b:rg_end]
+                    # Crop validSamplesSubSwath arrays (azimuth dimension)
+                    elif 'validSamplesSubSwath' in ds_path and len(data.shape) == 2:
+                        az_end = min(crop_az_end, data.shape[0]) if crop_az_end else data.shape[0]
+                        data = data[crop_az_start:az_end, :]
                 # Create dataset with attributes
                 try:
-                    ds = h5_mem.create_dataset(ds_path, data=ds_info['data'])
+                    ds = h5_mem.create_dataset(ds_path, data=data)
                     # Copy dataset attributes (description, units, etc.)
                     if 'attrs' in ds_info:
                         for attr_key, attr_val in ds_info['attrs'].items():
