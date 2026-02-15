@@ -152,7 +152,7 @@ def get_dem_wgs84ellipsoid(dem_path, geometry, buffer_degrees=0.04, netcdf_engin
             lon_idx = np.where((lon_coords >= lon_min) & (lon_coords <= lon_max))[0]
 
             if len(lat_idx) == 0 or len(lon_idx) == 0:
-                nc.close()
+                # Don't close here - finally block will handle it
                 return None
 
             lat_start, lat_end = lat_idx[0], lat_idx[-1] + 1
@@ -394,8 +394,9 @@ def _process_tile_worker(args):
         )
         dem_tile = get_dem_wgs84ellipsoid(dem_path, batch_geom, buffer_degrees=0.01, netcdf_engine=netcdf_engine)
 
-        if dem_tile is None or dem_tile.size == 0:
-            batch_ele = np.zeros(batch_shape, dtype=np.float32)
+        if dem_tile is None or dem_tile.size == 0 or len(dem_tile.lat) < 2 or len(dem_tile.lon) < 2:
+            # DEM tile missing or too small for interpolation - fill with NaN
+            batch_ele = np.full(batch_shape, np.nan, dtype=np.float32)
         else:
             # Interpolate DEM tile using cv2.remap
             dem_lat = dem_tile.lat.values.astype(np.float64)
