@@ -101,7 +101,7 @@ def get_geoid_correction(lat, lon, netcdf_engine='netcdf4'):
 
 
 def get_dem_wgs84ellipsoid(dem_path, geometry, buffer_degrees=0.04, netcdf_engine='netcdf4',
-                           geoid_correction=True):
+                           geoid_correction=True, geoid=None):
     """Load ellipsoid-corrected DEM cropped to geometry bounds.
 
     Reads only the needed tile directly from disk using netCDF4 slicing.
@@ -120,6 +120,9 @@ def get_dem_wgs84ellipsoid(dem_path, geometry, buffer_degrees=0.04, netcdf_engin
     geoid_correction : bool, optional
         Apply geoid correction. Set False for approximate use (e.g., boundary).
         Default is True.
+    geoid : xarray.DataArray, optional
+        Pre-loaded geoid data. If provided and geoid_correction=True, uses this
+        instead of loading geoid from file. For caching across multiple calls.
 
     Returns
     -------
@@ -201,8 +204,10 @@ def get_dem_wgs84ellipsoid(dem_path, geometry, buffer_degrees=0.04, netcdf_engin
 
     if geoid_correction:
         # Apply geoid correction (convert orthometric to ellipsoidal heights)
-        geoid = get_geoid(ortho, netcdf_engine=netcdf_engine)
-        return (ortho + geoid).astype(np.float32)
+        if geoid is None:
+            geoid = get_geoid(netcdf_engine=netcdf_engine)
+        geoid_interp = geoid.interp(lat=ortho.lat, lon=ortho.lon, method='linear')
+        return (ortho + geoid_interp).astype(np.float32)
     else:
         return ortho.astype(np.float32)
 
@@ -298,6 +303,9 @@ def _process_tile_worker(args):
     # Range conversion constants
     range_pixel_size = SOL / (2.0 * rng_samp_rate)
     e2_wgs = (ra**2 - 6356752.31424518**2) / ra**2
+
+    # Load geoid ONCE per tile (not per batch) for DEM correction
+    _geoid = get_geoid(netcdf_engine=netcdf_engine)
 
     # === COMPUTE RADAR BOUNDARY POLYGON (once per tile) ===
     # Forward transform radar edges to geocoded coords, build convex hull
@@ -397,7 +405,8 @@ def _process_tile_worker(args):
             float(np.nanmax(batch_lon)) + buffer_deg,
             float(np.nanmax(batch_lat)) + buffer_deg
         )
-        dem_tile = get_dem_wgs84ellipsoid(dem_path, batch_geom, buffer_degrees=0.01, netcdf_engine=netcdf_engine)
+        dem_tile = get_dem_wgs84ellipsoid(dem_path, batch_geom, buffer_degrees=0.01,
+                                          netcdf_engine=netcdf_engine, geoid=_geoid)
 
         if dem_tile is None or dem_tile.size == 0 or len(dem_tile.lat) < 2 or len(dem_tile.lon) < 2:
             # DEM tile missing or too small for interpolation - fill with NaN
@@ -593,6 +602,9 @@ def _process_topo_worker(args):
     topo_root = zarr.open(topo_store, mode='r+')
     topo_arr = topo_root['topo']
 
+    # Load geoid ONCE per tile (not per batch) for DEM correction
+    _geoid = get_geoid(netcdf_engine=netcdf_engine)
+
     # Process tile in row batches to limit memory
     for ba in range(0, tile_height, row_batch):
         ea = min(ba + row_batch, tile_height)
@@ -623,7 +635,8 @@ def _process_topo_worker(args):
             float(np.nanmax(lon)) + buffer_deg,
             float(np.nanmax(lat)) + buffer_deg
         )
-        dem_chunk = get_dem_wgs84ellipsoid(dem_path, batch_geom, buffer_degrees=0.01, netcdf_engine=netcdf_engine)
+        dem_chunk = get_dem_wgs84ellipsoid(dem_path, batch_geom, buffer_degrees=0.01,
+                                           netcdf_engine=netcdf_engine, geoid=_geoid)
 
         if dem_chunk is None or dem_chunk.size == 0:
             ele = np.zeros(lat.shape, dtype=np.float32).ravel()
@@ -675,12 +688,10 @@ def _process_boundary_worker(args):
     """Worker function for processing a boundary chunk in spawned subprocess.
 
     Must be at module level for multiprocessing spawn to pickle it.
-    Each worker processes one chunk then exits (max_tasks_per_child=1), releasing memory.
 
     Args now contain pre-sliced arrays (chunk_azi, chunk_rng) instead of full arrays.
     """
     import numpy as np
-    import time as _time
     from shapely.geometry import box
 
     # Unpack arguments - chunk_azi and chunk_rng are already sliced
@@ -688,14 +699,12 @@ def _process_boundary_worker(args):
      orbit_time, orbit_pos, orbit_vel, clock_start, prf,
      near_range, rng_samp_rate, earth_radius, epsg, lookdir, netcdf_engine) = args
 
-    _t0 = _time.perf_counter()
     # Fast ellipsoid transform to get approximate lon/lat
     lon_approx, lat_approx, _ = satellite_rat2llt(
         chunk_azi, chunk_rng, orbit_time, orbit_pos, orbit_vel,
         clock_start, prf, near_range, rng_samp_rate, earth_radius,
         dem=None, max_iter=1, tol=1.0, n_chunks=1, lookdir=lookdir
     )
-    _t1 = _time.perf_counter()
 
     # Read narrow DEM chunk from file
     buffer_deg = 0.02
@@ -705,14 +714,12 @@ def _process_boundary_worker(args):
     lon_max = np.nanmax(lon_approx) + buffer_deg
 
     chunk_geom = box(lon_min, lat_min, lon_max, lat_max)
-    # Skip geoid correction for boundary - just need approximate positions for grid bounds
+    # Skip geoid correction for boundary - approximate positions sufficient for grid bounds
     dem_chunk = get_dem_wgs84ellipsoid(dem_path, chunk_geom, buffer_degrees=0.01,
                                        netcdf_engine=netcdf_engine, geoid_correction=False)
-    _t2 = _time.perf_counter()
 
     if dem_chunk is None or dem_chunk.size == 0:
         y_proj, x_proj = proj(lat_approx.ravel(), lon_approx.ravel(), from_epsg=4326, to_epsg=epsg)
-        print(f'PROFILE boundary_worker: n={len(chunk_azi)} approx={_t1-_t0:.3f}s dem={_t2-_t1:.3f}s (no DEM)')
         return np.asarray(y_proj).ravel().astype(np.float32), np.asarray(x_proj).ravel().astype(np.float32)
 
     # Refine with DEM chunk
@@ -721,10 +728,7 @@ def _process_boundary_worker(args):
         clock_start, prf, near_range, rng_samp_rate, earth_radius,
         dem=dem_chunk, max_iter=10, tol=0.5, n_chunks=1, lookdir=lookdir
     )
-    _t3 = _time.perf_counter()
     y_proj, x_proj = proj(lat.ravel(), lon.ravel(), from_epsg=4326, to_epsg=epsg)
-    _t4 = _time.perf_counter()
-    print(f'PROFILE boundary_worker: n={len(chunk_azi)} approx={_t1-_t0:.3f}s dem={_t2-_t1:.3f}s refine={_t3-_t2:.3f}s proj={_t4-_t3:.3f}s')
     return np.asarray(y_proj).ravel().astype(np.float32), np.asarray(x_proj).ravel().astype(np.float32)
 
 
