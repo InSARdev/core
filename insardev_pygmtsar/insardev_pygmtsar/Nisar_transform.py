@@ -697,6 +697,7 @@ class Nisar_transform(Nisar_align):
                   target: str,
                   ref: str,
                   records: pd.DataFrame | None = None,
+                  frequency: str | None = None,
                   epsg: str | int | None = 'auto',
                   resolution: tuple[int, int] = (8, 16),
                   chunk: tuple[int, int] = (8192, 8192),
@@ -724,6 +725,11 @@ class Nisar_transform(Nisar_align):
             The reference scene date (YYYY-MM-DD).
         records : pd.DataFrame, optional
             The records to use. By default, all records are used.
+        frequency : str | None, optional
+            Frequency band to process: 'A' or 'B'.
+            - None: Auto-detect if files have single frequency, error if both present
+            - 'A': Process frequencyA (20MHz, ~7m resolution)
+            - 'B': Process frequencyB (5MHz, ~25m resolution)
         epsg : str|int|None, optional
             The EPSG code to use for the output data. Use 'auto' for automatic.
             Use epsg=0 to disable geocoding and keep radar coordinates.
@@ -782,6 +788,35 @@ class Nisar_transform(Nisar_align):
         if records is None:
             records = self.to_dataframe(ref=ref)
 
+        # Validate and determine frequency to use
+        if frequency is not None:
+            if frequency not in ('A', 'B'):
+                raise ValueError(f"frequency must be 'A', 'B', or None, got '{frequency}'")
+            use_frequency = frequency
+        elif self.frequency is not None:
+            # Use frequency detected during __init__
+            use_frequency = self.frequency
+        else:
+            # Check what frequencies are available in input files
+            import h5py
+            from .utils_nisar import nisar_get_frequencies
+            sample_path = records['path'].iloc[0]
+            available_freqs = nisar_get_frequencies(sample_path)
+            if len(available_freqs) == 1:
+                use_frequency = available_freqs[0]
+            else:
+                raise ValueError(
+                    f"Input files contain both frequencyA and frequencyB.\n"
+                    f"Please specify frequency='A' or frequency='B' parameter:\n"
+                    f"  frequency='A': 20MHz bandwidth (~7m resolution)\n"
+                    f"  frequency='B': 5MHz bandwidth (~25m resolution)"
+                )
+
+        # Store for use in processing (override self.frequency for this transform)
+        original_frequency = self.frequency
+        self.frequency = use_frequency
+        print(f'NOTE: Processing frequency{use_frequency}.')
+
         if epsg == 0:
             print('NOTE: epsg=0, keeping radar coordinates (no geocoding).')
         elif epsg is None:
@@ -805,6 +840,7 @@ class Nisar_transform(Nisar_align):
                 print(f'NOTE: target processing is not completed. Continuing...')
             elif not append:
                 print(f'NOTE: target processing is completed. Skipping...')
+                self.frequency = original_frequency
                 return
         if os.path.exists(metafile):
             os.remove(metafile)
@@ -944,3 +980,6 @@ class Nisar_transform(Nisar_align):
 
         # Consolidate zarr metadata
         self.consolidate_metadata(target)
+
+        # Restore original frequency setting
+        self.frequency = original_frequency
