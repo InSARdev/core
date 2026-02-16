@@ -635,7 +635,7 @@ class PRM(datagrid, PRM_gmtsar):
     # 3 model parameters
     # rank = 3 => nu = size-3
     @staticmethod
-    def robust_trend2d(data: np.ndarray, rank: int) -> np.ndarray:
+    def robust_trend2d(data: np.ndarray, rank: int, debug: bool = False) -> np.ndarray:
         """
         Perform robust linear regression to estimate the trend in 2D data.
 
@@ -681,6 +681,8 @@ class PRM(datagrid, PRM_gmtsar):
         MAD_NORMALIZE = 1.4826
         # significance value
         sig_threshold = 0.51
+        # maximum iterations to prevent infinite loops
+        max_iterations = 100
 
         if rank not in [1,2,3]:
             raise Exception('Number of model parameters "rank" should be 1, 2, or 3')
@@ -716,12 +718,14 @@ class PRM(datagrid, PRM_gmtsar):
 
         chisqs = []
         coeffs = []
+        iteration = 0
         while True:
+            iteration += 1
             # fit linear regression
             mlr.fit(xy, z, sample_weight=w)
 
             r = np.abs(z - mlr.predict(xy))
-            chisq = np.sum((r**2*w))/(z.size-3)    
+            chisq = np.sum((r**2*w))/(z.size-3)
             chisqs.append(chisq)
             k = 1.5 * MAD_NORMALIZE * np.median(r)
             w = np.where(r <= k, 1, (2*k/r) - (k * k/(r**2)))
@@ -732,6 +736,12 @@ class PRM(datagrid, PRM_gmtsar):
 
             #print ('chisq', chisq, 'significant', sig)
             if sig < sig_threshold:
+                if debug:
+                    print(f"    robust_trend2d: converged in {iteration} iterations")
+                break
+            if iteration >= max_iterations:
+                if debug:
+                    print(f"    robust_trend2d: max iterations ({max_iterations}) reached")
                 break
 
         # get the slope and intercept of the line best fit
@@ -741,7 +751,7 @@ class PRM(datagrid, PRM_gmtsar):
     # PRM.fitoffset(3, 3, offset_dat)
     # PRM.fitoffset(3, 3, matrix_fromfile='raw/offset.dat')
     @staticmethod
-    def fitoffset(rank_rng: int, rank_azi: int, matrix: np.ndarray|None=None, matrix_fromfile: str|None=None, SNR: int=20) -> "PRM":
+    def fitoffset(rank_rng: int, rank_azi: int, matrix: np.ndarray|None=None, matrix_fromfile: str|None=None, SNR: int=20, debug: bool=False) -> "PRM":
         """
         Estimates range and azimuth offsets for InSAR (Interferometric Synthetic Aperture Radar) data.
 
@@ -797,8 +807,8 @@ class PRM(datagrid, PRM_gmtsar):
         if rng.shape[0] < 8:
             raise Exception(f'FAILED - not enough points to estimate parameters, try lower SNR ({rng.shape[0]} < 8)')
 
-        rng_coef = PRM.robust_trend2d(rng, rank_rng)
-        azi_coef = PRM.robust_trend2d(azi, rank_azi)
+        rng_coef = PRM.robust_trend2d(rng, rank_rng, debug=debug)
+        azi_coef = PRM.robust_trend2d(azi, rank_azi, debug=debug)
 
         # print MSE (optional)
         #rng_mse = PRM.robust_trend2d_mse(rng, rng_coef, rank_rng)

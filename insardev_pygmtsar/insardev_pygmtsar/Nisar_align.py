@@ -431,9 +431,7 @@ class Nisar_align(Nisar_slc):
         corrections = xcorr_fitoffset(results, nx=nx1, ny=ny1, debug=debug)
 
         if corrections is None:
-            if debug:
-                print("Xcorr fitoffset failed - insufficient valid patches")
-            return None
+            raise RuntimeError("Xcorr fitoffset failed - insufficient valid patches. Scene alignment cannot continue.")
 
         if debug:
             print(f"Xcorr fitoffset result:")
