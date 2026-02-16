@@ -17,6 +17,10 @@ The previous-generation [PyGMTSAR](https://github.com/AlexeyPechnikov/pygmtsar) 
 
 For funded academic, institutional, or professional use of the insardev package, see [insardev/SUBSCRIBE](https://github.com/AlexeyPechnikov/InSARdev/blob/main/insardev/SUBSCRIBE). The BSD-licensed insardev_pygmtsar and insardev_toolkit do not require subscription.
 
+## API Services
+
+The Cache APIs at insar.dev provide fast access to Sentinel-1 data via NASA ASF and Copernicus, and NASA NISAR data. Free for non-commercial use; license required for funded academic, institutional, or professional use. See [insardev/LICENSE](./insardev/LICENSE) for terms.
+
 ## Features
 
 - **Per-burst/swath processing** — each Sentinel-1 TOPS burst and NISAR swaths processed independently on a geocoded grid, no frame stitching required

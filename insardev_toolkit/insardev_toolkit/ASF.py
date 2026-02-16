@@ -237,6 +237,8 @@ class ASF(progressbar_joblib):
         """
         self.username = username
         self.password = password
+        if username is None:
+            print("NOTE: Using insar.dev Cache API. Free for non-commercial use; license required for funded academic, institutional, or professional use.")
 
     def _get_asf_session(self):
         """Get authenticated session for ASF downloads.
@@ -414,11 +416,11 @@ class ASF(progressbar_joblib):
             - None: S1 uses pol from name, NISAR downloads all available
             - 'VV': Download only VV (S1) or 'HH' (NISAR)
             - ['VV', 'VH']: Download both polarizations
-        frequency : str, required for NISAR
-            Which frequency band to download (NISAR stores two frequencies with different resolutions):
-            - 'A': frequencyA (20MHz bandwidth, ~7m range resolution, primary InSAR)
-            - 'B': frequencyB (5MHz bandwidth, ~25m range resolution, 4x less data)
-            To download both frequencies, call download() twice with different output directories.
+        frequency : str or list, required for NISAR
+            Which frequency band(s) to download (NISAR stores two frequencies with different resolutions):
+            - 'A': frequencyA (20MHz bandwidth, ~7m range resolution, ~10GB per scene)
+            - 'B': frequencyB (5MHz bandwidth, ~25m range resolution, ~1.5GB per scene)
+            - ['A', 'B']: Both frequencies in same file (~14GB per scene)
         bbox : tuple or None, optional (NISAR cache proxy only)
             Bounding box in WGS84 coordinates: (west, south, east, north).
             When provided, only downloads aligned blocks covering the bbox.
@@ -480,10 +482,10 @@ class ASF(progressbar_joblib):
         # Require explicit frequency for NISAR to prevent accidental large downloads
         if nisar_granules and frequency is None:
             raise ValueError(
-                "NISAR data requires explicit frequency='A' or 'B' parameter.\n"
-                "  frequency='A': 20MHz bandwidth (~7m range resolution, primary InSAR)\n"
-                "  frequency='B': 5MHz bandwidth (~25m range resolution, 4x smaller)\n"
-                "To download both frequencies, run download() twice with different output directories."
+                "NISAR data requires explicit frequency parameter:\n"
+                "  frequency='B': 5MHz bandwidth (~25m res, ~1.5GB) - recommended for quick look\n"
+                "  frequency='A': 20MHz bandwidth (~7m res, ~10GB) - full resolution InSAR\n"
+                "  frequency=['A','B']: Both frequencies in same file (~14GB)"
             )
 
         # Check if any downloads needed BEFORE creating session (avoid network call)
@@ -1529,14 +1531,13 @@ class ASF(progressbar_joblib):
                     print(f"WARNING: Polarizations {missing} not available in {granule_id}")
 
             # Update frequency download flags based on actual availability
-            download_freq_a = frequency is None or frequency == 'A'
-            download_freq_b = (frequency is None or frequency == 'B') and has_freq_b
+            # Normalize frequency to list for consistent checking
+            freq_list = [frequency] if isinstance(frequency, str) else frequency
+            download_freq_a = 'A' in freq_list
+            download_freq_b = 'B' in freq_list and has_freq_b
 
             if debug and position is None:
-                if frequency is None:
-                    freq_str = 'A+B' if has_freq_b else 'A'
-                else:
-                    freq_str = frequency
+                freq_str = '+'.join(f for f in freq_list if f == 'A' or (f == 'B' and has_freq_b))
                 print(f"NISAR {track}_{frame}: downloading {pols_to_download} (frequency{freq_str})")
 
             if layout != 'A':
@@ -2332,9 +2333,10 @@ class ASF(progressbar_joblib):
                     if missing:
                         print(f"WARNING: Polarizations {missing} not available")
 
-                # Frequency flags
-                download_freq_a = frequency is None or frequency == 'A'
-                download_freq_b = (frequency is None or frequency == 'B') and has_freq_b
+                # Frequency flags - normalize to list for consistent checking
+                freq_list = [frequency] if isinstance(frequency, str) else frequency
+                download_freq_a = 'A' in freq_list
+                download_freq_b = 'B' in freq_list and has_freq_b
 
                 # Get chunk info for all pols
                 all_chunk_info = {}
@@ -2527,8 +2529,10 @@ class ASF(progressbar_joblib):
                 pols = [p for p in (polarizations or avail_pols) if p in avail_pols]
                 has_freq_b = 'frequencyB' in swaths
                 freq_b_pols = [k for k in swaths['frequencyB'].keys() if k in ['HH','HV','VH','VV']] if has_freq_b else []
-                dl_a = frequency is None or frequency == 'A'
-                dl_b = (frequency is None or frequency == 'B') and has_freq_b
+                # Normalize frequency to list for consistent checking
+                freq_list = [frequency] if isinstance(frequency, str) else frequency
+                dl_a = 'A' in freq_list
+                dl_b = 'B' in freq_list and has_freq_b
 
                 # Pre-collect chunk info for all pols while h5 is open
                 all_chunk_info = {}

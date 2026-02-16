@@ -324,6 +324,8 @@ class CDSE(progressbar_joblib):
         self.password = password
         self._session = None
         self._token_time = None
+        if username is None:
+            print("NOTE: Using insar.dev Cache API. Free for non-commercial use; license required for funded academic, institutional, or professional use.")
 
     @staticmethod
     def _normalize_polarization(polarization):

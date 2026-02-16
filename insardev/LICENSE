@@ -235,3 +235,23 @@ Not permitted without written permission:
   - Commercial redistribution
 
   Contact: alexey@pechnikov.dev
+
+---
+
+API SERVICES
+
+The Cache APIs at insar.dev (Sentinel-1 via NASA ASF and Copernicus, and NASA
+NISAR) are subject to the same licensing terms as the insardev library.
+
+Free for non-commercial use:
+  - Personal learning and self-education
+  - Unfunded academic coursework, thesis, or dissertation work
+  - Hobby projects with no commercial intent
+  - Teaching and classroom instruction
+
+License required for funded academic, institutional, or professional use:
+  - Grant-funded, institutional, or government-funded research
+  - Business, consulting, or professional services
+  - Corporate or organizational projects
+
+For licensing, contact: alexey@pechnikov.dev
