@@ -1835,10 +1835,11 @@ class ASF(progressbar_joblib):
         def chunks_to_bbox_blocks(chunk_info, az_chunk_start, az_chunk_end, rg_chunk_start, rg_chunk_end):
             """Create optimized blocks for bbox download - only exact chunks needed.
 
-            Groups chunks into ~10MB blocks for efficient HTTP requests while
+            Groups chunks into ~64MB blocks for efficient HTTP requests while
             downloading only the chunks that cover the bbox area.
+            Worker handles defragmentation (merging with 16MB gap threshold).
 
-            Returns list of dicts with 'chunks' (merged regions) and 'raw_chunks'.
+            Returns list of dicts with 'chunks' (raw chunk offsets) and 'total_size'.
             """
             if not chunk_info:
                 return []
@@ -1857,18 +1858,15 @@ class ASF(progressbar_joblib):
             if not raw_chunks:
                 return []
 
-            # Merge into regions with 1MB gap threshold
-            merged_regions = ASF._nisar_merge_chunks_to_regions(raw_chunks, gap_threshold=1024*1024)
-            regions = [(r[0], r[1]) for r in merged_regions]
-            total_size = sum(size for _, size in regions)
+            # Pass raw chunks directly - worker handles defragmentation
+            total_size = sum(size for _, size in raw_chunks)
 
             # Return as single block (or split if too large)
             if total_size <= MAX_MULTI_BLOCK:
                 return [{
                     'az_block': 0,
                     'rg_block': 0,
-                    'chunks': regions,
-                    'raw_chunks': raw_chunks,
+                    'chunks': raw_chunks,
                     'total_size': total_size
                 }]
             else:
@@ -1889,13 +1887,11 @@ class ASF(progressbar_joblib):
                     row_size = sum(s for _, s in row_chunks)
                     if current_size + row_size > BLOCK_TARGET and current_chunks:
                         # Flush current block
-                        merged = ASF._nisar_merge_chunks_to_regions(current_chunks, gap_threshold=1024*1024)
                         blocks.append({
                             'az_block': len(blocks),
                             'rg_block': 0,
-                            'chunks': [(r[0], r[1]) for r in merged],
-                            'raw_chunks': current_chunks,
-                            'total_size': sum(r[1] for r in merged)
+                            'chunks': current_chunks,
+                            'total_size': current_size
                         })
                         current_chunks = []
                         current_size = 0
@@ -1905,13 +1901,11 @@ class ASF(progressbar_joblib):
 
                 # Flush remaining
                 if current_chunks:
-                    merged = ASF._nisar_merge_chunks_to_regions(current_chunks, gap_threshold=1024*1024)
                     blocks.append({
                         'az_block': len(blocks),
                         'rg_block': 0,
-                        'chunks': [(r[0], r[1]) for r in merged],
-                        'raw_chunks': current_chunks,
-                        'total_size': sum(r[1] for r in merged)
+                        'chunks': current_chunks,
+                        'total_size': current_size
                     })
 
                 return blocks
@@ -1982,17 +1976,12 @@ class ASF(progressbar_joblib):
                                 raw_chunks.append((c['offset'], c['size']))
 
                     if raw_chunks:
-                        # Use shared helper to merge chunks with 1MB gap threshold
-                        merged_regions = ASF._nisar_merge_chunks_to_regions(raw_chunks, gap_threshold=1024*1024)
-                        # Convert to (offset, size) tuples without chunk list
-                        regions = [(r[0], r[1]) for r in merged_regions]
-
-                        total_size = sum(size for _, size in regions)
+                        # Pass raw chunks directly - worker handles defragmentation
+                        total_size = sum(size for _, size in raw_chunks)
                         aligned_blocks.append({
                             'az_block': ab,
                             'rg_block': rb,
-                            'chunks': regions,  # Merged regions as (offset, size) tuples
-                            'raw_chunks': raw_chunks,  # Keep original for extraction
+                            'chunks': raw_chunks,  # Raw chunks - worker merges with 16MB gap
                             'total_size': total_size
                         })
 
@@ -2201,14 +2190,13 @@ class ASF(progressbar_joblib):
             chunk_data = {}
 
             for block in aligned_blocks:
-                regions = block['chunks']  # Merged continuous regions (offset, size)
-                raw_chunks = block['raw_chunks']  # Original HDF5 chunks for extraction
+                chunks = block['chunks']  # Raw chunks (offset, size) - worker handles defragmentation
                 total_size = block['total_size']
 
                 # Try multi-offset API if block is in valid size range
                 if total_size <= MAX_MULTI_BLOCK:
-                    data, cache_hit, region_offsets = fetch_aligned_block(
-                        granule_id, regions, session=sess
+                    data, cache_hit, chunk_offsets = fetch_aligned_block(
+                        granule_id, chunks, session=sess
                     )
 
                     if data is not None:
@@ -2220,21 +2208,13 @@ class ASF(progressbar_joblib):
                             cache_stats['misses'] += 1
                             cache_stats['bytes_miss'] += total_size
                             if debug:
-                                n_regions = len(regions)
                                 print(f"    MISS: aligned block ({block['az_block']},{block['rg_block']}) "
-                                      f"{total_size/(1024**2):.0f}MB ({n_regions} regions)")
+                                      f"{total_size/(1024**2):.0f}MB ({len(chunks)} chunks)")
 
-                        # Extract individual HDF5 chunks from concatenated region data
-                        for chunk_off, chunk_size in raw_chunks:
-                            # Find which region contains this chunk
-                            for region_off, region_size in regions:
-                                region_end = region_off + region_size
-                                if region_off <= chunk_off < region_end:
-                                    # Calculate position in concatenated data
-                                    region_pos, _ = region_offsets[region_off]
-                                    chunk_pos = region_pos + (chunk_off - region_off)
-                                    chunk_data[chunk_off] = data[chunk_pos:chunk_pos + chunk_size]
-                                    break
+                        # Extract individual chunks - worker returns them concatenated in order
+                        for chunk_off, chunk_size in chunks:
+                            pos, _ = chunk_offsets[chunk_off]
+                            chunk_data[chunk_off] = data[pos:pos + chunk_size]
 
                         if pbar:
                             pbar.update(total_size)
@@ -2243,11 +2223,11 @@ class ASF(progressbar_joblib):
 
                         continue
 
-                # Fallback: block exceeds MAX_MULTI_BLOCK - should not happen with proper aligned blocks
-                # Log warning and skip (better than making huge requests)
-                if regions and debug:
-                    print(f"    WARNING: skipping block ({block['az_block']},{block['rg_block']}) "
-                          f"size={total_size/(1024**2):.1f}MB outside range")
+                # Block exceeds MAX_MULTI_BLOCK - code bug, should not happen with proper aligned blocks
+                raise RuntimeError(
+                    f"Block ({block['az_block']},{block['rg_block']}) size={total_size/(1024**2):.1f}MB "
+                    f"exceeds MAX_MULTI_BLOCK={MAX_MULTI_BLOCK/(1024**2):.0f}MB - this is a code issue"
+                )
 
             return chunk_data
 
@@ -2579,9 +2559,9 @@ class ASF(progressbar_joblib):
                         for block in chunks_to_bbox_blocks(ci_a, az_start, az_end, rg_start, rg_end):
                             if block['total_size'] <= MAX_MULTI_BLOCK:
                                 offsets_str = ','.join(f"{off}_{size}" for off, size in block['chunks'])
-                                blocks_to_download.append((offsets_str, block['total_size'], block['chunks'], block['raw_chunks']))
+                                blocks_to_download.append((offsets_str, block['total_size'], block['chunks']))
                             else:
-                                small_chunks_to_download.extend(block['raw_chunks'])
+                                small_chunks_to_download.extend(block['chunks'])
 
                     if ci_b:
                         rg_start = bbox_info.get('rg_chunk_start_b', 0)
@@ -2589,26 +2569,26 @@ class ASF(progressbar_joblib):
                         for block in chunks_to_bbox_blocks(ci_b, az_start, az_end, rg_start, rg_end):
                             if block['total_size'] <= MAX_MULTI_BLOCK:
                                 offsets_str = ','.join(f"{off}_{size}" for off, size in block['chunks'])
-                                blocks_to_download.append((offsets_str, block['total_size'], block['chunks'], block['raw_chunks']))
+                                blocks_to_download.append((offsets_str, block['total_size'], block['chunks']))
                             else:
-                                small_chunks_to_download.extend(block['raw_chunks'])
+                                small_chunks_to_download.extend(block['chunks'])
                 else:
                     # Full download: use cache-aligned blocks
                     if ci_a:
                         for block in chunks_to_aligned_blocks(ci_a):
                             if block['total_size'] <= MAX_MULTI_BLOCK:
                                 offsets_str = ','.join(f"{off}_{size}" for off, size in block['chunks'])
-                                blocks_to_download.append((offsets_str, block['total_size'], block['chunks'], block['raw_chunks']))
+                                blocks_to_download.append((offsets_str, block['total_size'], block['chunks']))
                             else:
-                                small_chunks_to_download.extend(block['raw_chunks'])
+                                small_chunks_to_download.extend(block['chunks'])
 
                     if ci_b:
                         for block in chunks_to_aligned_blocks(ci_b):
                             if block['total_size'] <= MAX_MULTI_BLOCK:
                                 offsets_str = ','.join(f"{off}_{size}" for off, size in block['chunks'])
-                                blocks_to_download.append((offsets_str, block['total_size'], block['chunks'], block['raw_chunks']))
+                                blocks_to_download.append((offsets_str, block['total_size'], block['chunks']))
                             else:
-                                small_chunks_to_download.extend(block['raw_chunks'])
+                                small_chunks_to_download.extend(block['chunks'])
 
                 # Debug: show block stats for this pol
                 if debug and blocks_to_download:
@@ -2630,29 +2610,20 @@ class ASF(progressbar_joblib):
                     if blocks_to_download:
                         results = joblib.Parallel(n_jobs=effective_n_jobs, backend=backend, return_as='generator')(
                             joblib.delayed(download_aligned_block)(gid, offsets_str, total_sz)
-                            for offsets_str, total_sz, _, _ in blocks_to_download
+                            for offsets_str, total_sz, _ in blocks_to_download
                         )
-                        for (offsets_str, total_sz, regions, raw_chunks), (_, data, cache_hit) in zip(blocks_to_download, results):
+                        for (offsets_str, total_sz, chunks), (_, data, cache_hit) in zip(blocks_to_download, results):
                             if cache_hit:
                                 cache_hits += 1
                             else:
                                 cache_misses += 1
                             pbar.update(total_sz)
                             pbar.set_postfix_str(f"H{cache_hits}M{cache_misses}")
-                            # Build region offset map: region_start -> position in data
-                            region_map = {}
+                            # Extract chunks - worker returns them concatenated in order
                             pos = 0
-                            for region_off, region_size in regions:
-                                region_map[region_off] = pos
-                                pos += region_size
-                            # Extract individual HDF5 chunks from regions
-                            for chunk_off, chunk_size in raw_chunks:
-                                for region_off, region_size in regions:
-                                    if region_off <= chunk_off < region_off + region_size:
-                                        region_pos = region_map[region_off]
-                                        chunk_pos = region_pos + (chunk_off - region_off)
-                                        block_data[chunk_off] = data[chunk_pos:chunk_pos + chunk_size]
-                                        break
+                            for chunk_off, chunk_size in chunks:
+                                block_data[chunk_off] = data[pos:pos + chunk_size]
+                                pos += chunk_size
 
                     # Download small chunks via single-block API
                     if small_chunks_to_download:
