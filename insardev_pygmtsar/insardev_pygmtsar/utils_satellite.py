@@ -100,7 +100,8 @@ def get_geoid_correction(lat, lon, netcdf_engine='netcdf4'):
     return result.reshape(lat.shape) if lat.ndim > 0 else result
 
 
-def get_dem_wgs84ellipsoid(dem_path, geometry, buffer_degrees=0.04, netcdf_engine='netcdf4'):
+def get_dem_wgs84ellipsoid(dem_path, geometry, buffer_degrees=0.04, netcdf_engine='netcdf4',
+                           geoid_correction=True):
     """Load ellipsoid-corrected DEM cropped to geometry bounds.
 
     Reads only the needed tile directly from disk using netCDF4 slicing.
@@ -116,6 +117,9 @@ def get_dem_wgs84ellipsoid(dem_path, geometry, buffer_degrees=0.04, netcdf_engin
         Buffer around geometry bounds in degrees. Default is 0.04.
     netcdf_engine : str, optional
         NetCDF engine to use: 'netcdf4' or 'h5netcdf'. Default is 'netcdf4'.
+    geoid_correction : bool, optional
+        Apply geoid correction. Set False for approximate use (e.g., boundary).
+        Default is True.
 
     Returns
     -------
@@ -195,11 +199,12 @@ def get_dem_wgs84ellipsoid(dem_path, geometry, buffer_degrees=0.04, netcdf_engin
     if ortho is None or ortho.size == 0:
         return None
 
-    # Apply geoid correction (convert orthometric to ellipsoidal heights)
-    geoid = get_geoid(ortho, netcdf_engine=netcdf_engine)
-    dem_ellipsoid = ortho + geoid
-
-    return dem_ellipsoid.astype(np.float32)
+    if geoid_correction:
+        # Apply geoid correction (convert orthometric to ellipsoidal heights)
+        geoid = get_geoid(ortho, netcdf_engine=netcdf_engine)
+        return (ortho + geoid).astype(np.float32)
+    else:
+        return ortho.astype(np.float32)
 
 
 def _process_tile_worker(args):
@@ -675,6 +680,7 @@ def _process_boundary_worker(args):
     Args now contain pre-sliced arrays (chunk_azi, chunk_rng) instead of full arrays.
     """
     import numpy as np
+    import time as _time
     from shapely.geometry import box
 
     # Unpack arguments - chunk_azi and chunk_rng are already sliced
@@ -682,12 +688,14 @@ def _process_boundary_worker(args):
      orbit_time, orbit_pos, orbit_vel, clock_start, prf,
      near_range, rng_samp_rate, earth_radius, epsg, lookdir, netcdf_engine) = args
 
+    _t0 = _time.perf_counter()
     # Fast ellipsoid transform to get approximate lon/lat
     lon_approx, lat_approx, _ = satellite_rat2llt(
         chunk_azi, chunk_rng, orbit_time, orbit_pos, orbit_vel,
         clock_start, prf, near_range, rng_samp_rate, earth_radius,
         dem=None, max_iter=1, tol=1.0, n_chunks=1, lookdir=lookdir
     )
+    _t1 = _time.perf_counter()
 
     # Read narrow DEM chunk from file
     buffer_deg = 0.02
@@ -697,10 +705,14 @@ def _process_boundary_worker(args):
     lon_max = np.nanmax(lon_approx) + buffer_deg
 
     chunk_geom = box(lon_min, lat_min, lon_max, lat_max)
-    dem_chunk = get_dem_wgs84ellipsoid(dem_path, chunk_geom, buffer_degrees=0.01, netcdf_engine=netcdf_engine)
+    # Skip geoid correction for boundary - just need approximate positions for grid bounds
+    dem_chunk = get_dem_wgs84ellipsoid(dem_path, chunk_geom, buffer_degrees=0.01,
+                                       netcdf_engine=netcdf_engine, geoid_correction=False)
+    _t2 = _time.perf_counter()
 
     if dem_chunk is None or dem_chunk.size == 0:
         y_proj, x_proj = proj(lat_approx.ravel(), lon_approx.ravel(), from_epsg=4326, to_epsg=epsg)
+        print(f'PROFILE boundary_worker: n={len(chunk_azi)} approx={_t1-_t0:.3f}s dem={_t2-_t1:.3f}s (no DEM)')
         return np.asarray(y_proj).ravel().astype(np.float32), np.asarray(x_proj).ravel().astype(np.float32)
 
     # Refine with DEM chunk
@@ -709,7 +721,10 @@ def _process_boundary_worker(args):
         clock_start, prf, near_range, rng_samp_rate, earth_radius,
         dem=dem_chunk, max_iter=10, tol=0.5, n_chunks=1, lookdir=lookdir
     )
+    _t3 = _time.perf_counter()
     y_proj, x_proj = proj(lat.ravel(), lon.ravel(), from_epsg=4326, to_epsg=epsg)
+    _t4 = _time.perf_counter()
+    print(f'PROFILE boundary_worker: n={len(chunk_azi)} approx={_t1-_t0:.3f}s dem={_t2-_t1:.3f}s refine={_t3-_t2:.3f}s proj={_t4-_t3:.3f}s')
     return np.asarray(y_proj).ravel().astype(np.float32), np.asarray(x_proj).ravel().astype(np.float32)
 
 
@@ -3479,58 +3494,44 @@ def compute_conversion_chunked(prm, dem_path, geometry, outdir,
     # Workers read DEM chunks directly from file - NO full DEM in memory
     t0 = time.perf_counter()
 
-    # Boundary task definitions (just indices, no data)
-    # line_type: 0=first_row, 1=last_row, 2=first_col, 3=last_col
-    bnd_chunk_size = 1000
-    tasks = []
-    # First row: azi=0, rng varies
-    for start in range(0, n_rng, bnd_chunk_size):
-        tasks.append((0, start, min(start + bnd_chunk_size, n_rng)))
-    # Last row: azi=n_azi-1, rng varies
-    for start in range(0, n_rng, bnd_chunk_size):
-        tasks.append((1, start, min(start + bnd_chunk_size, n_rng)))
-    # First col: azi varies, rng=0
-    for start in range(0, n_azi, bnd_chunk_size):
-        tasks.append((2, start, min(start + bnd_chunk_size, n_azi)))
-    # Last col: azi varies, rng=n_rng-1
-    for start in range(0, n_azi, bnd_chunk_size):
-        tasks.append((3, start, min(start + bnd_chunk_size, n_azi)))
-
-    # Build worker arguments with PRE-SLICED arrays (not full arrays)
-    # This prevents massive memory duplication when pickling for spawn workers
+    # 4 boundary edges: first_row, last_row, first_col, last_col
     worker_args = []
-    n_bnd = 0
-    for line_type, start, end in tasks:
-        n_bnd += end - start
-        # Pre-slice based on line_type - pass only what each worker needs
-        if line_type == 0:  # first row: azi=const, rng varies
-            chunk_azi = np.full(end - start, azi_coords[0], dtype=np.float32)
-            chunk_rng = rng_coords[start:end].astype(np.float32)
-        elif line_type == 1:  # last row: azi=const, rng varies
-            chunk_azi = np.full(end - start, azi_coords[-1], dtype=np.float32)
-            chunk_rng = rng_coords[start:end].astype(np.float32)
-        elif line_type == 2:  # first col: azi varies, rng=const
-            chunk_azi = azi_coords[start:end].astype(np.float32)
-            chunk_rng = np.full(end - start, rng_coords[0], dtype=np.float32)
-        else:  # last col: azi varies, rng=const
-            chunk_azi = azi_coords[start:end].astype(np.float32)
-            chunk_rng = np.full(end - start, rng_coords[-1], dtype=np.float32)
+    # First row: azi=0, rng varies
+    worker_args.append((
+        np.full(n_rng, azi_coords[0], dtype=np.float32),
+        rng_coords.astype(np.float32),
+        dem_path, orbit_time, orbit_pos, orbit_vel, clock_start, prf,
+        near_range, rng_samp_rate, earth_radius, epsg, lookdir, netcdf_engine
+    ))
+    # Last row: azi=n_azi-1, rng varies
+    worker_args.append((
+        np.full(n_rng, azi_coords[-1], dtype=np.float32),
+        rng_coords.astype(np.float32),
+        dem_path, orbit_time, orbit_pos, orbit_vel, clock_start, prf,
+        near_range, rng_samp_rate, earth_radius, epsg, lookdir, netcdf_engine
+    ))
+    # First col: azi varies, rng=0
+    worker_args.append((
+        azi_coords.astype(np.float32),
+        np.full(n_azi, rng_coords[0], dtype=np.float32),
+        dem_path, orbit_time, orbit_pos, orbit_vel, clock_start, prf,
+        near_range, rng_samp_rate, earth_radius, epsg, lookdir, netcdf_engine
+    ))
+    # Last col: azi varies, rng=n_rng-1
+    worker_args.append((
+        azi_coords.astype(np.float32),
+        np.full(n_azi, rng_coords[-1], dtype=np.float32),
+        dem_path, orbit_time, orbit_pos, orbit_vel, clock_start, prf,
+        near_range, rng_samp_rate, earth_radius, epsg, lookdir, netcdf_engine
+    ))
+    n_bnd = 2 * n_rng + 2 * n_azi
 
-        worker_args.append((
-            chunk_azi, chunk_rng, dem_path,
-            orbit_time, orbit_pos, orbit_vel, clock_start, prf,
-            near_range, rng_samp_rate, earth_radius, epsg, lookdir, netcdf_engine
-        ))
-    del tasks
-
-    # Parallel execution using subprocess pool with memory isolation
-    # Each worker processes one chunk then exits (max_tasks_per_child=1), releasing memory
+    # Parallel execution - reuse workers (boundary tasks are small)
     import multiprocessing as mp
     from concurrent.futures import ProcessPoolExecutor
 
     _t0_bnd = time.perf_counter()
-    with ProcessPoolExecutor(max_workers=n_jobs, mp_context=mp.get_context('spawn'),
-                             max_tasks_per_child=1) as executor:
+    with ProcessPoolExecutor(max_workers=n_jobs, mp_context=mp.get_context('spawn')) as executor:
         results = list(executor.map(_process_boundary_worker, worker_args))
     if debug:
         print(f'PROFILE: boundary ProcessPoolExecutor ({len(worker_args)} tasks, {n_jobs} workers) {time.perf_counter() - _t0_bnd:.3f}s')
