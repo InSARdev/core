@@ -331,9 +331,12 @@ def _transform_slc_int16_nisar_chunked(outdir, conversion_dir, prm_rep, prm_ref,
     import multiprocessing as mp
     from concurrent.futures import ProcessPoolExecutor
 
+    _t0_chunks = time.perf_counter()
     with ProcessPoolExecutor(max_workers=n_jobs, mp_context=mp.get_context('spawn'),
                              max_tasks_per_child=1) as executor:
         list(executor.map(_process_chunk_nisar_worker, chunk_args))
+    if debug:
+        print(f'PROFILE: SLC ProcessPoolExecutor ({n_chunks} chunks, {n_jobs} workers) {time.perf_counter() - _t0_chunks:.3f}s')
 
     del chunk_args
 

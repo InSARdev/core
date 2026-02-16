@@ -1770,6 +1770,76 @@ def satellite_baseline(orbit_df1: "pd.DataFrame", orbit_df2: "pd.DataFrame",
     }
 
 
+def _satellite_llt2rat_chunk_worker(args):
+    """Worker function for parallel satellite_llt2rat chunk processing.
+
+    Must be at module level for joblib pickling.
+    """
+    (chunk_xp, chunk_yp, chunk_zp, orb_x, orb_y, orb_z, orb_vx, orb_vy, orb_vz, npad, n_azi) = args
+
+    n_chunk = len(chunk_xp)
+
+    # Compute Doppler at a few sample points to bracket zero
+    sample_step = max(1, n_azi // 20)  # ~20 samples
+    sample_idx = np.arange(0, n_azi, sample_step)
+
+    # Compute Doppler at sample points: (T - S) · V
+    doppler_samples = np.zeros((n_chunk, len(sample_idx)), dtype=np.float32)
+    for j, idx in enumerate(sample_idx):
+        dx = chunk_xp - orb_x[idx]
+        dy = chunk_yp - orb_y[idx]
+        dz = chunk_zp - orb_z[idx]
+        doppler_samples[:, j] = dx * orb_vx[idx] + dy * orb_vy[idx] + dz * orb_vz[idx]
+
+    # Find sign change (zero crossing) for each target
+    sign_change = doppler_samples[:, :-1] * doppler_samples[:, 1:] < 0
+    first_crossing = np.argmax(sign_change, axis=1)
+    # Handle case where no crossing found (use minimum absolute Doppler)
+    no_crossing = ~np.any(sign_change, axis=1)
+    first_crossing[no_crossing] = np.argmin(np.abs(doppler_samples[no_crossing]), axis=1)
+
+    # Get bracket indices in original azi_times
+    bracket_lo = sample_idx[first_crossing]
+    bracket_hi = np.minimum(sample_idx[np.minimum(first_crossing + 1, len(sample_idx) - 1)], n_azi - 1)
+
+    # Refine within bracket using linear interpolation on Doppler
+    dx_lo = chunk_xp - orb_x[bracket_lo]
+    dy_lo = chunk_yp - orb_y[bracket_lo]
+    dz_lo = chunk_zp - orb_z[bracket_lo]
+    doppler_lo = dx_lo * orb_vx[bracket_lo] + dy_lo * orb_vy[bracket_lo] + dz_lo * orb_vz[bracket_lo]
+
+    dx_hi = chunk_xp - orb_x[bracket_hi]
+    dy_hi = chunk_yp - orb_y[bracket_hi]
+    dz_hi = chunk_zp - orb_z[bracket_hi]
+    doppler_hi = dx_hi * orb_vx[bracket_hi] + dy_hi * orb_vy[bracket_hi] + dz_hi * orb_vz[bracket_hi]
+    del dx_lo, dy_lo, dz_lo, dx_hi, dy_hi, dz_hi
+
+    # Linear interpolation to find zero crossing
+    denom = doppler_lo - doppler_hi
+    denom = np.where(np.abs(denom) < 1e-10, 1e-10, denom)
+    alpha = doppler_lo / denom
+    alpha = np.clip(alpha, 0, 1)
+
+    # Interpolated azimuth index (relative to azi_times array)
+    azi_idx_float = bracket_lo + alpha * (bracket_hi - bracket_lo)
+
+    # Convert to azimuth pixel (relative to image start)
+    chunk_azimuth_pix = azi_idx_float - npad  # subtract padding offset
+
+    # Compute slant range at zero-Doppler time
+    azi_idx_int = np.floor(azi_idx_float).astype(np.int32)
+    azi_idx_int = np.clip(azi_idx_int, 0, n_azi - 2)
+    azi_frac = azi_idx_float - azi_idx_int
+
+    sat_x = orb_x[azi_idx_int] * (1 - azi_frac) + orb_x[azi_idx_int + 1] * azi_frac
+    sat_y = orb_y[azi_idx_int] * (1 - azi_frac) + orb_y[azi_idx_int + 1] * azi_frac
+    sat_z = orb_z[azi_idx_int] * (1 - azi_frac) + orb_z[azi_idx_int + 1] * azi_frac
+
+    chunk_range_m = np.sqrt((chunk_xp - sat_x)**2 + (chunk_yp - sat_y)**2 + (chunk_zp - sat_z)**2)
+
+    return chunk_azimuth_pix, chunk_range_m
+
+
 def satellite_llt2rat(lon: np.ndarray, lat: np.ndarray, elevation: np.ndarray,
                       orbit_df: "pd.DataFrame",
                       clock_start: float,
@@ -1926,79 +1996,30 @@ def satellite_llt2rat(lon: np.ndarray, lat: np.ndarray, elevation: np.ndarray,
     # This is O(n_points × n_azi) but with vectorized operations
     n_azi = len(azi_times)
 
-    # Process in chunks to manage memory
-    chunk_size = 10000
-    azimuth_pix = np.zeros(n_points, dtype=np.float64)
-    range_m = np.zeros(n_points, dtype=np.float64)
+    # Process in chunks with parallel execution using joblib
+    import os
+    from joblib import Parallel, delayed
 
+    chunk_size = 1000000  # 1M points per chunk (~160 MB per worker)
+    n_jobs = os.cpu_count()
+
+    # Build chunk arguments
+    chunk_args = []
     for i in range(0, n_points, chunk_size):
         end = min(i + chunk_size, n_points)
-        chunk_xp = xp[i:end]
-        chunk_yp = yp[i:end]
-        chunk_zp = zp[i:end]
-        n_chunk = end - i
+        chunk_args.append((
+            xp[i:end].copy(), yp[i:end].copy(), zp[i:end].copy(),
+            orb_x, orb_y, orb_z, orb_vx, orb_vy, orb_vz, npad, n_azi
+        ))
 
-        # Compute Doppler at a few sample points to bracket zero
-        # Use coarse sampling first, then refine
-        sample_step = max(1, n_azi // 20)  # ~20 samples
-        sample_idx = np.arange(0, n_azi, sample_step)
+    # Parallel chunk processing
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(_satellite_llt2rat_chunk_worker)(args) for args in chunk_args
+    )
 
-        # Compute Doppler at sample points: (T - S) · V
-        doppler_samples = np.zeros((n_chunk, len(sample_idx)), dtype=np.float32)
-        for j, idx in enumerate(sample_idx):
-            dx = chunk_xp - orb_x[idx]
-            dy = chunk_yp - orb_y[idx]
-            dz = chunk_zp - orb_z[idx]
-            doppler_samples[:, j] = dx * orb_vx[idx] + dy * orb_vy[idx] + dz * orb_vz[idx]
-
-        # Find sign change (zero crossing) for each target
-        # Doppler typically goes from positive to negative (descending) or vice versa
-        sign_change = doppler_samples[:, :-1] * doppler_samples[:, 1:] < 0
-        first_crossing = np.argmax(sign_change, axis=1)
-        # Handle case where no crossing found (use minimum absolute Doppler)
-        no_crossing = ~np.any(sign_change, axis=1)
-        first_crossing[no_crossing] = np.argmin(np.abs(doppler_samples[no_crossing]), axis=1)
-
-        # Get bracket indices in original azi_times
-        bracket_lo = sample_idx[first_crossing]
-        bracket_hi = np.minimum(sample_idx[np.minimum(first_crossing + 1, len(sample_idx) - 1)], n_azi - 1)
-
-        # Refine within bracket using linear interpolation on Doppler
-        # Compute exact Doppler at bracket bounds - VECTORIZED (no Python loop!)
-        dx_lo = chunk_xp - orb_x[bracket_lo]
-        dy_lo = chunk_yp - orb_y[bracket_lo]
-        dz_lo = chunk_zp - orb_z[bracket_lo]
-        doppler_lo = dx_lo * orb_vx[bracket_lo] + dy_lo * orb_vy[bracket_lo] + dz_lo * orb_vz[bracket_lo]
-
-        dx_hi = chunk_xp - orb_x[bracket_hi]
-        dy_hi = chunk_yp - orb_y[bracket_hi]
-        dz_hi = chunk_zp - orb_z[bracket_hi]
-        doppler_hi = dx_hi * orb_vx[bracket_hi] + dy_hi * orb_vy[bracket_hi] + dz_hi * orb_vz[bracket_hi]
-        del dx_lo, dy_lo, dz_lo, dx_hi, dy_hi, dz_hi
-
-        # Linear interpolation to find zero crossing
-        denom = doppler_lo - doppler_hi
-        denom = np.where(np.abs(denom) < 1e-10, 1e-10, denom)
-        alpha = doppler_lo / denom
-        alpha = np.clip(alpha, 0, 1)
-
-        # Interpolated azimuth index (relative to azi_times array)
-        azi_idx_float = bracket_lo + alpha * (bracket_hi - bracket_lo)
-
-        # Convert to azimuth pixel (relative to image start)
-        azimuth_pix[i:end] = azi_idx_float - npad  # subtract padding offset
-
-        # Compute slant range at zero-Doppler time
-        # Interpolate satellite position
-        azi_idx_int = np.floor(azi_idx_float).astype(np.int32)
-        azi_idx_int = np.clip(azi_idx_int, 0, n_azi - 2)
-        azi_frac = azi_idx_float - azi_idx_int
-
-        sat_x = orb_x[azi_idx_int] * (1 - azi_frac) + orb_x[azi_idx_int + 1] * azi_frac
-        sat_y = orb_y[azi_idx_int] * (1 - azi_frac) + orb_y[azi_idx_int + 1] * azi_frac
-        sat_z = orb_z[azi_idx_int] * (1 - azi_frac) + orb_z[azi_idx_int + 1] * azi_frac
-
-        range_m[i:end] = np.sqrt((chunk_xp - sat_x)**2 + (chunk_yp - sat_y)**2 + (chunk_zp - sat_z)**2)
+    # Combine results
+    azimuth_pix = np.concatenate([r[0] for r in results])
+    range_m = np.concatenate([r[1] for r in results])
 
     # Compute azimuth time
     azimuth_time = t1 + azimuth_pix / prf
@@ -3507,9 +3528,12 @@ def compute_conversion_chunked(prm, dem_path, geometry, outdir,
     import multiprocessing as mp
     from concurrent.futures import ProcessPoolExecutor
 
+    _t0_bnd = time.perf_counter()
     with ProcessPoolExecutor(max_workers=n_jobs, mp_context=mp.get_context('spawn'),
                              max_tasks_per_child=1) as executor:
         results = list(executor.map(_process_boundary_worker, worker_args))
+    if debug:
+        print(f'PROFILE: boundary ProcessPoolExecutor ({len(worker_args)} tasks, {n_jobs} workers) {time.perf_counter() - _t0_bnd:.3f}s')
     del worker_args
 
     # Concatenate results
@@ -3616,9 +3640,12 @@ def compute_conversion_chunked(prm, dem_path, geometry, outdir,
     import multiprocessing as mp
     from concurrent.futures import ProcessPoolExecutor
 
+    _t0_tiles = time.perf_counter()
     with ProcessPoolExecutor(max_workers=n_jobs, mp_context=mp.get_context('spawn'),
                              max_tasks_per_child=1) as executor:
         list(executor.map(_process_tile_worker, tile_args))
+    if debug:
+        print(f'PROFILE: transform ProcessPoolExecutor ({len(tile_args)} tiles, {n_jobs} workers) {time.perf_counter() - _t0_tiles:.3f}s')
 
     del tile_args
 
@@ -3661,9 +3688,12 @@ def compute_conversion_chunked(prm, dem_path, geometry, outdir,
             print(f'Computing topo: {len(topo_tile_args)} tiles (row_batch={row_batch})...')
 
         # Process tiles using subprocess pool with memory isolation
+        _t0_topo = time.perf_counter()
         with ProcessPoolExecutor(max_workers=n_jobs, mp_context=mp.get_context('spawn'),
                                  max_tasks_per_child=1) as executor:
             list(executor.map(_process_topo_worker, topo_tile_args))
+        if debug:
+            print(f'PROFILE: topo ProcessPoolExecutor ({len(topo_tile_args)} tiles, {n_jobs} workers) {time.perf_counter() - _t0_topo:.3f}s')
 
         del topo_tile_args
 

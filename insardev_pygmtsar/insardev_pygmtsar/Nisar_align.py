@@ -413,13 +413,17 @@ class Nisar_align(Nisar_slc):
         batches = [patches[i:i+batch_size] for i in range(0, len(patches), batch_size)]
 
         # Parallel xcorr (batch processing, workers reuse file handles)
+        import time as _time
+        _t0_xcorr = _time.perf_counter()
         batch_results = Parallel(n_jobs=n_batches)(
             delayed(_xcorr_batch)(h5_path1, h5_path2, slc_path, batch, patch_size, min_response)
             for batch in batches
         )
         results = [r for batch in batch_results for r in batch]
+        _t1_xcorr = _time.perf_counter()
 
         if debug:
+            print(f"PROFILE: xcorr Parallel ({n_batches} batches, {len(patches)} patches) {_t1_xcorr - _t0_xcorr:.3f}s")
             print(f"Xcorr results: {len(results)} with response > {min_response}")
 
         # Use shared fitoffset function with full radar extent for normalization
