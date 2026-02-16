@@ -218,9 +218,30 @@ class Tiles(datagrid, progressbar_joblib):
             'All tiles must have the same shape to be combined correctly. '
             'This is a known issue with the Copernicus DEM — consider using the SRTM DEM instead.'
         )
+        # Check if tiles have overlapping edge coordinates (e.g., SRTM DEM)
+        all_lons = np.concatenate([t.lon.values for t in tile_xarrays])
+        all_lats = np.concatenate([t.lat.values for t in tile_xarrays])
+        lon_overlap = len(all_lons) != len(np.unique(all_lons))
+        lat_overlap = len(all_lats) != len(np.unique(all_lats))
+
+        if lon_overlap != lat_overlap:
+            raise ValueError(
+                f'Inconsistent tile overlaps: lon_overlap={lon_overlap}, lat_overlap={lat_overlap}. '
+                'Expected both or neither to have overlapping edge coordinates.'
+            )
+
+        if lon_overlap:  # implies lat_overlap too
+            # Drop last row/col from interior tiles to remove overlapping edges
+            max_lon = max(t.lon.values[-1] for t in tile_xarrays)
+            max_lat = max(t.lat.values[-1] for t in tile_xarrays)
+            tile_xarrays = [
+                t.isel(
+                    lon=slice(None, -1) if t.lon.values[-1] < max_lon else slice(None),
+                    lat=slice(None, -1) if t.lat.values[-1] < max_lat else slice(None)
+                )
+                for t in tile_xarrays
+            ]
         da = xr.combine_by_coords(tile_xarrays)
-        # drop duplicate indices for SRTM DEM when neighboring tiles share the same edge coordinates
-        da = da.sel(lat=~da.indexes['lat'].duplicated(), lon=~da.indexes['lon'].duplicated())
         
         if isinstance(da, xr.Dataset):
             da = da[list(da.data_vars)[0]]
