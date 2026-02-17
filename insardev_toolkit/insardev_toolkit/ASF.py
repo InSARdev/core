@@ -2024,6 +2024,9 @@ class ASF(progressbar_joblib):
             sess = session or requests.Session()
             resp = sess.get(url)
             resp.raise_for_status()
+            if len(resp.content) != total_size:
+                raise ValueError(
+                    f"Response size mismatch: got {len(resp.content)}, expected {total_size}")
 
             cache_hit = resp.headers.get('cf-cache-status', '').upper() == 'HIT'
 
@@ -2464,6 +2467,9 @@ class ASF(progressbar_joblib):
                 try:
                     resp = requests.get(url, timeout=120)
                     resp.raise_for_status()
+                    if len(resp.content) != total_size:
+                        raise ValueError(
+                            f"Response size mismatch: got {len(resp.content)}, expected {total_size}")
                     # Check both X-Cache (proxy) and cf-cache-status (CDN) headers
                     cache_hit = (resp.headers.get('X-Cache', '').upper() == 'HIT' or
                                 resp.headers.get('cf-cache-status', '').upper() == 'HIT')
@@ -2640,14 +2646,29 @@ class ASF(progressbar_joblib):
                 out_path = os.path.join(out_dir, out_name)
                 metadata = self._read_nisar_metadata_direct(pol, meta_buf)
 
-                def extract_chunks_from_data(ci):
+                def extract_chunks_from_data(ci, freq_label=''):
                     if not ci:
                         return None
                     # Only extract chunks that were actually downloaded (subset when bbox applied)
-                    return {c['offset']: block_data[c['offset']] for c in ci['chunks'] if c['offset'] in block_data}
+                    result = {}
+                    missing = 0
+                    empty = 0
+                    for c in ci['chunks']:
+                        if c['offset'] not in block_data:
+                            missing += 1
+                        else:
+                            chunk_bytes = block_data[c['offset']]
+                            if len(chunk_bytes) == 0:
+                                empty += 1
+                            result[c['offset']] = chunk_bytes
+                    if missing > 0 or empty > 0:
+                        raise ValueError(
+                            f"freq{freq_label} {pol}: {missing} missing + {empty} empty chunks "
+                            f"out of {len(ci['chunks'])} total ({len(block_data)} in block_data)")
+                    return result
 
-                data_a = extract_chunks_from_data(ci_a)
-                data_b = extract_chunks_from_data(ci_b)
+                data_a = extract_chunks_from_data(ci_a, 'A')
+                data_b = extract_chunks_from_data(ci_b, 'B')
 
                 self._write_nisar_pol_h5_from_bytes(
                     data_a, ci_a, metadata, pol, out_path,
