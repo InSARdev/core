@@ -3226,6 +3226,9 @@ def compute_transform_inverse(prm, dem,
 
     # Pre-allocate output arrays
     inv_ele_valid = np.empty(n_valid_pts, dtype=np.float32)
+    # Separate array for topo phase (constant earth_radius, cancels in calc_drho)
+    if compute_topo:
+        inv_ele_topo_valid = np.empty(n_valid_pts, dtype=np.float32)
     # NOTE: look_E/N/U calculation commented out - incidence is computed from azi/rng in Batch.incidence()
     # Keeping this GMTSAR-compatible code for reference
     # look_E_valid = np.empty(n_valid_pts, dtype=np.float32)
@@ -3256,8 +3259,13 @@ def compute_transform_inverse(prm, dem,
         yp = Nh * cos_lat * sin_lon
         zp = (N * np.float32(1 - e2) + ele_c) * sin_lat
 
-        # ele_gmtsar = distance from earth center - earth_radius
-        inv_ele_valid[i:j] = np.sqrt(xp**2 + yp**2 + zp**2, dtype=np.float32) - np.float32(earth_radius)
+        R_target = np.sqrt(xp**2 + yp**2 + zp**2, dtype=np.float32)
+        # Per-point local geocentric radius (consistent across all bursts)
+        R_local = N * np.sqrt(cos_lat**2 + np.float32((1 - e2)**2) * sin_lat**2, dtype=np.float32)
+        inv_ele_valid[i:j] = R_target - R_local
+        # For topo phase: constant earth_radius (cancels in calc_drho)
+        if compute_topo:
+            inv_ele_topo_valid[i:j] = R_target - np.float32(earth_radius)
 
         # NOTE: Look vector calculation commented out - incidence is computed from azi/rng in Batch.incidence()
         # Keeping this GMTSAR-compatible code for reference
@@ -3321,7 +3329,7 @@ def compute_transform_inverse(prm, dem,
         valid_mask_flat = valid_mask.ravel()
         valid_azi_flat = inv_azi.ravel()[valid_mask_flat]
         valid_rng_flat = inv_rng.ravel()[valid_mask_flat]
-        valid_ele_flat = inv_ele.ravel()[valid_mask_flat]
+        valid_ele_flat = inv_ele_topo_valid
 
         # Convert to radar grid indices and round to nearest
         azi_round = np.round(valid_azi_flat - azi_coords[0]).astype(np.int64)
@@ -3336,7 +3344,7 @@ def compute_transform_inverse(prm, dem,
 
         ele_sum = np.bincount(idx, weights=valid_ele_flat[m], minlength=grid_size)
         ele_cnt = np.bincount(idx, minlength=grid_size)
-        del idx, m, valid_ele_flat, valid_mask_flat
+        del idx, m, valid_ele_flat, inv_ele_topo_valid, valid_mask_flat
 
         with np.errstate(invalid='ignore', divide='ignore'):
             ele_gmtsar_full = (ele_sum / np.maximum(ele_cnt, 1)).reshape(n_azi, n_rng).astype(np.float32)

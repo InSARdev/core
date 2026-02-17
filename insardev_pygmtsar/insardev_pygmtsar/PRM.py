@@ -539,26 +539,6 @@ class PRM(datagrid, PRM_gmtsar):
                   burst_azimuth_time.second + burst_azimuth_time.microsecond / 1e6)
         t_brst += dta * lpb / 2.0  # Add half burst duration
 
-        # Parse firstValidSample to get ksr (first valid line) and ker (last valid line)
-        # These are needed for GMTSAR-style overlap boundary computation
-        first_valid = burst_info['firstValidSample']
-        if isinstance(first_valid, dict):
-            fvs_str = first_valid['#text']
-        else:
-            fvs_str = first_valid
-        fvs = [int(x) for x in fvs_str.split()]
-
-        ksr = None  # First valid line index within burst
-        ker = None  # Last valid line index within burst
-        for j, flag in enumerate(fvs):
-            if flag >= 0:
-                if ksr is None:
-                    ksr = j
-                ker = j
-
-        # Azimuth ANX time for computing overlap with adjacent bursts
-        azimuth_anx_time = float(burst_info['azimuthAnxTime'])
-
         # Find azimuthFmRate record closest to burst center
         fm_rate_list = product['generalAnnotation']['azimuthFmRateList']['azimuthFmRate']
         if not isinstance(fm_rate_list, list):
@@ -619,11 +599,7 @@ class PRM(datagrid, PRM_gmtsar):
             'dcPolynomial': dc_poly,
             'dcT0': dc_t0,
             'dcAzimuthTime': dc_azimuth_time,
-            # GMTSAR-style overlap boundary parameters
             'linesPerBurst': lpb,
-            'ksr': ksr,  # First valid line index within burst
-            'ker': ker,  # Last valid line index within burst
-            'azimuthAnxTime': azimuth_anx_time,  # Azimuth ANX time for overlap computation
             #'prf': float(product['imageAnnotation']['imageInformation']['azimuthFrequency']),
         }
 
