@@ -3176,10 +3176,8 @@ def compute_transform_inverse(prm, dem,
     valid_x = x_grid[valid_mask]
     del x_grid, y_grid
 
-    # Project UTM to lon/lat
+    # Project UTM to lon/lat (keep float64 for zero-Doppler precision)
     valid_lat, valid_lon = proj(valid_y, valid_x, from_epsg=epsg, to_epsg=4326)
-    valid_lat = valid_lat.astype(np.float32)
-    valid_lon = valid_lon.astype(np.float32)
 
     # Get DEM elevation at valid points
     valid_ele = dem.interp(
@@ -3202,12 +3200,16 @@ def compute_transform_inverse(prm, dem,
         earth_radius=earth_radius, precise=1, fd1=0.0,
         debug=debug
     )
-    inv_rng_valid = result[:, 0].astype(np.float32)
-    inv_azi_valid = result[:, 1].astype(np.float32)
+    # Convert satellite_llt2rat pixel indices to SLC 0.5-based coordinates
+    # (first pixel center at 0.5) for remap_radar_to_geo: inv_map = (val - 0.5) / 1.0
+    # Azimuth: 0-based (first line = 0) → add 0.5
+    # Range: effectively 1-based (first sample = 1, due to GMTSAR near_range -= dr) → subtract 0.5
+    inv_rng_valid = result[:, 0].astype(np.float32) - 0.5
+    inv_azi_valid = result[:, 1].astype(np.float32) + 0.5
     del result
-
-    # satellite_llt2rat returns values in same coordinate system as forward transform
-    # (0.5-based pixel centers), so no offset correction needed
+    # Downcast to float32 now that satellite_llt2rat is done (it needed float64 precision)
+    valid_lat = valid_lat.astype(np.float32)
+    valid_lon = valid_lon.astype(np.float32)
 
     # Filter out-of-bounds (valid pixel centers are [0.5, n-0.5])
     out_of_bounds = (inv_azi_valid < 0.5) | (inv_azi_valid > n_azi - 0.5) | (inv_rng_valid < 0.5) | (inv_rng_valid > n_rng - 0.5)
