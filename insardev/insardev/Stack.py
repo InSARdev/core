@@ -164,6 +164,10 @@ class Stack(Stack_plot, BatchCore):
         """Return a Batch view of this Stack (including 1D/2D non-complex vars)."""
         return Batch(self)
 
+    def incidence(self) -> Batch:
+        """Compute incidence angle for each burst via linear polynomial fit."""
+        return self.transform().incidence()
+
     def adi2(self, angle_coarse: float = 15, angle_fine: float = 5, device: str = 'auto') -> "Batches":
         """
         Polarimetric ADI optimization for dual-pol data (VV/VH or HH/HV).
@@ -1562,7 +1566,7 @@ class Stack(Stack_plot, BatchCore):
                     if arr.ndim == 1:
                         # Stack arrays from all dates: (n_dates, n_coef)
                         stacked = np.stack([info['array_attrs'].get(key, arr) for info in pol_infos])
-                        data_ds[key] = xr.DataArray(stacked, dims=['date', 'coef'])
+                        data_ds[key] = xr.DataArray(stacked, dims=['date', f'{key}_coef'])
 
                 datas.append(data_ds)
 
@@ -1767,7 +1771,7 @@ class Stack(Stack_plot, BatchCore):
                     for key, arr in first_info['array_attrs'].items():
                         if arr.ndim == 1:
                             stacked_arr = np.stack([info['array_attrs'].get(key, arr) for info in pol_infos])
-                            data_ds[key] = xr.DataArray(stacked_arr, dims=['date', 'coef'])
+                            data_ds[key] = xr.DataArray(stacked_arr, dims=['date', f'{key}_coef'])
 
                     datas.append(data_ds)
 

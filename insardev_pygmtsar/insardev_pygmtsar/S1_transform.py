@@ -343,16 +343,20 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
     del slc_complex
     _timings['slc_prep'] = time.perf_counter() - _t0
 
-    # Compute tidal datetime from PRM if tidal correction is enabled
+    # Compute differential tidal datetimes for rep bursts only.
+    # Both ref and rep times are needed for differential correction:
+    # tidal_los = tide(dt_ref)·look - tide(dt_rep)·look
+    # Ref bursts get no tidal correction (no differential to compute).
+    is_reference = prm_rep is prm_ref
     tidal_dt = None
-    if remove_tidal_phase and topo is not None:
+    if remove_tidal_phase and topo is not None and not is_reference:
         import datetime as _dt
-        sc_clock = prm_rep.get('SC_clock_start')
-        sc_clock_stop = prm_rep.get('SC_clock_stop')
-        sc_mid = (sc_clock + sc_clock_stop) / 2.0
-        year = int(sc_mid // 1000)
-        doy_frac = sc_mid % 1000
-        tidal_dt = _dt.datetime(year, 1, 1) + _dt.timedelta(days=doy_frac - 1)
+        def _sc_clock_to_dt(prm):
+            sc_mid = (prm.get('SC_clock_start') + prm.get('SC_clock_stop')) / 2.0
+            year = int(sc_mid // 1000)
+            doy_frac = sc_mid % 1000
+            return _dt.datetime(year, 1, 1) + _dt.timedelta(days=doy_frac - 1)
+        tidal_dt = (_sc_clock_to_dt(prm_ref), _sc_clock_to_dt(prm_rep))
 
     # Compute per-azimuth-line geocentric radius for inter-burst phase continuity
     topo_ydim = prm_ref.get('num_patches') * prm_ref.get('num_valid_az')
@@ -388,20 +392,22 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
         del azi_map, rng_map
 
         # Step 3: Compute topo phase (+ tidal) and geocode to projected coordinates
-        topo_phase = flat_earth_topo_phase(topo, prm_rep, prm_ref, er_azi,
-                                            baseline_params=baseline_params,
-                                            sc_height_params=sc_height_params)
-        if tidal_dt is not None:
-            topo_phase.values += tidal_phase_radar(topo, prm_ref, tidal_dt).values
+        # Skip for ref bursts: baseline=0 → drho≈0 (no-op, avoids FP noise)
+        if not is_reference:
+            topo_phase = flat_earth_topo_phase(topo, prm_rep, prm_ref, er_azi,
+                                                baseline_params=baseline_params,
+                                                sc_height_params=sc_height_params)
+            if tidal_dt is not None:
+                topo_phase.values += tidal_phase_radar(topo, prm_ref, tidal_dt).values
 
-        topo_phase_xa = xr.DataArray(topo_phase.values, coords=topo_phase.coords,
-                                     dims=topo_phase.dims).rename('data')
-        topo_phase_proj = _geocode(transform, topo_phase_xa).transpose('y', 'x').values
-        del topo_phase, topo_phase_xa
+            topo_phase_xa = xr.DataArray(topo_phase.values, coords=topo_phase.coords,
+                                         dims=topo_phase.dims).rename('data')
+            topo_phase_proj = _geocode(transform, topo_phase_xa).transpose('y', 'x').values
+            del topo_phase, topo_phase_xa
 
-        # Combine reramp + topo into total phase correction
-        phase_reramp += topo_phase_proj
-        del topo_phase_proj
+            # Combine reramp + topo into total phase correction
+            phase_reramp += topo_phase_proj
+            del topo_phase_proj
 
         _timings['phase_compute'] = time.perf_counter() - _t0
 
@@ -426,33 +432,38 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
         # Original path: ref bursts, or rep bursts with epsg=0 (radar coords)
         # ====================================================================
 
-        # Compute topo phase
+        # Compute and apply topo+tidal phase correction
+        # Skip for ref bursts: baseline=0 → drho≈0 (no-op, avoids FP noise)
         _t0 = time.perf_counter()
-        phase = flat_earth_topo_phase(topo, prm_rep, prm_ref, er_azi,
-                                                   baseline_params=baseline_params,
-                                                   sc_height_params=sc_height_params)
-        _timings['flat_earth_topo_phase'] = time.perf_counter() - _t0
+        if not is_reference:
+            phase = flat_earth_topo_phase(topo, prm_rep, prm_ref, er_azi,
+                                                       baseline_params=baseline_params,
+                                                       sc_height_params=sc_height_params)
+            _timings['flat_earth_topo_phase'] = time.perf_counter() - _t0
 
-        # Tidal phase correction
-        if tidal_dt is not None:
-            phase.values += tidal_phase_radar(topo, prm_ref, tidal_dt).values
+            # Tidal phase correction
+            if tidal_dt is not None:
+                phase.values += tidal_phase_radar(topo, prm_ref, tidal_dt).values
 
-        # Apply phase correction and optionally geocode
-        _t0 = time.perf_counter()
-        phase_aligned = phase.reindex_like(slc_xa, method='nearest').values
-        del phase
-        cos_phase = np.cos(phase_aligned)
-        sin_phase = np.sin(phase_aligned)
-        del phase_aligned
-        slc_vals = slc_xa.values
-        corrected_real = slc_vals.real * cos_phase + slc_vals.imag * sin_phase
-        corrected_imag = slc_vals.imag * cos_phase - slc_vals.real * sin_phase
-        del cos_phase, sin_phase
-        slc_corrected = xr.DataArray(
-            (corrected_real + 1j * corrected_imag).astype(np.complex64),
-            coords=slc_xa.coords, dims=slc_xa.dims
-        )
-        del corrected_real, corrected_imag, slc_vals, slc_xa
+            # Apply phase correction
+            _t0 = time.perf_counter()
+            phase_aligned = phase.reindex_like(slc_xa, method='nearest').values
+            del phase
+            cos_phase = np.cos(phase_aligned)
+            sin_phase = np.sin(phase_aligned)
+            del phase_aligned
+            slc_vals = slc_xa.values
+            corrected_real = slc_vals.real * cos_phase + slc_vals.imag * sin_phase
+            corrected_imag = slc_vals.imag * cos_phase - slc_vals.real * sin_phase
+            del cos_phase, sin_phase
+            slc_corrected = xr.DataArray(
+                (corrected_real + 1j * corrected_imag).astype(np.complex64),
+                coords=slc_xa.coords, dims=slc_xa.dims
+            )
+            del corrected_real, corrected_imag, slc_vals, slc_xa
+        else:
+            slc_corrected = slc_xa
+            del slc_xa
 
         if epsg == 0:
             complex_proj = slc_corrected.rename({'a': 'y', 'r': 'x'})
@@ -518,6 +529,26 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
     data_proj.attrs['earth_radius'] = float(np.mean(er_azi))
     # Store reference height for downstream elevation computation
     data_proj.attrs['ref_height'] = reference_height
+
+    # Replace approximate geometry with exact radar extent polygon from prm_ref
+    from insardev_pygmtsar.utils_satellite import satellite_rat2llt
+    _num_lines = prm_ref.get('num_lines')
+    _num_rng = prm_ref.get('num_rng_bins')
+    _orbit_ref = prm_ref.orbit_df
+    _corner_azi = np.array([0.5, 0.5, _num_lines - 0.5, _num_lines - 0.5], dtype=np.float64)
+    _corner_rng = np.array([0.5, _num_rng - 0.5, _num_rng - 0.5, 0.5], dtype=np.float64)
+    _clon, _clat, _ = satellite_rat2llt(
+        _corner_azi, _corner_rng,
+        _orbit_ref['clock'].values, _orbit_ref[['px','py','pz']].values,
+        _orbit_ref[['vx','vy','vz']].values,
+        86400.0 * prm_ref.get('clock_start'),
+        prm_ref.get('PRF'), prm_ref.get('near_range'), prm_ref.get('rng_samp_rate'),
+        prm_ref.get('earth_radius'), dem=None, max_iter=1, tol=1.0, n_chunks=1
+    )
+    from shapely.geometry import Polygon as _Polygon
+    _coords = list(zip(_clon.tolist(), _clat.tolist()))
+    _coords.append(_coords[0])  # close the ring
+    data_proj.attrs['geometry'] = _Polygon(_coords).wkt
 
     # DEBUG: check what was stored
     if debug:
@@ -755,7 +786,9 @@ class S1_transform(S1_align):
             print('NOTE: EPSG code will be computed automatically for each burst. These projections can be different.')
         elif isinstance(epsg, str) and epsg == 'auto':
             from .utils_satellite import get_utm_epsg
-            epsgs = self.to_dataframe().centroid.apply(lambda geom: get_utm_epsg(geom.y, geom.x)).unique()
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', message='.*geographic CRS.*')
+                epsgs = self.to_dataframe().centroid.apply(lambda geom: get_utm_epsg(geom.y, geom.x)).unique()
             if len(epsgs) > 1:
                 raise ValueError(f'ERROR: Multiple UTM zones found: {", ".join(map(str, epsgs))}. Specify the EPSG code manually.')
             epsg = epsgs[0]
@@ -842,6 +875,11 @@ class S1_transform(S1_align):
                     'SC_height_end': sc_height_result.get('SC_height_end')
                 }
 
+            # Cache topo_llt per reference burst (same DEM geometry for all dates)
+            topo_llt_cache = {}
+            for burst_ref in burst_refs:
+                topo_llt_cache[burst_ref[-1]] = self._get_topo_llt(burst_ref[-1], degrees=alignment_spacing)
+
             # Phase 2: Process dates sequentially (efficient - reuses cached data)
             all_dates = burst_reps + burst_refs
             for burst_item in all_dates:
@@ -863,7 +901,8 @@ class S1_transform(S1_align):
                     baseline_params = None
                 else:
                     prm, slc, reramp_params = self.align_rep(burst_name, burst_ref_name, prm_ref,
-                                                              degrees=alignment_spacing, xcorr=xcorr, debug=debug)
+                                                              degrees=alignment_spacing, xcorr=xcorr, debug=debug,
+                                                              topo_llt=topo_llt_cache.get(burst_ref_name))
                     baseline_result = prm_ref.SAT_baseline(prm)
                     baseline_params = {
                         'baseline_start': baseline_result.get('baseline_start'),

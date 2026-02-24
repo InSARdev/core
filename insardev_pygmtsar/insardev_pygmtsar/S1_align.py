@@ -46,16 +46,16 @@ def _read_slc_patch(src, cy: int, cx: int, half: int) -> np.ndarray:
 
 
 def _xcorr_refine_slc(ref_path: str, rep_path: str,
-                      ashift: float, rshift: float,
-                      stretch_a: float = 0.0, stretch_r: float = 0.0,
-                      a_stretch_a: float = 0.0, a_stretch_r: float = 0.0,
+                      int_ashift: int, int_rshift: int,
                       patch_size: int = 256,
                       min_response: float = 0.1, debug: bool = False) -> dict:
     """
-    Run xcorr refinement by reading patches directly from geotiff files.
+    Measure total alignment offsets via amplitude cross-correlation.
 
-    Reads only the required patches from disk, avoiding full image load.
-    Handles both S1 (1 band complex) and NISAR (2 bands real/imag) formats.
+    Uses only integer constant shifts for coarse alignment. xcorr measures
+    the full sub-pixel offset at each patch position. The integer shifts
+    are added back to get total offsets, which are then fitted with a
+    bilinear model to produce the final alignment parameters.
 
     Parameters
     ----------
@@ -63,10 +63,8 @@ def _xcorr_refine_slc(ref_path: str, rep_path: str,
         Path to reference SLC geotiff.
     rep_path : str
         Path to repeat SLC geotiff.
-    ashift, rshift : float
-        Geometry-based azimuth and range shifts.
-    stretch_a, stretch_r, a_stretch_a, a_stretch_r : float
-        Geometry-based stretch parameters.
+    int_ashift, int_rshift : int
+        Integer azimuth and range shifts for coarse alignment (TIFF space).
     patch_size : int
         Xcorr patch size. Default 256.
     min_response : float
@@ -77,7 +75,11 @@ def _xcorr_refine_slc(ref_path: str, rep_path: str,
     Returns
     -------
     dict
-        Correction coefficients (same as xcorr_fitoffset output).
+        Total alignment parameters (bilinear model fitted to total offsets):
+        {
+            'rshift': float, 'stretch_r': float, 'a_stretch_r': float,
+            'ashift': float, 'stretch_a': float, 'a_stretch_a': float,
+        }
 
     Raises
     ------
@@ -98,31 +100,20 @@ def _xcorr_refine_slc(ref_path: str, rep_path: str,
         # Auto-compute grid: ~2x patch spacing, minimum 4 patches per dimension
         n_rows = max(4, (ny_ref - patch_size) // (2 * patch_size) + 1)
         n_cols = max(4, (nx_ref - patch_size) // (2 * patch_size) + 1)
-        grid = (n_rows, n_cols)
 
         if debug:
-            print(f"Xcorr refinement: {grid[0]}×{grid[1]} = {grid[0]*grid[1]} patches, size {patch_size}")
-            print(f"Image sizes: ref={ny_ref}×{nx_ref}, rep={ny_rep}×{nx_rep}")
-            print(f"Geometry params: ashift={ashift:.2f}, rshift={rshift:.2f}")
+            print(f"Xcorr: {n_rows}x{n_cols} = {n_rows*n_cols} patches, size {patch_size}")
+            print(f"  Images: ref={ny_ref}x{nx_ref}, rep={ny_rep}x{nx_rep}")
+            print(f"  Integer shifts: ashift={int_ashift}, rshift={int_rshift}")
 
-        n_rows, n_cols = grid
         for row in range(n_rows):
             cy1 = int((row + 0.5) * ny_ref / n_rows)
             for col in range(n_cols):
                 cx1 = int((col + 0.5) * nx_ref / n_cols)
 
-                # Apply geometry offset - compute float position first
-                cy2_float = cy1 + ashift + stretch_a * cx1 + a_stretch_a * cy1
-                cx2_float = cx1 + rshift + stretch_r * cx1 + a_stretch_r * cy1
-
-                # Truncate to integer for patch reading
-                cy2 = int(cy2_float)
-                cx2 = int(cx2_float)
-
-                # Track truncation artifact - phaseCorrelate will "find" this sub-pixel
-                # and we need to subtract it to get the TRUE residual
-                frac_a = cy2_float - cy2
-                frac_r = cx2_float - cx2
+                # Coarse alignment: integer shifts only
+                cy2 = cy1 + int_ashift
+                cx2 = cx1 + int_rshift
 
                 # Bounds check
                 if cy1 < half or cy1 > ny_ref - half:
@@ -140,28 +131,26 @@ def _xcorr_refine_slc(ref_path: str, rep_path: str,
 
                 result = xcorr_patch(patch1, patch2, hann, min_response=min_response)
                 if result is not None:
-                    # Compensate for int() truncation artifact
-                    # phaseCorrelate "finds" the sub-pixel that was lost by truncation
-                    # Subtract it to get the TRUE residual beyond the geometry
-                    result['dy'] -= frac_a
-                    result['dx'] -= frac_r
+                    # Total offset = integer shift + xcorr-measured sub-pixel
+                    result['dy'] += int_ashift
+                    result['dx'] += int_rshift
                     result['cy1'] = cy1
                     result['cx1'] = cx1
                     results.append(result)
 
     if debug:
-        print(f"Xcorr results: {len(results)} with response > {min_response}")
+        print(f"  Valid patches: {len(results)}")
 
-    # Fit bilinear using full radar extent for normalization
+    # Fit bilinear model to TOTAL offsets
     corrections = xcorr_fitoffset(results, nx=nx_ref, ny=ny_ref, debug=debug)
 
     if corrections is None:
-        raise RuntimeError("Xcorr fitoffset failed - insufficient valid patches. Scene alignment cannot continue.")
+        raise RuntimeError("Xcorr correction did not converge - insufficient valid high-coherence patches. "
+                           "Use xcorr=None for geometry-only alignment in low-coherence areas.")
 
     if debug:
-        print(f"Xcorr fitoffset result:")
-        print(f"  ashift={corrections['ashift']:.4f}, stretch_a={corrections['stretch_a']:.8f}, a_stretch_a={corrections['a_stretch_a']:.8f}")
-        print(f"  rshift={corrections['rshift']:.4f}, stretch_r={corrections['stretch_r']:.8f}, a_stretch_r={corrections['a_stretch_r']:.8f}")
+        print(f"  Fitted total: ashift={corrections['ashift']:.4f}, stretch_a={corrections['stretch_a']:.8f}, a_stretch_a={corrections['a_stretch_a']:.8f}")
+        print(f"                rshift={corrections['rshift']:.4f}, stretch_r={corrections['stretch_r']:.8f}, a_stretch_r={corrections['a_stretch_r']:.8f}")
 
     return corrections
 
@@ -292,7 +281,8 @@ class S1_align(S1_gmtsar):
 
     def align_rep(self, burst_rep: str, burst_ref: str, prm_ref: "PRM",
                   degrees: float = 12.0/3600, debug: bool = False,
-                  xcorr: tuple = (128, 128), xcorr_min_response: float = 0.2) -> tuple:
+                  xcorr: tuple = None, xcorr_min_response: float = 0.2,
+                  topo_llt: "np.ndarray | None" = None) -> tuple:
         """
         Process and align secondary burst to reference.
 
@@ -342,10 +332,14 @@ class S1_align(S1_gmtsar):
 
         # Prepare coarse DEM for alignment using REFERENCE burst geometry
         # (12 arc seconds is enough for SRTM 90m)
-        topo_llt = self._get_topo_llt(burst_ref, degrees=degrees)
+        if topo_llt is None:
+            topo_llt = self._get_topo_llt(burst_ref, degrees=degrees)
 
-        # Extract PRM and orbit for secondary burst (mode=0, no SLC yet)
-        prm_rep, orbit_df = self._make_burst(burst_rep, mode=0, debug=debug)
+        # Extract PRM, orbit, deramped SLC, and reramp params in one call
+        prm_dict, orbit_df, slc_data, reramp_params = self._make_burst(burst_rep, mode=2)
+        prm_rep = PRM()
+        prm_rep.set(**prm_dict)
+        prm_rep.orbit_df = orbit_df
 
         # Compute time difference between frames
         t1, prf = prm_rep.get('clock_start', 'PRF')
@@ -392,14 +386,6 @@ class S1_align(S1_gmtsar):
         par_tmp = offset_dat_valid.copy()
         par_tmp[:, 2] += nl
 
-        # Extract deramped SLC (no shift, no reramp)
-        prm_dict, orbit_df_new, slc_data, reramp_params = self._make_burst(burst_rep, mode=2)
-
-        # Build PRM from dict (same as _make_burst does)
-        prm_rep = PRM()
-        prm_rep.set(**prm_dict)
-        prm_rep.orbit_df = orbit_df_new
-
         # Apply fitoffset parameters (bilinear offset model stored in PRM)
         prm_rep.set(PRM.fitoffset(3, 3, par_tmp))
 
@@ -427,88 +413,67 @@ class S1_align(S1_gmtsar):
                     print(f"    ref: {ref_tiff} (exists: {os.path.exists(ref_tiff)})")
                     print(f"    rep: {rep_tiff} (exists: {os.path.exists(rep_tiff)})")
             else:
-                if debug:
-                    print(f"  ref_tiff: {ref_tiff}")
-                    print(f"  rep_tiff: {rep_tiff}")
+                # Compute median integer shifts from raw geometry offsets
+                # par_tmp columns: [r, dr, a, da, SNR]
+                median_da = np.median(par_tmp[:, 3])
+                median_dr = np.median(par_tmp[:, 1])
 
-                # Get geometry alignment from prm_rep (computed by fitoffset above)
-                # This is in PRM coordinate space (valid lines only)
-                geom_ashift = prm_rep.get('ashift') + prm_rep.get('sub_int_a')
-                geom_rshift = prm_rep.get('rshift') + prm_rep.get('sub_int_r')
-                geom_stretch_a = prm_rep.get('stretch_a')
-                geom_stretch_r = prm_rep.get('stretch_r')
-                geom_a_stretch_a = prm_rep.get('a_stretch_a')
-                geom_a_stretch_r = prm_rep.get('a_stretch_r')
-
-                # Get k_start values to convert PRM coords to TIFF coords
-                # TIFF row 0 = PRM azimuth -k_start, so TIFF row = PRM azi + k_start
-                # For xcorr which reads from TIFF, we need to correct the offset:
-                # TIFF_offset = PRM_offset + (k_start_rep - k_start_ref)
+                # Convert azimuth offset from PRM to TIFF space
                 ref_xml = os.path.join(self.datadir, prefix_ref, 'annotation', f'{burst_ref}.xml')
                 rep_xml = os.path.join(self.datadir, prefix_rep, 'annotation', f'{burst_rep}.xml')
                 k_start_ref = self._get_k_start(ref_xml)
                 k_start_rep = self._get_k_start(rep_xml)
                 k_start_correction = k_start_rep - k_start_ref
 
-                # Convert geometry to TIFF space for xcorr
-                geom_ashift_tiff = geom_ashift + k_start_correction
+                int_ashift_tiff = int(np.round(median_da + k_start_correction))
+                int_rshift = int(np.round(median_dr))
 
                 if debug:
-                    print(f"  Geometry (PRM): ashift={geom_ashift:.2f}, rshift={geom_rshift:.2f}")
-                    print(f"  k_start: ref={k_start_ref}, rep={k_start_rep}, correction={k_start_correction}")
-                    print(f"  Geometry (TIFF): ashift={geom_ashift_tiff:.2f}")
+                    print(f"  Median geometry: da={median_da:.2f}, dr={median_dr:.2f}, "
+                          f"k_start_corr={k_start_correction}")
+                    print(f"  Integer shifts (TIFF): ashift={int_ashift_tiff}, rshift={int_rshift}")
 
-                # Run xcorr WITH geometry pre-applied (in TIFF space) to find small residuals
-                xcorr_params = _xcorr_refine_slc(
-                    ref_tiff, rep_tiff,
-                    ashift=geom_ashift_tiff, rshift=geom_rshift,
-                    stretch_a=geom_stretch_a, stretch_r=geom_stretch_r,
-                    a_stretch_a=geom_a_stretch_a, a_stretch_r=geom_a_stretch_r,
-                    patch_size=xcorr_patch_size,
-                    min_response=xcorr_min_response, debug=debug
-                )
+                # xcorr measures total offsets (int_shift + sub-pixel) at each patch
+                # then fits bilinear model to get final parameters (in TIFF space)
+                try:
+                    xcorr_params = _xcorr_refine_slc(
+                        ref_tiff, rep_tiff,
+                        int_ashift=int_ashift_tiff, int_rshift=int_rshift,
+                        patch_size=xcorr_patch_size,
+                        min_response=xcorr_min_response, debug=debug
+                    )
+                except RuntimeError as e:
+                    if debug:
+                        print(f"  WARNING: {e}")
+                    xcorr_params = None
 
-                # Check if xcorr succeeded
                 if xcorr_params is None:
-                    # Xcorr failed - keep geometry alignment
+                    # Xcorr failed - keep geometry alignment from fitoffset(3,3) above
                     print(f"WARNING: Xcorr FAILED for {burst_rep} - using geometry")
-                    ashift_new = geom_ashift
-                    stretch_a_new = geom_stretch_a
-                    a_stretch_a_new = geom_a_stretch_a
-                    rshift_new = geom_rshift
-                    stretch_r_new = geom_stretch_r
-                    a_stretch_r_new = geom_a_stretch_r
                 else:
-                    # xcorr found residuals - only apply RANGE refinement
-                    # Azimuth offsets kept from orbit geometry to avoid TOPS
-                    # inter-burst range ramp (reramp phase couples ashift × Doppler centroid)
-                    ashift_new = geom_ashift
-                    stretch_a_new = geom_stretch_a
-                    a_stretch_a_new = geom_a_stretch_a
-                    rshift_new = geom_rshift + xcorr_params['rshift']
-                    stretch_r_new = geom_stretch_r + xcorr_params['stretch_r']
-                    a_stretch_r_new = geom_a_stretch_r + xcorr_params['a_stretch_r']
+                    # Range-only xcorr: orbit geometry for azimuth, xcorr for range.
+                    # TOPS reramp phase has range-dependent Doppler centroid; per-burst
+                    # ashift noise × fnct(range) creates inter-burst range ramps.
+                    # Orbit-based azimuth is smooth across burst boundaries.
+                    geom_ashift = prm_rep.get('ashift') + prm_rep.get('sub_int_a')
+                    rshift_new = xcorr_params['rshift']
+
+                    prm_rep.set(
+                        # Azimuth: orbit geometry (smooth across burst boundaries)
+                        ashift=int(geom_ashift) if geom_ashift >= 0 else int(geom_ashift) - 1,
+                        sub_int_a=math.fmod(geom_ashift, 1) if geom_ashift >= 0 else math.fmod(geom_ashift, 1) + 1,
+                        stretch_a=prm_rep.get('stretch_a'),
+                        a_stretch_a=prm_rep.get('a_stretch_a'),
+                        # Range: xcorr total offsets (improves coherence, no inter-burst ramp)
+                        rshift=int(rshift_new) if rshift_new >= 0 else int(rshift_new) - 1,
+                        sub_int_r=math.fmod(rshift_new, 1) if rshift_new >= 0 else math.fmod(rshift_new, 1) + 1,
+                        stretch_r=xcorr_params['stretch_r'],
+                        a_stretch_r=xcorr_params['a_stretch_r'],
+                    )
 
                     if debug:
-                        print(f"  Xcorr residuals: da={xcorr_params['ashift']:.4f} (ignored), dr={xcorr_params['rshift']:.4f} (applied)")
-
-                # Update PRM (split into integer and fractional parts)
-                prm_rep.set(
-                    ashift=int(ashift_new) if ashift_new >= 0 else int(ashift_new) - 1,
-                    sub_int_a=math.fmod(ashift_new, 1) if ashift_new >= 0 else math.fmod(ashift_new, 1) + 1,
-                    stretch_a=stretch_a_new,
-                    a_stretch_a=a_stretch_a_new,
-                    rshift=int(rshift_new) if rshift_new >= 0 else int(rshift_new) - 1,
-                    sub_int_r=math.fmod(rshift_new, 1) if rshift_new >= 0 else math.fmod(rshift_new, 1) + 1,
-                    stretch_r=stretch_r_new,
-                    a_stretch_r=a_stretch_r_new,
-                )
-
-                if debug:
-                    print(f"Xcorr alignment:")
-                    print(f"  ashift={ashift_new:.4f}, rshift={rshift_new:.4f}")
-                    print(f"  stretch_a={stretch_a_new:.8f}, stretch_r={stretch_r_new:.8f}")
-                    print(f"  a_stretch_a={a_stretch_a_new:.8f}, a_stretch_r={a_stretch_r_new:.8f}")
+                        print(f"  Range-only xcorr:")
+                        print(f"    ashift={geom_ashift:.4f} (geometry), rshift={rshift_new:.4f} (xcorr)")
 
         # Recompute Doppler with earth_radius
         prm_rep.calc_dop_orb(earth_radius, inplace=True, debug=debug)

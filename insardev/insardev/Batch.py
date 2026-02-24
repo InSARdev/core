@@ -615,30 +615,6 @@ class Batch(BatchCore):
             out[key] = result_ds
         return Batch(out)
 
-    def incidence_look(self) -> "Batch":
-        """Compute incidence angle from look vector components (legacy method).
-
-        Required vars: look_E, look_N, look_U
-        """
-        import rioxarray  # for .rio accessor
-
-        # Get CRS from input batch
-        crs = self.crs
-
-        out: dict[str, xr.Dataset] = {}
-        for key, tfm in self.items():
-            look_E = tfm["look_E"]
-            look_N = tfm["look_N"]
-            look_U = tfm["look_U"]
-            incidence = xr.ufuncs.atan2(xr.ufuncs.sqrt(look_E ** 2 + look_N ** 2), look_U) * xr.ufuncs.sign(look_E).astype("float32")
-            result_ds = xr.Dataset({"incidence": incidence})
-            result_ds.attrs = tfm.attrs
-            # Preserve CRS
-            if crs is not None:
-                result_ds = result_ds.rio.write_crs(crs)
-            out[key] = result_ds
-        return Batch(out)
-
     def iexp(self, sign: int = -1, **kwargs):
         """
         Apply exp(sign * 1j * da) to convert phase to complex phasor.

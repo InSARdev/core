@@ -714,6 +714,8 @@ def deramped_burst(xml_path: str, tiff_path: str, eof_path: str) -> tuple:
 
     # Find velocity at burst center
     orbit_time = orbit_df['clock'].values
+    assert orbit_time[-1] % 86400 >= orbit_time[0] % 86400, \
+        f'Orbit spans midnight ({orbit_time[0] % 86400:.0f}s to {orbit_time[-1] % 86400:.0f}s), not supported'
     vx = np.interp(t_brst, orbit_time % 86400, orbit_df['vx'].values)
     vy = np.interp(t_brst, orbit_time % 86400, orbit_df['vy'].values)
     vz = np.interp(t_brst, orbit_time % 86400, orbit_df['vz'].values)
@@ -936,6 +938,8 @@ def repeat_burst(xml_path: str, tiff_path: str, eof_path: str,
 
     # Find velocity at burst center by interpolating orbit
     orbit_time = orbit_df['clock'].values
+    assert orbit_time[-1] % 86400 >= orbit_time[0] % 86400, \
+        f'Orbit spans midnight ({orbit_time[0] % 86400:.0f}s to {orbit_time[-1] % 86400:.0f}s), not supported'
     vx = np.interp(t_brst, orbit_time % 86400, orbit_df['vx'].values)
     vy = np.interp(t_brst, orbit_time % 86400, orbit_df['vy'].values)
     vz = np.interp(t_brst, orbit_time % 86400, orbit_df['vz'].values)

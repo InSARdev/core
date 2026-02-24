@@ -114,7 +114,8 @@ def _process_chunk_nisar(iy, ix, chunk_y, chunk_x, n_y, n_x,
     proj_im[~valid_mask] = np.nan
 
     # Apply topo/tidal phase if needed
-    if remove_topo_phase and epsg != 0:
+    # Skip for ref bursts: baseline_params=None → drho≈0 (no-op, avoids FP noise)
+    if remove_topo_phase and epsg != 0 and baseline_params is not None:
         from .utils_satellite import flat_earth_topo_phase, tidal_phase_radar
         from .PRM import PRM
         import xarray as xr
@@ -264,16 +265,17 @@ def _transform_slc_int16_nisar_chunked(outdir, conversion_dir, prm_rep, prm_ref,
     else:
         alignment_params = None
 
-    # Compute tidal datetime if needed
+    # Compute tidal datetime if needed (differential: ref - rep)
+    is_reference = prm_rep is prm_ref
     tidal_dt = None
-    if remove_tidal_phase and remove_topo_phase:
+    if remove_tidal_phase and remove_topo_phase and not is_reference:
         import datetime as _dt
-        sc_clock = prm_rep.get('SC_clock_start')
-        sc_clock_stop = prm_rep.get('SC_clock_stop')
-        sc_mid = (sc_clock + sc_clock_stop) / 2.0
-        year = int(sc_mid // 1000)
-        doy_frac = sc_mid % 1000
-        tidal_dt = _dt.datetime(year, 1, 1) + _dt.timedelta(days=doy_frac - 1)
+        def _sc_clock_to_dt(prm):
+            sc_mid = (prm.get('SC_clock_start') + prm.get('SC_clock_stop')) / 2.0
+            year = int(sc_mid // 1000)
+            doy_frac = sc_mid % 1000
+            return _dt.datetime(year, 1, 1) + _dt.timedelta(days=doy_frac - 1)
+        tidal_dt = (_sc_clock_to_dt(prm_ref), _sc_clock_to_dt(prm_rep))
 
     # Set scale - NISAR L-band has small amplitudes, use 1e-04 like GMTSAR
     # to avoid quantization to zero (with scale=0.5, ~60% of pixels become zero)
@@ -524,16 +526,17 @@ def _transform_slc_int16_nisar(outdir, transform, topo, prm_rep, prm_ref, slc_da
     del slc_complex
     _timings['slc_prep'] = time.perf_counter() - _t0
 
-    # Compute tidal datetime from PRM if tidal correction is enabled
+    # Compute tidal datetime if needed (differential: ref - rep)
+    is_reference = prm_rep is prm_ref
     tidal_dt = None
-    if remove_tidal_phase and topo is not None:
+    if remove_tidal_phase and topo is not None and not is_reference:
         import datetime as _dt
-        sc_clock = prm_rep.get('SC_clock_start')
-        sc_clock_stop = prm_rep.get('SC_clock_stop')
-        sc_mid = (sc_clock + sc_clock_stop) / 2.0
-        year = int(sc_mid // 1000)
-        doy_frac = sc_mid % 1000
-        tidal_dt = _dt.datetime(year, 1, 1) + _dt.timedelta(days=doy_frac - 1)
+        def _sc_clock_to_dt(prm):
+            sc_mid = (prm.get('SC_clock_start') + prm.get('SC_clock_stop')) / 2.0
+            year = int(sc_mid // 1000)
+            doy_frac = sc_mid % 1000
+            return _dt.datetime(year, 1, 1) + _dt.timedelta(days=doy_frac - 1)
+        tidal_dt = (_sc_clock_to_dt(prm_ref), _sc_clock_to_dt(prm_rep))
 
     # Nisar: Direct geocoding (no reramp needed - stripmap mode)
     if epsg != 0:
@@ -553,64 +556,72 @@ def _transform_slc_int16_nisar(outdir, transform, topo, prm_rep, prm_ref, slc_da
         _timings['geocode'] = time.perf_counter() - _t0
 
         # Compute and geocode topo phase
+        # Skip for ref bursts: baseline=0 → drho≈0 (no-op, avoids FP noise)
         _t0 = time.perf_counter()
-        from .utils_satellite import flat_earth_topo_phase, tidal_phase_radar
-        topo_phase = flat_earth_topo_phase(topo, prm_rep, prm_ref,
-                                           baseline_params=baseline_params,
-                                           sc_height_params=sc_height_params)
-        if tidal_dt is not None:
-            topo_phase.values += tidal_phase_radar(topo, prm_ref, tidal_dt).values
+        if not is_reference:
+            from .utils_satellite import flat_earth_topo_phase, tidal_phase_radar
+            topo_phase = flat_earth_topo_phase(topo, prm_rep, prm_ref,
+                                               baseline_params=baseline_params,
+                                               sc_height_params=sc_height_params)
+            if tidal_dt is not None:
+                topo_phase.values += tidal_phase_radar(topo, prm_ref, tidal_dt).values
 
-        topo_phase_xa = xr.DataArray(topo_phase.values, coords=topo_phase.coords,
-                                     dims=topo_phase.dims).rename('data')
+            topo_phase_xa = xr.DataArray(topo_phase.values, coords=topo_phase.coords,
+                                         dims=topo_phase.dims).rename('data')
 
-        # Geocode topo phase
-        topo_phase_proj = remap_radar_to_geo(topo_phase_xa, azi_map, rng_map,
-                                             transform.y.values, transform.x.values).transpose('y', 'x').values
-        del topo_phase, topo_phase_xa, azi_map, rng_map
-        _timings['phase_compute'] = time.perf_counter() - _t0
+            # Geocode topo phase
+            topo_phase_proj = remap_radar_to_geo(topo_phase_xa, azi_map, rng_map,
+                                                 transform.y.values, transform.x.values).transpose('y', 'x').values
+            del topo_phase, topo_phase_xa
+            _timings['phase_compute'] = time.perf_counter() - _t0
 
-        # Apply topo phase correction
-        _t0 = time.perf_counter()
-        cos_phase = np.cos(topo_phase_proj)
-        sin_phase = np.sin(topo_phase_proj)
-        del topo_phase_proj
-        proj_re = complex_proj.values.real.copy()
-        proj_im = complex_proj.values.imag
-        corrected_re = (proj_re * cos_phase + proj_im * sin_phase)
-        corrected_im = (proj_im * cos_phase - proj_re * sin_phase)
-        del cos_phase, sin_phase, proj_re, proj_im
-        complex_proj = xr.DataArray(
-            (corrected_re + 1j * corrected_im).astype(np.complex64),
-            coords=complex_proj.coords, dims=complex_proj.dims
-        )
-        del corrected_re, corrected_im
+            # Apply topo phase correction
+            _t0 = time.perf_counter()
+            cos_phase = np.cos(topo_phase_proj)
+            sin_phase = np.sin(topo_phase_proj)
+            del topo_phase_proj
+            proj_re = complex_proj.values.real.copy()
+            proj_im = complex_proj.values.imag
+            corrected_re = (proj_re * cos_phase + proj_im * sin_phase)
+            corrected_im = (proj_im * cos_phase - proj_re * sin_phase)
+            del cos_phase, sin_phase, proj_re, proj_im
+            complex_proj = xr.DataArray(
+                (corrected_re + 1j * corrected_im).astype(np.complex64),
+                coords=complex_proj.coords, dims=complex_proj.dims
+            )
+            del corrected_re, corrected_im
+        del azi_map, rng_map
         _timings['phase_apply'] = time.perf_counter() - _t0
     else:
         # Radar coordinates output (epsg=0)
         _t0 = time.perf_counter()
-        from .utils_satellite import flat_earth_topo_phase, tidal_phase_radar
-        phase = flat_earth_topo_phase(topo, prm_rep, prm_ref,
-                                      baseline_params=baseline_params,
-                                      sc_height_params=sc_height_params)
+        # Skip for ref bursts: baseline=0 → drho≈0 (no-op, avoids FP noise)
+        if not is_reference:
+            from .utils_satellite import flat_earth_topo_phase, tidal_phase_radar
+            phase = flat_earth_topo_phase(topo, prm_rep, prm_ref,
+                                          baseline_params=baseline_params,
+                                          sc_height_params=sc_height_params)
 
-        if tidal_dt is not None:
-            phase.values += tidal_phase_radar(topo, prm_ref, tidal_dt).values
+            if tidal_dt is not None:
+                phase.values += tidal_phase_radar(topo, prm_ref, tidal_dt).values
 
-        phase_aligned = phase.reindex_like(slc_xa, method='nearest').values
-        del phase
-        cos_phase = np.cos(phase_aligned)
-        sin_phase = np.sin(phase_aligned)
-        del phase_aligned
-        slc_vals = slc_xa.values
-        corrected_real = slc_vals.real * cos_phase + slc_vals.imag * sin_phase
-        corrected_imag = slc_vals.imag * cos_phase - slc_vals.real * sin_phase
-        del cos_phase, sin_phase
-        slc_corrected = xr.DataArray(
-            (corrected_real + 1j * corrected_imag).astype(np.complex64),
-            coords=slc_xa.coords, dims=slc_xa.dims
-        )
-        del corrected_real, corrected_imag, slc_vals, slc_xa
+            phase_aligned = phase.reindex_like(slc_xa, method='nearest').values
+            del phase
+            cos_phase = np.cos(phase_aligned)
+            sin_phase = np.sin(phase_aligned)
+            del phase_aligned
+            slc_vals = slc_xa.values
+            corrected_real = slc_vals.real * cos_phase + slc_vals.imag * sin_phase
+            corrected_imag = slc_vals.imag * cos_phase - slc_vals.real * sin_phase
+            del cos_phase, sin_phase
+            slc_corrected = xr.DataArray(
+                (corrected_real + 1j * corrected_imag).astype(np.complex64),
+                coords=slc_xa.coords, dims=slc_xa.dims
+            )
+            del corrected_real, corrected_imag, slc_vals, slc_xa
+        else:
+            slc_corrected = slc_xa
+            del slc_xa
         complex_proj = slc_corrected.rename({'a': 'y', 'r': 'x'})
         _timings['phase_apply'] = time.perf_counter() - _t0
 

@@ -2434,12 +2434,16 @@ def compute_merged_transform(transform, prm_rep):
     return azi_rep, rng_rep
 
 
-def tidal_phase_radar(topo, prm, dt):
-    """Compute solid Earth tidal phase correction on the radar coordinate grid.
+def tidal_phase_radar(topo, prm, tidal_dt):
+    """Compute differential solid Earth tidal phase correction on radar grid.
+
+    Computes tide at both ref and rep epochs, takes the difference
+    (ref - rep), projects to LOS, and converts to phase.  This cancels
+    the tidal signal in the interferogram when added to the rep burst's
+    drho phase.
 
     Uses 2×2 radar-grid corners: computes tidal E,N,U and look vectors at the
-    4 corner points, bilinearly interpolates each component separately onto the
-    full topo grid, then dot-products to LOS and converts to phase.
+    4 corner points, bilinearly interpolates onto the full topo grid.
 
     Satellite-agnostic: works for both S1 and NISAR.
 
@@ -2449,18 +2453,20 @@ def tidal_phase_radar(topo, prm, dt):
         Topographic elevation with radar coordinates (a, r).
     prm : PRM
         Reference scene PRM (has orbit_df, clock_start, PRF, etc.).
-    dt : datetime.datetime
-        Acquisition UTC time.
+    tidal_dt : tuple(datetime, datetime)
+        (dt_ref, dt_rep) acquisition UTC times for differential correction.
 
     Returns
     -------
     xr.DataArray
-        Tidal phase correction in radians, same coords as topo.
+        Differential tidal phase correction in radians, same coords as topo.
     """
     import numpy as np
     import xarray as xr
     import cv2
     from .utils_tidal import solid_tide
+
+    dt_ref, dt_rep = tidal_dt
 
     n_azi = len(topo.a)
     n_rng = len(topo.r)
@@ -2491,8 +2497,12 @@ def tidal_phase_radar(topo, prm, dt):
         lookdir=lookdir
     )
 
-    # --- (c) Compute tidal E, N, U at 4 corners ---
-    tide_e, tide_n, tide_u = solid_tide(lon_corners, lat_corners, dt)
+    # --- (c) Differential tidal E, N, U at 4 corners (ref - rep) ---
+    tide_e_ref, tide_n_ref, tide_u_ref = solid_tide(lon_corners, lat_corners, dt_ref)
+    tide_e_rep, tide_n_rep, tide_u_rep = solid_tide(lon_corners, lat_corners, dt_rep)
+    tide_e = tide_e_ref - tide_e_rep
+    tide_n = tide_n_ref - tide_n_rep
+    tide_u = tide_u_ref - tide_u_rep
 
     # --- (d) Compute look vectors at 4 corners from orbit ---
     sat_time = np.float64(clock_start) + azi_corners / np.float64(prf)
