@@ -479,16 +479,18 @@ class S1_align(S1_gmtsar):
                     stretch_r_new = geom_stretch_r
                     a_stretch_r_new = geom_a_stretch_r
                 else:
-                    # xcorr found residuals - ADD to geometry
-                    ashift_new = geom_ashift + xcorr_params['ashift']
-                    stretch_a_new = geom_stretch_a + xcorr_params['stretch_a']
-                    a_stretch_a_new = geom_a_stretch_a + xcorr_params['a_stretch_a']
+                    # xcorr found residuals - only apply RANGE refinement
+                    # Azimuth offsets kept from orbit geometry to avoid TOPS
+                    # inter-burst range ramp (reramp phase couples ashift × Doppler centroid)
+                    ashift_new = geom_ashift
+                    stretch_a_new = geom_stretch_a
+                    a_stretch_a_new = geom_a_stretch_a
                     rshift_new = geom_rshift + xcorr_params['rshift']
                     stretch_r_new = geom_stretch_r + xcorr_params['stretch_r']
                     a_stretch_r_new = geom_a_stretch_r + xcorr_params['a_stretch_r']
 
                     if debug:
-                        print(f"  Xcorr residuals: da={xcorr_params['ashift']:.4f}, dr={xcorr_params['rshift']:.4f}")
+                        print(f"  Xcorr residuals: da={xcorr_params['ashift']:.4f} (ignored), dr={xcorr_params['rshift']:.4f} (applied)")
 
                 # Update PRM (split into integer and fractional parts)
                 prm_rep.set(
