@@ -1393,6 +1393,8 @@ class Stack(Stack_plot, BatchCore):
             'rng_samp_rate', 'num_lines',
             # Baseline
             'BPR', 'BPT', 'B_perpendicular', 'B_parallel',
+            # Reference height for elevation computation
+            'ref_height',
         }
 
         def store_open_group_delayed(zarr_path, group):
@@ -1845,6 +1847,298 @@ class Stack(Stack_plot, BatchCore):
         return self
 
 
+    def align(self,
+              ref: int | str = 0,
+              polarization: str | None = None,
+              debug: bool = False,
+              return_residuals: bool = False):
+        """
+        Align burst phases using interferometric double differences (ESD).
+
+        For Sentinel-1 TOPS, adjacent bursts observe overlap regions at different
+        azimuth squint angles, so single-date SLC cross-products have zero coherence.
+        Instead, this method uses interferometric double differences: for each repeat
+        date, it forms interferograms (ref × conj(rep)) per burst, then computes the
+        double difference between adjacent bursts' interferograms to measure the
+        burst-to-burst phase jump. These jumps are decomposed into per-date, per-burst
+        corrections via global least-squares, then applied to the SLC data.
+
+        The reference date is assumed to have zero burst-to-burst phase offsets
+        (it defines the coregistration geometry).
+
+        Parameters
+        ----------
+        ref : int or str, optional
+            Reference date index or date string. Default is 0 (first date).
+            The reference date gets zero correction.
+        polarization : str, optional
+            Polarization to use for offset estimation. Auto-detected if
+            only one complex variable exists, otherwise defaults to 'VV'.
+            Corrections are applied to all complex variables.
+        debug : bool, optional
+            Print debug information. Default is False.
+        return_residuals : bool, optional
+            If True, also return per-date residuals (rad). Default is False.
+
+        Returns
+        -------
+        Stack or tuple
+            If return_residuals is False:
+                Phase-corrected Stack.
+            If return_residuals is True:
+                (corrected_stack, residuals) where residuals is list[float].
+
+        Examples
+        --------
+        >>> # Align burst phases before interferogram formation
+        >>> stack_aligned = stack.align()
+        >>> phase, corr = stack_aligned.pairs(baseline).interferogram(wavelength=30)
+        """
+        import numpy as np
+        import xarray as xr
+        from scipy import sparse
+        from scipy.sparse.linalg import lsqr
+        from scipy.sparse.csgraph import connected_components
+
+        MIN_OVERLAP_PIXELS = 50
+
+        ids = sorted(self.keys())
+        n_bursts = len(ids)
+        id_to_idx = {bid: i for i, bid in enumerate(ids)}
+
+        # Auto-detect polarization (must be complex)
+        sample_ds = self[ids[0]]
+        available_pols = [v for v in sample_ds.data_vars
+                         if 'y' in sample_ds[v].dims and 'x' in sample_ds[v].dims
+                         and np.issubdtype(sample_ds[v].dtype, np.complexfloating)]
+        if polarization is None:
+            if not available_pols:
+                raise ValueError("No complex variables found in Stack")
+            polarization = available_pols[0]
+
+        # Get dates
+        sample_da = sample_ds[polarization]
+        if 'date' not in sample_da.dims:
+            raise ValueError("Stack.align() requires complex SLC data with date dimension")
+        n_dates = sample_da.sizes['date']
+        dates = sample_da.coords['date'].values
+
+        # Resolve reference date index
+        if isinstance(ref, str):
+            ref_idx = list(dates).index(np.datetime64(ref))
+        else:
+            ref_idx = int(ref)
+
+        if n_dates < 2:
+            if debug:
+                print('align(): need at least 2 dates for double-difference', flush=True)
+            return (self, [0.0]) if return_residuals else self
+
+        if debug:
+            print(f'align(): {n_bursts} bursts, {n_dates} dates, ref=date[{ref_idx}], pol={polarization}', flush=True)
+
+        # Collect burst extents
+        extents = {}
+        for bid in ids:
+            da = self[bid][polarization]
+            y_coords = da.coords['y'].values
+            x_coords = da.coords['x'].values
+            extents[bid] = (y_coords.min(), y_coords.max(), x_coords.min(), x_coords.max())
+
+        def extents_overlap(e1, e2):
+            y1_min, y1_max, x1_min, x1_max = e1
+            y2_min, y2_max, x2_min, x2_max = e2
+            return not (y1_max < y2_min or y2_max < y1_min) and not (x1_max < x2_min or x2_max < x1_min)
+
+        # Find overlapping burst pairs
+        overlap_pairs = []
+        for i, id1 in enumerate(ids):
+            for j, id2 in enumerate(ids[i+1:], i+1):
+                if extents_overlap(extents[id1], extents[id2]):
+                    overlap_pairs.append((id1, id2))
+
+        if not overlap_pairs:
+            if debug:
+                print('No overlapping bursts found', flush=True)
+            return (self, [0.0] * n_dates) if return_residuals else self
+
+        if debug:
+            print(f'Found {len(overlap_pairs)} overlapping burst pairs', flush=True)
+
+        # For each repeat date, compute double-difference at each overlap:
+        #   dd = intf_burst1 × conj(intf_burst2)
+        #   where intf_burst = burst[ref_date] × conj(burst[rep_date])
+        # Phase(dd) = burst_jump(ref_date) - burst_jump(rep_date) ≈ -burst_jump(rep_date)
+        # since ref_date is the coregistration reference (jump ≈ 0).
+        import dask
+        rep_dates = [d for d in range(n_dates) if d != ref_idx]
+
+        # Pre-compute overlap y,x ranges for each pair (avoid loading full bursts)
+        overlap_slices = {}
+        for id1, id2 in overlap_pairs:
+            y1 = self[id1][polarization].coords['y'].values
+            y2 = self[id2][polarization].coords['y'].values
+            x1 = self[id1][polarization].coords['x'].values
+            x2 = self[id2][polarization].coords['x'].values
+            overlap_slices[(id1, id2)] = (
+                slice(max(y1.min(), y2.min()), min(y1.max(), y2.max())),
+                slice(max(x1.min(), x2.min()), min(x1.max(), x2.max())),
+            )
+
+        n_total_dds = len(rep_dates) * len(overlap_pairs)
+        if debug:
+            print(f'Computing {n_total_dds} double differences...', flush=True)
+
+        # Build lazy dask graphs that reduce each overlap DD to two scalars (complex sum
+        # and valid count). dask.compute() schedules them in parallel across workers;
+        # each worker materializes only one overlap region at a time, and only the
+        # scalar results are returned — full DD arrays are never collected to the client.
+        import dask.array as da_module
+        dd_keys = []    # (d_rep, k) for result indexing
+        dd_sums = []    # lazy scalar: nansum of DD complex values
+        dd_counts = []  # lazy scalar: count of finite pixels
+        for d_rep in rep_dates:
+            for k, (id1, id2) in enumerate(overlap_pairs):
+                y_sl, x_sl = overlap_slices[(id1, id2)]
+                da1_ov = self[id1][polarization].sel(y=y_sl, x=x_sl)
+                da2_ov = self[id2][polarization].sel(y=y_sl, x=x_sl)
+                intf1 = da1_ov.isel(date=ref_idx) * da1_ov.isel(date=d_rep).conj()
+                intf2 = da2_ov.isel(date=ref_idx) * da2_ov.isel(date=d_rep).conj()
+                dd = intf1 * intf2.conj()  # lazy (y, x) overlap array
+                # Reduce to two scalars within the dask graph
+                dd_dask = dd.data  # underlying dask array
+                dd_sums.append(da_module.nansum(dd_dask))
+                dd_counts.append(da_module.sum(da_module.isfinite(dd_dask)))
+                dd_keys.append((d_rep, k))
+
+        # Single dask.compute() call — parallel across workers, returns only scalars
+        all_scalars = dask.compute(*dd_sums, *dd_counts)
+        n = len(dd_keys)
+        sums = all_scalars[:n]
+        counts = all_scalars[n:]
+
+        dd_stats = {}
+        for i, key in enumerate(dd_keys):
+            cnt = int(counts[i])
+            if cnt >= MIN_OVERLAP_PIXELS:
+                dd_stats[key] = (float(np.angle(sums[i] / cnt)), cnt)
+            else:
+                dd_stats[key] = None
+
+        # Solve per-date global least-squares
+        corrections = np.zeros((n_bursts, n_dates))
+
+        for d_rep in rep_dates:
+            rows_data = []
+            for k, (id1, id2) in enumerate(overlap_pairs):
+                stat = dd_stats[(d_rep, k)]
+                if stat is None:
+                    continue
+
+                dd_phase, cnt = stat
+                weight = np.sqrt(float(cnt))
+                i, j = id_to_idx[id1], id_to_idx[id2]
+                # dd_phase = jump_ref - jump_rep ≈ -jump_rep
+                # correction_i - correction_j = -dd_phase
+                rows_data.append((i, j, -dd_phase, weight))
+
+                if debug:
+                    print(f'  dd {id1}-{id2} date[{d_rep}]: phase={dd_phase:.4f} rad, '
+                          f'count={cnt}, weight={weight:.0f}', flush=True)
+
+            if not rows_data:
+                continue
+
+            n_edges = len(rows_data)
+            A = sparse.lil_matrix((n_edges, n_bursts))
+            b = np.zeros(n_edges)
+            W = np.zeros(n_edges)
+
+            for r, (i, j, offset, weight) in enumerate(rows_data):
+                A[r, i] = 1
+                A[r, j] = -1
+                b[r] = offset
+                W[r] = weight
+
+            A = A.tocsr()
+
+            # Connected components for per-component constraints
+            adjacency = sparse.lil_matrix((n_bursts, n_bursts))
+            for (i, j, _, _) in rows_data:
+                adjacency[i, j] = 1
+                adjacency[j, i] = 1
+            n_comp, labels = connected_components(adjacency.tocsr(), directed=False)
+
+            # Constraint: first burst in each component = 0
+            constraint_weight = np.sum(W) * 100 if np.sum(W) > 0 else 1e6
+            constraints = []
+            for comp in range(n_comp):
+                members = np.where(labels == comp)[0]
+                row = sparse.lil_matrix((1, n_bursts))
+                row[0, members[0]] = 1.0
+                constraints.append(row.tocsr())
+
+            A_constrained = sparse.vstack([A] + constraints)
+            b_constrained = np.concatenate([b, np.zeros(n_comp)])
+            W_constrained = np.concatenate([W, np.full(n_comp, constraint_weight)])
+
+            sqrt_W = np.sqrt(W_constrained)
+            result = lsqr(sparse.diags(sqrt_W) @ A_constrained.tocsr(), sqrt_W * b_constrained)
+            corrections[:, d_rep] = result[0]
+
+        if debug:
+            for i, bid in enumerate(ids):
+                corr = corrections[i, :]
+                if np.any(corr != 0):
+                    print(f'  {bid}: corrections = {[f"{c:.4f}" for c in corr]} rad', flush=True)
+
+        # Apply corrections: multiply SLC by exp(-i * phi) per date
+        # Use numpy broadcasting to avoid xarray coordinate alignment issues
+        result = {}
+        for bid in ids:
+            ds = self[bid]
+            bidx = id_to_idx[bid]
+            phase_corr = corrections[bidx, :]  # shape (n_dates,)
+            # Build correction array matching the date dimension position
+            corr_arr = np.exp(-1j * phase_corr).astype(np.complex64)
+
+            new_vars = {}
+            for var in ds.data_vars:
+                da = ds[var]
+                if np.issubdtype(da.dtype, np.complexfloating) and 'date' in da.dims:
+                    # Reshape corr to broadcast: (n_dates, 1, 1, ...) matching date dim position
+                    date_axis = list(da.dims).index('date')
+                    shape = [1] * da.ndim
+                    shape[date_axis] = n_dates
+                    new_vars[var] = da * corr_arr.reshape(shape)
+                else:
+                    new_vars[var] = da
+            result[bid] = xr.Dataset(new_vars, coords=ds.coords, attrs=ds.attrs)
+
+        aligned = type(self)(result)
+
+        if return_residuals:
+            residuals = [0.0] * n_dates
+            for d_rep in rep_dates:
+                abs_discrepancies = []
+                weights = []
+                for k, (id1, id2) in enumerate(overlap_pairs):
+                    stat = dd_stats[(d_rep, k)]
+                    if stat is None:
+                        continue
+                    dd_phase, cnt = stat
+                    i, j = id_to_idx[id1], id_to_idx[id2]
+                    corrected = -dd_phase - (corrections[i, d_rep] - corrections[j, d_rep])
+                    corrected = (corrected + np.pi) % (2*np.pi) - np.pi
+                    abs_discrepancies.append(abs(corrected))
+                    weights.append(float(cnt))
+                if abs_discrepancies:
+                    residuals[d_rep] = float(np.average(abs_discrepancies, weights=weights))
+            return aligned, residuals
+
+        return aligned
+
+
     def pairs(self,
               pairs: list[tuple[str|int, str|int]] | np.ndarray | pd.DataFrame
               ) -> Batches:
@@ -1975,8 +2269,10 @@ class Stack(Stack_plot, BatchCore):
             phase_arr = np.asarray(phase)
             is_scalar = phase_arr.ndim == 0
 
-            # Height from phase formula: h = -λ * φ * R * cos(incidence) / (4π * B⊥)
-            elev = -(wavelength * phase_arr * slant_range * np.cos(incidence) / (4 * np.pi * baseline))
+            ref_height = _scalar_from_ds(tfm, 'ref_height') or 0.0
+
+            # Height from phase formula: h = ref_height - λ * φ * R * cos(incidence) / (4π * B⊥)
+            elev = ref_height - (wavelength * phase_arr * slant_range * np.cos(incidence) / (4 * np.pi * baseline))
 
             # Return same type as input, rounded to 3 decimals
             if is_scalar:
@@ -2026,6 +2322,8 @@ class Stack(Stack_plot, BatchCore):
                 dims=('x',)
             )
 
+            ref_height = _scalar_from_ds(tfm, 'ref_height') or 0.0
+
             elev_vars: dict[str, xr.DataArray] = {}
             for var_name, data in phase_ds.data_vars.items():
                 if 'y' in data.coords and 'x' in data.coords:
@@ -2036,10 +2334,10 @@ class Stack(Stack_plot, BatchCore):
                     slant = slant_range.reindex_like(data.x, method='nearest')
 
                 # Height from phase formula (PyGMTSAR convention):
-                # h = -λ * φ * R * cos(incidence) / (4π * B⊥)
+                # h = ref_height - λ * φ * R * cos(incidence) / (4π * B⊥)
                 # BPR broadcasts across pair dimension automatically
-                elev = -(wavelength * data * slant * xr.ufuncs.cos(incidence) / (4 * np.pi * bpr))
-                name = 'ele' if len(phase_ds.data_vars) == 1 else f'{var_name}_ele'
+                elev = ref_height - (wavelength * data * slant * xr.ufuncs.cos(incidence) / (4 * np.pi * bpr))
+                name = var_name
                 elev_vars[name] = elev.astype('float32')
 
             out[key] = xr.Dataset(elev_vars, coords=phase_ds.coords, attrs=phase_ds.attrs)

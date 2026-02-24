@@ -915,6 +915,8 @@ class Batch(BatchCore):
                 dims=('x',)
             )
 
+            ref_height = _scalar_from_ds(tfm, 'ref_height') or 0.0
+
             elev_vars: dict[str, xr.DataArray] = {}
             for var_name, data in phase_ds.data_vars.items():
                 if 'y' in data.coords and 'x' in data.coords:
@@ -924,9 +926,9 @@ class Batch(BatchCore):
                     incidence = inc_da.reindex_like(data, method='nearest')
                     slant = slant_range.reindex_like(data.x, method='nearest')
 
-                # Height from phase formula: h = -λ * φ * R * cos(incidence) / (4π * B⊥)
-                elev = -(wavelength * data * slant * xr.ufuncs.cos(incidence) / (4 * np.pi * bpr))
-                name = 'ele' if len(phase_ds.data_vars) == 1 else f'{var_name}_ele'
+                # Height from phase formula: h = ref_height - λ * φ * R * cos(incidence) / (4π * B⊥)
+                elev = ref_height - (wavelength * data * slant * xr.ufuncs.cos(incidence) / (4 * np.pi * bpr))
+                name = var_name
                 elev_vars[name] = elev.astype('float32')
 
             out[key] = xr.Dataset(elev_vars, coords=phase_ds.coords, attrs=phase_ds.attrs)

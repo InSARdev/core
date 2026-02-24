@@ -82,7 +82,7 @@ def _process_date_worker(args):
      prm_ref_df, prm_ref_orbit_df, sc_height,
      topo_llt, epsg, remove_tidal_phase,
      remove_thermal_noise, radiometric_calibration,
-     calibration_xml, noise_xml, debug) = args
+     calibration_xml, noise_xml, reference_height, debug) = args
 
     import warnings
     import numpy as np
@@ -189,6 +189,7 @@ def _process_date_worker(args):
         remove_thermal_noise=remove_thermal_noise,
         radiometric_calibration=radiometric_calibration,
         calibration_xml=calibration_xml, noise_xml=noise_xml,
+        reference_height=reference_height,
         debug=debug
     )
     return burst_name
@@ -261,6 +262,7 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
                                remove_thermal_noise=False,
                                radiometric_calibration=None,
                                calibration_xml=None, noise_xml=None,
+                               reference_height=0.0,
                                debug=False):
     """Transform SLC to geocoded int16 zarr.
 
@@ -279,7 +281,7 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
     import xarray as xr
     import pandas as pd
     from insardev_pygmtsar.PRM import PRM
-    from insardev_pygmtsar.utils_satellite import remap_radar_to_geo, tidal_phase_radar, flat_earth_topo_phase, compute_merged_transform
+    from insardev_pygmtsar.utils_satellite import remap_radar_to_geo, tidal_phase_radar, flat_earth_topo_phase, compute_merged_transform, _earth_radius_azimuth
     from insardev_toolkit.datagrid import datagrid
 
     _t0 = time.perf_counter()
@@ -352,6 +354,11 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
         doy_frac = sc_mid % 1000
         tidal_dt = _dt.datetime(year, 1, 1) + _dt.timedelta(days=doy_frac - 1)
 
+    # Compute per-azimuth-line geocentric radius for inter-burst phase continuity
+    topo_ydim = prm_ref.get('num_patches') * prm_ref.get('num_valid_az')
+    topo_y = np.arange(0.5, topo_ydim, 1)
+    er_azi = _earth_radius_azimuth(prm_ref, topo_y)
+
     if reramp_params is not None and epsg != 0:
         # ====================================================================
         # Merged alignment + geocoding path (projected output)
@@ -381,7 +388,7 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
         del azi_map, rng_map
 
         # Step 3: Compute topo phase (+ tidal) and geocode to projected coordinates
-        topo_phase = flat_earth_topo_phase(topo, prm_rep, prm_ref,
+        topo_phase = flat_earth_topo_phase(topo, prm_rep, prm_ref, er_azi,
                                             baseline_params=baseline_params,
                                             sc_height_params=sc_height_params)
         if tidal_dt is not None:
@@ -421,7 +428,7 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
 
         # Compute topo phase
         _t0 = time.perf_counter()
-        phase = flat_earth_topo_phase(topo, prm_rep, prm_ref,
+        phase = flat_earth_topo_phase(topo, prm_rep, prm_ref, er_azi,
                                                    baseline_params=baseline_params,
                                                    sc_height_params=sc_height_params)
         _timings['flat_earth_topo_phase'] = time.perf_counter() - _t0
@@ -506,6 +513,12 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
             if isinstance(value, (pd.Timestamp, np.datetime64)):
                 value = pd.Timestamp(value).strftime('%Y-%m-%d %H:%M:%S')
             data_proj.attrs[name] = value
+    # Override earth_radius with mean of per-azimuth geocentric radius
+    # (more representative than PRM's center-lat scalar)
+    data_proj.attrs['earth_radius'] = float(np.mean(er_azi))
+    # Store reference height for downstream elevation computation
+    data_proj.attrs['ref_height'] = reference_height
+
     # DEBUG: check what was stored
     if debug:
         print(f'DEBUG: attrs stored: {sorted(data_proj.attrs.keys())}')
@@ -623,6 +636,7 @@ class S1_transform(S1_align):
                   remove_tidal_phase: bool = True,
                   remove_thermal_noise: bool = False,
                   radiometric_calibration: str|None = None,
+                  reference_height: float|None = None,
                   dem_vertical_accuracy: float=0.5,
                   alignment_spacing: float=12.0/3600,
                   xcorr: tuple|None = None,
@@ -661,6 +675,12 @@ class S1_transform(S1_align):
             Apply radiometric calibration. Options: 'sigmaNought', 'betaNought', 'gamma', or None.
             Default is 'sigmaNought'. Output amplitude represents sqrt(σ₀) in linear units and uses
             a calibration-specific output scale factor. Set to None to preserve raw DN values.
+        reference_height : float or None, optional
+            Reference height (meters above WGS84 ellipsoid) for flat-earth phase removal.
+            All bursts use this same value, ensuring consistent phase across burst boundaries.
+            Set to the elevation of your area of interest for best precision and fewer fringes.
+            Default is None (sea level, i.e. 0). Only used when remove_topo_phase=False.
+            Raises ValueError if set when remove_topo_phase=True.
         dem_vertical_accuracy : float, optional
             The DEM vertical accuracy in meters.
         alignment_spacing : float, optional
@@ -700,6 +720,12 @@ class S1_transform(S1_align):
 
         # Suppress zarr v3 consolidated metadata warnings
         warnings.filterwarnings('ignore', message='.*Consolidated metadata.*', category=UserWarning)
+
+        # Validate reference_height vs remove_topo_phase
+        if remove_topo_phase and reference_height is not None:
+            raise ValueError("reference_height is only used when remove_topo_phase=False (flat-earth mode for DEM generation)")
+        if reference_height is None:
+            reference_height = 0.0
 
         # Early check: verify insardev_backscatter extension is installed if needed
         if remove_thermal_noise or radiometric_calibration:
@@ -795,7 +821,12 @@ class S1_transform(S1_align):
             save_transform(transform, outdir, scale_factor=1/dem_vertical_accuracy)
 
             if not remove_topo_phase:
-                topo = None
+                if reference_height != 0:
+                    # Fill topo with reference_height for flat-earth at that elevation
+                    import xarray as xr
+                    topo = xr.full_like(topo, reference_height)
+                else:
+                    topo = None
             # Drop ele - not needed for geocoding
             transform = transform.drop_vars('ele')
 
@@ -854,7 +885,8 @@ class S1_transform(S1_align):
                                         remove_thermal_noise=remove_thermal_noise,
                                         radiometric_calibration=radiometric_calibration,
                                         calibration_xml=calibration_xml,
-                                        noise_xml=noise_xml)
+                                        noise_xml=noise_xml,
+                                        reference_height=reference_height)
                 del slc
 
             # Cleanup and consolidate
@@ -911,6 +943,11 @@ class S1_transform(S1_align):
                 topo = xr.DataArray(result['topo_values'],
                                    coords={'a': result['topo_a_coords'], 'r': result['topo_r_coords']},
                                    dims=['a', 'r'])
+            elif reference_height != 0:
+                topo = xr.DataArray(
+                    np.full_like(result['topo_values'], reference_height),
+                    coords={'a': result['topo_a_coords'], 'r': result['topo_r_coords']},
+                    dims=['a', 'r'])
             else:
                 topo = None
 
@@ -984,7 +1021,7 @@ class S1_transform(S1_align):
                     prm_ref_df, prm_ref_orbit_df, sc_height,
                     topo_llt, epsg, remove_tidal_phase,
                     remove_thermal_noise, radiometric_calibration,
-                    calibration_xml, noise_xml, debug
+                    calibration_xml, noise_xml, reference_height, debug
                 ))
 
             # Use ProcessPoolExecutor or ThreadPoolExecutor based on scheduler
@@ -1062,7 +1099,8 @@ class S1_transform(S1_align):
                             remove_thermal_noise: bool=False,
                             radiometric_calibration: str|None=None,
                             calibration_xml: str|None=None,
-                            noise_xml: str|None=None
+                            noise_xml: str|None=None,
+                            reference_height: float=0.0
                             ):
         """
         Perform geocoding from radar to geographic coordinates.
@@ -1102,6 +1140,7 @@ class S1_transform(S1_align):
             remove_thermal_noise=remove_thermal_noise,
             radiometric_calibration=radiometric_calibration,
             calibration_xml=calibration_xml, noise_xml=noise_xml,
+            reference_height=reference_height,
             debug=bool(os.environ.get('INSAR_DEBUG'))
         )
 
@@ -1282,7 +1321,8 @@ class S1_transform(S1_align):
 
         # Calculate the combined earth curvature and topography correction
         _t0 = time.perf_counter()
-        drho = calc_drho(near_range, topo_vals, prm1.get('earth_radius'),
+        er = prm1.get('earth_radius')
+        drho = calc_drho(near_range, topo_vals, er,
                          height.reshape(-1, 1), B.reshape(-1, 1), alpha.reshape(-1, 1), Bx.reshape(-1, 1))
 
         phase_shift = (cnst * drho).astype(np.float32)

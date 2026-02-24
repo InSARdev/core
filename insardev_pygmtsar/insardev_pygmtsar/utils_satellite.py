@@ -932,6 +932,61 @@ def _geodetic_to_ecef(lon, lat, height):
     return X, Y, Z
 
 
+def geocentric_radius(lat_rad):
+    """Geocentric radius for WGS84 ellipsoid at given geodetic latitude (radians).
+
+    Parameters
+    ----------
+    lat_rad : float or array
+        Geodetic latitude in radians.
+
+    Returns
+    -------
+    float or array
+        Geocentric radius in meters.
+    """
+    a, b = 6378137.0, 6356752.31424518
+    cos, sin = np.cos(lat_rad), np.sin(lat_rad)
+    return np.sqrt(((a**2 * cos)**2 + (b**2 * sin)**2) / ((a * cos)**2 + (b * sin)**2))
+
+
+def _earth_radius_azimuth(prm, y_coords):
+    """Compute geocentric radius for each azimuth line at rng=0.
+
+    Uses satellite_rat2llt to get latitude at each azimuth line (range=0),
+    then computes the WGS84 geocentric radius. This gives a 1D array that
+    captures latitude variation along-track, ensuring continuity across
+    adjacent burst boundaries.
+
+    Parameters
+    ----------
+    prm : PRM
+        Reference burst PRM object with orbit_df attached.
+    y_coords : array
+        Azimuth line coordinates (typically np.arange(0.5, ydim, 1)).
+
+    Returns
+    -------
+    numpy.ndarray
+        1D array of shape (len(y_coords),) with R_gc per azimuth line.
+    """
+    rng_zeros = np.zeros_like(y_coords)
+    orbit_time = prm.orbit_df['clock'].values
+    orbit_pos = prm.orbit_df[['px', 'py', 'pz']].values
+    orbit_vel = prm.orbit_df[['vx', 'vy', 'vz']].values
+    clock_start = 86400.0 * prm.get('clock_start')
+
+    _, lat, _ = satellite_rat2llt(
+        y_coords, rng_zeros,
+        orbit_time, orbit_pos, orbit_vel,
+        clock_start, prm.get('PRF'),
+        prm.get('near_range'), prm.get('rng_samp_rate'),
+        prm.get('earth_radius'),
+        dem=None, max_iter=1, tol=1.0, n_chunks=1
+    )
+    return geocentric_radius(np.radians(lat))
+
+
 def satellite_rat2llt(azi, rng, orbit_time, orbit_pos, orbit_vel,
                       clock_start, prf, near_range, rng_samp_rate,
                       earth_radius, dem=None, max_iter=50, tol=0.01, n_chunks=1,
@@ -2496,7 +2551,7 @@ def tidal_phase_radar(topo, prm, dt):
     return xr.DataArray(tidal_phase, coords=topo.coords, dims=topo.dims).rename('tidal_phase')
 
 
-def flat_earth_topo_phase(topo, prm_rep, prm_ref, baseline_params=None, sc_height_params=None):
+def flat_earth_topo_phase(topo, prm_rep, prm_ref, earth_radius_azi, baseline_params=None, sc_height_params=None):
     """Compute the combined earth curvature and topographic phase correction.
 
     Uses the full GMTSAR algorithm with time-varying baseline geometry.
@@ -2514,6 +2569,9 @@ def flat_earth_topo_phase(topo, prm_rep, prm_ref, baseline_params=None, sc_heigh
         Pre-computed baseline parameters.
     sc_height_params : dict, optional
         Pre-computed SC_height parameters.
+    earth_radius_azi : numpy.ndarray
+        Per-azimuth-line geocentric radius (1D array). Eliminates inter-burst
+        phase ramps caused by different per-burst scalar earth_radius values.
 
     Returns
     -------
@@ -2631,8 +2689,13 @@ def flat_earth_topo_phase(topo, prm_rep, prm_ref, baseline_params=None, sc_heigh
     alpha = np.arctan2(Bv, Bh)
     height = ht0 + dht * t_arr + ddht * t_arr**2
 
-    drho = calc_drho(near_range, topo_vals, prm1.get('earth_radius'),
-                     height.reshape(-1, 1), B.reshape(-1, 1), alpha.reshape(-1, 1), Bx.reshape(-1, 1))
+    er = earth_radius_azi.reshape(-1, 1)
+    # SC_height was computed relative to the PRM scalar earth_radius.
+    # Adjust height so c = earth_radius + height = satellite distance stays constant,
+    # while ret = earth_radius + topo uses per-azi geocentric radius.
+    height_adj = height.reshape(-1, 1) + (prm1.get('earth_radius') - er)
+    drho = calc_drho(near_range, topo_vals, er,
+                     height_adj, B.reshape(-1, 1), alpha.reshape(-1, 1), Bx.reshape(-1, 1))
 
     phase_shift = (cnst * drho).astype(np.float32)
     topo_phase = xr.DataArray(phase_shift, topo.coords)
