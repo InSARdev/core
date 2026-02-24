@@ -2627,6 +2627,16 @@ class BatchCore(dict):
             first_datas = datas_by_pol[first_pol]
 
         n_stack = len(stackval)
+
+        # Filter out empty bursts (e.g., after spatial .sel() subsetting)
+        nonempty_indices = [i for i, ds in enumerate(first_datas) if ds.y.size > 0 and ds.x.size > 0]
+        if not nonempty_indices:
+            return None
+        if len(nonempty_indices) < len(first_datas):
+            for pol in polarizations:
+                datas_by_pol[pol] = [datas_by_pol[pol][i] for i in nonempty_indices]
+            first_datas = datas_by_pol[first_pol]
+
         # Ensure coordinates are concrete values (important for data from delayed computations)
         dy = float(first_datas[0].y.diff('y').values[0])  # Signed spacing
         dx = float(first_datas[0].x.diff('x').values[0])
