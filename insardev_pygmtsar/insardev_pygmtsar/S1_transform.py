@@ -849,6 +849,7 @@ class S1_transform(S1_align):
             record = self.get_record(ref_burst_name)
             dem = get_dem_wgs84ellipsoid(self.DEM, record.geometry.iloc[0], netcdf_engine=self.netcdf_engine_read)
             topo, transform = compute_transform_inverse(prm_ref_main, dem, scale_factor=1/dem_vertical_accuracy, epsg=epsg, resolution=resolution, debug=debug)
+            del dem
 
             # Save transform to zarr
             save_transform(transform, outdir, scale_factor=1/dem_vertical_accuracy)

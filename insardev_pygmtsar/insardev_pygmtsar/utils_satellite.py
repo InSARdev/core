@@ -2061,6 +2061,7 @@ def satellite_llt2rat(lon: np.ndarray, lat: np.ndarray, elevation: np.ndarray,
     xp = (N + elevation) * cos_lat * cos_lon
     yp = (N + elevation) * cos_lat * sin_lon
     zp = (N * (1 - e2) + elevation) * sin_lat
+    del lon_rad, lat_rad, sin_lat, cos_lat, sin_lon, cos_lon, N
 
     # For each target, find zero-Doppler azimuth time using Doppler search
     # Doppler = (T - S) · V, we want Doppler = 0
@@ -3249,8 +3250,11 @@ def compute_transform_inverse(prm, dem,
     valid_x = x_grid[valid_mask]
     del x_grid, y_grid
 
-    # Project UTM to lon/lat (keep float64 for zero-Doppler precision)
+    # Project UTM to lon/lat
     valid_lat, valid_lon = proj(valid_y, valid_x, from_epsg=epsg, to_epsg=4326)
+    del valid_y, valid_x
+    valid_lat = valid_lat.astype(np.float32)
+    valid_lon = valid_lon.astype(np.float32)
 
     # Get DEM elevation at valid points
     valid_ele = dem.interp(
@@ -3280,9 +3284,6 @@ def compute_transform_inverse(prm, dem,
     inv_rng_valid = result[:, 0].astype(np.float32) - 0.5
     inv_azi_valid = result[:, 1].astype(np.float32) + 0.5
     del result
-    # Downcast to float32 now that satellite_llt2rat is done (it needed float64 precision)
-    valid_lat = valid_lat.astype(np.float32)
-    valid_lon = valid_lon.astype(np.float32)
 
     # Filter out-of-bounds (valid pixel centers are [0.5, n-0.5])
     out_of_bounds = (inv_azi_valid < 0.5) | (inv_azi_valid > n_azi - 0.5) | (inv_rng_valid < 0.5) | (inv_rng_valid > n_rng - 0.5)
