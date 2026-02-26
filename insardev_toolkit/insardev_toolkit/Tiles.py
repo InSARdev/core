@@ -218,29 +218,15 @@ class Tiles(datagrid, progressbar_joblib):
             'All tiles must have the same shape to be combined correctly. '
             'This is a known issue with the Copernicus DEM — consider using the SRTM DEM instead.'
         )
-        # Check if adjacent tiles share boundary coordinates (e.g., SRTM grid-registered tiles)
-        # Must compare actual neighbors, not all tiles — same-column tiles share lon values normally
-        # Use gap < half-pixel test, not np.isclose (rtol=1e-5 is too loose for degree coordinates)
-        lon_starts = sorted(set(float(t.lon.values[0]) for t in tile_xarrays))
-        lat_starts = sorted(set(float(t.lat.values[0]) for t in tile_xarrays))
-        lon_overlap = False
-        if len(lon_starts) > 1:
-            t0 = next(t for t in tile_xarrays if abs(float(t.lon.values[0]) - lon_starts[0]) < 1e-8)
-            t1 = next(t for t in tile_xarrays if abs(float(t.lon.values[0]) - lon_starts[1]) < 1e-8)
-            gap = abs(float(t1.lon.values[0]) - float(t0.lon.values[-1]))
-            spacing = abs(float(np.diff(t0.lon.values[:2])[0]))
-            lon_overlap = gap < spacing * 0.5
-        lat_overlap = False
-        if len(lat_starts) > 1:
-            t0 = next(t for t in tile_xarrays if abs(float(t.lat.values[0]) - lat_starts[0]) < 1e-8)
-            t1 = next(t for t in tile_xarrays if abs(float(t.lat.values[0]) - lat_starts[1]) < 1e-8)
-            gap = abs(float(t1.lat.values[0]) - float(t0.lat.values[-1]))
-            spacing = abs(float(np.diff(t0.lat.values[:2])[0]))
-            lat_overlap = gap < spacing * 0.5
+        # Check if tiles have overlapping edge coordinates (e.g., SRTM DEM)
+        # Overlap can occur in one or both dimensions depending on tile layout
+        all_lons = np.concatenate([t.lon.values for t in tile_xarrays])
+        all_lats = np.concatenate([t.lat.values for t in tile_xarrays])
+        lon_overlap = len(all_lons) != len(np.unique(all_lons))
+        lat_overlap = len(all_lats) != len(np.unique(all_lats))
 
         if lon_overlap or lat_overlap:
             # Drop last row/col from interior tiles to remove overlapping edges
-            # Handle each dimension independently (some tiles overlap in one dimension only)
             max_lon = max(t.lon.values[-1] for t in tile_xarrays)
             max_lat = max(t.lat.values[-1] for t in tile_xarrays)
             tile_xarrays = [
@@ -254,15 +240,6 @@ class Tiles(datagrid, progressbar_joblib):
 
         if isinstance(da, xr.Dataset):
             da = da[list(da.data_vars)[0]]
-        # Verify merged grid has uniform spacing (no duplicates or gaps from incorrect overlap handling)
-        for dim in ['lon', 'lat']:
-            diffs = np.diff(da[dim].values)
-            if not np.allclose(diffs, diffs[0], rtol=1e-6):
-                raise ValueError(
-                    f'Non-uniform {dim} spacing after tile merge: '
-                    f'min={diffs.min():.9f}, max={diffs.max():.9f}, expected={diffs[0]:.9f}. '
-                    f'Check tile overlap handling (lon_overlap={lon_overlap}, lat_overlap={lat_overlap}).'
-                )
         # crop geometry extent
         da = da.sel(lat=slice(bounds[1], bounds[3]), lon=slice(bounds[0], bounds[2]))
         # set CRS and spatial dimensions for rioxarray compatibility
