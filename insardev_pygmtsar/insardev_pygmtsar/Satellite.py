@@ -518,15 +518,15 @@ class Satellite(progressbar_joblib, datagrid):
             # Direct remap - no chunking needed
             if np.iscomplexobj(data_vals):
                 grid_proj_re = cv2.remap(data_vals.real.astype(np.float32), inv_map_r, inv_map_a,
-                                         interpolation=cv2.INTER_LANCZOS4,
+                                         interpolation=cv2.INTER_CUBIC,
                                          borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
                 grid_proj_im = cv2.remap(data_vals.imag.astype(np.float32), inv_map_r, inv_map_a,
-                                         interpolation=cv2.INTER_LANCZOS4,
+                                         interpolation=cv2.INTER_CUBIC,
                                          borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
                 grid_proj = (grid_proj_re + 1j * grid_proj_im).astype(data.dtype)
             else:
                 grid_proj = cv2.remap(data_vals.astype(np.float32), inv_map_r, inv_map_a,
-                                      interpolation=cv2.INTER_LANCZOS4,
+                                      interpolation=cv2.INTER_CUBIC,
                                       borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
         else:
             # Chunked remap - split x dimension into minimal equal chunks
@@ -541,10 +541,10 @@ class Satellite(progressbar_joblib, datagrid):
                 for idx in chunk_indices:
                     x_slice = slice(idx[0], idx[-1] + 1)
                     re_chunk = cv2.remap(data_re, inv_map_r[:, x_slice], inv_map_a[:, x_slice],
-                                         interpolation=cv2.INTER_LANCZOS4,
+                                         interpolation=cv2.INTER_CUBIC,
                                          borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
                     im_chunk = cv2.remap(data_im, inv_map_r[:, x_slice], inv_map_a[:, x_slice],
-                                         interpolation=cv2.INTER_LANCZOS4,
+                                         interpolation=cv2.INTER_CUBIC,
                                          borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
                     grid_proj[:, x_slice] = (re_chunk + 1j * im_chunk).astype(data.dtype)
                 del data_re, data_im
@@ -554,7 +554,7 @@ class Satellite(progressbar_joblib, datagrid):
                 for idx in chunk_indices:
                     x_slice = slice(idx[0], idx[-1] + 1)
                     grid_proj[:, x_slice] = cv2.remap(data_f32, inv_map_r[:, x_slice], inv_map_a[:, x_slice],
-                                                      interpolation=cv2.INTER_LANCZOS4,
+                                                      interpolation=cv2.INTER_CUBIC,
                                                       borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
                 del data_f32
 

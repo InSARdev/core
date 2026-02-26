@@ -11,7 +11,7 @@ from .S1_align import S1_align
 
 
 def _compute_transform_inverse_worker(prm_ref_df, prm_ref_orbit_df, dem_path, geometry_wkt, outdir,
-                               scale_factor, epsg, resolution, n_chunks, debug, netcdf_engine, result_queue):
+                               scale_factor, epsg, resolution, bbox, n_chunks, debug, netcdf_engine, result_queue):
     """Worker function for compute_transform_inverse in spawned subprocess.
 
     Must be at module level for multiprocessing spawn to pickle it.
@@ -37,7 +37,7 @@ def _compute_transform_inverse_worker(prm_ref_df, prm_ref_orbit_df, dem_path, ge
     topo, transform = compute_transform_inverse(
         prm_ref, dem,
         scale_factor=scale_factor, epsg=epsg,
-        resolution=resolution, n_chunks=n_chunks, debug=debug
+        resolution=resolution, bbox=bbox, n_chunks=n_chunks, debug=debug
     )
     save_transform(transform, outdir, scale_factor=scale_factor)
 
@@ -608,15 +608,15 @@ def _geocode(transform, data):
         # Direct remap - no chunking needed
         if np.iscomplexobj(data_vals):
             grid_proj_re = cv2.remap(data_vals.real.astype(np.float32), inv_map_r, inv_map_a,
-                                     interpolation=cv2.INTER_LANCZOS4,
+                                     interpolation=cv2.INTER_CUBIC,
                                      borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
             grid_proj_im = cv2.remap(data_vals.imag.astype(np.float32), inv_map_r, inv_map_a,
-                                     interpolation=cv2.INTER_LANCZOS4,
+                                     interpolation=cv2.INTER_CUBIC,
                                      borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
             grid_proj = (grid_proj_re + 1j * grid_proj_im).astype(data.dtype)
         else:
             grid_proj = cv2.remap(data_vals.astype(np.float32), inv_map_r, inv_map_a,
-                                  interpolation=cv2.INTER_LANCZOS4,
+                                  interpolation=cv2.INTER_CUBIC,
                                   borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
     else:
         # Chunked remap - split x dimension into minimal equal chunks
@@ -631,10 +631,10 @@ def _geocode(transform, data):
             for idx in chunk_indices:
                 x_slice = slice(idx[0], idx[-1] + 1)
                 re_chunk = cv2.remap(data_re, inv_map_r[:, x_slice], inv_map_a[:, x_slice],
-                                     interpolation=cv2.INTER_LANCZOS4,
+                                     interpolation=cv2.INTER_CUBIC,
                                      borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
                 im_chunk = cv2.remap(data_im, inv_map_r[:, x_slice], inv_map_a[:, x_slice],
-                                     interpolation=cv2.INTER_LANCZOS4,
+                                     interpolation=cv2.INTER_CUBIC,
                                      borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
                 grid_proj[:, x_slice] = (re_chunk + 1j * im_chunk).astype(data.dtype)
             del data_re, data_im
@@ -644,7 +644,7 @@ def _geocode(transform, data):
             for idx in chunk_indices:
                 x_slice = slice(idx[0], idx[-1] + 1)
                 grid_proj[:, x_slice] = cv2.remap(data_f32, inv_map_r[:, x_slice], inv_map_a[:, x_slice],
-                                                  interpolation=cv2.INTER_LANCZOS4,
+                                                  interpolation=cv2.INTER_CUBIC,
                                                   borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
             del data_f32
 
@@ -671,6 +671,7 @@ class S1_transform(S1_align):
                   dem_vertical_accuracy: float=0.5,
                   alignment_spacing: float=12.0/3600,
                   xcorr: tuple|None = None,
+                  bbox: list|tuple|None = None,
                   overwrite: bool=False,
                   append: bool=False,
                   n_jobs: int|None=None,
@@ -848,7 +849,7 @@ class S1_transform(S1_align):
             from .utils_satellite import compute_transform_inverse, get_dem_wgs84ellipsoid, save_transform
             record = self.get_record(ref_burst_name)
             dem = get_dem_wgs84ellipsoid(self.DEM, record.geometry.iloc[0], netcdf_engine=self.netcdf_engine_read)
-            topo, transform = compute_transform_inverse(prm_ref_main, dem, scale_factor=1/dem_vertical_accuracy, epsg=epsg, resolution=resolution, debug=debug)
+            topo, transform = compute_transform_inverse(prm_ref_main, dem, scale_factor=1/dem_vertical_accuracy, epsg=epsg, resolution=resolution, bbox=bbox, debug=debug)
             del dem
 
             # Save transform to zarr
@@ -972,7 +973,7 @@ class S1_transform(S1_align):
             result_queue = ctx.Queue()
             p = ctx.Process(target=_compute_transform_inverse_worker, args=(
                 prm_ref_df, prm_ref_orbit_df, self.DEM, geometry_wkt, outdir,
-                1/dem_vertical_accuracy, epsg, resolution, 8, debug, self.netcdf_engine_read, result_queue
+                1/dem_vertical_accuracy, epsg, resolution, bbox, 8, debug, self.netcdf_engine_read, result_queue
             ))
             p.start()
             result = result_queue.get()  # wait for result
@@ -1099,13 +1100,12 @@ class S1_transform(S1_align):
         n_dates = len(refreps[0][0]) + len(refreps[0][1]) if refreps else 1
         n_rep_dates = n_dates - 1  # Only repeat dates matter for parallelization comparison
 
+        # Force sequential scheduler for debug mode
+        if debug and scheduler is None:
+            scheduler = 'sequential'
+
         # Determine scheduler: 'sequential', 'threads', or 'loky' (default)
-        if scheduler == 'sequential' or debug:
-            # Sequential execution for debugging or explicit sequential scheduler
-            print(f'NOTE: Sequential execution ({n_bursts} bursts, {n_dates} dates).')
-            for bursts in tqdm(refreps, desc='Transforming SLC...'.ljust(25)):
-                process_burst_sequential(bursts, target, debug=debug)
-        elif n_bursts >= n_rep_dates:
+        if n_bursts >= n_rep_dates or scheduler == 'sequential':
             # More bursts than repeat dates: parallelize across bursts
             # e.g., 1000 bursts × 2 dates → burst-parallel
             n_procs = min(n_jobs, n_bursts)

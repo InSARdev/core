@@ -422,7 +422,7 @@ def _process_tile_worker(args):
             map_row = ((batch_lat - dem_lat0) / dem_dlat).astype(np.float32)
             map_col = ((batch_lon - dem_lon0) / dem_dlon).astype(np.float32)
             batch_ele = cv2.remap(dem_vals, map_col, map_row,
-                                  interpolation=cv2.INTER_LINEAR,
+                                  interpolation=cv2.INTER_CUBIC,
                                   borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
             del dem_tile, dem_lat, dem_lon, dem_vals, map_row, map_col
 
@@ -650,7 +650,7 @@ def _process_topo_worker(args):
             map_row = ((lat - dem_lat0) / dem_dlat).astype(np.float32)
             map_col = ((lon - dem_lon0) / dem_dlon).astype(np.float32)
             ele = cv2.remap(dem_vals, map_col, map_row,
-                            interpolation=cv2.INTER_LINEAR,
+                            interpolation=cv2.INTER_CUBIC,
                             borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
             ele = ele.ravel().astype(np.float32)
             del dem_chunk, dem_lat_arr, dem_lon_arr, dem_vals, map_row, map_col
@@ -2334,7 +2334,7 @@ def remap_radar_to_geo(data, azi_map, rng_map, out_y, out_x):
 
     Notes
     -----
-    - Uses cv2.INTER_LANCZOS4 for high-quality resampling
+    - Uses cv2.INTER_CUBIC for high-quality resampling
     - Pixels outside the radar coverage are filled with NaN
     - For grids wider than 32766 pixels, processes in x-chunks
     """
@@ -2357,15 +2357,15 @@ def remap_radar_to_geo(data, azi_map, rng_map, out_y, out_x):
         # Fast path: single cv2.remap call
         if np.iscomplexobj(data_vals):
             grid_proj_re = cv2.remap(data_vals.real.astype(np.float32), inv_map_r, inv_map_a,
-                                     interpolation=cv2.INTER_LANCZOS4,
+                                     interpolation=cv2.INTER_CUBIC,
                                      borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
             grid_proj_im = cv2.remap(data_vals.imag.astype(np.float32), inv_map_r, inv_map_a,
-                                     interpolation=cv2.INTER_LANCZOS4,
+                                     interpolation=cv2.INTER_CUBIC,
                                      borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
             grid_proj = (grid_proj_re + 1j * grid_proj_im).astype(data.dtype)
         else:
             grid_proj = cv2.remap(data_vals.astype(np.float32), inv_map_r, inv_map_a,
-                                  interpolation=cv2.INTER_LANCZOS4,
+                                  interpolation=cv2.INTER_CUBIC,
                                   borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
     else:
         # Chunked path: work around OpenCV's 32k pixel limit
@@ -2380,10 +2380,10 @@ def remap_radar_to_geo(data, azi_map, rng_map, out_y, out_x):
             for idx in chunk_indices:
                 x_slice = slice(idx[0], idx[-1] + 1)
                 re_chunk = cv2.remap(data_re, inv_map_r[:, x_slice], inv_map_a[:, x_slice],
-                                     interpolation=cv2.INTER_LANCZOS4,
+                                     interpolation=cv2.INTER_CUBIC,
                                      borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
                 im_chunk = cv2.remap(data_im, inv_map_r[:, x_slice], inv_map_a[:, x_slice],
-                                     interpolation=cv2.INTER_LANCZOS4,
+                                     interpolation=cv2.INTER_CUBIC,
                                      borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
                 grid_proj[:, x_slice] = (re_chunk + 1j * im_chunk).astype(data.dtype)
             del data_re, data_im
@@ -2393,7 +2393,7 @@ def remap_radar_to_geo(data, azi_map, rng_map, out_y, out_x):
             for idx in chunk_indices:
                 x_slice = slice(idx[0], idx[-1] + 1)
                 grid_proj[:, x_slice] = cv2.remap(data_f32, inv_map_r[:, x_slice], inv_map_a[:, x_slice],
-                                                  interpolation=cv2.INTER_LANCZOS4,
+                                                  interpolation=cv2.INTER_CUBIC,
                                                   borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
             del data_f32
 
@@ -3027,6 +3027,7 @@ def compute_transform_inverse(prm, dem,
                               scale_factor=2.0,
                               epsg=None,
                               resolution=(16.0, 4.0),
+                              bbox=None,
                               n_chunks=8,
                               compute_topo=True,
                               debug=False):
@@ -3148,6 +3149,20 @@ def compute_transform_inverse(prm, dem,
     x_min = dx * (np.floor(np.nanmin([np.nanmin(x_first), np.nanmin(x_last)]) / dx) - margin)
     x_max = dx * (np.ceil(np.nanmax([np.nanmax(x_first), np.nanmax(x_last)]) / dx) + margin)
     del y_first, x_first, y_last, x_last
+
+    # Apply bbox crop if specified (WGS84: [lon_min, lat_min, lon_max, lat_max])
+    if bbox is not None:
+        bbox_y, bbox_x = proj(
+            np.array([bbox[1], bbox[3]]),
+            np.array([bbox[0], bbox[2]]),
+            from_epsg=4326, to_epsg=epsg
+        )
+        y_min = max(y_min, dy * np.floor(min(bbox_y) / dy))
+        y_max = min(y_max, dy * np.ceil(max(bbox_y) / dy))
+        x_min = max(x_min, dx * np.floor(min(bbox_x) / dx))
+        x_max = min(x_max, dx * np.ceil(max(bbox_x) / dx))
+        if debug:
+            print(f'  bbox crop: y=[{y_min:.0f}, {y_max:.0f}], x=[{x_min:.0f}, {x_max:.0f}]')
 
     out_y = np.arange(y_min + dy/2, y_max, dy).astype(np.float32)
     out_x = np.arange(x_min + dx/2, x_max, dx).astype(np.float32)
