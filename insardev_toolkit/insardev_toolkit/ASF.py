@@ -488,6 +488,18 @@ class ASF(progressbar_joblib):
                 "  frequency=['A','B']: Both frequencies in same file (~14GB)"
             )
 
+        # Expand S1 burst names by requested polarizations before skip-exist check
+        if s1_bursts and pols:
+            expanded = []
+            for burst in s1_bursts:
+                parts = burst.split('_')
+                for pol in pols:
+                    new_parts = parts.copy()
+                    new_parts[4] = pol
+                    expanded.append('_'.join(new_parts))
+            seen = set()
+            s1_bursts = [b for b in expanded if not (b in seen or seen.add(b))]
+
         # Check if any downloads needed BEFORE creating session (avoid network call)
         if skip_exist:
             # Filter S1 bursts that need download
