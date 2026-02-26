@@ -130,8 +130,17 @@ def _asf_granule_search(granule_list):
         'output': 'geojson'
     }
 
-    response = requests.get(_ASF_SEARCH_URL, params=params)
-    response.raise_for_status()
+    import time
+    for attempt in range(30):
+        try:
+            response = requests.get(_ASF_SEARCH_URL, params=params, timeout=30)
+            response.raise_for_status()
+            break
+        except Exception as e:
+            if attempt + 1 == 30:
+                raise
+            print(f'ASF catalog search attempt {attempt+1} failed: {e}, retrying in 3s...')
+            time.sleep(3)
 
     data = response.json()
     features = data.get('features', [])
@@ -186,8 +195,17 @@ def _asf_search(start=None, end=None, flightDirection=None, intersectsWith=None,
     if beamMode:
         params['beamMode'] = beamMode
 
-    response = requests.get(_ASF_SEARCH_URL, params=params)
-    response.raise_for_status()
+    import time
+    for attempt in range(30):
+        try:
+            response = requests.get(_ASF_SEARCH_URL, params=params, timeout=30)
+            response.raise_for_status()
+            break
+        except Exception as e:
+            if attempt + 1 == 30:
+                raise
+            print(f'ASF catalog search attempt {attempt+1} failed: {e}, retrying in 3s...')
+            time.sleep(3)
 
     data = response.json()
     features = data.get('features', [])
