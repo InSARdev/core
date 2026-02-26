@@ -214,27 +214,35 @@ def regression1d_array(data, dim_values, weight, device, degree=1, wrap=False, i
     return result.astype(np.float32)
 
 
-def trend2d_array(phase, weight, variables, device, degree=1):
+def trend2d_array(phase, weight, variables, device, degree=1, wrap=False):
     """
     Fit 2D polynomial trend using PyTorch least squares (pure GPU implementation).
+
+    Supports three modes:
+    - Complex input: fit complex values directly, return complex trend
+    - wrap=True (real input): convert to exp(iφ), fit complex, return phase angle
+    - Real input, wrap=False: standard real polynomial fit
 
     Parameters
     ----------
     phase : np.ndarray
-        2D or 3D phase array (pair, y, x) or (y, x)
+        2D or 3D array (pair, y, x) or (y, x). Real or complex.
     weight : np.ndarray or None
-        Weight array, same shape as phase
+        Weight array (real), same spatial shape as phase
     variables : list of np.ndarray
         List of 2D variable arrays (y, x) to use as regressors
     device : torch.device
         PyTorch device
     degree : int
         Polynomial degree for each variable (1=linear, 2=quadratic, etc.)
+    wrap : bool
+        If True and input is real, fit in complex domain via exp(iφ).
+        Ignored when input is already complex.
 
     Returns
     -------
     np.ndarray
-        Trend surface, same shape as phase
+        Trend surface, same shape and dtype as phase
     """
     import torch
     from itertools import combinations_with_replacement
@@ -259,22 +267,30 @@ def trend2d_array(phase, weight, variables, device, degree=1):
     n_pairs, ny, nx = phase.shape
     n_pixels = ny * nx
 
+    # Detect complex input
+    is_complex = np.iscomplexobj(phase)
+    # Complex fitting: either complex input or wrapped real phase
+    use_complex = is_complex or wrap
+
     # Use float64 on CPU, float32 on GPU (MPS doesn't support float64)
     if device.type == 'cpu':
         dtype = torch.float64
     else:
         dtype = torch.float32
 
-    # Flatten variables and track valid coordinates (on CPU first)
-    valid_coords = np.ones(n_pixels, dtype=bool)
+    # Flatten variables and track fitting mask (NaN = excluded from fit, not from output)
+    fit_mask = np.ones(n_pixels, dtype=bool)
     vars_np = []
     for var in variables:
         v_flat = var.ravel()
-        valid_coords &= np.isfinite(v_flat)
-        vars_np.append(np.nan_to_num(v_flat, nan=0.0))
+        fit_mask &= np.isfinite(v_flat)
+        vars_np.append(v_flat)
 
-    # Move variables to GPU and build polynomial features there
-    vars_t = [torch.tensor(v, dtype=dtype, device=device) for v in vars_np]
+    # For polynomial features: use nan_to_num so all pixels get valid features
+    # NaN pixels get 0.0 features — but we use standardized features, so the
+    # prediction at these pixels uses the mean value (bias term dominates).
+    # This is acceptable for a smooth polynomial trend.
+    vars_t = [torch.tensor(np.nan_to_num(v, nan=0.0), dtype=dtype, device=device) for v in vars_np]
     n_vars = len(vars_t)
 
     # Build polynomial features on GPU (matching sklearn PolynomialFeatures order)
@@ -294,16 +310,15 @@ def trend2d_array(phase, weight, variables, device, degree=1):
     ones = torch.ones(n_pixels, 1, dtype=dtype, device=device)
     A_all = torch.cat([X_poly, ones], dim=1)
 
-    # Valid coordinates mask on GPU
-    valid_coords_t = torch.tensor(valid_coords, dtype=torch.bool, device=device)
-
     trends = np.empty_like(phase)
+
+    cdtype = torch.complex128 if dtype == torch.float64 else torch.complex64
 
     for i in range(n_pairs):
         phase_flat = phase[i].ravel()
 
-        # Get valid (non-NaN) mask
-        valid_np = np.isfinite(phase_flat) & valid_coords
+        # Get fitting mask: finite phase, finite weight, finite transform variables
+        valid_np = np.isfinite(phase_flat) & fit_mask
         if weight is not None:
             weight_flat = weight[i].ravel()
             valid_np &= np.isfinite(weight_flat)
@@ -317,7 +332,6 @@ def trend2d_array(phase, weight, variables, device, degree=1):
 
         # Extract valid rows
         A_valid = A_all[valid_t]  # (n_valid, n_features+1)
-        b_valid = torch.tensor(phase_flat[valid_np], dtype=dtype, device=device)
 
         # Standardize features on GPU (excluding bias column)
         # Compute mean and std on valid data only
@@ -328,27 +342,56 @@ def trend2d_array(phase, weight, variables, device, degree=1):
             A_valid[:, -1:]  # Keep bias column as-is
         ], dim=1)
 
-        # Apply weights if provided
+        # Compute weights once
         if weight is not None:
             w = torch.tensor(np.sqrt(weight_flat[valid_np]), dtype=dtype, device=device)
-            A_valid_scaled = A_valid_scaled * w[:, None]
-            b_valid = b_valid * w
+        else:
+            w = None
 
-        # Solve normal equations: (A^T A) coeffs = A^T b
-        # Move to CPU for solve (faster for small matrices and avoids CUDA lazy init race)
-        AtA = (A_valid_scaled.T @ A_valid_scaled).cpu()
-        Atb = (A_valid_scaled.T @ b_valid).cpu()
-        coeffs = torch.linalg.solve(AtA, Atb).to(device)
-
-        # Compute trend for all pixels using the same scaling
+        # Scale all pixels for prediction
         A_all_scaled = torch.cat([
             (A_all[:, :-1] - feature_mean) / feature_std,
             A_all[:, -1:]
         ], dim=1)
-        trend = (A_all_scaled @ coeffs).cpu().numpy()
-        # Mask invalid pixels (where variables or phase were NaN)
-        trend[~valid_coords] = np.nan
-        trend[~np.isfinite(phase_flat)] = np.nan
+
+        if use_complex:
+            # Complex fitting on unit circle: fit phase only, ignore amplitude
+            if is_complex:
+                # Normalize to unit magnitude: z/|z| = exp(iφ)
+                z_np = phase_flat[valid_np]
+                z_valid = torch.tensor(z_np / np.abs(z_np), dtype=cdtype, device=device)
+            else:
+                z_valid = torch.tensor(np.exp(1j * phase_flat[valid_np]), dtype=cdtype, device=device)
+
+            # Apply real weights to complex data
+            A_w = A_valid_scaled * w[:, None] if w is not None else A_valid_scaled
+            z_w = z_valid * w if w is not None else z_valid
+
+            # Solve: cast A to complex for matmul with complex z
+            A_w_c = A_w.to(cdtype)
+            AtA = (A_w_c.T @ A_w_c).cpu()
+            Atz = (A_w_c.T @ z_w).cpu()
+            coeffs = torch.linalg.solve(AtA, Atz).to(device)
+
+            # Predict complex trend and normalize to unit magnitude
+            z_trend = (A_all_scaled.to(cdtype) @ coeffs).cpu().numpy()
+            if is_complex:
+                trend = z_trend / np.abs(z_trend)  # unit complex trend
+            else:
+                trend = np.angle(z_trend)  # extract phase for wrapped real
+        else:
+            # Standard real fitting
+            b_valid = torch.tensor(phase_flat[valid_np], dtype=dtype, device=device)
+
+            A_w = A_valid_scaled * w[:, None] if w is not None else A_valid_scaled
+            b_w = b_valid * w if w is not None else b_valid
+
+            AtA = (A_w.T @ A_w).cpu()
+            Atb = (A_w.T @ b_w).cpu()
+            coeffs = torch.linalg.solve(AtA, Atb).to(device)
+
+            trend = (A_all_scaled @ coeffs).cpu().numpy()
+
         trends[i] = trend.reshape(ny, nx)
 
     if squeeze:
@@ -360,6 +403,8 @@ def trend2d_array(phase, weight, variables, device, degree=1):
     elif device.type == 'cuda':
         torch.cuda.empty_cache()
 
+    if is_complex:
+        return trends.astype(np.complex64)
     return trends.astype(np.float32)
 
 

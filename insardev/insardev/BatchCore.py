@@ -595,7 +595,7 @@ class BatchCore(dict):
         if hasattr(sample, 'obj'):
             sample = sample.obj
         data_var = [var for var in sample.data_vars if (sample[var].ndim in (2,3) and sample[var].dims[-2:] == ('y','x'))][0]
-        
+
         chunks = sample[data_var].chunks
         #print ('chunks', chunks)
         if chunks is None:
@@ -974,6 +974,12 @@ class BatchCore(dict):
                             for var in data_vars:
                                 if var in mask_vars:
                                     mask_da = mask_obj[var]
+                                    extra_dims = set(mask_da.dims) - set(ds[var].dims)
+                                    if extra_dims:
+                                        raise ValueError(
+                                            f"where() mask has extra dimensions {extra_dims} not in data. "
+                                            f"Reduce the mask first, e.g. mask.mean() or mask.min() to collapse extra dims."
+                                        )
                                     mask_da = mask_da.reindex_like(ds[var], method='nearest')
                                     new_ds[var] = ds[var].where(mask_da, other, **kwargs)
                             out[k] = new_ds
@@ -1000,6 +1006,15 @@ class BatchCore(dict):
                     ref_da = ds[ref_var]
                 else:
                     ref_da = ds
+
+                # Deny broadcasting: mask must not add dimensions to data
+                extra_dims = set(mask_da.dims) - set(ref_da.dims)
+                if extra_dims:
+                    raise ValueError(
+                        f"where() mask has extra dimensions {extra_dims} not in data. "
+                        f"Reduce the mask first, e.g. mask.mean() or mask.min() to collapse extra dims."
+                    )
+
                 mask_da = mask_da.reindex_like(ref_da, method='nearest')
 
                 out[k] = ds.where(mask_da, other, **kwargs)
@@ -1159,9 +1174,11 @@ class BatchCore(dict):
         return type(self)(out)
 
     def trend2d(self, transform: 'BatchCore', weight: 'BatchUnit | None' = None,
-                degree: int = 1, device: str = 'auto', debug: bool = False) -> 'Batch':
+                degree: int = 1, device: str = 'auto', debug: bool = False) -> 'BatchCore':
         """
         Compute 2D polynomial trend (ramp) from data.
+
+        Supports real, wrapped, and complex input — returns same type.
 
         Parameters
         ----------
@@ -1178,14 +1195,16 @@ class BatchCore(dict):
 
         Returns
         -------
-        Batch
-            Trend surface.
+        Batch, BatchWrap, or BatchComplex
+            Trend surface (same type as input).
 
         Examples
         --------
-        >>> phase, corr = stack.pairs(baseline.tolist()).phasediff(wavelength=30).angle()
+        >>> # Real phase
         >>> trend = phase.trend2d(stack.transform(), weight=corr)
-        >>> detrended = phase - trend
+        >>> # Complex interferogram
+        >>> trend = intf_complex.trend2d(stack.transform(), weight=corr)
+        >>> detrended = intf_complex * trend.conj()
         """
         from .Stack_detrend import Stack_detrend
 

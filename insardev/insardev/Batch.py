@@ -1914,6 +1914,10 @@ class Batches(tuple):
         """Apply downsample to all batches."""
         return Batches([b.downsample(*args, **kwargs) for b in self])
 
+    def where(self, cond, other=np.nan, **kwargs):
+        """Apply where mask to all batches."""
+        return Batches([b.where(cond, other, **kwargs) for b in self])
+
     def crop(self, *args, **kwargs):
         """Apply crop to all batches."""
         return Batches([b.crop(*args, **kwargs) for b in self])
@@ -2330,11 +2334,65 @@ class Batches(tuple):
         phase = self[0]
         weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
 
-        if not isinstance(phase, (Batch, BatchWrap)):
-            raise TypeError(f"First element must be Batch or BatchWrap, got {type(phase).__name__}")
+        if not isinstance(phase, (Batch, BatchWrap, BatchComplex)):
+            raise TypeError(f"First element must be Batch, BatchWrap, or BatchComplex, got {type(phase).__name__}")
 
-        # Delegate to Batch.trend2d
+        # Delegate to BatchCore.trend2d
         return phase.trend2d(transform, weight=weight, degree=degree, device=device, debug=debug)
+
+    def detrend2d(self, transform, degree=1, device='auto', debug=False):
+        """
+        Detrend 2D polynomial trend and return Batches with detrended data.
+
+        Expects Batches from interferogram(): [BatchComplex (intf), BatchUnit (corr)]
+        or from angle(): [BatchWrap (phase), BatchUnit (corr)].
+
+        For complex input: detrended = intf * trend.conj()
+        For wrapped input: detrended = wrap(phase - trend)
+        For real input: detrended = phase - trend
+
+        Parameters
+        ----------
+        transform : Batch
+            Coordinate transform from stack.transform() containing 'azi' and 'rng'.
+        degree : int
+            Polynomial degree (1=plane, 2=quadratic). Default 1.
+        device : str
+            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
+        debug : bool
+            Print diagnostic information.
+
+        Returns
+        -------
+        Batches
+            Batches with [detrended_phase, weight] preserving original types.
+
+        Examples
+        --------
+        >>> # Complex interferogram detrending (chained)
+        >>> intf, corr = stack.pairs(baseline).interferogram(wavelength=30).detrend2d(transform)
+        >>> # Wrapped phase detrending
+        >>> phase, corr = stack.pairs(baseline).phasediff(wavelength=30).angle().detrend2d(transform)
+        """
+        if len(self) < 1:
+            raise ValueError("detrend2d() requires Batches with at least 1 element: [phase]")
+
+        phase = self[0]
+        weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
+
+        if not isinstance(phase, (Batch, BatchWrap, BatchComplex)):
+            raise TypeError(f"First element must be Batch, BatchWrap, or BatchComplex, got {type(phase).__name__}")
+
+        trend = phase.trend2d(transform, weight=weight, degree=degree, device=device, debug=debug)
+
+        if isinstance(phase, BatchComplex):
+            detrended = phase * trend.conj()
+        else:
+            detrended = phase - trend
+
+        # Rebuild Batches preserving all original elements except first
+        elements = [detrended] + list(self[1:])
+        return Batches(elements)
 
     def lstsq(self, device='auto', cumsum=True, debug=False):
         """

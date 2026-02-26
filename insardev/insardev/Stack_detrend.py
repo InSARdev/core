@@ -21,15 +21,16 @@ class Stack_detrend(Stack_unwrap2d):
         """
         Compute 2D polynomial trend using PyTorch (GPU-accelerated).
 
-        .. deprecated::
-            Use ``phase.trend2d(transform, weight=corr)`` on Batch/BatchWrap instead.
-            This Stack method will be removed in a future version.
+        Supports real, wrapped, and complex phase input:
+        - Batch (real): standard polynomial fit
+        - BatchWrap (wrapped real): complex fit via exp(iφ), returns wrapped trend
+        - BatchComplex (complex): complex polynomial fit, returns complex trend
 
         Parameters
         ----------
-        phase : Batch or BatchWrap
+        phase : Batch, BatchWrap, or BatchComplex
             Phase data to detrend.
-        weight : Batch or None
+        weight : BatchUnit or None
             Optional weights (e.g., correlation).
         transform : Batch or None
             Transform with variables to use as regressors (e.g., 'azi', 'rng', 'ele').
@@ -47,7 +48,7 @@ class Stack_detrend(Stack_unwrap2d):
 
         Returns
         -------
-        Batch or BatchWrap
+        Batch, BatchWrap, or BatchComplex
             Trend surface (same type as input phase, lazy).
 
         Examples
@@ -61,6 +62,7 @@ class Stack_detrend(Stack_unwrap2d):
         import xarray as xr
         import numpy as np
         from .BatchCore import BatchCore
+        from .Batch import BatchComplex
 
         # Validate lazy data
         BatchCore._require_lazy(phase, 'trend2d')
@@ -78,6 +80,7 @@ class Stack_detrend(Stack_unwrap2d):
             print(f"NOTE: MPS has float32 precision issues for degree>={degree}. Use device='cpu' for better accuracy.")
 
         wrap = isinstance(phase, BatchWrap)
+        is_complex = isinstance(phase, BatchComplex)
 
         # Unify transform keys to phase
         if transform is not None:
@@ -158,7 +161,7 @@ class Stack_detrend(Stack_unwrap2d):
                     var_dask_list.append(var_dask)
 
                 # Create wrapper function for blockwise - receives variable chunks
-                def make_process_chunk(n_vars, device, degree):
+                def make_process_chunk(n_vars, device, degree, wrap):
                     def process_chunk(*args):
                         import torch
                         # First arg is phase, optional second is weight, rest are variable chunks
@@ -177,18 +180,19 @@ class Stack_detrend(Stack_unwrap2d):
                             if weight_chunk is not None:
                                 weight_chunk = weight_chunk[np.newaxis, ...]
                         result = utils_detrend.trend2d_array(
-                            phase_chunk, weight_chunk, list(var_chunks), torch.device(device), degree
+                            phase_chunk, weight_chunk, list(var_chunks), torch.device(device), degree, wrap=wrap
                         )
                         return result
                     return process_chunk
 
-                process_fn = make_process_chunk(len(var_dask_list), str(device), degree)
+                process_fn = make_process_chunk(len(var_dask_list), str(device), degree, wrap or is_complex)
                 dim_str = ''.join(chr(ord('a') + i) for i in range(phase_dask.ndim))
                 spatial_dim_str = dim_str[-2:]  # Last 2 chars for y, x
 
                 # Resource annotation limits concurrent detrend operations
                 task_resources = {'detrend': 1, 'gpu': 1} if device != 'cpu' else {'detrend': 1}
-                meta = np.empty((0,) * phase_dask.ndim, dtype=np.float32)
+                out_dtype = phase_da.dtype if is_complex else np.float32
+                meta = np.empty((0,) * phase_dask.ndim, dtype=out_dtype)
                 with dask.annotate(resources=task_resources):
                     # Build blockwise args: phase, [weight], *variables
                     blockwise_args = [phase_dask, dim_str]
@@ -205,7 +209,7 @@ class Stack_detrend(Stack_unwrap2d):
                     result_dask = da.blockwise(
                         process_fn, dim_str,
                         *blockwise_args,
-                        dtype=np.float32,
+                        dtype=out_dtype,
                         meta=meta,
                     )
 
@@ -219,7 +223,12 @@ class Stack_detrend(Stack_unwrap2d):
 
             result[key] = xr.Dataset(result_ds, attrs=ds.attrs)
 
-        return BatchWrap(result) if wrap else Batch(result)
+        if is_complex:
+            return BatchComplex(result)
+        elif wrap:
+            return BatchWrap(result)
+        else:
+            return Batch(result)
 
     def trend2d_dataset(self, phase, weight=None, transform=None, degree=1, device='auto', debug=False):
         """
