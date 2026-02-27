@@ -3951,3 +3951,178 @@ def xcorr_fitoffset(results: list, nx: int, ny: int, debug: bool = False) -> dic
         'stretch_a': prm_result.get('stretch_a'),
         'a_stretch_a': prm_result.get('a_stretch_a'),
     }
+
+
+# =============================================================================
+# SATELLITE-AGNOSTIC UTILITIES (moved from S1_align.py, S1_transform.py)
+# =============================================================================
+
+def _read_slc_patch(src, cy: int, cx: int, half: int) -> np.ndarray:
+    """
+    Read a complex SLC patch from an open rasterio dataset.
+
+    Handles both formats:
+    - 1 band complex (S1 geotiffs: complex_int16 → complex64)
+    - 2 bands real/imag (NISAR: int16 pairs)
+
+    Parameters
+    ----------
+    src : rasterio.DatasetReader
+        Open rasterio dataset.
+    cy, cx : int
+        Center coordinates of patch.
+    half : int
+        Half patch size.
+
+    Returns
+    -------
+    np.ndarray
+        Complex64 patch of shape (2*half, 2*half).
+    """
+    from rasterio.windows import Window
+    window = Window(cx - half, cy - half, 2 * half, 2 * half)
+    data = src.read(window=window)
+    if src.count == 1:
+        # Single band complex (S1)
+        return data[0].astype(np.complex64)
+    else:
+        # Two bands: real, imag (NISAR)
+        return (data[0] + 1j * data[1]).astype(np.complex64)
+
+
+def _xcorr_refine_slc(ref_path: str, rep_path: str,
+                      int_ashift: int, int_rshift: int,
+                      patch_size: int = 256,
+                      min_response: float = 0.1, debug: bool = False) -> dict:
+    """
+    Measure total alignment offsets via amplitude cross-correlation.
+
+    Uses only integer constant shifts for coarse alignment. xcorr measures
+    the full sub-pixel offset at each patch position. The integer shifts
+    are added back to get total offsets, which are then fitted with a
+    bilinear model to produce the final alignment parameters.
+
+    Parameters
+    ----------
+    ref_path : str
+        Path to reference SLC geotiff.
+    rep_path : str
+        Path to repeat SLC geotiff.
+    int_ashift, int_rshift : int
+        Integer azimuth and range shifts for coarse alignment (TIFF space).
+    patch_size : int
+        Xcorr patch size. Default 256.
+    min_response : float
+        Minimum correlation response.
+    debug : bool
+        Print debug info.
+
+    Returns
+    -------
+    dict
+        Total alignment parameters (bilinear model fitted to total offsets):
+        {
+            'rshift': float, 'stretch_r': float, 'a_stretch_r': float,
+            'ashift': float, 'stretch_a': float, 'a_stretch_a': float,
+        }
+
+    Raises
+    ------
+    RuntimeError
+        If xcorr failed (insufficient valid patches).
+    """
+    import rasterio
+
+    half = patch_size // 2
+    hann = np.outer(np.hanning(patch_size), np.hanning(patch_size)).astype(np.float32)
+    results = []
+
+    with rasterio.open(ref_path) as src_ref, rasterio.open(rep_path) as src_rep:
+        ny_ref, nx_ref = src_ref.height, src_ref.width
+        ny_rep, nx_rep = src_rep.height, src_rep.width
+
+        # Auto-compute grid: ~2x patch spacing, minimum 4 patches per dimension
+        n_rows = max(4, (ny_ref - patch_size) // (2 * patch_size) + 1)
+        n_cols = max(4, (nx_ref - patch_size) // (2 * patch_size) + 1)
+
+        if debug:
+            print(f"Xcorr: {n_rows}x{n_cols} = {n_rows*n_cols} patches, size {patch_size}")
+            print(f"  Images: ref={ny_ref}x{nx_ref}, rep={ny_rep}x{nx_rep}")
+            print(f"  Integer shifts: ashift={int_ashift}, rshift={int_rshift}")
+
+        for row in range(n_rows):
+            cy1 = int((row + 0.5) * ny_ref / n_rows)
+            for col in range(n_cols):
+                cx1 = int((col + 0.5) * nx_ref / n_cols)
+
+                # Coarse alignment: integer shifts only
+                cy2 = cy1 + int_ashift
+                cx2 = cx1 + int_rshift
+
+                # Bounds check
+                if cy1 < half or cy1 > ny_ref - half:
+                    continue
+                if cy2 < half or cy2 > ny_rep - half:
+                    continue
+                if cx1 < half or cx1 > nx_ref - half:
+                    continue
+                if cx2 < half or cx2 > nx_rep - half:
+                    continue
+
+                # Read and correlate patches
+                patch1 = _read_slc_patch(src_ref, cy1, cx1, half)
+                patch2 = _read_slc_patch(src_rep, cy2, cx2, half)
+
+                result = xcorr_patch(patch1, patch2, hann, min_response=min_response)
+                if result is not None:
+                    # Total offset = integer shift + xcorr-measured sub-pixel
+                    result['dy'] += int_ashift
+                    result['dx'] += int_rshift
+                    result['cy1'] = cy1
+                    result['cx1'] = cx1
+                    results.append(result)
+
+    if debug:
+        print(f"  Valid patches: {len(results)}")
+
+    # Fit bilinear model to TOTAL offsets
+    corrections = xcorr_fitoffset(results, nx=nx_ref, ny=ny_ref, debug=debug)
+
+    if corrections is None:
+        raise RuntimeError("Xcorr correction did not converge - insufficient valid high-coherence patches. "
+                           "Use xcorr=None for geometry-only alignment in low-coherence areas.")
+
+    if debug:
+        print(f"  Fitted total: ashift={corrections['ashift']:.4f}, stretch_a={corrections['stretch_a']:.8f}, a_stretch_a={corrections['a_stretch_a']:.8f}")
+        print(f"                rshift={corrections['rshift']:.4f}, stretch_r={corrections['stretch_r']:.8f}, a_stretch_r={corrections['a_stretch_r']:.8f}")
+
+    return corrections
+
+
+def _offset2shift(xyz, rmax, amax, method='linear'):
+    """Convert offset coordinates to shift grid.
+
+    Parameters
+    ----------
+    xyz : np.ndarray
+        Array of shape (N, 3) with columns [range, azimuth, value].
+    rmax : int
+        Maximum range coordinate.
+    amax : int
+        Maximum azimuth coordinate.
+    method : str
+        Interpolation method for scipy.interpolate.griddata.
+
+    Returns
+    -------
+    xr.DataArray
+        Interpolated shift grid with dims ['a', 'r'].
+    """
+    import xarray as xr
+    from scipy.interpolate import griddata
+
+    rngs = np.arange(8/2, rmax+8/2, 8)
+    azis = np.arange(4/2, amax+4/2, 4)
+    grid_r, grid_a = np.meshgrid(rngs, azis)
+    grid = griddata((xyz[:, 0], xyz[:, 1]), xyz[:, 2], (grid_r, grid_a), method=method)
+    return xr.DataArray(grid, coords={'a': azis, 'r': rngs}, dims=['a', 'r'])

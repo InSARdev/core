@@ -8,6 +8,7 @@
 # See the LICENSE file in the insardev_pygmtsar directory for license terms.
 # ----------------------------------------------------------------------------
 from .S1_align import S1_align
+from .utils_satellite import remap_radar_to_geo
 
 
 def _compute_transform_inverse_worker(prm_ref_df, prm_ref_orbit_df, dem_path, geometry_wkt, outdir,
@@ -52,19 +53,6 @@ def _compute_transform_inverse_worker(prm_ref_df, prm_ref_orbit_df, dem_path, ge
         'transform_x': transform.x.values,
         'transform_attrs': dict(transform.attrs),
     })
-
-
-def _offset2shift(xyz, rmax, amax, method='linear'):
-    """Convert offset coordinates to shift grid."""
-    import numpy as np
-    import xarray as xr
-    from scipy.interpolate import griddata
-
-    rngs = np.arange(8/2, rmax+8/2, 8)
-    azis = np.arange(4/2, amax+4/2, 4)
-    grid_r, grid_a = np.meshgrid(rngs, azis)
-    grid = griddata((xyz[:, 0], xyz[:, 1]), xyz[:, 2], (grid_r, grid_a), method=method)
-    return xr.DataArray(grid, coords={'a': azis, 'r': rngs}, dims=['a', 'r'])
 
 
 def _process_date_worker(args):
@@ -402,7 +390,8 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
 
             topo_phase_xa = xr.DataArray(topo_phase.values, coords=topo_phase.coords,
                                          dims=topo_phase.dims).rename('data')
-            topo_phase_proj = _geocode(transform, topo_phase_xa).transpose('y', 'x').values
+            topo_phase_proj = remap_radar_to_geo(topo_phase_xa, transform.azi.values, transform.rng.values,
+                                                       transform.y.values, transform.x.values).transpose('y', 'x').values
             del topo_phase, topo_phase_xa
 
             # Combine reramp + topo into total phase correction
@@ -469,7 +458,8 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
             complex_proj = slc_corrected.rename({'a': 'y', 'r': 'x'})
             _timings['phase_apply'] = time.perf_counter() - _t0
         else:
-            complex_proj = _geocode(transform, slc_corrected)
+            complex_proj = remap_radar_to_geo(slc_corrected, transform.azi.values, transform.rng.values,
+                                                       transform.y.values, transform.x.values)
             complex_proj = complex_proj.transpose('y', 'x')
             _timings['geocode'] = time.perf_counter() - _t0
         del slc_corrected
@@ -581,75 +571,6 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
     )
     _timings['to_zarr'] = time.perf_counter() - _t0
     del data_proj
-
-
-def _geocode(transform, data):
-    """Geocode data from radar to geographic coordinates using transform."""
-    import cv2
-    import numpy as np
-    import xarray as xr
-
-    trans_azi = transform.azi.values
-    trans_rng = transform.rng.values
-    out_y = transform.y.values
-    out_x = transform.x.values
-
-    data_vals = data.values
-    coord_a = data.a.values
-    coord_r = data.r.values
-
-    inv_map_a = ((trans_azi - coord_a[0]) / (coord_a[1] - coord_a[0])).astype(np.float32)
-    inv_map_r = ((trans_rng - coord_r[0]) / (coord_r[1] - coord_r[0])).astype(np.float32)
-
-    n_y, n_x = inv_map_a.shape
-    OPENCV_MAX = 32766  # cv2.remap requires dimensions < 32767
-
-    if n_x <= OPENCV_MAX:
-        # Direct remap - no chunking needed
-        if np.iscomplexobj(data_vals):
-            grid_proj_re = cv2.remap(data_vals.real.astype(np.float32), inv_map_r, inv_map_a,
-                                     interpolation=cv2.INTER_CUBIC,
-                                     borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
-            grid_proj_im = cv2.remap(data_vals.imag.astype(np.float32), inv_map_r, inv_map_a,
-                                     interpolation=cv2.INTER_CUBIC,
-                                     borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
-            grid_proj = (grid_proj_re + 1j * grid_proj_im).astype(data.dtype)
-        else:
-            grid_proj = cv2.remap(data_vals.astype(np.float32), inv_map_r, inv_map_a,
-                                  interpolation=cv2.INTER_CUBIC,
-                                  borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
-    else:
-        # Chunked remap - split x dimension into minimal equal chunks
-        n_chunks = (n_x + OPENCV_MAX - 1) // OPENCV_MAX
-        x_indices = np.arange(n_x)
-        chunk_indices = np.array_split(x_indices, n_chunks)
-
-        if np.iscomplexobj(data_vals):
-            grid_proj = np.empty((n_y, n_x), dtype=data.dtype)
-            data_re = data_vals.real.astype(np.float32)
-            data_im = data_vals.imag.astype(np.float32)
-            for idx in chunk_indices:
-                x_slice = slice(idx[0], idx[-1] + 1)
-                re_chunk = cv2.remap(data_re, inv_map_r[:, x_slice], inv_map_a[:, x_slice],
-                                     interpolation=cv2.INTER_CUBIC,
-                                     borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
-                im_chunk = cv2.remap(data_im, inv_map_r[:, x_slice], inv_map_a[:, x_slice],
-                                     interpolation=cv2.INTER_CUBIC,
-                                     borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
-                grid_proj[:, x_slice] = (re_chunk + 1j * im_chunk).astype(data.dtype)
-            del data_re, data_im
-        else:
-            grid_proj = np.empty((n_y, n_x), dtype=np.float32)
-            data_f32 = data_vals.astype(np.float32)
-            for idx in chunk_indices:
-                x_slice = slice(idx[0], idx[-1] + 1)
-                grid_proj[:, x_slice] = cv2.remap(data_f32, inv_map_r[:, x_slice], inv_map_a[:, x_slice],
-                                                  interpolation=cv2.INTER_CUBIC,
-                                                  borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
-            del data_f32
-
-    coords = {'y': out_y, 'x': out_x}
-    return xr.DataArray(grid_proj, coords=coords, dims=['y', 'x']).rename(data.name)
 
 
 class S1_transform(S1_align):
