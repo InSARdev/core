@@ -1013,12 +1013,12 @@ def repeat_burst(xml_path: str, tiff_path: str, eof_path: str,
     # Apply shift using OpenCV remap with Lanczos interpolation
     slc_real_shifted = cv2.remap(slc_deramped.real,
                                   map_x, map_y,
-                                  interpolation=cv2.INTER_CUBIC,
+                                  interpolation=cv2.INTER_LANCZOS4,
                                   borderMode=cv2.BORDER_CONSTANT,
                                   borderValue=0)
     slc_imag_shifted = cv2.remap(slc_deramped.imag,
                                   map_x, map_y,
-                                  interpolation=cv2.INTER_CUBIC,
+                                  interpolation=cv2.INTER_LANCZOS4,
                                   borderMode=cv2.BORDER_CONSTANT,
                                   borderValue=0)
     del slc_deramped, map_x, map_y

@@ -101,10 +101,10 @@ def _process_chunk_nisar(iy, ix, chunk_y, chunk_x, n_y, n_x,
     del slc_chunk
 
     proj_re = cv2.remap(slc_re, inv_map_r, inv_map_a,
-                        interpolation=cv2.INTER_CUBIC,
+                        interpolation=cv2.INTER_LANCZOS4,
                         borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
     proj_im = cv2.remap(slc_im, inv_map_r, inv_map_a,
-                        interpolation=cv2.INTER_CUBIC,
+                        interpolation=cv2.INTER_LANCZOS4,
                         borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
     del slc_re, slc_im, inv_map_a, inv_map_r
 
