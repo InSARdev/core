@@ -1930,6 +1930,38 @@ class Batches(tuple):
         """Apply isel to all batches."""
         return Batches([b.isel(*args, **kwargs) for b in self])
 
+    def coherent(self, threshold=0.5):
+        """Mask low-coherence pixels using mean correlation.
+
+        Computes mean correlation across pairs from the BatchUnit item
+        and sets pixels with mean correlation below threshold to NaN
+        in all batch items.
+
+        Parameters
+        ----------
+        threshold : float
+            Minimum mean correlation to keep. Default 0.5.
+
+        Returns
+        -------
+        Batches
+            Same structure with NaN where mean correlation < threshold.
+        """
+        corr = next((b for b in self if isinstance(b, BatchUnit)), None)
+        if corr is None:
+            raise ValueError('coherent() requires a BatchUnit (correlation) in Batches')
+        results = []
+        for b in self:
+            out = {}
+            for key in b:
+                corr_ds = corr[key]
+                corr_var = next(v for v in corr_ds.data_vars if 'y' in corr_ds[v].dims)
+                corr_da = corr_ds[corr_var]
+                mask = corr_da.mean('pair') >= threshold if 'pair' in corr_da.dims else corr_da >= threshold
+                out[key] = b[key].where(mask)
+            results.append(type(b)(out))
+        return Batches(results)
+
     def angle(self):
         """Apply angle() to BatchComplex batches, return others unchanged.
 
