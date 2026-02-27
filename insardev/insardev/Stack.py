@@ -1395,6 +1395,7 @@ class Stack(Stack_plot, BatchCore):
             'radar_wavelength', 'near_range',
             'SC_height_start', 'SC_height_end', 'earth_radius',
             'rng_samp_rate', 'num_lines',
+            'num_rng_bins',  # insardev_ecef: bilinear interpolation of incidence/elevation corners
             # Baseline
             'BPR', 'BPT', 'B_perpendicular', 'B_parallel',
             # Reference height for elevation computation
