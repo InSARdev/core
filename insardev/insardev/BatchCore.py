@@ -2032,6 +2032,80 @@ class BatchCore(dict):
     def var(self, dim=None, **kwargs):
         return self._agg("var", dim=dim, **kwargs)
 
+    def rmse(self, solution, weight=None):
+        """RMSE: self (pairs) vs solution (pairs or dates).
+
+        Parameters
+        ----------
+        solution : Batch or BatchWrap
+            If pair-based: direct comparison.
+            If date-based: pairs reconstructed as sol[rep] - sol[ref].
+        weight : BatchUnit, optional
+            Per-pair weights (e.g., correlation).
+
+        Returns
+        -------
+        Batch
+            Per-pixel RMSE on (y, x) grid.
+        """
+        import numpy as np
+        import xarray as xr
+        from .Batch import Batch
+
+        # Detect pair-based vs date-based solution
+        sol_sample_ds = next(iter(solution.values()))
+        spatial_vars = [v for v in sol_sample_ds.data_vars if 'y' in sol_sample_ds[v].dims]
+        is_date_based = 'date' in sol_sample_ds[spatial_vars[0]].dims
+
+        if is_date_based:
+            # Reconstruct pairs from date-based solution
+            recon = {}
+            for key in self:
+                if key not in solution:
+                    continue
+                obs_ds = self[key]
+                sol_ds = solution[key]
+                recon_vars = {}
+                for var in obs_ds.data_vars:
+                    if var not in sol_ds.data_vars or 'y' not in obs_ds[var].dims:
+                        continue
+                    refs = obs_ds[var].coords['ref'].values
+                    reps = obs_ds[var].coords['rep'].values
+                    recon_list = []
+                    for p in range(len(refs)):
+                        recon_list.append(
+                            sol_ds[var].sel(date=reps[p]) - sol_ds[var].sel(date=refs[p])
+                        )
+                    recon_vars[var] = xr.concat(recon_list, dim='pair')
+                recon[key] = xr.Dataset(recon_vars)
+            solution_pairs = Batch(recon)
+        else:
+            solution_pairs = solution
+
+        # Compute error using batch subtraction (handles wrapping for BatchWrap)
+        error = self - solution_pairs
+
+        # Compute per-pixel RMSE across pairs
+        out = {}
+        for key in error:
+            err_ds = error[key]
+            rmse_vars = {}
+            for var in err_ds.data_vars:
+                if 'y' not in err_ds[var].dims or 'pair' not in err_ds[var].dims:
+                    continue
+                err_sq = err_ds[var] ** 2
+                if weight is not None and key in weight:
+                    w_ds = weight[key]
+                    w_da = w_ds[var] if var in w_ds.data_vars else w_ds[next(
+                        v for v in w_ds.data_vars if 'y' in w_ds[v].dims)]
+                    rmse_val = np.sqrt((w_da * err_sq).sum('pair') / w_da.sum('pair'))
+                else:
+                    rmse_val = np.sqrt(err_sq.mean('pair'))
+                rmse_vars[var] = rmse_val.astype('float32')
+            out[key] = xr.Dataset(rmse_vars)
+
+        return Batch(out)
+
     def polyval(self, coeffs: dict[str, list | xr.DataArray], dim: str = 'x') -> BatchCore:
         """
         Evaluate polynomial coefficients for each burst.
