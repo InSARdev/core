@@ -319,6 +319,8 @@ def trend2d_array(phase, weight, variables, device, degree=1, wrap=False):
 
         # Get fitting mask: finite phase, finite weight, finite transform variables
         valid_np = np.isfinite(phase_flat) & fit_mask
+        if is_complex:
+            valid_np &= phase_flat != 0
         if weight is not None:
             weight_flat = weight[i].ravel()
             valid_np &= np.isfinite(weight_flat)
@@ -359,7 +361,8 @@ def trend2d_array(phase, weight, variables, device, degree=1, wrap=False):
             if is_complex:
                 # Normalize to unit magnitude: z/|z| = exp(iφ)
                 z_np = phase_flat[valid_np]
-                z_valid = torch.tensor(z_np / np.abs(z_np), dtype=cdtype, device=device)
+                z_np /= np.abs(z_np)
+                z_valid = torch.tensor(z_np, dtype=cdtype, device=device)
             else:
                 z_valid = torch.tensor(np.exp(1j * phase_flat[valid_np]), dtype=cdtype, device=device)
 
@@ -376,7 +379,10 @@ def trend2d_array(phase, weight, variables, device, degree=1, wrap=False):
             # Predict complex trend and normalize to unit magnitude
             z_trend = (A_all_scaled.to(cdtype) @ coeffs).cpu().numpy()
             if is_complex:
-                trend = z_trend / np.abs(z_trend)  # unit complex trend
+                with np.errstate(invalid='ignore'):
+                    z_trend /= np.abs(z_trend)
+                z_trend[~np.isfinite(z_trend)] = 0
+                trend = z_trend  # unit complex trend
             else:
                 trend = np.angle(z_trend)  # extract phase for wrapped real
         else:

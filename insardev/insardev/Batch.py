@@ -2082,7 +2082,6 @@ class Batches(tuple):
                 else:
                     intf = intf * phase.iexp(-1)
 
-            corr_look = BatchUnit()
             if wavelength is not None:
                 intf_look = intf.gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold, device=device)
                 intensity_ref = ref.power().gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold, device=device)
@@ -2092,6 +2091,7 @@ class Batches(tuple):
                 del intensity_ref, intensity_rep
             else:
                 intf_look = intf
+                corr_look = None
                 del ref, rep
             del intf
 
@@ -2099,6 +2099,8 @@ class Batches(tuple):
                 intf_look = intf_look.where(weight.isfinite())
                 corr_look = corr_look.where(weight.isfinite()) if corr_look else None
 
+        if corr_look is None:
+            return Batches([intf_look])
         return Batches([intf_look, corr_look])
 
     def interferogram2(self, *args, **kwargs):
