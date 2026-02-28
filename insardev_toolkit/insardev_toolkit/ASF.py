@@ -691,22 +691,13 @@ class ASF(progressbar_joblib):
 
             # download manifest to memory to get dimensions for TIFF validation
             manifest_url = get_burst_url(properties['additionalUrls'][0])
-            response = session.get(manifest_url, stream=True)
+            response = session.get(manifest_url, timeout=(10, 30))
             response.raise_for_status()
-            cache_status = response.headers.get('x-cache', 'N/A')
-            cache_enc = response.headers.get('content-encoding', 'none')
-            # Read and decompress for debug logging
-            if debug and cache_enc in ('br', 'gzip', 'deflate'):
-                import brotli
-                compressed_bytes = response.raw.read()
-                transfer_mb = len(compressed_bytes) / 1024 / 1024
-                xml_content = brotli.decompress(compressed_bytes).decode('utf-8')
-                print(f'  XML  {cache_status:4} {cache_enc:4} {transfer_mb:5.1f}MB {burst}')
-            else:
-                xml_content = response.text
-                if debug:
-                    size_mb = len(xml_content.encode()) / 1024 / 1024
-                    print(f'  XML  {cache_status:4} {cache_enc:4} {size_mb:5.1f}MB {burst}')
+            xml_content = response.text
+            if debug:
+                cache_status = response.headers.get('x-cache', 'N/A')
+                size_mb = len(xml_content.encode()) / 1024 / 1024
+                print(f'  XML  {cache_status:4} {size_mb:5.1f}MB {burst}')
             if len(xml_content) == 0:
                 raise Exception(f'ERROR: Downloaded manifest is empty: {manifest_url}')
             # check if server returned JSON error instead of XML
@@ -758,16 +749,22 @@ class ASF(progressbar_joblib):
                 import rasterio
                 from rasterio.io import MemoryFile
 
-                # Download TIFF to memory (brotli compression - faster than uncompressed)
+                # Download TIFF to memory with total time limit
                 tiff_url = get_burst_url(properties['url'])
-                response = session.get(tiff_url, stream=True)
+                response = session.get(tiff_url, stream=True, timeout=(30, 30))
                 response.raise_for_status()
-                tiff_bytes = b''.join(response.iter_content(chunk_size=1024*1024))
+                chunks = []
+                download_start = time.time()
+                for chunk in response.iter_content(chunk_size=1024*1024):
+                    chunks.append(chunk)
+                    if time.time() - download_start > 120:
+                        response.close()
+                        raise Exception(f'Download exceeded 120s for {burst}')
+                tiff_bytes = b''.join(chunks)
                 if debug:
                     cache_status = response.headers.get('x-cache', 'N/A')
-                    cache_enc = response.headers.get('content-encoding', 'none')
                     size_mb = len(tiff_bytes) / 1024 / 1024
-                    print(f'  TIFF {cache_status:4} {cache_enc:4} {size_mb:5.1f}MB {burst}')
+                    print(f'  TIFF {cache_status:4} {size_mb:5.1f}MB {burst}')
                 if len(tiff_bytes) == 0:
                     raise Exception(f'ERROR: Downloaded TIFF is empty: {tiff_url}')
 
@@ -1002,7 +999,7 @@ class ASF(progressbar_joblib):
                 time.sleep(timeout_second)
 
         # download bursts
-        with self.progressbar_joblib(tqdm(desc='Downloading ASF SLC'.ljust(25), total=len(bursts_missed))) as progress_bar:
+        with self.progressbar_joblib(tqdm(desc='Downloading ASF SLC'.ljust(25), total=len(results))) as progress_bar:
             statuses = joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(download_burst_with_retry)\
                                     (result, basedir, session, retries=retries, timeout_second=timeout_second) for result in results)
 
