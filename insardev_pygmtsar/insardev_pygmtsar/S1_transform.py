@@ -978,17 +978,10 @@ class S1_transform(S1_align):
                     calibration_xml, noise_xml, reference_height, debug
                 ))
 
-            # Use ProcessPoolExecutor or ThreadPoolExecutor based on scheduler
-            from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-
-            if scheduler_inner == 'threads':
-                with ThreadPoolExecutor(max_workers=n_jobs_inner) as executor:
-                    list(executor.map(_process_date_worker, worker_args))
-            else:
-                # Default: ProcessPoolExecutor with max_tasks_per_child=1 for memory isolation
-                with ProcessPoolExecutor(max_workers=n_jobs_inner, mp_context=mp.get_context('spawn'),
-                                         max_tasks_per_child=1) as executor:
-                    list(executor.map(_process_date_worker, worker_args))
+            # Process dates in parallel using joblib
+            joblib.Parallel(n_jobs=n_jobs_inner, backend=scheduler_inner)(
+                joblib.delayed(_process_date_worker)(args) for args in worker_args
+            )
 
             # Cleanup and consolidate
             del topo, transform, prm_ref
