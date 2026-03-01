@@ -695,11 +695,11 @@ class CDSE(progressbar_joblib):
                     redirect_url = response.headers.get('Location')
                     if redirect_url:
                         # Follow redirect with auth header, allow further redirects
-                        response = requests.post(redirect_url, headers=headers, stream=True,
-                                                timeout=120, allow_redirects=True)
+                        response = requests.post(redirect_url, headers=headers,
+                                                timeout=(10, 300), allow_redirects=True)
             else:
                 # Cache proxy - simple GET
-                response = session.get(url, stream=True, timeout=120)
+                response = session.get(url, timeout=(10, 300))
 
             if response.status_code != 200:
                 try:
@@ -712,7 +712,7 @@ class CDSE(progressbar_joblib):
             cache_status = response.headers.get('cf-cache-status', response.headers.get('x-cache', 'N/A'))
             cache_enc = response.headers.get('content-encoding', 'none')
 
-            zip_bytes = b''.join(response.iter_content(chunk_size=1024*1024))
+            zip_bytes = response.content
             if len(zip_bytes) == 0:
                 raise Exception(f'ERROR: Downloaded ZIP is empty for {burst}')
 
@@ -978,13 +978,18 @@ class CDSE(progressbar_joblib):
 
                 xml_contents[xml_calib_file] = xmltodict.unparse({'calibration': calibration}, pretty=True, indent='  ')
 
-            # All validations passed - write everything to disk atomically
-            with open(tif_file, 'wb') as f:
+            # All validations passed - write to temp files then atomic rename.
+            # This guarantees no partial files on disk if interrupted mid-write.
+            tmp = tif_file + '.tmp'
+            with open(tmp, 'wb') as f:
                 f.write(tiff_bytes)
+            os.rename(tmp, tif_file)
 
             for filepath, content in xml_contents.items():
-                with open(filepath, 'w') as f:
+                tmp = filepath + '.tmp'
+                with open(tmp, 'w') as f:
                     f.write(content)
+                os.rename(tmp, filepath)
 
             return cache_status  # Return cache status (HIT/MISS/etc)
 

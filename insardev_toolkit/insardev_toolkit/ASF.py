@@ -746,21 +746,13 @@ class ASF(progressbar_joblib):
             else:
                 # Download and validate TIFF entirely in memory before writing to disk
                 import io
-                import rasterio
-                from rasterio.io import MemoryFile
 
-                # Download TIFF to memory with total time limit
+                # Download TIFF fully into memory (no streaming — requests will raise
+                # on incomplete/truncated responses instead of silently returning partial data)
                 tiff_url = get_burst_url(properties['url'])
-                response = session.get(tiff_url, stream=True, timeout=(10, 60))
+                response = session.get(tiff_url, timeout=(10, 300))
                 response.raise_for_status()
-                chunks = []
-                download_start = time.time()
-                for chunk in response.iter_content(chunk_size=1024*1024):
-                    chunks.append(chunk)
-                    if time.time() - download_start > 120:
-                        response.close()
-                        raise Exception(f'Download exceeded 120s for {burst}')
-                tiff_bytes = b''.join(chunks)
+                tiff_bytes = response.content
                 if debug:
                     cache_status = response.headers.get('x-cache', 'N/A')
                     size_mb = len(tiff_bytes) / 1024 / 1024
@@ -780,7 +772,7 @@ class ASF(progressbar_joblib):
                     except json.JSONDecodeError:
                         raise Exception(f'ERROR: ASF server returned invalid response for {burst}: {tiff_bytes[:100]!r}')
 
-                # Validate TIFF structure and dimensions in memory using TiffFile
+                # Validate TIFF structure, dimensions, and completeness using TiffFile
                 with TiffFile(io.BytesIO(tiff_bytes)) as tif:
                     page = tif.pages[0]
                     actual_lines, actual_samples = page.shape
@@ -788,16 +780,14 @@ class ASF(progressbar_joblib):
                         raise Exception(f'ERROR: Downloaded TIFF dimensions mismatch for {burst}: '
                                       f'got {actual_lines}x{actual_samples}, expected {lines_per_burst}x{samples_per_burst}. '
                                       f'ASF burst extraction may have failed.')
+                    # Verify all strip data fits within the downloaded bytes
+                    for offset, bytecount in zip(page.dataoffsets, page.databytecounts):
+                        if offset + bytecount > len(tiff_bytes):
+                            raise Exception(f'ERROR: Downloaded TIFF truncated for {burst}: '
+                                          f'strip at offset {offset} needs {bytecount} bytes '
+                                          f'but file is only {len(tiff_bytes)} bytes.')
                     # Also get offset for XML creation
                     tiff_offset = page.dataoffsets[0]
-
-                # Validate TIFF can be read by rasterio/GDAL (detects corruption)
-                with MemoryFile(tiff_bytes) as memfile:
-                    with memfile.open() as ds:
-                        if ds.width != samples_per_burst or ds.height != lines_per_burst:
-                            raise Exception(f'ERROR: Rasterio dimensions mismatch for {burst}')
-                        # Read a small portion to verify data is accessible
-                        _ = ds.read(1, window=rasterio.windows.Window(0, 0, min(100, ds.width), min(100, ds.height)))
 
                 # TIFF validated - now build XML content in memory before writing anything
 
@@ -949,16 +939,19 @@ class ASF(progressbar_joblib):
 
                 xml_contents[xml_calib_file] = xmltodict.unparse({'calibration': calibration}, pretty=True, indent='  ')
 
-            # All validations passed - now write everything to disk atomically
-            # Write TIFF if we downloaded it (tiff_bytes exists in local scope)
+            # All validations passed - write to temp files then atomic rename.
+            # This guarantees no partial files on disk if interrupted mid-write.
             if 'tiff_bytes' in dir():
-                with open(tif_file, 'wb') as f:
+                tmp = tif_file + '.tmp'
+                with open(tmp, 'wb') as f:
                     f.write(tiff_bytes)
+                os.rename(tmp, tif_file)
 
-            # Write all XML files
             for filepath, content in xml_contents.items():
-                with open(filepath, 'w') as f:
+                tmp = filepath + '.tmp'
+                with open(tmp, 'w') as f:
                     f.write(content)
+                os.rename(tmp, filepath)
 
         with tqdm(desc=f'Downloading ASF Catalog'.ljust(25), total=1) as pbar:
             results = asf_search.granule_search(bursts_missed)
