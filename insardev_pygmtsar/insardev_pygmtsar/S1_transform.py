@@ -597,7 +597,6 @@ class S1_transform(S1_align):
                   append: bool=False,
                   n_jobs: int|None=None,
                   scheduler: str|None=None,
-                  tmpdir: str|None=None,
                   debug: bool=False):
         """
         Transform SLC data to geographic coordinates.
@@ -650,9 +649,6 @@ class S1_transform(S1_align):
         scheduler : str, optional
             The parallel scheduler to use: 'loky' (default, multiprocessing), 'threads' (threading),
             or 'sequential' (no parallelism, lowest memory usage). Default is None which uses 'loky'.
-        tmpdir : str, optional
-            Directory for temporary files. Use fast local storage (e.g., '/mnt' on Google Colab)
-            for better performance. Default is system temp directory.
         debug : bool, optional
             Whether to print debug information.
 
@@ -664,7 +660,6 @@ class S1_transform(S1_align):
         from tqdm.auto import tqdm
         import joblib
         import os
-        import tempfile
         import shutil
         import sys
         import warnings
@@ -736,9 +731,6 @@ class S1_transform(S1_align):
         # remove the consolidated metadata file when appending
         if os.path.exists(metafile):
             os.remove(metafile)
-
-        # Use user-specified tmpdir or fall back to system temp directory
-        tmpdir_base = tmpdir if tmpdir is not None else tempfile.gettempdir()
 
         def process_burst_sequential(bursts, target, debug=False):
             """Process a single burst with dates processed sequentially (efficient - caches prm/transform)."""
