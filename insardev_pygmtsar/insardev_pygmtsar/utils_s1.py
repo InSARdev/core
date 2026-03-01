@@ -572,11 +572,10 @@ def satellite_slc(tiff_path: str) -> "xr.DataArray":
     >>> print(slc.dtype)  # complex64
     """
     import xarray as xr
-    import rasterio
+    from tifffile import imread
 
-    with rasterio.open(tiff_path) as src:
-        data = src.read(1).astype('complex64')
-        n_lines, n_samples = data.shape
+    data = imread(tiff_path).astype('complex64')
+    n_lines, n_samples = data.shape
 
     return xr.DataArray(
         data,
