@@ -3235,22 +3235,19 @@ def compute_transform_inverse(prm, dem,
     margin = 10 * max(dx, dy)
     polygon = polygon.buffer(margin)
 
-    # Rasterize polygon to valid mask
-    from rasterio.features import rasterize
-    from rasterio.transform import from_bounds
-
-    # Create affine transform for output grid
-    transform = from_bounds(out_x[0] - dx/2, out_y[-1] - dy/2,
-                            out_x[-1] + dx/2, out_y[0] + dy/2, n_x, n_y)
-
-    # Rasterize polygon
-    valid_mask = rasterize(
-        [(polygon, 1)],
-        out_shape=(n_y, n_x),
-        transform=transform,
-        fill=0,
-        dtype=np.uint8
-    ).astype(bool)
+    # Fast path: if polygon covers entire grid, all pixels are valid (skip cv2 import)
+    grid_box = shapely.box(out_x[0], out_y[0], out_x[-1], out_y[-1])
+    if polygon.contains(grid_box):
+        valid_mask = np.ones((n_y, n_x), dtype=bool)
+    else:
+        # Rasterize polygon to valid mask (cv2, no rasterio/GDAL to avoid fork deadlocks)
+        import cv2
+        poly_coords = np.array(polygon.exterior.coords)
+        px = ((poly_coords[:, 0] - out_x[0]) / (out_x[-1] - out_x[0]) * (n_x - 1)).astype(np.int32)
+        py = ((poly_coords[:, 1] - out_y[0]) / (out_y[-1] - out_y[0]) * (n_y - 1)).astype(np.int32)
+        valid_mask = np.zeros((n_y, n_x), dtype=np.uint8)
+        cv2.fillPoly(valid_mask, [np.column_stack([px, py])], 1)
+        valid_mask = valid_mask.astype(bool)
 
     n_valid = valid_mask.sum()
 
