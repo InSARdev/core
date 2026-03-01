@@ -848,11 +848,9 @@ class S1_transform(S1_align):
             self.consolidate_metadata(target, record_id=all_dates[-1][-1])
 
         def process_burst_dates_parallel(bursts, target, n_jobs_inner, scheduler_inner=None, debug=False):
-            """Process a single burst with dates parallelized across n_jobs_inner processes."""
-            import multiprocessing as mp
+            """Process a single burst with dates parallelized across n_jobs_inner workers."""
             import numpy as np
             import xarray as xr
-            from .PRM import PRM
 
             burst_refs = bursts[0]
             burst_reps = bursts[1]
@@ -869,122 +867,97 @@ class S1_transform(S1_align):
                     print(f'NOTE: {fullBurstId} directory exists but metadata file is missing. Removing...')
                     shutil.rmtree(outdir)
 
+            # Phase 1: Compute transform inline (same as process_burst_sequential)
+            prm_cache = {}
+            for burst_ref in burst_refs:
+                prm, _, _ = self.align_ref(burst_ref[-1], debug=debug, return_slc=False)
+                prm_cache[burst_ref[-1]] = prm
+
             ref_burst_name = burst_refs[0][-1]
+            prm_ref_main = prm_cache[ref_burst_name]
 
-            # Phase 1: Compute prm_ref with doppler correction (shared with subprocess and date workers)
-            prm_ref, _, _ = self.align_ref(ref_burst_name, debug=debug, return_slc=False)
-            prm_ref_df = prm_ref.df
-            prm_ref_orbit_df = prm_ref.orbit_df
-
-            # Get geometry for transform subprocess
+            from .utils_satellite import compute_transform_inverse, get_dem_wgs84ellipsoid, save_transform
             record = self.get_record(ref_burst_name)
-            geometry_wkt = record.geometry.iloc[0].wkt
+            dem = get_dem_wgs84ellipsoid(self.DEM, record.geometry.iloc[0], netcdf_engine=self.netcdf_engine_read)
+            topo, transform = compute_transform_inverse(prm_ref_main, dem, scale_factor=1/dem_vertical_accuracy, epsg=epsg, resolution=resolution, bbox=bbox, debug=debug)
+            del dem
 
-            # Phase 2: Compute transform in spawned subprocess (memory released on exit)
-            # Use spawn context for true memory isolation (not fork which shares pages)
-            ctx = mp.get_context('spawn')
-            result_queue = ctx.Queue()
-            p = ctx.Process(target=_compute_transform_inverse_worker, args=(
-                prm_ref_df, prm_ref_orbit_df, self.DEM, geometry_wkt, outdir,
-                1/dem_vertical_accuracy, epsg, resolution, bbox, 8, debug, self.netcdf_engine_read, result_queue
-            ))
-            p.start()
-            result = result_queue.get()  # wait for result
-            p.join()
+            save_transform(transform, outdir, scale_factor=1/dem_vertical_accuracy)
 
-            # Reconstruct topo from queue result
-            if remove_topo_phase:
-                topo = xr.DataArray(result['topo_values'],
-                                   coords={'a': result['topo_a_coords'], 'r': result['topo_r_coords']},
-                                   dims=['a', 'r'])
-            elif reference_height != 0:
-                topo = xr.DataArray(
-                    np.full_like(result['topo_values'], reference_height),
-                    coords={'a': result['topo_a_coords'], 'r': result['topo_r_coords']},
-                    dims=['a', 'r'])
-            else:
-                topo = None
+            if not remove_topo_phase:
+                if reference_height != 0:
+                    topo = xr.full_like(topo, reference_height)
+                else:
+                    topo = None
+            transform = transform.drop_vars('ele')
 
-            # Reconstruct transform from queue result (without ele - not needed for geocoding)
-            transform = xr.Dataset({
-                'rng': xr.DataArray(result['transform_rng'],
-                                   coords={'y': result['transform_y'], 'x': result['transform_x']},
-                                   dims=['y', 'x']),
-                'azi': xr.DataArray(result['transform_azi'],
-                                   coords={'y': result['transform_y'], 'x': result['transform_x']},
-                                   dims=['y', 'x']),
-            }, attrs=result['transform_attrs'])
+            # Pre-compute SC_height and topo_llt caches
+            sc_height_cache = {}
+            for burst_ref in burst_refs:
+                burst_ref_name = burst_ref[-1]
+                prm_ref = prm_cache[burst_ref_name]
+                sc_height_result = prm_ref.SAT_baseline(prm_ref)
+                sc_height_cache[burst_ref_name] = {
+                    'SC_height': sc_height_result.get('SC_height'),
+                    'SC_height_start': sc_height_result.get('SC_height_start'),
+                    'SC_height_end': sc_height_result.get('SC_height_end')
+                }
 
-            # Get SC_height from prm_ref (already computed before subprocess)
-            sc_height_result = prm_ref.SAT_baseline(prm_ref)
-            sc_height = {
-                'SC_height': sc_height_result.get('SC_height'),
-                'SC_height_start': sc_height_result.get('SC_height_start'),
-                'SC_height_end': sc_height_result.get('SC_height_end')
-            }
+            topo_llt_cache = {}
+            for burst_ref in burst_refs:
+                topo_llt_cache[burst_ref[-1]] = self._get_topo_llt(burst_ref[-1], degrees=alignment_spacing)
 
-            # Phase 3: Process dates in parallel using spawned subprocesses
-            # Each worker processes one date then exits (max_tasks_per_child=1), releasing memory
+            # Phase 2: Build worker args and process dates in parallel
             all_dates = burst_reps + burst_refs
+            prm_ref_df = prm_cache[ref_burst_name].df
+            prm_ref_orbit_df = prm_cache[ref_burst_name].orbit_df
+            topo_llt = topo_llt_cache[ref_burst_name]
 
-            # prm_ref_df and prm_ref_orbit_df already serialized before subprocess
-
-            # Get topo_llt once (small, shared by all workers for alignment computation)
-            topo_llt = self._get_topo_llt(ref_burst_name, degrees=alignment_spacing)
-
-            # Build argument tuples for each date (no S1 instance needed in workers)
             worker_args = []
             for burst_item in all_dates:
                 is_ref = burst_item in burst_refs
                 burst_name = burst_item[-1]
+                burst_ref = [b for b in burst_refs if b[:2] == burst_item[:2]][0]
+                burst_ref_name = burst_ref[-1]
 
-                # Get file paths for this burst
                 prefix = self.fullBurstId(burst_name)
                 record = self.get_record(burst_name)
                 xml_file = os.path.join(self.datadir, prefix, 'annotation', f'{burst_name}.xml')
                 tiff_file = os.path.join(self.datadir, prefix, 'measurement', f'{burst_name}.tiff')
                 orbit_file = os.path.join(self.datadir, record['orbit'].iloc[0])
-
-                # Derive calibration and noise XML paths (ASF burst format: {burst_name}.xml)
                 calibration_xml = os.path.join(self.datadir, prefix, 'calibration', f'{burst_name}.xml')
                 noise_xml = os.path.join(self.datadir, prefix, 'noise', f'{burst_name}.xml')
-                # Raise error if files don't exist when corrections are requested
+
                 if radiometric_calibration and not os.path.exists(calibration_xml):
                     raise FileNotFoundError(f"Calibration XML not found: {calibration_xml}")
                 if remove_thermal_noise and not os.path.exists(noise_xml):
                     raise FileNotFoundError(f"Noise XML not found: {noise_xml}")
 
-                # Build record dict for worker (use reset_index to include index values like polarization)
                 record_dict = {}
                 record_reset = record.reset_index()
-                if debug and burst_item == all_dates[0]:
-                    print(f'DEBUG: record_reset.columns = {list(record_reset.columns)}')
                 for col in record_reset.columns:
                     val = record_reset[col].iloc[0]
-                    if hasattr(val, 'wkt'):  # geometry
+                    if hasattr(val, 'wkt'):
                         record_dict[col] = val.wkt
                     else:
                         record_dict[col] = val
-                if debug and burst_item == all_dates[0]:
-                    print(f'DEBUG: record_dict keys = {list(record_dict.keys())}')
 
                 worker_args.append((
                     outdir, burst_item, burst_refs, is_ref,
                     xml_file, tiff_file, orbit_file, record_dict,
                     topo, transform,
-                    prm_ref_df, prm_ref_orbit_df, sc_height,
+                    prm_ref_df, prm_ref_orbit_df, sc_height_cache[burst_ref_name],
                     topo_llt, epsg, remove_tidal_phase,
                     remove_thermal_noise, radiometric_calibration,
                     calibration_xml, noise_xml, reference_height, debug
                 ))
 
-            # Process dates in parallel using joblib
             joblib.Parallel(n_jobs=n_jobs_inner, backend=scheduler_inner)(
                 joblib.delayed(_process_date_worker)(args) for args in worker_args
             )
 
             # Cleanup and consolidate
-            del topo, transform, prm_ref
+            del topo, transform, prm_cache
             self.consolidate_metadata(target, record_id=all_dates[-1][-1])
 
         # Get reference and repeat bursts as groups
