@@ -691,7 +691,7 @@ class ASF(progressbar_joblib):
 
             # download manifest to memory to get dimensions for TIFF validation
             manifest_url = get_burst_url(properties['additionalUrls'][0])
-            response = session.get(manifest_url, timeout=(10, 30))
+            response = session.get(manifest_url, timeout=(10, 60))
             response.raise_for_status()
             xml_content = response.text
             if debug:
@@ -751,7 +751,7 @@ class ASF(progressbar_joblib):
 
                 # Download TIFF to memory with total time limit
                 tiff_url = get_burst_url(properties['url'])
-                response = session.get(tiff_url, stream=True, timeout=(30, 30))
+                response = session.get(tiff_url, stream=True, timeout=(10, 60))
                 response.raise_for_status()
                 chunks = []
                 download_start = time.time()
