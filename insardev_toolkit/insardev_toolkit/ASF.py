@@ -747,8 +747,7 @@ class ASF(progressbar_joblib):
                 # Download and validate TIFF entirely in memory before writing to disk
                 import io
 
-                # Download TIFF fully into memory (no streaming — requests will raise
-                # on incomplete/truncated responses instead of silently returning partial data)
+                # Download TIFF fully into memory
                 tiff_url = get_burst_url(properties['url'])
                 response = session.get(tiff_url, timeout=(10, 300))
                 response.raise_for_status()
@@ -759,6 +758,16 @@ class ASF(progressbar_joblib):
                     print(f'  TIFF {cache_status:4} {size_mb:5.1f}MB {burst}')
                 if len(tiff_bytes) == 0:
                     raise Exception(f'ERROR: Downloaded TIFF is empty: {tiff_url}')
+
+                # Early truncation check using expected size from server or ASF metadata
+                expected_size = int(response.headers.get('X-Original-Size', 0)) or int(properties['bytes'])
+                if expected_size > 0 and len(tiff_bytes) < expected_size:
+                    pct = 100 * len(tiff_bytes) / expected_size
+                    cache_status = response.headers.get('x-cache', 'N/A')
+                    raise Exception(f'ERROR: Downloaded TIFF truncated for {burst}: '
+                                  f'got {len(tiff_bytes)} bytes ({pct:.0f}%) of {expected_size} expected '
+                                  f'(cache: {cache_status}). '
+                                  f'The cache proxy may have timed out fetching from upstream.')
 
                 # Check if server returned JSON error instead of TIFF
                 # TIFF magic bytes: II*\x00 (little-endian) or MM\x00* (big-endian)
