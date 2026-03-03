@@ -1178,7 +1178,9 @@ class BatchCore(dict):
         """
         Compute 2D polynomial trend (ramp) from data.
 
-        Supports real, wrapped, and complex input — returns same type.
+        Two modes:
+        - Complex (BatchComplex): unit-circle fitting, returns BatchComplex
+        - Real (Batch): standard polynomial, returns Batch
 
         Parameters
         ----------
@@ -1195,7 +1197,7 @@ class BatchCore(dict):
 
         Returns
         -------
-        Batch, BatchWrap, or BatchComplex
+        Batch or BatchComplex
             Trend surface (same type as input).
 
         Examples
@@ -1206,16 +1208,249 @@ class BatchCore(dict):
         >>> trend = intf_complex.trend2d(stack.transform(), weight=corr)
         >>> detrended = intf_complex * trend.conj()
         """
-        from .Stack_detrend import Stack_detrend
+        import dask
+        import dask.array as da
+        import numpy as np
+        import xarray as xr
+        from . import utils_detrend
+        from .Batch import Batch, BatchComplex
 
-        return Stack_detrend.trend2d(Stack_detrend(), self, weight=weight, transform=transform,
-                                     degree=degree, device=device, debug=debug)
+        phase = self
 
-    def regression1d_baseline(self, weight: 'BatchUnit | None' = None, baseline: str = 'BPR',
-                               degree: int = 1, wrap: bool = False, iterations: int = 1,
-                               device: str = 'auto', debug: bool = False) -> 'Batch':
+        # Validate lazy data
+        BatchCore._require_lazy(phase, 'trend2d')
+
+        # Auto-detect device
+        resolved = BatchCore._get_torch_device(device, debug=debug)
+        device = resolved.type
+
+        if debug:
+            print(f"DEBUG: using device={device}")
+
+        if device == 'mps' and degree >= 3:
+            print(f"NOTE: MPS has float32 precision issues for degree>={degree}. Use device='cpu' for better accuracy.")
+
+        is_complex = isinstance(phase, BatchComplex)
+
+        if transform is None:
+            raise ValueError("transform is required for trend2d. Use stack.transform()[['azi','rng','ele']] or stack.transform()[['azi','rng']].")
+
+        # Unify transform keys to phase
+        transform = transform.sel(phase)
+
+        result = {}
+        for key in phase.keys():
+            ds = phase[key]
+
+            pols = [v for v in ds.data_vars
+                   if 'y' in ds[v].dims and 'x' in ds[v].dims]
+
+            trans_ds = transform[key]
+            var_names = [v for v in trans_ds.data_vars
+                        if 'y' in trans_ds[v].dims and 'x' in trans_ds[v].dims]
+
+            # Check that transform and weight resolutions match phase resolution
+            phase_da_ref = ds[pols[0]]
+            phase_shape = phase_da_ref.shape[-2:]
+            phase_dy = float(phase_da_ref.y.diff('y')[0])
+            phase_dx = float(phase_da_ref.x.diff('x')[0])
+
+            trans_da_ref = trans_ds[var_names[0]]
+            trans_shape = trans_da_ref.shape
+            if phase_shape != trans_shape:
+                trans_dy = float(trans_da_ref.y.diff('y')[0])
+                trans_dx = float(trans_da_ref.x.diff('x')[0])
+                raise ValueError(
+                    f"Transform shape {trans_shape} does not match phase shape {phase_shape}. "
+                    f"Phase spacing: dy={phase_dy:.1f}, dx={phase_dx:.1f}. "
+                    f"Transform spacing: dy={trans_dy:.1f}, dx={trans_dx:.1f}. "
+                    f"Use stack.transform()[['azi','rng','ele']].downsample(N) to match."
+                )
+
+            if weight is not None:
+                weight_ds = weight[key]
+                weight_pols = [v for v in weight_ds.data_vars
+                              if 'y' in weight_ds[v].dims and 'x' in weight_ds[v].dims]
+                if weight_pols:
+                    weight_da_ref = weight_ds[weight_pols[0]]
+                    weight_shape = weight_da_ref.shape[-2:]
+                    if phase_shape != weight_shape:
+                        weight_dy = float(weight_da_ref.y.diff('y')[0])
+                        weight_dx = float(weight_da_ref.x.diff('x')[0])
+                        raise ValueError(
+                            f"Weight shape {weight_shape} does not match phase shape {phase_shape}. "
+                            f"Phase spacing: dy={phase_dy:.1f}, dx={phase_dx:.1f}. "
+                            f"Weight spacing: dy={weight_dy:.1f}, dx={weight_dx:.1f}. "
+                            f"Use weight.downsample(N) to match."
+                        )
+
+            if debug:
+                print(f"DEBUG {key}: variables={var_names}")
+
+            result_ds = {}
+            for pol in pols:
+                phase_da = ds[pol]
+                weight_da = weight[key][pol] if weight is not None else None
+
+                phase_dask = phase_da.data
+
+                # Rechunk transform to match phase spatial chunks
+                phase_spatial_chunks = phase_dask.chunks[-2:]
+                var_dask_list = []
+                for v in var_names:
+                    var_dask = trans_ds[v].data
+                    if var_dask.chunks != phase_spatial_chunks:
+                        var_dask = var_dask.rechunk(phase_spatial_chunks)
+                    var_dask_list.append(var_dask)
+
+                def make_process_chunk(n_vars, device, degree):
+                    def process_chunk(*args):
+                        import torch
+                        phase_chunk = args[0]
+                        if len(args) == 1 + n_vars:
+                            weight_chunk = None
+                            var_chunks = args[1:]
+                        else:
+                            weight_chunk = args[1]
+                            var_chunks = args[2:]
+                        if phase_chunk.ndim == 2:
+                            phase_chunk = phase_chunk[np.newaxis, ...]
+                            if weight_chunk is not None:
+                                weight_chunk = weight_chunk[np.newaxis, ...]
+                        result = utils_detrend.trend2d_array(
+                            phase_chunk, weight_chunk, list(var_chunks), torch.device(device), degree
+                        )
+                        return result
+                    return process_chunk
+
+                process_fn = make_process_chunk(len(var_dask_list), str(device), degree)
+                dim_str = ''.join(chr(ord('a') + i) for i in range(phase_dask.ndim))
+                spatial_dim_str = dim_str[-2:]
+
+                task_resources = {'detrend': 1, 'gpu': 1} if device != 'cpu' else {'detrend': 1}
+                out_dtype = phase_da.dtype if is_complex else np.float32
+                meta = np.empty((0,) * phase_dask.ndim, dtype=out_dtype)
+                with dask.annotate(resources=task_resources):
+                    blockwise_args = [phase_dask, dim_str]
+                    if weight_da is not None:
+                        weight_dask = weight_da.data
+                        if weight_dask.chunks != phase_dask.chunks:
+                            weight_dask = weight_dask.rechunk(phase_dask.chunks)
+                        blockwise_args.extend([weight_dask, dim_str])
+                    for var_dask in var_dask_list:
+                        blockwise_args.extend([var_dask, spatial_dim_str])
+
+                    result_dask = da.blockwise(
+                        process_fn, dim_str,
+                        *blockwise_args,
+                        dtype=out_dtype,
+                        meta=meta,
+                    )
+
+                trend_da = xr.DataArray(
+                    result_dask,
+                    dims=phase_da.dims,
+                    coords=phase_da.coords
+                )
+
+                result_ds[pol] = trend_da
+
+            result[key] = xr.Dataset(result_ds, attrs=ds.attrs)
+
+        if is_complex:
+            return BatchComplex(result)
+        return Batch(result)
+
+    @classmethod
+    def trend2d_dataset(cls, phase, weight=None, transform=None, degree=1, device='auto', debug=False):
+        """
+        Compute 2D trend from phase Dataset using PyTorch (GPU-accelerated).
+
+        Convenience wrapper around trend2d() for working with merged datasets
+        instead of per-burst batches.
+
+        Parameters
+        ----------
+        phase : xr.Dataset
+            Phase dataset.
+        weight : xr.Dataset, optional
+            Correlation/weight dataset.
+        transform : xr.Dataset, optional
+            Transform dataset with variables to use as regressors.
+        degree : int, optional
+            Polynomial degree (default 1).
+        device : str, optional
+            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
+        debug : bool, optional
+            Print debug information.
+
+        Returns
+        -------
+        xr.Dataset
+            Trend dataset with same structure as input phase.
+
+        Examples
+        --------
+        >>> trend = BatchCore.trend2d_dataset(phase_ds, corr_ds, transform_ds, degree=1)
+        """
+        import xarray as xr
+        from .Batch import Batch, BatchUnit
+
+        if not isinstance(phase, xr.Dataset):
+            raise TypeError(f"phase must be xr.Dataset, got {type(phase).__name__}")
+        if weight is not None and not isinstance(weight, xr.Dataset):
+            raise TypeError(f"weight must be xr.Dataset, got {type(weight).__name__}")
+        if transform is not None and not isinstance(transform, xr.Dataset):
+            raise TypeError(f"transform must be xr.Dataset, got {type(transform).__name__}")
+
+        # Rechunk to single spatial chunk if needed
+        needs_rechunk = False
+        for var_name in phase.data_vars:
+            var_data = phase[var_name]
+            if hasattr(var_data.data, 'chunks'):
+                chunks = var_data.data.chunks
+                y_chunks = chunks[-2] if len(chunks) >= 2 else chunks[0]
+                x_chunks = chunks[-1]
+                if len(y_chunks) > 1 or len(x_chunks) > 1:
+                    print(f"NOTE: trend2d_dataset() rechunking to single spatial chunk "
+                          f"(from y: {len(y_chunks)} chunks, x: {len(x_chunks)} chunks)")
+                    needs_rechunk = True
+                break
+
+        if needs_rechunk:
+            phase = phase.chunk({'y': -1, 'x': -1})
+            if weight is not None:
+                weight = weight.chunk({'y': -1, 'x': -1})
+            if transform is not None:
+                transform = transform.chunk({'y': -1, 'x': -1})
+
+        # Wrap datasets in single-key Batches for trend2d()
+        dummy_key = '__dataset__'
+        phase_batch = Batch({dummy_key: phase})
+        weight_batch = BatchUnit({dummy_key: weight}) if weight is not None else None
+        transform_batch = Batch({dummy_key: transform}) if transform is not None else None
+
+        # Call trend2d on the batch
+        trend_batch = phase_batch.trend2d(
+            transform=transform_batch,
+            weight=weight_batch,
+            degree=degree,
+            device=device,
+            debug=debug
+        )
+
+        output = trend_batch[dummy_key]
+        output.attrs = phase.attrs
+        return output
+
+    def trend1d(self, weight: 'BatchUnit | None' = None, baseline: str = 'BPR',
+                degree: int = 1, device: str = 'auto', debug: bool = False) -> 'Batch':
         """
         Fit 1D polynomial trend along perpendicular baseline at each (y, x) pixel.
+
+        Two modes:
+        - Complex (BatchComplex): unit-circle fitting, returns BatchComplex
+        - Real (Batch): standard polynomial, returns Batch
 
         Parameters
         ----------
@@ -1225,11 +1460,6 @@ class BatchCore(dict):
             Variable name to regress against (default 'BPR' for perpendicular baseline).
         degree : int
             Polynomial degree (1=linear, 2=quadratic). Default 1.
-        wrap : bool
-            If True, use circular (sin/cos) fitting for wrapped phase.
-        iterations : int
-            Number of fitting iterations (default 1). For wrap=True, multiple
-            iterations capture more of the trend.
         device : str
             PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
         debug : bool
@@ -1237,30 +1467,181 @@ class BatchCore(dict):
 
         Returns
         -------
-        Batch
-            Fitted trend values, same shape as input data.
+        Batch or BatchComplex
+            Fitted trend values, same type and shape as input data.
 
         Examples
         --------
-        >>> trend = intf.regression1d_baseline(weight=corr)
-        >>> detrended = intf - trend
+        >>> trend = intf.trend1d(weight=corr)
+        >>> detrended = intf * trend.conj()  # complex
+        >>> detrended = phase - trend        # real
         """
-        from .Stack_detrend import Stack_detrend
+        import dask
+        import dask.array as da
+        import numpy as np
+        import xarray as xr
+        import pandas as pd
+        from . import utils_detrend
+        from .Batch import Batch, BatchComplex
 
-        return Stack_detrend.regression1d_baseline(Stack_detrend(), self, weight=weight,
-                                                    baseline=baseline, degree=degree,
-                                                    wrap=wrap, iterations=iterations,
-                                                    device=device, debug=debug)
+        data = self
 
-    def regression1d_pairs(self, weight: 'BatchUnit | None' = None, degree: int = 0,
-                            days: int | None = None, count: int | None = None,
-                            wrap: bool = False, iterations: int = 1,
-                            device: str = 'auto', debug: bool = False) -> 'Batch':
+        # Validate lazy data
+        BatchCore._require_lazy(data, 'trend1d')
+
+        # Auto-detect device
+        resolved = BatchCore._get_torch_device(device, debug=debug)
+        device = resolved.type
+
+        if debug:
+            print(f"DEBUG: using device={device}")
+
+        is_complex = isinstance(data, BatchComplex)
+
+        result = {}
+        for key in data.keys():
+            ds = data[key]
+
+            pols = [v for v in ds.data_vars
+                   if 'y' in ds[v].dims and 'x' in ds[v].dims]
+
+            if not pols:
+                result[key] = ds
+                continue
+
+            ref_da = ds[pols[0]]
+
+            # Detect stack dimension (pair or date)
+            stack_dims = [d for d in ['pair', 'date'] if d in ref_da.dims]
+            if not stack_dims:
+                raise ValueError(f"Data must have 'pair' or 'date' dimension, got: {ref_da.dims}")
+            stack_dim = stack_dims[0]
+
+            # Determine baseline_values for regression
+            if hasattr(baseline, 'keys') and callable(baseline.keys):
+                baseline_ds = baseline[key]
+                if hasattr(baseline_ds, 'data_vars') and len(baseline_ds.data_vars) > 0:
+                    baseline_var = list(baseline_ds.data_vars)[0]
+                    baseline_values = np.asarray(baseline_ds[baseline_var].values, dtype=np.float64)
+                else:
+                    baseline_values = np.asarray(baseline_ds.values, dtype=np.float64)
+            elif isinstance(baseline, str):
+                if baseline in ds.data_vars:
+                    baseline_values = np.asarray(ds[baseline].values, dtype=np.float64)
+                elif baseline in ref_da.coords:
+                    baseline_coord = ref_da.coords[baseline]
+                    if np.issubdtype(baseline_coord.dtype, np.datetime64):
+                        dates = pd.to_datetime(baseline_coord.values)
+                        baseline_values = (dates - dates.min()).total_seconds().values / 86400.0
+                    else:
+                        baseline_values = baseline_coord.values.astype(np.float64)
+                else:
+                    raise ValueError(f"'{baseline}' not found in data variables or coordinates")
+            elif isinstance(baseline, (xr.DataArray, pd.DataFrame, pd.Series)):
+                baseline_values = np.asarray(baseline.values, dtype=np.float64)
+            else:
+                baseline_values = np.asarray(baseline, dtype=np.float64)
+
+            if debug:
+                print(f"DEBUG {key}: stack_dim={stack_dim}, n_samples={len(baseline_values)}, baseline range=[{baseline_values.min():.2f}, {baseline_values.max():.2f}]")
+
+            out_dtype = np.complex64 if is_complex else np.float32
+
+            result_ds = {}
+            for pol in pols:
+                data_da = ds[pol]
+                weight_da = weight[key][pol] if weight is not None else None
+
+                if data_da.dims[0] != stack_dim:
+                    data_da = data_da.transpose(stack_dim, ...)
+                    if weight_da is not None:
+                        weight_da = weight_da.transpose(stack_dim, ...)
+
+                def process_chunk(data_chunk, weight_chunk=None, baseline_values=baseline_values,
+                                  device=device, degree=degree):
+                    import torch
+                    squeeze = False
+                    if data_chunk.ndim == 2:
+                        data_chunk = data_chunk[np.newaxis, ...]
+                        if weight_chunk is not None:
+                            weight_chunk = weight_chunk[np.newaxis, ...]
+                        squeeze = True
+                    result = utils_detrend.trend1d_array(
+                        data_chunk, baseline_values, weight_chunk, torch.device(device), degree
+                    )
+                    if squeeze:
+                        result = result[0]
+                    return result
+
+                # Rechunk: all samples together, optimal spatial chunks
+                n_samples = len(baseline_values)
+                from .utils_dask import rechunk2d
+                elem_bytes = n_samples * (16 if is_complex else 8)  # data + weight + torch overhead
+                optimal = rechunk2d((data_da.sizes['y'], data_da.sizes['x']), element_bytes=elem_bytes)
+                chunks_y, chunks_x = optimal['y'], optimal['x']
+
+                data_da = data_da.chunk({stack_dim: -1, 'y': chunks_y, 'x': chunks_x})
+                if weight_da is not None:
+                    weight_da = weight_da.chunk({stack_dim: -1, 'y': chunks_y, 'x': chunks_x})
+
+                data_dask = data_da.data
+                dim_str = ''.join(chr(ord('a') + i) for i in range(data_dask.ndim))
+
+                task_resources = {'regression': 1, 'gpu': 1} if device != 'cpu' else {'regression': 1}
+                meta = np.empty((0,) * data_dask.ndim, dtype=out_dtype)
+                with dask.annotate(resources=task_resources):
+                    if weight_da is not None:
+                        weight_dask = weight_da.data
+                        def process_with_weight(data_block, weight_block):
+                            return process_chunk(data_block, weight_block)
+                        result_dask = da.blockwise(
+                            process_with_weight, dim_str,
+                            data_dask, dim_str,
+                            weight_dask, dim_str,
+                            dtype=out_dtype,
+                            meta=meta,
+                        )
+                    else:
+                        result_dask = da.blockwise(
+                            process_chunk, dim_str,
+                            data_dask, dim_str,
+                            dtype=out_dtype,
+                            meta=meta,
+                        )
+
+                # Rechunk back to per-slice for efficient downstream operations
+                if hasattr(result_dask, 'rechunk'):
+                    result_dask = result_dask.rechunk({0: 1})
+
+                fit_da = xr.DataArray(
+                    result_dask,
+                    dims=data_da.dims,
+                    coords=data_da.coords
+                )
+
+                result_ds[pol] = fit_da
+
+            result[key] = xr.Dataset(result_ds, attrs=ds.attrs)
+
+        if is_complex:
+            return BatchComplex(result)
+        return Batch(result)
+
+    # Backward compatibility alias
+    regression1d_baseline = trend1d
+
+    def trend1d_pairs(self, weight: 'BatchUnit | None' = None, degree: int = 0,
+                      days: int = 90, count: int | None = None,
+                      device: str = 'auto', debug: bool = False) -> 'Batch':
         """
         Fit 1D polynomial trend along temporal pairs for each date.
 
-        For each date, fits a polynomial along the time dimension using interferometric
-        pairs that contain that date, then reconstructs the trend for each pair.
+        Two modes:
+        - Complex input (BatchComplex): unit-circle fitting per date,
+          reconstruct pair trend as model[ref] * conj(model[rep]).
+          Returns BatchComplex with unit-magnitude complex trend.
+        - Real input (Batch): standard polynomial fit per date,
+          reconstruct as model[ref] - model[rep]. Returns Batch.
 
         Parameters
         ----------
@@ -1269,13 +1650,12 @@ class BatchCore(dict):
         degree : int
             Polynomial degree (0=mean, 1=linear). Default 0.
         days : int or None
-            Maximum time interval (in days) to include. Default None (all pairs).
+            Maximum time interval (±days symmetric window) to include.
+            Default 90. Controls temporal high-pass: only pairs within ±days
+            contribute to the per-date atmospheric estimate.
+            Set to None to use all pairs (risk of removing deformation signal).
         count : int or None
-            Maximum number of pairs per date to use. Default None (all pairs).
-        wrap : bool
-            If True, use circular (sin/cos) fitting for wrapped phase.
-        iterations : int
-            Number of fitting iterations (default 1).
+            Maximum number of pairs per date to use. Default None.
         device : str
             PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
         debug : bool
@@ -1283,20 +1663,137 @@ class BatchCore(dict):
 
         Returns
         -------
-        Batch
+        Batch or BatchComplex
             Fitted trend values, same shape as input data.
 
         Examples
         --------
-        >>> trend = intf.regression1d_pairs(degree=0, days=100)
-        >>> detrended = intf - trend
+        >>> trend = intf.trend1d_pairs(degree=0, days=100)
+        >>> detrended = intf * trend.conj()  # complex
+        >>> detrended = phase - trend        # real
         """
-        from .Stack_detrend import Stack_detrend
+        import dask
+        import dask.array as da
+        import numpy as np
+        import xarray as xr
+        import pandas as pd
+        from . import utils_detrend
+        from .Batch import Batch, BatchComplex
 
-        return Stack_detrend.regression1d_pairs(Stack_detrend(), self, weight=weight,
-                                                 degree=degree, days=days, count=count,
-                                                 wrap=wrap, iterations=iterations,
-                                                 device=device, debug=debug)
+        data = self
+
+        # Validate lazy data
+        BatchCore._require_lazy(data, 'trend1d_pairs')
+
+        # Auto-detect device
+        resolved = BatchCore._get_torch_device(device, debug=debug)
+        device = resolved.type
+
+        if debug:
+            print(f"DEBUG: trend1d_pairs using device={device}")
+
+        is_complex = isinstance(data, BatchComplex)
+
+        if not isinstance(data, (Batch, BatchComplex)):
+            raise TypeError(f"trend1d_pairs() requires Batch or BatchComplex, got {type(data).__name__}")
+
+        out_dtype = np.complex64 if is_complex else np.float32
+
+        results = {}
+        for burst_id in data.keys():
+            burst_ds = data[burst_id]
+            burst_weight = weight[burst_id] if weight is not None else None
+
+            result_ds = {}
+            for pol in [v for v in burst_ds.data_vars if v not in ['ref', 'rep', 'BPR', 'BPT']]:
+                data_da = burst_ds[pol]
+                weight_da = burst_weight[pol] if burst_weight is not None else None
+
+                if debug:
+                    n_pairs = len(data_da.pair)
+                    n_dates = len(set(burst_ds['ref'].values.tolist() + burst_ds['rep'].values.tolist()))
+                    print(f"DEBUG {burst_id}: {n_dates} dates, {n_pairs} pairs")
+
+                # Get ref/rep as int64 nanoseconds (avoids datetime64 serialization issues)
+                ref_values = burst_ds['ref'].values.astype('datetime64[ns]').astype(np.int64)
+                rep_values = burst_ds['rep'].values.astype('datetime64[ns]').astype(np.int64)
+
+                if data_da.dims[0] != 'pair':
+                    data_da = data_da.transpose('pair', ...)
+                    if weight_da is not None:
+                        weight_da = weight_da.transpose('pair', ...)
+
+                # Rechunk: all pairs together, optimal spatial chunks
+                n_pairs_val = len(ref_values)
+                from .utils_dask import rechunk2d
+                # Memory per pixel: data + weight + torch overhead per date loop
+                elem_bytes = n_pairs_val * (16 if is_complex else 8)
+                optimal = rechunk2d((data_da.sizes['y'], data_da.sizes['x']), element_bytes=elem_bytes)
+                chunks_y, chunks_x = optimal['y'], optimal['x']
+
+                data_da = data_da.chunk({'pair': -1, 'y': chunks_y, 'x': chunks_x})
+                if weight_da is not None:
+                    weight_da = weight_da.chunk({'pair': -1, 'y': chunks_y, 'x': chunks_x})
+
+                data_dask = data_da.data
+
+                def make_wrapper(ref_vals, rep_vals, dev, deg, days_f, count_f):
+                    def process_chunk(data_block, weight_block=None):
+                        import torch
+                        return utils_detrend.trend1d_pairs_array(
+                            data_block, weight_block, ref_vals, rep_vals,
+                            torch.device(dev), deg, days_f, count_f
+                        )
+                    return process_chunk
+
+                wrapper = make_wrapper(ref_values, rep_values, str(device), degree, days, count)
+
+                dim_str = ''.join(chr(ord('a') + i) for i in range(data_dask.ndim))
+
+                task_resources = {'regression': 1, 'gpu': 1} if device != 'cpu' else {'regression': 1}
+                meta = np.empty((0,) * data_dask.ndim, dtype=out_dtype)
+                with dask.annotate(resources=task_resources):
+                    if weight_da is not None:
+                        weight_dask = weight_da.data
+
+                        def make_weighted_wrapper(wrapper_fn):
+                            def process_with_weight(data_block, weight_block):
+                                return wrapper_fn(data_block, weight_block)
+                            return process_with_weight
+
+                        result_dask = da.blockwise(
+                            make_weighted_wrapper(wrapper), dim_str,
+                            data_dask, dim_str,
+                            weight_dask, dim_str,
+                            dtype=out_dtype,
+                            meta=meta,
+                        )
+                    else:
+                        result_dask = da.blockwise(
+                            wrapper, dim_str,
+                            data_dask, dim_str,
+                            dtype=out_dtype,
+                            meta=meta,
+                        )
+
+                if hasattr(result_dask, 'rechunk'):
+                    result_dask = result_dask.rechunk({0: 1})
+
+                trend_da = xr.DataArray(
+                    result_dask,
+                    dims=data_da.dims,
+                    coords=data_da.coords
+                )
+                result_ds[pol] = trend_da
+
+            results[burst_id] = xr.Dataset(result_ds, attrs=burst_ds.attrs)
+
+        if is_complex:
+            return BatchComplex(results)
+        return Batch(results)
+
+    def regression1d_pairs(self, *args, **kwargs):
+        raise NotImplementedError("regression1d_pairs() is removed. Use trend1d_pairs() instead.")
 
     def neighbors(
         self,

@@ -966,6 +966,24 @@ class BatchWrap(BatchCore):
     def wrap(data):
         return np.mod(data + np.pi, 2 * np.pi) - np.pi
 
+    def trend1d(self, *args, **kwargs):
+        raise TypeError(
+            "trend1d() does not support wrapped phase (BatchWrap). "
+            "Use BatchComplex for complex phase fitting, or unwrap first for real polynomial fitting."
+        )
+
+    def trend2d(self, *args, **kwargs):
+        raise TypeError(
+            "trend2d() does not support wrapped phase (BatchWrap). "
+            "Use BatchComplex for complex phase fitting, or unwrap first for real polynomial fitting."
+        )
+
+    def trend1d_pairs(self, *args, **kwargs):
+        raise TypeError(
+            "trend1d_pairs() does not support wrapped phase (BatchWrap). "
+            "Use BatchComplex for complex phase fitting, or unwrap first."
+        )
+
     def __add__(self, other: Batch):
         keys = self.keys()
         return type(self)({k: (self[k] + other[k] if k in other else self[k]) for k in keys})
@@ -1775,6 +1793,24 @@ class Batches(tuple):
     def __new__(cls, batches=()):
         return super().__new__(cls, batches)
 
+    @staticmethod
+    def _preserve_nonspatial(source, target):
+        """Copy non-spatial variables (e.g. BPR) from source to target batch."""
+        import dask.array as da
+        for key in source:
+            src_ds = source[key]
+            tgt_ds = target[key]
+            extra = {}
+            for v in src_ds.data_vars:
+                if v not in tgt_ds.data_vars:
+                    var = src_ds[v]
+                    if not isinstance(var.data, da.Array):
+                        var = var.chunk()
+                    extra[v] = var
+            if extra:
+                target[key] = tgt_ds.assign(extra)
+        return target
+
     def snapshot(self, store: str | None = None, storage_options: dict[str, str] | None = None,
                  caption: str | None = None, allow_rechunk: bool = False,
                  n_jobs: int = 1, debug: bool = False):
@@ -2334,56 +2370,14 @@ class Batches(tuple):
         # Delegate to BatchWrap.unwrap1d
         return phase.unwrap1d(weight=weight, device=device, debug=debug, **kwargs)
 
-    def trend2d(self, transform, degree=1, device='auto', debug=False):
-        """
-        Compute 2D polynomial trend (ramp) from phase.
-
-        Expects Batches with [Batch/BatchWrap (phase), BatchUnit (weight, optional)].
-
-        Parameters
-        ----------
-        transform : Batch
-            Coordinate transform from stack.transform() containing 'azi' and 'rng'.
-        degree : int
-            Polynomial degree (1=plane, 2=quadratic). Default 1.
-        device : str
-            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
-        debug : bool
-            Print diagnostic information.
-
-        Returns
-        -------
-        Batch
-            Trend surface.
-
-        Examples
-        --------
-        >>> phase, corr = stack.pairs(baseline.tolist()).phasediff(wavelength=30).angle()
-        >>> trend = Batches([phase, corr]).trend2d(stack.transform())
-        >>> detrended = phase - trend
-        """
-        if len(self) < 1:
-            raise ValueError("trend2d() requires Batches with at least 1 element: [phase]")
-
-        phase = self[0]
-        weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
-
-        if not isinstance(phase, (Batch, BatchWrap, BatchComplex)):
-            raise TypeError(f"First element must be Batch, BatchWrap, or BatchComplex, got {type(phase).__name__}")
-
-        # Delegate to BatchCore.trend2d
-        return phase.trend2d(transform, weight=weight, degree=degree, device=device, debug=debug)
-
     def detrend2d(self, transform, degree=1, device='auto', debug=False):
         """
         Detrend 2D polynomial trend and return Batches with detrended data.
 
-        Expects Batches from interferogram(): [BatchComplex (intf), BatchUnit (corr)]
-        or from angle(): [BatchWrap (phase), BatchUnit (corr)].
+        Expects Batches from interferogram(): [BatchComplex (intf), BatchUnit (corr)].
 
-        For complex input: detrended = intf * trend.conj()
-        For wrapped input: detrended = wrap(phase - trend)
-        For real input: detrended = phase - trend
+        For complex input (BatchComplex): detrended = intf * trend.conj()
+        For real input (Batch): detrended = phase - trend
 
         Parameters
         ----------
@@ -2405,8 +2399,6 @@ class Batches(tuple):
         --------
         >>> # Complex interferogram detrending (chained)
         >>> intf, corr = stack.pairs(baseline).interferogram(wavelength=30).detrend2d(transform)
-        >>> # Wrapped phase detrending
-        >>> phase, corr = stack.pairs(baseline).phasediff(wavelength=30).angle().detrend2d(transform)
         """
         if len(self) < 1:
             raise ValueError("detrend2d() requires Batches with at least 1 element: [phase]")
@@ -2414,8 +2406,8 @@ class Batches(tuple):
         phase = self[0]
         weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
 
-        if not isinstance(phase, (Batch, BatchWrap, BatchComplex)):
-            raise TypeError(f"First element must be Batch, BatchWrap, or BatchComplex, got {type(phase).__name__}")
+        if not isinstance(phase, (Batch, BatchComplex)):
+            raise TypeError(f"First element must be Batch or BatchComplex, got {type(phase).__name__}")
 
         trend = phase.trend2d(transform, weight=weight, degree=degree, device=device, debug=debug)
 
@@ -2423,6 +2415,66 @@ class Batches(tuple):
             detrended = phase * trend.conj()
         else:
             detrended = phase - trend
+
+        # Preserve non-spatial variables (e.g. BPR) that may be dropped by arithmetic
+        detrended = Batches._preserve_nonspatial(phase, detrended)
+
+        # Rebuild Batches preserving all original elements except first
+        elements = [detrended] + list(self[1:])
+        return Batches(elements)
+
+    def detrend1d(self, baseline='BPR', degree=1, device='auto', debug=False):
+        """
+        Detrend 1D polynomial trend along perpendicular baseline and return Batches.
+
+        Removes DEM residual phase proportional to perpendicular baseline at each pixel.
+        Mirrors detrend2d() pattern: auto-detects input type.
+
+        For complex input (BatchComplex): unit-circle fitting, detrend multiplicatively (phase * trend.conj())
+        For real input (Batch): standard polynomial, subtract
+
+        Parameters
+        ----------
+        baseline : str
+            Variable name to regress against (default 'BPR' for perpendicular baseline).
+        degree : int
+            Polynomial degree (1=linear, 2=quadratic). Default 1.
+        device : str
+            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
+        debug : bool
+            Print diagnostic information.
+
+        Returns
+        -------
+        Batches
+            Batches with [detrended_phase, weight] preserving original types.
+
+        Examples
+        --------
+        >>> # Complex interferogram: multiplicative detrend (like detrend2d)
+        >>> intf, corr = stack.pairs(baseline).interferogram(wavelength=30).detrend1d()
+        >>> # Full pipeline: detrend2d (spatial) then detrend1d (baseline)
+        >>> result = stack.pairs(bl).interferogram(wavelength=30).detrend2d(transform).detrend1d()
+        """
+        if len(self) < 1:
+            raise ValueError("detrend1d() requires Batches with at least 1 element: [phase]")
+
+        phase = self[0]
+        weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
+
+        if not isinstance(phase, (Batch, BatchComplex)):
+            raise TypeError(f"First element must be Batch or BatchComplex, got {type(phase).__name__}")
+
+        trend = phase.trend1d(weight=weight, baseline=baseline, degree=degree,
+                              device=device, debug=debug)
+
+        if isinstance(phase, BatchComplex):
+            detrended = phase * trend.conj()
+        else:
+            detrended = phase - trend
+
+        # Preserve non-spatial variables (e.g. BPR) that may be dropped by arithmetic
+        detrended = Batches._preserve_nonspatial(phase, detrended)
 
         # Rebuild Batches preserving all original elements except first
         elements = [detrended] + list(self[1:])
@@ -2465,68 +2517,30 @@ class Batches(tuple):
         # Delegate to Batch.lstsq
         return data.lstsq(weight=weight, device=device, cumsum=cumsum, debug=debug)
 
-    def regression1d_baseline(self, baseline='BPR', degree=1, wrap=False, iterations=1,
-                               device='auto', debug=False):
+    def regression1d_baseline(self, *args, **kwargs):
+        raise NotImplementedError("Batches.regression1d_baseline() is removed. Use Batches.detrend1d() or Batch.trend1d() instead.")
+
+    def detrend1d_pairs(self, degree=0, days=90, count=None,
+                        device='auto', debug=False):
         """
-        Fit 1D polynomial trend along perpendicular baseline at each (y, x) pixel.
+        Detrend 1D polynomial trend along temporal pairs and return Batches.
 
-        Expects Batches with [Batch/BatchWrap (phase), BatchUnit (weight, optional)].
+        Removes per-date temporal trend from pair data. Mirrors detrend1d()/detrend2d()
+        pattern: auto-detects input type.
 
-        Parameters
-        ----------
-        baseline : str
-            Variable name to regress against (default 'BPR' for perpendicular baseline).
-        degree : int
-            Polynomial degree (1=linear, 2=quadratic). Default 1.
-        wrap : bool
-            If True, use circular (sin/cos) fitting for wrapped phase.
-        iterations : int
-            Number of fitting iterations (default 1).
-        device : str
-            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
-        debug : bool
-            Print diagnostic information.
-
-        Returns
-        -------
-        Batch
-            Fitted trend values, same shape as input data.
-
-        Examples
-        --------
-        >>> trend = Batches([intf, corr]).regression1d_baseline()
-        >>> detrended = intf - trend
-        """
-        if len(self) < 1:
-            raise ValueError("regression1d_baseline() requires Batches with at least 1 element: [data]")
-
-        data = self[0]
-        weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
-
-        # Delegate to BatchCore.regression1d_baseline
-        return data.regression1d_baseline(weight=weight, baseline=baseline, degree=degree,
-                                           wrap=wrap, iterations=iterations,
-                                           device=device, debug=debug)
-
-    def regression1d_pairs(self, degree=0, days=None, count=None, wrap=False, iterations=1,
-                            device='auto', debug=False):
-        """
-        Fit 1D polynomial trend along temporal pairs for each date.
-
-        Expects Batches with [Batch/BatchWrap (phase), BatchUnit (weight, optional)].
+        For complex input (BatchComplex): unit-circle fitting, detrend multiplicatively (phase * trend.conj())
+        For real input (Batch): standard polynomial, subtract (phase - trend)
 
         Parameters
         ----------
         degree : int
             Polynomial degree (0=mean, 1=linear). Default 0.
-        days : int or None
-            Maximum time interval (in days) to include. Default None (all pairs).
+        days : int
+            Maximum time interval (±days symmetric window) to include.
+            Default 90. Controls temporal high-pass: only pairs within ±days
+            contribute to the per-date atmospheric estimate.
         count : int or None
             Maximum number of pairs per date to use. Default None (all pairs).
-        wrap : bool
-            If True, use circular (sin/cos) fitting for wrapped phase.
-        iterations : int
-            Number of fitting iterations (default 1).
         device : str
             PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
         debug : bool
@@ -2534,24 +2548,45 @@ class Batches(tuple):
 
         Returns
         -------
-        Batch
-            Fitted trend values, same shape as input data.
+        Batches
+            Batches with [detrended_phase, weight] preserving original types.
 
         Examples
         --------
-        >>> trend = Batches([intf, corr]).regression1d_pairs(degree=0, days=100)
-        >>> detrended = intf - trend
+        >>> # Complex interferogram detrending (chained)
+        >>> intf, corr = stack.pairs(baseline).interferogram(wavelength=30).detrend1d_pairs()
+        >>> # Real detrending
+        >>> result = Batches([unwrapped, corr]).detrend1d_pairs(degree=0, days=100)
         """
         if len(self) < 1:
-            raise ValueError("regression1d_pairs() requires Batches with at least 1 element: [data]")
+            raise ValueError("detrend1d_pairs() requires Batches with at least 1 element: [phase]")
 
-        data = self[0]
+        phase = self[0]
         weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
 
-        # Delegate to BatchCore.regression1d_pairs
-        return data.regression1d_pairs(weight=weight, degree=degree, days=days, count=count,
-                                        wrap=wrap, iterations=iterations,
-                                        device=device, debug=debug)
+        if not isinstance(phase, (Batch, BatchComplex)):
+            raise TypeError(f"First element must be Batch or BatchComplex, got {type(phase).__name__}")
+
+        trend = phase.trend1d_pairs(weight=weight, degree=degree, days=days, count=count,
+                                    device=device, debug=debug)
+
+        if isinstance(phase, BatchComplex):
+            detrended = phase * trend.conj()
+        else:
+            detrended = phase - trend
+
+        # Preserve non-spatial variables (e.g. BPR) that may be dropped by arithmetic
+        detrended = Batches._preserve_nonspatial(phase, detrended)
+
+        # Rebuild Batches preserving all original elements except first
+        elements = [detrended] + list(self[1:])
+        return Batches(elements)
+
+    def regression1d_pairs(self, *args, **kwargs):
+        raise NotImplementedError("Batches.regression1d_pairs() is removed. Use Batches.detrend1d_pairs() instead.")
+
+    def trend1d_pairs(self, *args, **kwargs):
+        raise NotImplementedError("Batches.trend1d_pairs() is removed. Use Batches.detrend1d_pairs() instead.")
 
     def stl(self, freq='W', periods=52, robust=False):
         """

@@ -23,42 +23,49 @@ _linalg_init_lock = threading.Lock()
 _linalg_initialized = False
 
 
-def regression1d_array(data, dim_values, weight, device, degree=1, wrap=False, iterations=1):
+def trend1d_array(data, dim_values, weight, device, degree=1):
     """
     Fit 1D polynomial along first dimension at each (y, x) pixel using PyTorch.
+
+    Two modes:
+    - Complex input: unit-circle fitting (normalize to unit magnitude, fit complex
+      polynomial, normalize result), returns complex64 unit-magnitude trend
+    - Real input: standard polynomial fit, returns float32 trend
 
     Parameters
     ----------
     data : np.ndarray
-        3D array (n_samples, y, x) - polynomial fit along first dimension
+        3D array (n_samples, y, x) - polynomial fit along first dimension.
+        Real or complex.
     dim_values : np.ndarray
         1D array of x-values for fitting (length n_samples)
     weight : np.ndarray or None
-        Weight array, same shape as data
+        Weight array (real), same shape as data
     device : torch.device
         PyTorch device
     degree : int
         Polynomial degree (1=linear, 2=quadratic, etc.)
-    wrap : bool
-        If True, use circular (sin/cos) fitting for wrapped phase
-    iterations : int
-        Number of fitting iterations (for wrap=True, captures more trend per iteration)
 
     Returns
     -------
     np.ndarray
-        Fitted values, same shape as data
+        Fitted values, same shape as data.
+        Complex input returns complex64 unit-magnitude trend.
+        Real input returns float32 trend.
     """
     import torch
 
     n_samples, ny, nx = data.shape
     n_pixels = ny * nx
 
+    is_complex = np.iscomplexobj(data)
+
     # Use float64 on CPU, float32 on GPU (MPS doesn't support float64)
     if device.type == 'cpu':
         dtype = torch.float64
     else:
         dtype = torch.float32
+    cdtype = torch.complex128 if dtype == torch.float64 else torch.complex64
 
     # Normalize dim_values to [-1, 1] for numerical stability
     dim_min = dim_values.min()
@@ -66,34 +73,38 @@ def regression1d_array(data, dim_values, weight, device, degree=1, wrap=False, i
     dim_range = dim_max - dim_min
     if dim_range > 0:
         dim_norm = 2 * (dim_values - dim_min) / dim_range - 1
-        # Where does 0 map to in normalized space?
-        x_origin_norm = 2 * (0.0 - dim_min) / dim_range - 1
     else:
         dim_norm = np.zeros_like(dim_values)
-        x_origin_norm = 0.0
 
     # Build Vandermonde matrix: [1, x, x^2, ..., x^degree]
-    # Shape: (n_samples, degree+1)
     X = np.column_stack([dim_norm**d for d in range(degree + 1)])
     X_t = torch.tensor(X, dtype=dtype, device=device)
-
-    # For wrap mode, we need value at x=0 (original coordinates) to compute angle offset
-    X_origin = torch.tensor([x_origin_norm**d for d in range(degree + 1)], dtype=dtype, device=device)
 
     # Flatten spatial dimensions: data becomes (n_samples, n_pixels)
     data_flat = data.reshape(n_samples, n_pixels)
     if weight is not None:
         weight_flat = weight.reshape(n_samples, n_pixels)
 
-    # Move data to GPU
-    data_t = torch.tensor(data_flat, dtype=dtype, device=device)
+    # Prepare data tensor
+    if is_complex:
+        data_abs = np.abs(data_flat)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            data_unit = np.where(data_abs > 0, data_flat / data_abs, 0 + 0j)
+        data_t = torch.tensor(data_unit, dtype=cdtype, device=device)
+    else:
+        data_t = torch.tensor(data_flat, dtype=dtype, device=device)
+
     if weight is not None:
         weight_t = torch.tensor(weight_flat, dtype=dtype, device=device)
     else:
         weight_t = None
 
     # Find valid pixels (no NaN in any sample)
-    valid_mask = torch.isfinite(data_t).all(dim=0)  # (n_pixels,)
+    if is_complex:
+        valid_mask = torch.isfinite(data_t.real).all(dim=0) & torch.isfinite(data_t.imag).all(dim=0)
+        valid_mask &= (data_t != 0).any(dim=0)
+    else:
+        valid_mask = torch.isfinite(data_t).all(dim=0)
     if weight_t is not None:
         valid_mask &= torch.isfinite(weight_t).all(dim=0)
 
@@ -101,6 +112,8 @@ def regression1d_array(data, dim_values, weight, device, degree=1, wrap=False, i
     n_valid = len(valid_indices)
 
     if n_valid == 0:
+        if is_complex:
+            return np.full(data.shape, complex('nan'), dtype=np.complex64)
         return np.full_like(data, np.nan, dtype=np.float32)
 
     # Extract valid pixels: (n_samples, n_valid)
@@ -111,99 +124,50 @@ def regression1d_array(data, dim_values, weight, device, degree=1, wrap=False, i
     else:
         sqrt_w = None
 
-    # Precompute (X^T X)^-1 X^T for unweighted case (normal equations)
-    # This avoids lstsq which is not supported on MPS
+    # Precompute (X^T X)^-1 X^T for unweighted case
     XtX = X_t.T @ X_t
     XtX_inv = torch.linalg.inv(XtX + 1e-10 * torch.eye(XtX.shape[0], dtype=dtype, device=device))
     XtX_inv_Xt = XtX_inv @ X_t.T  # (degree+1, n_samples)
 
-    # Helper function to fit sin/cos once
-    def fit_sincos_once(current_data):
-        """Fit sin/cos to data and return angle trend."""
-        sin_data = torch.sin(current_data)
-        cos_data = torch.cos(current_data)
-
+    if is_complex:
+        # ---- Complex unit-circle fitting ----
         if sqrt_w is not None:
-            # Weighted case: solve via normal equations per pixel
-            sin_weighted = (sin_data * sqrt_w).T  # (n_valid, n_samples)
-            cos_weighted = (cos_data * sqrt_w).T
+            z_weighted = (data_valid * sqrt_w).T  # (n_valid, n_samples)
             X_batch = X_t[None, :, :] * sqrt_w.T[:, :, None]  # (n_valid, n_samples, d+1)
-            # Normal equations: (X^T X) coeffs = X^T y
-            XtX_batch = X_batch.transpose(1, 2) @ X_batch  # (n_valid, d+1, d+1)
-            Xty_sin = X_batch.transpose(1, 2) @ sin_weighted.unsqueeze(-1)  # (n_valid, d+1, 1)
-            Xty_cos = X_batch.transpose(1, 2) @ cos_weighted.unsqueeze(-1)
-            # Add regularization for stability
+            XtX_batch = X_batch.transpose(1, 2) @ X_batch
+            Xtz = X_batch.transpose(1, 2).to(cdtype) @ z_weighted.unsqueeze(-1)
             reg = 1e-10 * torch.eye(XtX_batch.shape[-1], dtype=dtype, device=device)
-            coeffs_sin = torch.linalg.solve(XtX_batch + reg, Xty_sin)
-            coeffs_cos = torch.linalg.solve(XtX_batch + reg, Xty_cos)
+            coeffs = torch.linalg.solve(
+                (XtX_batch + reg).to(cdtype).cpu(), Xtz.cpu()
+            ).to(device)
         else:
-            # Unweighted case: use precomputed pseudo-inverse
-            # coeffs = (X^T X)^-1 X^T y
-            sin_T = sin_data.T  # (n_valid, n_samples)
-            cos_T = cos_data.T
-            coeffs_sin = (XtX_inv_Xt @ sin_T.T).T.unsqueeze(-1)  # (n_valid, d+1, 1)
-            coeffs_cos = (XtX_inv_Xt @ cos_T.T).T.unsqueeze(-1)
+            data_T = data_valid.T
+            coeffs = (XtX_inv_Xt.to(cdtype) @ data_T.T).T.unsqueeze(-1)
 
-        # Evaluate fit
-        fit_sin = (X_t @ coeffs_sin.squeeze(-1).T).T  # (n_valid, n_samples)
-        fit_cos = (X_t @ coeffs_cos.squeeze(-1).T).T
+        fit = (X_t.to(cdtype) @ coeffs.squeeze(-1).T).T
+        fit_abs = fit.abs().clamp(min=1e-10)
+        fit = fit / fit_abs
 
-        # Compute angle offset at origin
-        sin_origin = (X_origin @ coeffs_sin.squeeze(-1).T)  # (n_valid,)
-        cos_origin = (X_origin @ coeffs_cos.squeeze(-1).T)
-        angle_origin = torch.atan2(sin_origin, cos_origin)
-
-        # Convert back to angle (relative to origin)
-        fit_angle = torch.atan2(fit_sin, fit_cos) - angle_origin[:, None]
-        return fit_angle
-
-    if wrap:
-        # Iterative circular fitting
-        # data_valid has shape (n_samples, n_valid)
-        cumulative_trend = torch.zeros_like(data_valid)
-        current_data = data_valid.clone()
-
-        for _ in range(iterations):
-            # Fit current data - returns (n_valid, n_samples), need to transpose
-            fit_angle = fit_sincos_once(current_data).T  # Now (n_samples, n_valid)
-
-            # Accumulate trend
-            cumulative_trend = cumulative_trend + fit_angle
-
-            # Update residual for next iteration (subtract trend circularly)
-            current_data = current_data - fit_angle
-
-        # Wrap final result to [-π, π]
-        cumulative_trend = torch.remainder(cumulative_trend + np.pi, 2 * np.pi) - np.pi
-
-        # Put back into full array
-        result_t = torch.full((n_samples, n_pixels), float('nan'), dtype=dtype, device=device)
-        result_t[:, valid_indices] = cumulative_trend
-
+        result_t = torch.full((n_samples, n_pixels), complex(float('nan'), 0), dtype=cdtype, device=device)
+        result_t[:, valid_indices] = fit.T
+        out = result_t.cpu().numpy().reshape(n_samples, ny, nx).astype(np.complex64)
     else:
-        # Standard polynomial fitting (iterations not needed - one fit is exact)
+        # ---- Standard real polynomial fitting ----
         if sqrt_w is not None:
-            # Weighted case: solve via normal equations per pixel
-            y_weighted = (data_valid * sqrt_w).T  # (n_valid, n_samples)
-            X_batch = X_t[None, :, :] * sqrt_w.T[:, :, None]  # (n_valid, n_samples, d+1)
-            XtX_batch = X_batch.transpose(1, 2) @ X_batch  # (n_valid, d+1, d+1)
-            Xty = X_batch.transpose(1, 2) @ y_weighted.unsqueeze(-1)  # (n_valid, d+1, 1)
+            y_weighted = (data_valid * sqrt_w).T
+            X_batch = X_t[None, :, :] * sqrt_w.T[:, :, None]
+            XtX_batch = X_batch.transpose(1, 2) @ X_batch
+            Xty = X_batch.transpose(1, 2) @ y_weighted.unsqueeze(-1)
             reg = 1e-10 * torch.eye(XtX_batch.shape[-1], dtype=dtype, device=device)
             coeffs = torch.linalg.solve(XtX_batch + reg, Xty)
         else:
-            # Unweighted case: use precomputed pseudo-inverse
-            data_T = data_valid.T  # (n_valid, n_samples)
-            coeffs = (XtX_inv_Xt @ data_T.T).T.unsqueeze(-1)  # (n_valid, d+1, 1)
+            data_T = data_valid.T
+            coeffs = (XtX_inv_Xt @ data_T.T).T.unsqueeze(-1)
 
-        # Evaluate fit
-        fit = (X_t @ coeffs.squeeze(-1).T).T  # (n_valid, n_samples)
-
-        # Put back into full array
+        fit = (X_t @ coeffs.squeeze(-1).T).T
         result_t = torch.full((n_samples, n_pixels), float('nan'), dtype=dtype, device=device)
         result_t[:, valid_indices] = fit.T
-
-    # Reshape back to (n_samples, ny, nx)
-    result = result_t.cpu().numpy().reshape(n_samples, ny, nx)
+        out = result_t.cpu().numpy().reshape(n_samples, ny, nx).astype(np.float32)
 
     # Cleanup GPU memory
     if device.type == 'mps':
@@ -211,17 +175,21 @@ def regression1d_array(data, dim_values, weight, device, degree=1, wrap=False, i
     elif device.type == 'cuda':
         torch.cuda.empty_cache()
 
-    return result.astype(np.float32)
+    return out
 
 
-def trend2d_array(phase, weight, variables, device, degree=1, wrap=False):
+# Backward compatibility alias
+regression1d_array = trend1d_array
+
+
+def trend2d_array(phase, weight, variables, device, degree=1):
     """
     Fit 2D polynomial trend using PyTorch least squares (pure GPU implementation).
 
-    Supports three modes:
-    - Complex input: fit complex values directly, return complex trend
-    - wrap=True (real input): convert to exp(iφ), fit complex, return phase angle
-    - Real input, wrap=False: standard real polynomial fit
+    Two modes:
+    - Complex input: unit-circle fitting (normalize to unit magnitude, fit complex
+      polynomial, normalize result), returns complex64 unit-magnitude trend
+    - Real input: standard real polynomial fit, returns float32 trend
 
     Parameters
     ----------
@@ -235,14 +203,13 @@ def trend2d_array(phase, weight, variables, device, degree=1, wrap=False):
         PyTorch device
     degree : int
         Polynomial degree for each variable (1=linear, 2=quadratic, etc.)
-    wrap : bool
-        If True and input is real, fit in complex domain via exp(iφ).
-        Ignored when input is already complex.
 
     Returns
     -------
     np.ndarray
-        Trend surface, same shape and dtype as phase
+        Trend surface, same shape as phase.
+        Complex input returns complex64 unit-magnitude trend.
+        Real input returns float32 trend.
     """
     import torch
     from itertools import combinations_with_replacement
@@ -269,8 +236,6 @@ def trend2d_array(phase, weight, variables, device, degree=1, wrap=False):
 
     # Detect complex input
     is_complex = np.iscomplexobj(phase)
-    # Complex fitting: either complex input or wrapped real phase
-    use_complex = is_complex or wrap
 
     # Use float64 on CPU, float32 on GPU (MPS doesn't support float64)
     if device.type == 'cpu':
@@ -310,95 +275,118 @@ def trend2d_array(phase, weight, variables, device, degree=1, wrap=False):
     ones = torch.ones(n_pixels, 1, dtype=dtype, device=device)
     A_all = torch.cat([X_poly, ones], dim=1)
 
-    trends = np.empty_like(phase)
-
     cdtype = torch.complex128 if dtype == torch.float64 else torch.complex64
+    n_feat = A_all.shape[1]
 
-    for i in range(n_pairs):
-        phase_flat = phase[i].ravel()
+    # Common standardization from transform-valid pixels (fit_mask)
+    fit_indices = torch.tensor(np.where(fit_mask)[0], device=device)
+    A_fit = A_all[fit_indices]
+    feature_mean = A_fit[:, :-1].mean(dim=0, keepdim=True)
+    feature_std = A_fit[:, :-1].std(dim=0, keepdim=True) + 1e-10
 
-        # Get fitting mask: finite phase, finite weight, finite transform variables
-        valid_np = np.isfinite(phase_flat) & fit_mask
+    # Standardize design matrix once — (n_pixels, n_feat), stays on device
+    A_std = torch.cat([
+        (A_all[:, :-1] - feature_mean) / feature_std,
+        A_all[:, -1:]
+    ], dim=1)
+
+    del vars_t, features, X_poly, ones, A_all, A_fit, fit_indices
+
+    # Flatten phase/weight to (n_pairs, n_pixels) — stay on CPU
+    phase_flat = phase.reshape(n_pairs, n_pixels)
+    weight_flat = weight.reshape(n_pairs, n_pixels) if weight is not None else None
+
+    # Compute batch size from dask chunk memory budget
+    # Dominant memory per pixel: WA_batch (n_pairs × n_feat) + W,b (n_pairs × 2)
+    from .utils_dask import get_dask_chunk_size_mb
+    dtype_size = 8 if dtype == torch.float64 else 4
+    mem_per_pixel = n_pairs * (n_feat + 2) * dtype_size
+    batch_size = max(1024, (get_dask_chunk_size_mb() * 1024 * 1024) // mem_per_pixel)
+
+    # Accumulate normal equations incrementally over spatial batches
+    AtWA = torch.zeros((n_pairs, n_feat, n_feat), dtype=dtype, device=device)
+    acc_dtype = cdtype if is_complex else dtype
+    AtWb = torch.zeros((n_pairs, n_feat), dtype=acc_dtype, device=device)
+    n_valid = np.zeros(n_pairs, dtype=np.int64)
+
+    n_batches = (n_pixels + batch_size - 1) // batch_size
+    for i in range(n_batches):
+        s, e = i * batch_size, min((i + 1) * batch_size, n_pixels)
+        p_batch = phase_flat[:, s:e]
+        fm_batch = fit_mask[s:e]
+
+        # Per-batch valid mask (stays on CPU)
         if is_complex:
-            valid_np &= phase_flat != 0
-        if weight is not None:
-            weight_flat = weight[i].ravel()
-            valid_np &= np.isfinite(weight_flat)
-
-        n_valid = valid_np.sum()
-        if n_valid < 10:
-            trends[i] = np.nan
-            continue
-
-        valid_t = torch.tensor(valid_np, dtype=torch.bool, device=device)
-
-        # Extract valid rows
-        A_valid = A_all[valid_t]  # (n_valid, n_features+1)
-
-        # Standardize features on GPU (excluding bias column)
-        # Compute mean and std on valid data only
-        feature_mean = A_valid[:, :-1].mean(dim=0, keepdim=True)
-        feature_std = A_valid[:, :-1].std(dim=0, keepdim=True) + 1e-10
-        A_valid_scaled = torch.cat([
-            (A_valid[:, :-1] - feature_mean) / feature_std,
-            A_valid[:, -1:]  # Keep bias column as-is
-        ], dim=1)
-
-        # Compute weights once
-        if weight is not None:
-            w = torch.tensor(np.sqrt(weight_flat[valid_np]), dtype=dtype, device=device)
+            valid_b = np.isfinite(p_batch) & (p_batch != 0)
         else:
-            w = None
+            valid_b = np.isfinite(p_batch)
+        valid_b = valid_b & fm_batch[None, :]
+        if weight_flat is not None:
+            w_batch = weight_flat[:, s:e]
+            valid_b = valid_b & np.isfinite(w_batch)
+        n_valid += valid_b.sum(axis=1)
 
-        # Scale all pixels for prediction
-        A_all_scaled = torch.cat([
-            (A_all[:, :-1] - feature_mean) / feature_std,
-            A_all[:, -1:]
-        ], dim=1)
-
-        if use_complex:
-            # Complex fitting on unit circle: fit phase only, ignore amplitude
-            if is_complex:
-                # Normalize to unit magnitude: z/|z| = exp(iφ)
-                z_np = phase_flat[valid_np]
-                z_np /= np.abs(z_np)
-                z_valid = torch.tensor(z_np, dtype=cdtype, device=device)
-            else:
-                z_valid = torch.tensor(np.exp(1j * phase_flat[valid_np]), dtype=cdtype, device=device)
-
-            # Apply real weights to complex data
-            A_w = A_valid_scaled * w[:, None] if w is not None else A_valid_scaled
-            z_w = z_valid * w if w is not None else z_valid
-
-            # Solve: cast A to complex for matmul with complex z
-            A_w_c = A_w.to(cdtype)
-            AtA = (A_w_c.T @ A_w_c).cpu()
-            Atz = (A_w_c.T @ z_w).cpu()
-            coeffs = torch.linalg.solve(AtA, Atz).to(device)
-
-            # Predict complex trend and normalize to unit magnitude
-            z_trend = (A_all_scaled.to(cdtype) @ coeffs).cpu().numpy()
-            if is_complex:
-                with np.errstate(invalid='ignore'):
-                    z_trend /= np.abs(z_trend)
-                z_trend[~np.isfinite(z_trend)] = 0
-                trend = z_trend  # unit complex trend
-            else:
-                trend = np.angle(z_trend)  # extract phase for wrapped real
+        # W_batch: (n_pairs, batch) on device
+        if weight_flat is not None:
+            sqrt_w = np.sqrt(np.nan_to_num(w_batch, nan=0.0)).astype(np.float32)
+            W_b = torch.tensor(np.where(valid_b, sqrt_w, 0.0), dtype=dtype, device=device)
         else:
-            # Standard real fitting
-            b_valid = torch.tensor(phase_flat[valid_np], dtype=dtype, device=device)
+            W_b = torch.tensor(valid_b.astype(np.float32), dtype=dtype, device=device)
 
-            A_w = A_valid_scaled * w[:, None] if w is not None else A_valid_scaled
-            b_w = b_valid * w if w is not None else b_valid
+        # b_batch: (n_pairs, batch) on device
+        if is_complex:
+            p_abs = np.abs(p_batch)
+            with np.errstate(invalid='ignore', divide='ignore'):
+                p_unit = np.where(p_abs > 0, p_batch / p_abs, 0 + 0j)
+            b_b = torch.tensor(np.nan_to_num(p_unit, nan=0.0), dtype=cdtype, device=device)
+        else:
+            b_b = torch.tensor(np.nan_to_num(p_batch, nan=0.0), dtype=dtype, device=device)
 
-            AtA = (A_w.T @ A_w).cpu()
-            Atb = (A_w.T @ b_w).cpu()
-            coeffs = torch.linalg.solve(AtA, Atb).to(device)
+        # WA_batch: (n_pairs, batch, n_feat) — bounded memory
+        A_b = A_std[s:e]  # view on device
+        WA_b = W_b[:, :, None] * A_b[None, :, :]
 
-            trend = (A_all_scaled @ coeffs).cpu().numpy()
+        # Accumulate AtWA (real) and AtWb (real or complex)
+        AtWA += WA_b.transpose(1, 2) @ WA_b
+        Wb_b = (W_b * b_b)[:, :, None]
+        if is_complex:
+            AtWb += (WA_b.transpose(1, 2).to(cdtype) @ Wb_b.to(cdtype)).squeeze(2)
+        else:
+            AtWb += (WA_b.transpose(1, 2) @ Wb_b).squeeze(2)
 
-        trends[i] = trend.reshape(ny, nx)
+        del WA_b, W_b, b_b, Wb_b
+
+    # Regularize and solve
+    reg = 1e-10 * torch.eye(n_feat, dtype=dtype, device=device)
+    if is_complex:
+        AtWA = AtWA.to(cdtype)
+    AtWA = AtWA + reg
+    coeffs = torch.linalg.solve(AtWA.cpu(), AtWb.cpu()).to(device)
+
+    # Skip pairs with too few valid pixels
+    skip_mask = n_valid < 10
+
+    # Predict in batches — bounded memory
+    out_dtype = np.complex64 if is_complex else np.float32
+    trends_np = np.empty((n_pairs, n_pixels), dtype=out_dtype)
+    for i in range(n_batches):
+        s, e = i * batch_size, min((i + 1) * batch_size, n_pixels)
+        A_b = A_std[s:e]
+        if is_complex:
+            t_b = (A_b.to(cdtype) @ coeffs.T).T.cpu().numpy()
+            with np.errstate(invalid='ignore'):
+                t_abs = np.abs(t_b)
+                t_b = np.where(t_abs > 0, t_b / t_abs, 0)
+            t_b[~np.isfinite(t_b)] = 0
+        else:
+            t_b = (A_b @ coeffs.T).T.cpu().numpy()
+        trends_np[:, s:e] = t_b
+
+    # Set skipped pairs to NaN
+    if skip_mask.any():
+        trends_np[skip_mask] = np.nan
+
+    trends = trends_np.reshape(n_pairs, ny, nx)
 
     if squeeze:
         trends = trends[0]
@@ -414,39 +402,41 @@ def trend2d_array(phase, weight, variables, device, degree=1, wrap=False):
     return trends.astype(np.float32)
 
 
-def polyfit1d_pytorch(data, time_values, weight, sign, device, degree=0, wrap=False, iterations=1):
+def polyfit1d_pytorch(data, time_values, weight, sign, device, degree=0):
     """
     Fit 1D polynomial along first dimension at each pixel using PyTorch.
+
+    Two modes:
+    - Complex input: unit-circle fitting (normalize to unit magnitude, apply sign
+      via conj for rep dates, fit complex polynomial, normalize result)
+    - Real input: standard polynomial fit with sign applied multiplicatively
 
     Parameters
     ----------
     data : np.ndarray
-        3D array (n_samples, ny, nx)
+        3D array (n_samples, ny, nx). Real or complex.
     time_values : np.ndarray
         1D array of time values for fitting (length n_samples)
     weight : np.ndarray or None
-        Weight array, same shape as data
+        Weight array (real), same shape as data
     sign : np.ndarray
-        Sign array (n_samples,) to flip phase for pairs where date is rep
+        Sign array (n_samples,): +1 for ref dates, -1 for rep dates.
+        Real: multiplied into data. Complex: -1 triggers conj().
     device : torch.device
         PyTorch device
     degree : int
         Polynomial degree (0=mean, 1=linear)
-    wrap : bool
-        If True, use circular (sin/cos) fitting
-    iterations : int
-        Number of fitting iterations (for wrap=True, captures more trend per iteration)
 
     Returns
     -------
-    np.ndarray or tuple
-        If wrap=False: model coefficients (ny, nx) for the requested degree
-        If wrap=True: (sin_coeff, cos_coeff) tuple of (ny, nx) arrays
+    np.ndarray
+        Model coefficients (ny, nx). complex64 for complex input, float32 for real.
     """
     import torch
 
     n_samples, ny, nx = data.shape
     n_pixels = ny * nx
+    is_complex = np.iscomplexobj(data)
 
     # Use float64 on CPU, float32 on GPU
     if device.type == 'cpu':
@@ -454,12 +444,28 @@ def polyfit1d_pytorch(data, time_values, weight, sign, device, degree=0, wrap=Fa
     else:
         dtype = torch.float32
 
-    # Apply sign to data (flip for pairs where date is rep)
-    sign_3d = sign[:, None, None]
-    data_signed = data * sign_3d
+    if is_complex:
+        cdtype = torch.complex128 if dtype == torch.float64 else torch.complex64
+
+        # Complex unit-circle fitting: normalize to unit magnitude, apply sign via conj
+        data_unit = data.copy()
+        with np.errstate(invalid='ignore'):
+            data_unit /= np.abs(data_unit)
+        # Apply sign: conj for rep dates (sign=-1)
+        for s in range(n_samples):
+            if sign[s] < 0:
+                data_unit[s] = np.conj(data_unit[s])
+    else:
+        # Real: apply sign multiplicatively
+        sign_3d = sign[:, None, None]
+        data_signed = data * sign_3d
+
     if weight is not None:
-        # Apply sqrt(weight) for weighted least squares
-        data_signed = data_signed * np.sqrt(weight)
+        sqrt_w = np.sqrt(weight)
+        if is_complex:
+            data_unit = data_unit * sqrt_w
+        else:
+            data_signed = data_signed * sqrt_w
 
     # Normalize time values to [-1, 1] for numerical stability
     t_min, t_max = time_values.min(), time_values.max()
@@ -474,19 +480,25 @@ def polyfit1d_pytorch(data, time_values, weight, sign, device, degree=0, wrap=Fa
     X_t = torch.tensor(X, dtype=dtype, device=device)
 
     # Flatten spatial dimensions
-    data_flat = data_signed.reshape(n_samples, n_pixels)
-    data_t = torch.tensor(data_flat, dtype=dtype, device=device)
+    work_data = data_unit if is_complex else data_signed
+    data_flat = work_data.reshape(n_samples, n_pixels)
 
-    # Find valid pixels
-    valid_mask = torch.isfinite(data_t).all(dim=0)
+    if is_complex:
+        data_t = torch.tensor(data_flat, dtype=cdtype, device=device)
+        # Valid: finite and nonzero
+        valid_mask = torch.isfinite(data_t.real).all(dim=0) & torch.isfinite(data_t.imag).all(dim=0)
+    else:
+        data_t = torch.tensor(data_flat, dtype=dtype, device=device)
+        valid_mask = torch.isfinite(data_t).all(dim=0)
+
     valid_indices = torch.where(valid_mask)[0]
     n_valid = len(valid_indices)
 
+    nan_val = np.nan + 0j if is_complex else np.nan
+    out_dtype = np.complex64 if is_complex else np.float32
+
     if n_valid == 0:
-        if wrap:
-            return np.full((ny, nx), np.nan, dtype=np.float32), np.full((ny, nx), np.nan, dtype=np.float32)
-        else:
-            return np.full((ny, nx), np.nan, dtype=np.float32)
+        return np.full((ny, nx), nan_val, dtype=out_dtype)
 
     data_valid = data_t[:, valid_indices]  # (n_samples, n_valid)
 
@@ -495,86 +507,53 @@ def polyfit1d_pytorch(data, time_values, weight, sign, device, degree=0, wrap=Fa
     XtX_inv = torch.linalg.inv(XtX + 1e-10 * torch.eye(XtX.shape[0], dtype=dtype, device=device))
     XtX_inv_Xt = XtX_inv @ X_t.T  # (degree+1, n_samples)
 
-    if wrap:
-        # Iterative circular fitting
-        current_data = data_valid.clone()
-        cumulative_sin = torch.zeros(n_valid, dtype=dtype, device=device)
-        cumulative_cos = torch.ones(n_valid, dtype=dtype, device=device)  # cos(0) = 1
+    if is_complex:
+        # Complex fit: real design matrix, complex data
+        coeffs = (XtX_inv_Xt.to(cdtype) @ data_valid).T  # (n_valid, degree+1)
+        coeff = coeffs[:, degree]  # (n_valid,)
 
-        for _ in range(iterations):
-            # Fit sin and cos components separately
-            sin_data = torch.sin(current_data)
-            cos_data = torch.cos(current_data)
+        # Normalize to unit magnitude
+        coeff_abs = coeff.abs()
+        coeff = torch.where(coeff_abs > 0, coeff / coeff_abs, coeff)
 
-            # coeffs = (X^T X)^-1 X^T y
-            coeffs_sin = (XtX_inv_Xt @ sin_data).T  # (n_valid, degree+1)
-            coeffs_cos = (XtX_inv_Xt @ cos_data).T
-
-            # Extract coefficient for requested degree
-            iter_sin = coeffs_sin[:, degree]  # (n_valid,)
-            iter_cos = coeffs_cos[:, degree]
-
-            # Accumulate using angle addition formulas:
-            # sin(A+B) = sin(A)cos(B) + cos(A)sin(B)
-            # cos(A+B) = cos(A)cos(B) - sin(A)sin(B)
-            new_sin = cumulative_sin * iter_cos + cumulative_cos * iter_sin
-            new_cos = cumulative_cos * iter_cos - cumulative_sin * iter_sin
-            cumulative_sin = new_sin
-            cumulative_cos = new_cos
-
-            # Compute fitted angle for this iteration and subtract from data
-            fit_angle = torch.atan2(iter_sin, iter_cos)
-            current_data = current_data - fit_angle[None, :]
-
-        # Put back into full arrays (NaN for invalid pixels)
-        result_sin = torch.full((n_pixels,), float('nan'), dtype=dtype, device=device)
-        result_cos = torch.full((n_pixels,), float('nan'), dtype=dtype, device=device)
-        result_sin[valid_indices] = cumulative_sin
-        result_cos[valid_indices] = cumulative_cos
-
-        result = (result_sin.cpu().numpy().reshape(ny, nx).astype(np.float32),
-                  result_cos.cpu().numpy().reshape(ny, nx).astype(np.float32))
-
-        # Cleanup GPU memory
-        if device.type == 'mps':
-            torch.mps.empty_cache()
-        elif device.type == 'cuda':
-            torch.cuda.empty_cache()
-
-        return result
+        result = torch.full((n_pixels,), float('nan'), dtype=cdtype, device=device)
+        result[valid_indices] = coeff
+        result_np = result.cpu().numpy().reshape(ny, nx).astype(np.complex64)
     else:
         # Standard polynomial fitting
         coeffs = (XtX_inv_Xt @ data_valid).T  # (n_valid, degree+1)
-
-        # Extract coefficient for requested degree
         coeff = coeffs[:, degree]  # (n_valid,)
 
-        # Put back into full array (NaN for invalid pixels)
         result = torch.full((n_pixels,), float('nan'), dtype=dtype, device=device)
         result[valid_indices] = coeff
-
         result_np = result.cpu().numpy().reshape(ny, nx).astype(np.float32)
 
-        # Cleanup GPU memory
-        if device.type == 'mps':
-            torch.mps.empty_cache()
-        elif device.type == 'cuda':
-            torch.cuda.empty_cache()
+    # Cleanup GPU memory
+    if device.type == 'mps':
+        torch.mps.empty_cache()
+    elif device.type == 'cuda':
+        torch.cuda.empty_cache()
 
-        return result_np
+    return result_np
 
 
-def regression1d_pairs_chunk(data_chunk, weight_chunk, ref_values, rep_values,
-                              device, degree, days_filter, count_filter, wrap, iterations):
+def trend1d_pairs_array(data_chunk, weight_chunk, ref_values, rep_values,
+                         device, degree, days_filter, count_filter):
     """
-    Process a spatial chunk for regression1d_pairs.
+    Process a spatial chunk for trend1d_pairs.
+
+    Two modes:
+    - Complex input: unit-circle fitting per date, reconstruct pair trend as
+      model[ref] * conj(model[rep]) (complex64 output)
+    - Real input: standard polynomial fit per date, reconstruct as
+      model[ref] - model[rep] (float32 output)
 
     Parameters
     ----------
     data_chunk : np.ndarray
-        3D array (n_pairs, chunk_y, chunk_x)
+        3D array (n_pairs, chunk_y, chunk_x). Real or complex.
     weight_chunk : np.ndarray or None
-        Weight array, same shape as data_chunk
+        Weight array (real), same shape as data_chunk
     ref_values : np.ndarray
         1D array of ref dates as int64 (nanoseconds since epoch)
     rep_values : np.ndarray
@@ -587,22 +566,18 @@ def regression1d_pairs_chunk(data_chunk, weight_chunk, ref_values, rep_values,
         Maximum time interval filter
     count_filter : int or None
         Maximum pairs per date filter
-    wrap : bool
-        Use circular fitting
-    iterations : int
-        Number of fitting iterations
 
     Returns
     -------
     np.ndarray
-        Trend array (n_pairs, chunk_y, chunk_x)
+        Trend array (n_pairs, chunk_y, chunk_x). complex64 or float32.
     """
     import torch
 
     n_pairs, ny, nx = data_chunk.shape
+    is_complex = np.iscomplexobj(data_chunk)
 
     # Convert int64 nanoseconds to days (relative to first date)
-    # This avoids datetime64 issues in the chunk function
     ns_per_day = 86400 * 1e9
     ref_days = ref_values / ns_per_day
     rep_days = rep_values / ns_per_day
@@ -612,11 +587,7 @@ def regression1d_pairs_chunk(data_chunk, weight_chunk, ref_values, rep_values,
     unique_days = np.unique(all_days)
 
     # Build per-date models
-    if wrap:
-        models_sin = {}
-        models_cos = {}
-    else:
-        models = {}
+    models = {}
 
     for date_day in unique_days:
         # Find pairs containing this date
@@ -672,64 +643,35 @@ def regression1d_pairs_chunk(data_chunk, weight_chunk, ref_values, rep_values,
         selected_weight = weight_chunk[pair_indices] if weight_chunk is not None else None
 
         # Fit polynomial using PyTorch
-        result = polyfit1d_pytorch(
+        models[date_day] = polyfit1d_pytorch(
             selected_data, time_values, selected_weight, signs,
-            device, degree=degree, wrap=wrap, iterations=iterations
+            device, degree=degree
         )
 
-        if wrap:
-            sin_coeff, cos_coeff = result
-            models_sin[date_day] = sin_coeff
-            models_cos[date_day] = cos_coeff
-        else:
-            models[date_day] = result
-
     # Reconstruct pair-wise trends
-    trend_data = np.full((n_pairs, ny, nx), np.nan, dtype=np.float32)
+    out_dtype = np.complex64 if is_complex else np.float32
+    nan_val = np.nan + 0j if is_complex else np.nan
+    trend_data = np.full((n_pairs, ny, nx), nan_val, dtype=out_dtype)
 
-    if wrap:
-        for i in range(n_pairs):
-            ref_day = ref_days[i]
-            rep_day = rep_days[i]
+    for i in range(n_pairs):
+        ref_day = ref_days[i]
+        rep_day = rep_days[i]
 
-            # Find matching keys (use isclose for float comparison)
-            ref_key = None
-            rep_key = None
-            for key in models_sin.keys():
-                if np.isclose(key, ref_day):
-                    ref_key = key
-                if np.isclose(key, rep_day):
-                    rep_key = key
+        # Find matching keys (use isclose for float comparison)
+        ref_key = None
+        rep_key = None
+        for key in models.keys():
+            if np.isclose(key, ref_day):
+                ref_key = key
+            if np.isclose(key, rep_day):
+                rep_key = key
 
-            if ref_key is None or rep_key is None:
-                continue
+        if ref_key is None or rep_key is None:
+            continue
 
-            sin_ref = models_sin[ref_key]
-            cos_ref = models_cos[ref_key]
-            sin_rep = models_sin[rep_key]
-            cos_rep = models_cos[rep_key]
-
-            # Angle difference: atan2(sin(A-B), cos(A-B))
-            sin_diff = sin_ref * cos_rep - cos_ref * sin_rep
-            cos_diff = cos_ref * cos_rep + sin_ref * sin_rep
-            trend_data[i] = np.arctan2(sin_diff, cos_diff)
-    else:
-        for i in range(n_pairs):
-            ref_day = ref_days[i]
-            rep_day = rep_days[i]
-
-            # Find matching keys
-            ref_key = None
-            rep_key = None
-            for key in models.keys():
-                if np.isclose(key, ref_day):
-                    ref_key = key
-                if np.isclose(key, rep_day):
-                    rep_key = key
-
-            if ref_key is None or rep_key is None:
-                continue
-
+        if is_complex:
+            trend_data[i] = models[ref_key] * np.conj(models[rep_key])
+        else:
             trend_data[i] = models[ref_key] - models[rep_key]
 
     return trend_data

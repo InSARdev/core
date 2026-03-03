@@ -158,25 +158,28 @@ class Stack_unwrap1d(BatchCore):
             return ts_block.astype(np.float32)
 
         data_dask = data.data
+        task_resources = {'lstsq': 1, 'gpu': 1} if device != 'cpu' else {'lstsq': 1}
         if weight is not None:
             weight_dask = weight.data
-            result_dask = da.map_blocks(
-                process_block, data_dask, weight_dask,
-                dtype=np.float32,
-                drop_axis=0,
-                new_axis=0,
-                chunks=(n_dates,) + data_dask.chunks[1:],
-            )
+            with dask.annotate(resources=task_resources):
+                result_dask = da.map_blocks(
+                    process_block, data_dask, weight_dask,
+                    dtype=np.float32,
+                    drop_axis=0,
+                    new_axis=0,
+                    chunks=(n_dates,) + data_dask.chunks[1:],
+                )
         else:
             def process_block_no_weight(data_block):
                 return process_block(data_block, None)
-            result_dask = da.map_blocks(
-                process_block_no_weight, data_dask,
-                dtype=np.float32,
-                drop_axis=0,
-                new_axis=0,
-                chunks=(n_dates,) + data_dask.chunks[1:],
-            )
+            with dask.annotate(resources=task_resources):
+                result_dask = da.map_blocks(
+                    process_block_no_weight, data_dask,
+                    dtype=np.float32,
+                    drop_axis=0,
+                    new_axis=0,
+                    chunks=(n_dates,) + data_dask.chunks[1:],
+                )
 
         # Rechunk to date=1 for efficient per-slice downstream operations (preserve spatial chunks)
         ts_dask = result_dask.rechunk({0: 1})
@@ -323,10 +326,12 @@ class Stack_unwrap1d(BatchCore):
                 original_coords[k] = vals
 
         # Use rechunk2d for uniform chunk sizes based on memory
-        # Multiplier accounts for unwrap1d internal memory (IRLS iterations)
-        # Effective memory: 4 * n_pairs * 16 bytes (complex128) per pixel
+        # Per-pixel memory in unwrap1d_pairs_numpy:
+        #   phases_flat (view of input), weights_flat (view or ones_like),
+        #   unwrapped_flat (new allocation) — all n_pairs * float32
+        # Torch batch tensors are bounded by batch_size, not n_pixels
         from .utils_dask import rechunk2d
-        mem_per_pixel = 4 * n_pairs * 16  # complex128 = 16 bytes
+        mem_per_pixel = n_pairs * 12  # 3 arrays × n_pairs × 4 bytes (float32)
         optimal = rechunk2d((data.y.size, data.x.size), element_bytes=mem_per_pixel)
         chunks_y, chunks_x = optimal['y'], optimal['x']
 

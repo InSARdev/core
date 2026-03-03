@@ -286,6 +286,82 @@ class Stack(Stack_plot, BatchCore):
 
         return Batches([s_opt_stack, adi_batch, psi_batch])
 
+    def optimize2(self, angle_coarse: float = 15, angle_fine: float = 5, device: str = 'auto') -> "Stack":
+        """
+        Polarimetric amplitude optimization with original co-pol phase.
+
+        NOTE: Requires insardev_polsar extension.
+
+        Finds optimal VV/VH combination that minimizes ADI, then returns
+        a Stack with optimized amplitude and original VV phase:
+
+            S_opt(t) = |cos(ψ)·VV(t) + sin(ψ)·exp(iφ)·VH(t)| · exp(i·arg(VV(t)))
+
+        Unlike adi2() which returns mixed VV+VH phase, optimize2() preserves
+        the original VV phase so standard interferometric processing works
+        directly on the result.
+
+        Parameters
+        ----------
+        angle_coarse : float
+            Coarse grid step in degrees. Default 15°.
+        angle_fine : float
+            Fine grid step in degrees. Default 5°.
+        device : str
+            PyTorch device: 'auto', 'cuda', 'mps', or 'cpu'.
+
+        Returns
+        -------
+        Stack
+            Optimized Stack with VV phase and optimized VV+VH amplitude.
+            Crosspol variable is dropped; all other variables preserved.
+
+        Examples
+        --------
+        >>> import insardev_polsar
+        >>> stack_opt = stack.optimize2()
+        >>> adi = stack_opt.adi()
+        >>> ps_mask = adi[['VV']] < 0.5
+        >>> mintf, mcorr = stack_opt.pairs(baseline.tolist()).interferogram(wavelength=30)
+
+        Notes
+        -----
+        Use adi2() when you need the ADI and psi maps directly.
+        Use optimize2() when you want to feed the result into standard
+        interferometric pipelines (phasediff, unwrap, etc.).
+        """
+        # Detect polarizations
+        sample_ds = next(iter(self.values()))
+        if 'VV' in sample_ds.data_vars and 'VH' in sample_ds.data_vars:
+            pols = ['VV', 'VH']
+        elif 'HH' in sample_ds.data_vars and 'HV' in sample_ds.data_vars:
+            pols = ['HH', 'HV']
+        else:
+            raise ValueError("Dual-pol data required (VV+VH or HH+HV)")
+
+        # Import implementation from insardev_polsar
+        try:
+            from insardev_polsar.adi2 import optimize2 as _optimize2_impl
+        except ImportError:
+            raise ImportError("optimize2() requires insardev_polsar extension. Install it first.")
+
+        # Get dual-pol subset as BatchComplex
+        batch_complex = self[pols]
+
+        # Call internal optimize2 implementation
+        s_opt_batch = _optimize2_impl(batch_complex, angle_coarse, angle_fine, device)
+
+        # Merge S_opt back into original stack structure (preserves BPR, etc.)
+        output_pol = pols[0]  # VV or HH
+        s_opt_dict = {}
+        for burst_id, orig_ds in self.items():
+            s_opt_ds = s_opt_batch[burst_id]
+            # Drop original pols, add optimized output
+            merged = orig_ds.drop_vars(pols).assign({output_pol: s_opt_ds[output_pol]})
+            s_opt_dict[burst_id] = merged
+
+        return type(self)(s_opt_dict)
+
     def adi(self, device: str = 'auto') -> Batch:
         """
         Compute Amplitude Dispersion Index (ADI) for calibrated σ₀ data.
