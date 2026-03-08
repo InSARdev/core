@@ -702,19 +702,23 @@ def _compute_chunk_score(
 def rechunk2d(
     shape: tuple,
     element_bytes: int,
-    target_mb: int = None,
+    input_chunks: tuple = None,
+    target_mb: float = None,
     min_chunk: int = 64,
     max_chunk: int = 16384,
+    merge: bool = False,
 ) -> dict:
     """
-    Compute optimal chunk sizes with uniform chunk sizes (no tiny corners).
+    Compute optimal chunk sizes aligned to input chunk boundaries.
 
-    Features:
-    - Hard upper budget limit (120%)
-    - Soft lower budget limit (80%)
-    - Uniform chunk sizes (minimize variance between full/edge/corner chunks)
-    - Balanced chunk counts
-    - Near-square preference
+    When input_chunks is provided, output chunk boundaries never cross
+    input chunk boundaries.  Each input chunk is individually split or
+    kept whole to produce output chunks close to the memory budget.
+    When merge=True, adjacent small chunks may be merged.
+    Returns chunk tuples per dim.
+
+    When input_chunks is not provided, falls back to computing a single
+    optimal chunk size per dim (legacy behaviour).
 
     Parameters
     ----------
@@ -722,19 +726,31 @@ def rechunk2d(
         Array shape: (y_size, x_size) for 2D or (n, y_size, x_size) for 3D.
     element_bytes : int
         Bytes per element (e.g., 8 for complex64, 4 for float32).
+    input_chunks : tuple of tuples, optional
+        Input chunk sizes per spatial dim: ((cy0, cy1, ...), (cx0, cx1, ...)).
     target_mb : int, optional
         Target memory per chunk in MB. If None, uses dask config.
     min_chunk : int
         Minimum chunk size (default 64).
     max_chunk : int
         Maximum chunk size (default 16384).
+    merge : bool
+        If True, adjacent small input chunks may be merged into larger
+        output tiles.  If False (default), each input chunk is kept
+        whole or split — never merged with neighbors.  False avoids
+        cross-chunk rechunk graphs that explode in layered pipelines.
 
     Returns
     -------
     dict
-        {'y': cy, 'x': cx}
-        For 3D input, also includes {0: 1}.
+        When input_chunks is provided:
+            {'y': (cy0, cy1, ...), 'x': (cx0, cx1, ...)} — chunk tuples.
+        When input_chunks is not provided:
+            {'y': cy, 'x': cx} — single int per dim.
+        For 3D input, also includes {0: 1} (legacy) or {0: -1}.
     """
+    import math
+
     # Handle 3D arrays
     is_3d = len(shape) == 3
     if is_3d:
@@ -747,8 +763,77 @@ def rechunk2d(
         target_mb = get_dask_chunk_size_mb()
 
     pixel_budget = (target_mb * 1024 * 1024) // element_bytes
-    max_pixels = int(1.2 * pixel_budget)  # Hard upper limit
 
+    if input_chunks is not None:
+        y_in, x_in = input_chunks
+        max_cy_in = max(y_in)
+        max_cx_in = max(x_in)
+
+        # Split (and optionally merge) input chunks, aligned to boundaries
+        def split_dim(in_chunks, target_size, allow_merge=merge):
+            out_chunks = []
+            accum = 0
+            for c in in_chunks:
+                if c >= target_size:
+                    # Flush any accumulated small chunks first
+                    if accum > 0:
+                        out_chunks.append(accum)
+                        accum = 0
+                    # Split large chunk into n roughly equal sub-tiles
+                    n = max(1, math.ceil(c / target_size))
+                    base = c // n
+                    remainder = c % n
+                    for i in range(n):
+                        out_chunks.append(base + (1 if i < remainder else 0))
+                elif allow_merge:
+                    # Merge adjacent small chunks until reaching target
+                    if accum + c > target_size and accum > 0:
+                        out_chunks.append(accum)
+                        accum = c
+                    else:
+                        accum += c
+                else:
+                    # Keep each input chunk as-is (no merging)
+                    out_chunks.append(c)
+            if accum > 0:
+                out_chunks.append(accum)
+            return tuple(out_chunks)
+
+        # Try multiple strategies and pick the one with fewest output tiles.
+        # Each strategy accounts for both dims: keeping one dim's chunks
+        # whole lets the other dim use a larger target (= fewer tiles).
+        candidates = []
+
+        # Strategy A: keep y input chunks whole, adjust x
+        x_target_a = pixel_budget // max_cy_in
+        if x_target_a >= min_chunk:
+            yg = split_dim(y_in, max_cy_in)
+            xg = split_dim(x_in, x_target_a)
+            candidates.append((yg, xg))
+
+        # Strategy B: keep x input chunks whole, adjust y
+        y_target_b = pixel_budget // max_cx_in
+        if y_target_b >= min_chunk:
+            yg = split_dim(y_in, y_target_b)
+            xg = split_dim(x_in, max_cx_in)
+            candidates.append((yg, xg))
+
+        # Strategy C: balanced split/merge
+        target_c = _find_optimal_chunk_pair(
+            y_size, x_size, pixel_budget, element_bytes, min_chunk, max_chunk)
+        yg = split_dim(y_in, target_c['y'])
+        xg = split_dim(x_in, target_c['x'])
+        candidates.append((yg, xg))
+
+        # Pick strategy with fewest output tiles
+        best_yg, best_xg = min(candidates, key=lambda c: len(c[0]) * len(c[1]))
+
+        result = {'y': best_yg, 'x': best_xg}
+        if is_3d:
+            result[0] = 1
+        return result
+
+    # Legacy path: no input_chunks — return single int per dim
     # Edge case: array smaller than budget
     if y_size * x_size <= pixel_budget:
         result = {'y': y_size, 'x': x_size}
@@ -756,11 +841,23 @@ def rechunk2d(
             result[0] = 1
         return result
 
-    # Generate candidate chunk sizes: divisors + regular intervals
+    result = _find_optimal_chunk_pair(
+        y_size, x_size, pixel_budget, element_bytes, min_chunk, max_chunk)
+    if is_3d:
+        result[0] = 1
+    return result
+
+
+def _find_optimal_chunk_pair(
+    y_size: int, x_size: int,
+    pixel_budget: int, element_bytes: int,
+    min_chunk: int = 64, max_chunk: int = 16384,
+) -> dict:
+    """Find optimal (cy, cx) chunk pair for a given array shape and budget."""
+    max_pixels = int(1.2 * pixel_budget)
+
     def get_candidates(dim_size):
         candidates = set()
-
-        # Add divisors of dim_size (for zero remainder = 100% uniformity)
         for d in range(1, int(dim_size**0.5) + 1):
             if dim_size % d == 0:
                 if min_chunk <= d <= min(max_chunk, dim_size):
@@ -768,45 +865,33 @@ def rechunk2d(
                 comp = dim_size // d
                 if min_chunk <= comp <= min(max_chunk, dim_size):
                     candidates.add(comp)
-
-        # Add regular intervals (every 64 pixels)
         for c in range(min_chunk, min(dim_size, max_chunk) + 1, 64):
             candidates.add(c)
-
-        # Add full dimension if small enough
         if dim_size <= max_chunk:
             candidates.add(dim_size)
-
         return sorted(candidates, reverse=True)
 
     valid_y = get_candidates(y_size)
     valid_x = get_candidates(x_size)
 
-    # Relax aspect ratio for narrow inputs
     input_aspect = max(y_size / x_size, x_size / y_size)
     max_aspect = max(4, min(input_aspect, 16))
 
     best_score = float('inf')
     best_result = None
 
-    # Search all combinations
     for cy in valid_y:
         for cx in valid_x:
-            # Hard constraint: budget limit
             if cy * cx > max_pixels:
                 continue
-
-            # Aspect ratio constraint
             aspect = max(cy / cx, cx / cy)
             if aspect > max_aspect:
                 continue
-
             score = _compute_chunk_score(cy, cx, y_size, x_size, pixel_budget)
             if score < best_score:
                 best_score = score
                 best_result = {'y': cy, 'x': cx}
 
-    # Fallback
     if best_result is None:
         cy = min(y_size, max_chunk)
         cx = min(x_size, max_chunk)
@@ -815,9 +900,6 @@ def rechunk2d(
         while cy * cx > max_pixels and cx > min_chunk:
             cx //= 2
         best_result = {'y': cy, 'x': cx}
-
-    if is_3d:
-        best_result[0] = 1
 
     return best_result
 

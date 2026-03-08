@@ -876,12 +876,15 @@ class Stack(Stack_plot, BatchCore):
 
                 pbar.update(1)
 
-    def compute(self, *batches: BatchCore, allow_rechunk: bool = False) -> tuple:
+    def compute(self, *batches: BatchCore, n_bursts: int = 2) -> tuple:
         """Compute multiple Batch objects together efficiently.
 
         This method materializes multiple dependent Batch objects in a single
         dask graph execution, which is faster than computing them separately
         because shared computations are only performed once.
+
+        When called without arguments, computes the Stack's own lazy data
+        (equivalent to BatchCore.compute()).
 
         Stack serves as a unified interface - use empty Stack() for utility operations:
         - stack.compute(batch1, batch2) or Stack().compute(batch1, batch2)
@@ -890,27 +893,29 @@ class Stack(Stack_plot, BatchCore):
         ----------
         *batches : BatchCore
             One or more Batch objects to compute together.
-        allow_rechunk : bool, optional
-            If True (default), auto-rechunk output for efficient further processing:
-            - 3D data: chunk size 1 for first dim (date/pair), auto for y,x
-            - 2D data: auto for y,x based on dask.config['array.chunk-size']
-            If False, use single spatial chunk (-1 for y,x).
+            If empty, computes the Stack itself.
+        n_bursts : int
+            Number of bursts to process in parallel. Default 2.
 
         Returns
         -------
-        tuple
-            Tuple of computed Batch objects in the same order as input.
+        tuple or Stack
+            Tuple of computed Batch objects in the same order as input,
+            or computed Stack when called without arguments.
 
         Examples
         --------
         >>> mintf, mcorr = stack.phasediff(pairs, wavelength=200)
         >>> mintf, mcorr = Stack().compute(mintf.downsample(20), mcorr.downsample(20))
+        >>> stack_opt = stack.optimize2().compute()  # compute Stack itself
         """
+        if not batches:
+            return BatchCore.compute(self, n_bursts=n_bursts)
         from .Batch import Batches
-        return Batches(batches).compute(allow_rechunk=allow_rechunk)
+        return Batches(batches).compute(n_bursts=n_bursts)
 
     def snapshot(self, *args, store: str | None = None, storage_options: dict[str, str] | None = None,
-                caption: str | None = None, n_jobs: int = -1, debug=False):
+                caption: str | None = None, n_bursts: int = 2, debug=False):
         """Save or open a snapshot of the Stack or Batch objects.
 
         Stack serves as a unified interface - use empty Stack() for utility operations:
@@ -928,8 +933,8 @@ class Stack(Stack_plot, BatchCore):
             Storage options for cloud stores.
         caption : str, optional
             Progress bar caption.
-        n_jobs : int
-            Number of parallel jobs (-1 for all cores).
+        n_bursts : int
+            Number of bursts to process in parallel. Default 2.
         debug : bool
             Print debug information.
 
@@ -962,20 +967,20 @@ class Stack(Stack_plot, BatchCore):
             # Empty Stack -> open mode, non-empty Stack -> save mode
             if len(self) == 0:
                 result = Batches().snapshot(store=store, storage_options=storage_options,
-                                             caption=caption, n_jobs=n_jobs, debug=debug)
+                                             caption=caption, n_bursts=n_bursts, debug=debug)
                 # Unwrap single Stack from tuple
                 if len(result) == 1 and isinstance(result[0], Stack):
                     return result[0]
                 return result
             utils_io.save(self, store=store, storage_options=storage_options, compat=True,
-                         caption=caption or 'Snapshotting...', n_jobs=n_jobs, debug=debug)
+                         caption=caption or 'Snapshotting...', n_bursts=n_bursts, debug=debug)
             return self
 
         # Save mode - args are batches
-        return Batches(args).snapshot(store=store, storage_options=storage_options, caption=caption, n_jobs=n_jobs, debug=debug)
+        return Batches(args).snapshot(store=store, storage_options=storage_options, caption=caption, n_bursts=n_bursts, debug=debug)
 
     def archive(self, *args, store: str | None = None, caption: str | None = None,
-                compression: int = 6, n_jobs: int = -1, debug=False):
+                compression: int = 6, n_bursts: int = 2, debug=False):
         """Save or open an archive of the Stack or Batch objects as a single ZIP file.
 
         Wrapper around snapshot() that uses ZipStore for single-file storage.
@@ -997,8 +1002,8 @@ class Stack(Stack_plot, BatchCore):
         compression : int
             ZIP compression level 0-9 (0=no compression, 9=max). Default 6.
             Higher values produce smaller files but take longer.
-        n_jobs : int
-            Number of parallel jobs (-1 for all cores).
+        n_bursts : int
+            Number of bursts to process in parallel. Default 2.
         debug : bool
             Print debug information.
 
@@ -1055,7 +1060,7 @@ class Stack(Stack_plot, BatchCore):
                     raise FileNotFoundError(f"Archive not found: {store}")
                 # Use ZipStore directly for reading
                 zip_store = zarr.storage.ZipStore(store, mode='r')
-                result = Batches().snapshot(store=zip_store, caption=caption or 'Opening archive...', n_jobs=n_jobs, debug=debug)
+                result = Batches().snapshot(store=zip_store, caption=caption or 'Opening archive...', n_bursts=n_bursts, debug=debug)
                 zip_store.close()
                 # Unwrap single Stack from tuple
                 if len(result) == 1 and isinstance(result[0], Stack):
@@ -1065,7 +1070,7 @@ class Stack(Stack_plot, BatchCore):
             temp_dir = tempfile.mkdtemp()
             try:
                 utils_io.save(self, store=temp_dir, storage_options=None, compat=True,
-                             caption=caption or 'Archiving...', n_jobs=n_jobs, debug=debug)
+                             caption=caption or 'Archiving...', n_bursts=n_bursts, debug=debug)
                 # Create zip with specified compression level
                 # Use fsspec for cloud storage support
                 with fsspec.open(store, 'wb') as f:
@@ -1081,7 +1086,7 @@ class Stack(Stack_plot, BatchCore):
             return self
 
         # Save mode - args are batches
-        return Batches(args).archive(store, caption=caption, compression=compression, n_jobs=n_jobs, debug=debug)
+        return Batches(args).archive(store, caption=caption, compression=compression, n_bursts=n_bursts, debug=debug)
 
     # def downsample(self, *args, coarsen=None, resolution=60, func='mean', debug:bool=False):
     #     datas = []
@@ -1426,7 +1431,7 @@ class Stack(Stack_plot, BatchCore):
         return shape, chunks, scale, fill_value
 
     def load(self, urls:str | list | dict[str, str], storage_options:dict[str, str]|None=None,
-             allow_rechunk:bool=False, debug:bool=False):
+             debug:bool=False):
         import numpy as np
         import dask
         import dask.array as da
@@ -1477,6 +1482,12 @@ class Stack(Stack_plot, BatchCore):
             # Reference height for elevation computation
             'ref_height',
         }
+
+        # Resolve dask chunk budget in main process (joblib loky workers
+        # don't inherit dask.config, so get_dask_chunk_size_mb() would
+        # return the default 128 MB regardless of user config).
+        from .utils_dask import get_dask_chunk_size_mb
+        _load_target_mb = get_dask_chunk_size_mb()
 
         def store_open_group_delayed(zarr_path, group):
             """
@@ -1554,8 +1565,6 @@ class Stack(Stack_plot, BatchCore):
                 )
 
                 # Create delayed dask arrays for each date
-                # Resource annotation limits concurrent loads to prevent memory accumulation
-                # Workers must be configured with resources={'load': N} to limit concurrency
                 delayed_arrays = []
                 for info in pol_infos:
                     shape = info['shape']
@@ -1568,10 +1577,9 @@ class Stack(Stack_plot, BatchCore):
 
                     if n_chunks_y == 1 and n_chunks_x == 1:
                         # Single chunk (S1): one reader for entire array
-                        with dask.annotate(resources={'load': 1}):
-                            delayed_load = dask.delayed(Stack._load_zarr_complex)(
-                                zarr_path, info['burst_path'], storage_options
-                            )
+                        delayed_load = dask.delayed(Stack._load_zarr_complex)(
+                            zarr_path, info['burst_path'], storage_options
+                        )
                         arr = da.from_delayed(delayed_load, shape=shape, dtype=np.complex64)
                     else:
                         # Multi-chunk (NISAR): one reader call per chunk
@@ -1584,11 +1592,10 @@ class Stack(Stack_plot, BatchCore):
                                 x0, x1 = ix * zarr_chunks[1], min((ix + 1) * zarr_chunks[1], shape[1])
                                 chunk_shape = (y1 - y0, x1 - x0)
 
-                                with dask.annotate(resources={'load': 1}):
-                                    delayed_chunk = dask.delayed(Stack._load_zarr_complex_chunk)(
-                                        zarr_path, info['burst_path'], (iy, ix),
-                                        chunk_shape, zarr_chunks, scale, fill_value, storage_options
-                                    )
+                                delayed_chunk = dask.delayed(Stack._load_zarr_complex_chunk)(
+                                    zarr_path, info['burst_path'], (iy, ix),
+                                    chunk_shape, zarr_chunks, scale, fill_value, storage_options
+                                )
                                 chunk_arr = da.from_delayed(delayed_chunk, shape=chunk_shape, dtype=np.complex64)
                                 chunk_cols.append(chunk_arr)
                             chunk_rows.append(chunk_cols)
@@ -1599,6 +1606,8 @@ class Stack(Stack_plot, BatchCore):
 
                 # Stack all dates: (n_dates, y, x)
                 stacked = da.concatenate(delayed_arrays, axis=0)
+
+                # Zarr disk chunks are rechunked to dask budget via chunk2d logic below.
 
                 # Create xarray DataArray
                 dates = [info['date'] for info in pol_infos]
@@ -1661,6 +1670,7 @@ class Stack(Stack_plot, BatchCore):
 
             # 2D vars as lazy dask arrays via custom reader (no persistent file descriptors)
             # One reader call per chunk for memory efficiency
+            # Transform 2D vars loaded with zarr disk chunks, rechunked via chunk2d logic below.
             transform_path = f"{group}/transform"
             for var in transform.data_vars:
                 shape, zarr_chunks, scale_factor, fill_value, dtype = Stack._get_zarr_array_meta(
@@ -1707,6 +1717,33 @@ class Stack(Stack_plot, BatchCore):
             # Close zarr resources (metadata only, no lazy data references)
             transform.close()
             root.store.close()
+
+            # Apply chunk2d logic: rechunk spatial dims to optimal sizes for budget
+            from .utils_dask import rechunk2d
+            sample = None
+            for var in ds.data_vars:
+                arr = ds[var]
+                if arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x'):
+                    sample = arr
+                    break
+            if sample is not None:
+                y_size, x_size = sample.shape[-2], sample.shape[-1]
+                in_chunks = (sample.data.chunks[-2], sample.data.chunks[-1]) if hasattr(sample.data, 'chunks') else None
+                optimal = rechunk2d((y_size, x_size), element_bytes=8,
+                                   input_chunks=in_chunks, merge=False,
+                                   target_mb=_load_target_mb)
+                rechunked_vars = {}
+                for var in ds.data_vars:
+                    arr = ds[var]
+                    if not (arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x')):
+                        continue
+                    if arr.ndim == 3:
+                        var_chunks = {arr.dims[0]: 1, 'y': optimal['y'], 'x': optimal['x']}
+                    else:
+                        var_chunks = {'y': optimal['y'], 'x': optimal['x']}
+                    rechunked_vars[var] = arr.chunk(var_chunks)
+                if rechunked_vars:
+                    ds = ds.assign(rechunked_vars)
 
             return group, ds
 
@@ -1805,13 +1842,11 @@ class Stack(Stack_plot, BatchCore):
                         key=lambda x: x['date']
                     )
 
-                    # Resource annotation limits concurrent loads to prevent memory accumulation
                     delayed_arrays = []
                     for info in pol_infos:
-                        with dask.annotate(resources={'load': 1}):
-                            delayed_load = dask.delayed(Stack._load_zarr_complex)(
-                                info['url'], '', storage_options
-                            )
+                        delayed_load = dask.delayed(Stack._load_zarr_complex)(
+                            info['url'], '', storage_options
+                        )
                         arr = da.from_delayed(delayed_load, shape=info['shape'], dtype=np.complex64)
                         arr = arr[np.newaxis, :, :]
                         delayed_arrays.append(arr)
@@ -1878,6 +1913,32 @@ class Stack(Stack_plot, BatchCore):
                 ds.rio.write_crs(spatial_ref, inplace=True)
                 transform.close()
 
+                # Apply chunk2d logic: rechunk spatial dims to optimal sizes for budget
+                from .utils_dask import rechunk2d
+                sample = None
+                for var in ds.data_vars:
+                    arr = ds[var]
+                    if arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x'):
+                        sample = arr
+                        break
+                if sample is not None:
+                    y_size, x_size = sample.shape[-2], sample.shape[-1]
+                    in_chunks = (sample.data.chunks[-2], sample.data.chunks[-1]) if hasattr(sample.data, 'chunks') else None
+                    optimal = rechunk2d((y_size, x_size), element_bytes=8,
+                                       input_chunks=in_chunks, merge=True)
+                    rechunked_vars = {}
+                    for var_name in ds.data_vars:
+                        arr = ds[var_name]
+                        if not (arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x')):
+                            continue
+                        if arr.ndim == 3:
+                            var_chunks = {arr.dims[0]: 1, 'y': optimal['y'], 'x': optimal['x']}
+                        else:
+                            var_chunks = {'y': optimal['y'], 'x': optimal['x']}
+                        rechunked_vars[var_name] = arr.chunk(var_chunks)
+                    if rechunked_vars:
+                        ds = ds.assign(rechunked_vars)
+
                 dss[fullBurstID] = ds
 
             #assert len(np.unique([ds.rio.crs.to_epsg() for ds in dss])) == 1, 'All datasets must have the same coordinate reference system'
@@ -1893,37 +1954,8 @@ class Stack(Stack_plot, BatchCore):
                                  'This may be caused by corrupted data or library issues. '
                                  'Try restarting the runtime and reloading the data.')
 
-        # Rechunk spatial variables only (non-spatial stay as-is)
-        from .utils_dask import get_dask_chunk_size_mb, rechunk2d
-        dask_chunk_mb = get_dask_chunk_size_mb()
-        note_printed = False
-
-        for key, ds in self.items():
-            rechunked_vars = {}
-            for var in ds.data_vars:
-                arr = ds[var]
-                # Only touch spatial variables (y, x dims)
-                if not (arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x')):
-                    continue
-                if allow_rechunk:
-                    # Use rechunk2d for uniform chunk sizes
-                    y_size, x_size = arr.shape[-2], arr.shape[-1]
-                    element_bytes = arr.dtype.itemsize
-                    optimal = rechunk2d((y_size, x_size), element_bytes)
-                    if arr.ndim == 3:
-                        chunks = {arr.dims[0]: 1, 'y': optimal['y'], 'x': optimal['x']}
-                    else:
-                        chunks = {'y': optimal['y'], 'x': optimal['x']}
-                    rechunked_vars[var] = arr.chunk(chunks)
-                # else: preserve existing zarr chunks (don't rechunk)
-            if rechunked_vars:
-                self[key] = ds.assign(rechunked_vars)
-            if not note_printed:
-                if allow_rechunk:
-                    print(f"NOTE load: rechunking to dask.config['array.chunk-size']={dask_chunk_mb} MB")
-                else:
-                    print(f"NOTE load: preserving zarr chunks (allow_rechunk=False)")
-                note_printed = True
+        # chunk2d applied: spatial dims rechunked to dask budget, dim0=1.
+        # User can override with .chunk2d(budget) or .chunk1d(budget) after load().
 
         return self
 

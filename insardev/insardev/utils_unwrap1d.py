@@ -178,7 +178,7 @@ def irls_solve_1d(phi, W_corr, A_t, dev, max_iter=5, epsilon=0.1,
 
 
 def unwrap1d_pairs_numpy(phase_stack, weight_stack, pair_dates, device='auto',
-                         max_iter=5, epsilon=0.1, batch_size=50000, debug=False):
+                         max_iter=5, epsilon=0.1, batch_size=None, debug=False):
     """
     L1-norm IRLS temporal phase unwrapping on numpy arrays.
 
@@ -209,8 +209,28 @@ def unwrap1d_pairs_numpy(phase_stack, weight_stack, pair_dates, device='auto',
     import torch
     from .BatchCore import BatchCore
 
-    n_pairs, height, width = phase_stack.shape
-    n_pixels = height * width
+    # Accept chunk lists or 3D array → flat (n_pairs, n_pixels) views.
+    if isinstance(phase_stack, list):
+        flat_chunks = [np.asarray(c) for c in phase_stack]
+        height, width = flat_chunks[0].shape[1], flat_chunks[0].shape[2]
+        n_pixels = height * width
+        n_pairs = sum(c.shape[0] for c in flat_chunks)
+        flat_chunks = [c.reshape(c.shape[0], n_pixels) for c in flat_chunks]
+        multi_chunk = True
+    else:
+        n_pairs, height, width = phase_stack.shape
+        n_pixels = height * width
+        flat_chunks = [phase_stack.reshape(n_pairs, n_pixels)]
+        multi_chunk = False
+
+    if weight_stack is not None:
+        if isinstance(weight_stack, list):
+            flat_w_chunks = [np.asarray(c) for c in weight_stack]
+            flat_w_chunks = [c.reshape(c.shape[0], n_pixels) for c in flat_w_chunks]
+        else:
+            flat_w_chunks = [weight_stack.reshape(weight_stack.shape[0], n_pixels)]
+    else:
+        flat_w_chunks = None
 
     # Build incidence matrix
     A, dates = build_incidence_matrix(pair_dates)
@@ -223,48 +243,62 @@ def unwrap1d_pairs_numpy(phase_stack, weight_stack, pair_dates, device='auto',
     # Move matrix to device
     A_t = torch.from_numpy(A).to(dev)
 
-    # Reshape to (n_pairs, n_pixels)
-    phases_flat = phase_stack.reshape(n_pairs, n_pixels)
-    if weight_stack is not None:
-        weights_flat = weight_stack.reshape(n_pairs, n_pixels)
-    else:
-        weights_flat = np.ones_like(phases_flat)
+    # Compute batch size from dask config if not provided
+    if batch_size is None:
+        from .utils_dask import get_dask_chunk_size_mb
+        n_intervals = len(dates) - 1
+        elem_bytes = max(1, n_pairs * n_intervals * 4)
+        batch_size = max(1024, (get_dask_chunk_size_mb() * 1024 * 1024) // elem_bytes)
 
-    # Process in batches
-    unwrapped_flat = np.zeros_like(phases_flat)
-    n_batches = (n_pixels + batch_size - 1) // batch_size
+    # Gather size: pixel columns to concatenate at once (~dask chunk budget)
+    from .utils_dask import get_dask_chunk_size_mb
+    gather_size = max(batch_size, (get_dask_chunk_size_mb() * 1024 * 1024) // max(1, n_pairs * 4))
 
-    for b in range(n_batches):
-        start = b * batch_size
-        end = min((b + 1) * batch_size, n_pixels)
+    unwrapped_flat = np.zeros((n_pairs, n_pixels), dtype=np.float32)
 
-        if debug and (b == 0 or (b + 1) % 10 == 0 or b == n_batches - 1):
-            print(f'  Batch {b+1}/{n_batches}')
+    for g_start in range(0, n_pixels, gather_size):
+        g_end = min(g_start + gather_size, n_pixels)
 
-        # Move batch to device
-        phi = torch.from_numpy(phases_flat[:, start:end].astype(np.float32)).to(dev)
-        W = torch.from_numpy(weights_flat[:, start:end].astype(np.float32)).to(dev)
+        # Concatenate per-pair slices for this pixel range (one concat per gather block)
+        if multi_chunk:
+            phases_block = np.concatenate([c[:, g_start:g_end] for c in flat_chunks], axis=0)
+            weights_block = np.concatenate([c[:, g_start:g_end] for c in flat_w_chunks], axis=0) \
+                if flat_w_chunks is not None else None
+        else:
+            phases_block = flat_chunks[0][:, g_start:g_end]
+            weights_block = flat_w_chunks[0][:, g_start:g_end] if flat_w_chunks is not None else None
 
-        # Solve
-        result = irls_solve_1d(
-            phi, W, A_t, dev, max_iter=max_iter, epsilon=epsilon,
-            return_increments=False
-        )
+        # Inner loop: torch batches from the concatenated block
+        block_pixels = g_end - g_start
+        for b_start in range(0, block_pixels, batch_size):
+            b_end = min(b_start + batch_size, block_pixels)
 
-        unwrapped_flat[:, start:end] = result.cpu().numpy()
+            phi = torch.from_numpy(phases_block[:, b_start:b_end].astype(np.float32)).to(dev)
+            if weights_block is not None:
+                W = torch.from_numpy(weights_block[:, b_start:b_end].astype(np.float32)).to(dev)
+            else:
+                W = torch.ones(n_pairs, b_end - b_start, device=dev)
 
-        del phi, W, result
-        if dev.type == 'mps':
-            torch.mps.empty_cache()
-        elif dev.type == 'cuda':
-            torch.cuda.empty_cache()
+            result = irls_solve_1d(
+                phi, W, A_t, dev, max_iter=max_iter, epsilon=epsilon,
+                return_increments=False
+            )
+            unwrapped_flat[:, g_start + b_start:g_start + b_end] = result.cpu().numpy()
+
+            del phi, W, result
+            if dev.type == 'mps':
+                torch.mps.empty_cache()
+            elif dev.type == 'cuda':
+                torch.cuda.empty_cache()
+
+        del phases_block, weights_block
 
     # Reshape back
     return unwrapped_flat.reshape(n_pairs, height, width)
 
 
 def unwrap1d_to_dates_numpy(phase_stack, weight_stack, pair_dates, device='auto',
-                            max_iter=5, epsilon=0.1, batch_size=50000,
+                            max_iter=5, epsilon=0.1, batch_size=None,
                             cumsum=True, debug=False):
     """
     L1-norm IRLS temporal unwrapping directly to date-based time series.
@@ -327,6 +361,12 @@ def unwrap1d_to_dates_numpy(phase_stack, weight_stack, pair_dates, device='auto'
         weights_flat = weight_stack.reshape(n_pairs, n_pixels)
     else:
         weights_flat = np.ones_like(phases_flat)
+
+    # Compute batch size from dask config if not provided
+    if batch_size is None:
+        from .utils_dask import get_dask_chunk_size_mb
+        elem_bytes = max(1, n_pairs * n_intervals * 4)
+        batch_size = max(1024, (get_dask_chunk_size_mb() * 1024 * 1024) // elem_bytes)
 
     # Step 1: Unwrap pairs (apply 2π corrections)
     # Step 2: Compute increments from unwrapped pairs
@@ -421,8 +461,28 @@ def lstsq_to_dates_numpy(phase_stack, weight_stack, pair_dates, device='auto',
     import torch
     from .BatchCore import BatchCore
 
-    n_pairs, height, width = phase_stack.shape
-    n_pixels = height * width
+    # Accept chunk lists or 3D array → flat (n_pairs, n_pixels) views.
+    if isinstance(phase_stack, list):
+        flat_chunks = [np.asarray(c) for c in phase_stack]
+        height, width = flat_chunks[0].shape[1], flat_chunks[0].shape[2]
+        n_pixels = height * width
+        n_pairs = sum(c.shape[0] for c in flat_chunks)
+        flat_chunks = [c.reshape(c.shape[0], n_pixels) for c in flat_chunks]
+        multi_chunk = True
+    else:
+        n_pairs, height, width = phase_stack.shape
+        n_pixels = height * width
+        flat_chunks = [phase_stack.reshape(n_pairs, n_pixels)]
+        multi_chunk = False
+
+    if weight_stack is not None:
+        if isinstance(weight_stack, list):
+            flat_w_chunks = [np.asarray(c) for c in weight_stack]
+            flat_w_chunks = [c.reshape(c.shape[0], n_pixels) for c in flat_w_chunks]
+        else:
+            flat_w_chunks = [weight_stack.reshape(weight_stack.shape[0], n_pixels)]
+    else:
+        flat_w_chunks = None
 
     # Build incidence matrix
     A, dates = build_incidence_matrix(pair_dates)
@@ -433,76 +493,83 @@ def lstsq_to_dates_numpy(phase_stack, weight_stack, pair_dates, device='auto',
     if debug:
         print(f'lstsq: {n_pairs} pairs -> {n_dates} dates, {n_pixels} pixels, device={dev}')
 
-    # Reshape to (n_pairs, n_pixels)
-    phases_flat = phase_stack.reshape(n_pairs, n_pixels)  # (n_pairs, n_pixels)
-    if weight_stack is not None:
-        weights_flat = weight_stack.reshape(n_pairs, n_pixels)
-        # Clamp weights to (0, 1-eps) for numerical stability
-        weights_flat = np.clip(weights_flat, 1e-6, 1 - 1e-6)
-    else:
-        weights_flat = None
+    # Compute batch size from dask config
+    from .utils_dask import get_dask_chunk_size_mb
+    elem_bytes = max(1, n_pairs * n_intervals * 4)
+    batch_size = max(1024, (get_dask_chunk_size_mb() * 1024 * 1024) // elem_bytes)
 
-    # Move to device
-    A_t = torch.from_numpy(A.astype(np.float32)).to(dev)  # (n_pairs, n_intervals)
-    phi = torch.from_numpy(phases_flat.astype(np.float32)).to(dev)  # (n_pairs, n_pixels)
+    # Gather size: pixel columns to concatenate at once (~dask chunk budget)
+    gather_size = max(batch_size, (get_dask_chunk_size_mb() * 1024 * 1024) // max(1, n_pairs * 4))
 
-    # Handle NaN in phase
-    nan_mask_phi = torch.isnan(phi)
-    phi = torch.where(nan_mask_phi, torch.zeros_like(phi), phi)
+    A_t = torch.from_numpy(A.astype(np.float32)).to(dev)
+    reg = 1e-4 * torch.eye(n_intervals, device='cpu')
 
-    if weights_flat is not None:
-        W = torch.from_numpy(weights_flat.astype(np.float32)).to(dev)
-        # Handle NaN in weights too
-        nan_mask_w = torch.isnan(W)
-        nan_mask = nan_mask_phi | nan_mask_w
-        W = torch.where(nan_mask, torch.zeros_like(W), W)
-        # Transform correlation to least squares weight: w / sqrt(1 - w^2)
-        # Clamp to avoid Inf (W=1) and NaN (W>1)
-        W_clamped = torch.clamp(W, 0.0, 0.9999)
-        W_lstsq = W_clamped / torch.sqrt(1 - W_clamped**2)
-    else:
-        nan_mask = nan_mask_phi
-        W_lstsq = torch.where(nan_mask, torch.zeros(1, device=dev), torch.ones(1, device=dev))
-        W_lstsq = W_lstsq.expand(n_pairs, n_pixels)
+    increments = np.full((n_pixels, n_intervals), np.nan, dtype=np.float32)
 
-    # Weighted least squares: solve (W*A)x = W*b for each pixel
-    # Transpose to (n_pixels, n_pairs) for batched solve
-    phi_T = phi.T  # (n_pixels, n_pairs)
-    W_T = W_lstsq.T  # (n_pixels, n_pairs)
+    for g_start in range(0, n_pixels, gather_size):
+        g_end = min(g_start + gather_size, n_pixels)
 
-    # Apply weights: WA and Wb
-    # WA: (n_pixels, n_pairs, n_intervals) = W_T[:, :, None] * A_t[None, :, :]
-    # Wb: (n_pixels, n_pairs) = W_T * phi_T
-    WA = W_T.unsqueeze(2) * A_t.unsqueeze(0)  # (n_pixels, n_pairs, n_intervals)
-    Wb = (W_T * phi_T).unsqueeze(2)  # (n_pixels, n_pairs, 1)
+        # Concatenate per-pair slices for this pixel range (one concat per gather block)
+        if multi_chunk:
+            phases_block = np.concatenate([c[:, g_start:g_end] for c in flat_chunks], axis=0)
+            weights_block = np.concatenate([c[:, g_start:g_end] for c in flat_w_chunks], axis=0) \
+                if flat_w_chunks is not None else None
+        else:
+            phases_block = flat_chunks[0][:, g_start:g_end]
+            weights_block = flat_w_chunks[0][:, g_start:g_end] if flat_w_chunks is not None else None
 
-    # Batched least squares solve on CPU (faster for small matrices)
-    WA_cpu = WA.cpu()
-    Wb_cpu = Wb.cpu()
+        # Inner loop: torch batches from the concatenated block
+        block_pixels = g_end - g_start
+        for b_start in range(0, block_pixels, batch_size):
+            b_end = min(b_start + batch_size, block_pixels)
+            b_len = b_end - b_start
 
-    # Replace any non-finite values with 0 (CUDA lstsq is strict)
-    WA_cpu = torch.nan_to_num(WA_cpu, nan=0.0, posinf=0.0, neginf=0.0)
-    Wb_cpu = torch.nan_to_num(Wb_cpu, nan=0.0, posinf=0.0, neginf=0.0)
+            phi_b = torch.from_numpy(phases_block[:, b_start:b_end].astype(np.float32)).to(dev)
+            nan_mask_b = torch.isnan(phi_b)
+            phi_b = torch.where(nan_mask_b, torch.zeros_like(phi_b), phi_b)
 
-    # torch.linalg.lstsq returns (solution, residuals, rank, singular_values)
-    result = torch.linalg.lstsq(WA_cpu, Wb_cpu)
-    x = result.solution.squeeze(2)  # (n_pixels, n_intervals)
+            if weights_block is not None:
+                w_batch = weights_block[:, b_start:b_end].astype(np.float32)
+                np.clip(w_batch, 1e-6, 1 - 1e-6, out=w_batch)
+                W_b = torch.from_numpy(w_batch).to(dev)
+                del w_batch
+                nan_mask_w = torch.isnan(W_b)
+                nan_mask_b = nan_mask_b | nan_mask_w
+                W_b = torch.where(nan_mask_b, torch.zeros_like(W_b), W_b)
+                W_clamped = torch.clamp(W_b, 0.0, 0.9999)
+                W_lstsq_b = W_clamped / torch.sqrt(1 - W_clamped**2)
+            else:
+                W_lstsq_b = torch.where(nan_mask_b, torch.zeros(1, device=dev),
+                                         torch.ones(1, device=dev)).expand(n_pairs, b_len)
 
-    # Mark all-NaN pixels
-    all_nan = nan_mask.all(dim=0).cpu()
-    x[all_nan, :] = float('nan')
+            phi_T = phi_b.T
+            W_T = W_lstsq_b.T
+
+            WA = W_T.unsqueeze(2) * A_t.unsqueeze(0)
+            Wb = (W_T * phi_T).unsqueeze(2)
+
+            WA_cpu = torch.nan_to_num(WA.cpu(), nan=0.0, posinf=0.0, neginf=0.0)
+            Wb_cpu = torch.nan_to_num(Wb.cpu(), nan=0.0, posinf=0.0, neginf=0.0)
+
+            result = torch.linalg.lstsq(WA_cpu, Wb_cpu)
+            x = result.solution.squeeze(2)
+
+            all_nan = nan_mask_b.all(dim=0).cpu()
+            x[all_nan, :] = float('nan')
+            increments[g_start + b_start:g_start + b_end] = x.numpy()
+
+        del phases_block, weights_block
 
     # Build time series
     if cumsum:
-        # Cumulative sum: first date = 0, then cumsum of increments
-        ts = torch.zeros((n_pixels, n_dates), dtype=torch.float32)
-        ts[:, 1:] = torch.cumsum(x, dim=1)
+        ts = np.zeros((n_pixels, n_dates), dtype=np.float32)
+        ts[:, 1:] = np.nancumsum(increments, axis=1)
     else:
-        ts = torch.zeros((n_pixels, n_dates), dtype=torch.float32)
-        ts[:, 1:] = x
+        ts = np.zeros((n_pixels, n_dates), dtype=np.float32)
+        ts[:, 1:] = increments
 
     # Reshape: (n_pixels, n_dates) -> (n_dates, height, width)
-    time_series = ts.T.numpy().reshape(n_dates, height, width)
+    time_series = ts.T.reshape(n_dates, height, width)
 
     # Cleanup GPU memory
     if dev.type == 'mps':

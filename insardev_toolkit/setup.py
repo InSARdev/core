@@ -55,10 +55,11 @@ setup(
                       'rioxarray',
                       'tifffile',
                       'netCDF4',
-                      'nc-time-axis',
                       'remotezip',
                       'matplotlib',
-                      'imageio'
+                      'imageio',
+                      'h5py',
+                      'requests'
                       ],
     extras_require={
                       'vtk_support': ['vtk', 'panel']

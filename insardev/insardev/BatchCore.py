@@ -23,6 +23,24 @@ if TYPE_CHECKING:
     import matplotlib
 
 
+def _parse_budget(budget):
+    """Parse budget string like '128MiB', '256MB', '1GiB' to integer MB."""
+    import re
+    s = budget.strip().upper()
+    m = re.match(r'^([\d.]+)\s*(MIB|MB|GIB|GB|KIB|KB)$', s)
+    if not m:
+        raise ValueError(f"Cannot parse budget '{budget}'. Use e.g. '128MiB', '256MB', '1GiB'.")
+    val = float(m.group(1))
+    unit = m.group(2)
+    if unit in ('GIB', 'GB'):
+        return int(val * 1024)
+    elif unit in ('MIB', 'MB'):
+        return int(val)
+    elif unit in ('KIB', 'KB'):
+        return max(1, int(val / 1024))
+    return int(val)
+
+
 def _merge_tiles_for_dask(tiles, offsets, out_shape, fill_dtype):
     """
     Module-level function for merging tiles in to_dataset().
@@ -207,6 +225,186 @@ def _apply_gaussian_2d_for_dask(block, weight_block=None, sigmas=None, threshold
                           device=device, pixel_sizes=pixel_sizes).astype(out_dtype)
 
 
+def _trend2d_chunk_kernel(phase_block, *args, var_count=0,
+                            degree=1, detrend=False, has_weight=False):
+    """
+    Per-tile trend2d kernel for da.map_overlap / da.blockwise.
+
+    Accepts 2D (y, x) or 3D (1, y, x) phase blocks.
+    Uses pure-numpy polynomial fitting (same as trend2d)
+    to avoid torch overhead per tile.
+
+    For map_overlap: all inputs are 2D (y, x).
+    For blockwise: phase is 3D (1, y, x), vars are 2D (y, x).
+    """
+    from .utils_detrend import _build_poly_features
+
+    is_3d = phase_block.ndim == 3
+    if is_3d:
+        # 3D (1, y, x) → extract 2D
+        phase_2d = phase_block[0]
+    else:
+        phase_2d = phase_block
+
+    # All-NaN tile: nothing to fit, return input as-is
+    if not np.any(np.isfinite(phase_2d)):
+        return phase_block
+
+    # Unpack positional args: var_count transform arrays, then optional weight.
+    # Vars may be 2D (blockwise 'yx') or 3D (map_overlap broadcast).
+    var_blocks = []
+    for i in range(var_count):
+        v = args[i]
+        var_blocks.append(v[0] if v.ndim == 3 else v)
+    if has_weight:
+        w = args[var_count]
+        weight_2d = w[0] if w.ndim == 3 else w
+    else:
+        weight_2d = None
+
+    ny, nx = phase_2d.shape
+    n_pixels = ny * nx
+    is_complex = np.iscomplexobj(phase_2d)
+
+    # Build fit mask and flatten variables
+    fit_mask = np.ones(n_pixels, dtype=bool)
+    var_flat_list = []
+    for v in var_blocks:
+        v_flat = v.ravel().astype(np.float64)
+        fit_mask &= np.isfinite(v_flat)
+        var_flat_list.append(np.nan_to_num(v_flat, nan=0.0))
+
+    n_valid_fit = fit_mask.sum()
+    if n_valid_fit < 10:
+        return phase_block
+
+    # Build polynomial features for standardization stats (only on fit-valid pixels)
+    X_poly_valid = _build_poly_features([v[fit_mask] for v in var_flat_list],
+                                         int(n_valid_fit), degree)
+    n_poly = X_poly_valid.shape[1]
+    n_feat = n_poly + 1  # +1 for bias
+    feature_mean = X_poly_valid.mean(axis=0)
+    feature_std = X_poly_valid.std(axis=0) + 1e-10
+    del X_poly_valid
+
+    # Phase + weight flattened
+    phase_flat = phase_2d.ravel()
+    if is_complex:
+        valid = np.isfinite(phase_flat) & (phase_flat != 0) & fit_mask
+    else:
+        valid = np.isfinite(phase_flat) & fit_mask
+    if weight_2d is not None:
+        w_flat = weight_2d.ravel()
+        valid &= np.isfinite(w_flat)
+    else:
+        w_flat = None
+
+    n_valid = valid.sum()
+    if n_valid < n_feat:
+        return phase_block
+
+    # Pixel batching: keep A_std_batch + WA under half dask chunk budget
+    from .utils_dask import get_dask_chunk_size_mb
+    _budget = get_dask_chunk_size_mb() * 1024 * 1024 // 2
+    batch_size = max(1024, _budget // max(1, 2 * n_feat * 8))
+    n_batches = (n_pixels + batch_size - 1) // batch_size
+
+    # Phase 1: Accumulate normal equations in batches
+    AtWA = np.zeros((n_feat, n_feat), dtype=np.float64)
+    cdtype = np.complex128 if is_complex else np.float64
+    AtWb = np.zeros(n_feat, dtype=cdtype)
+
+    for bi in range(n_batches):
+        s = bi * batch_size
+        e = min((bi + 1) * batch_size, n_pixels)
+
+        valid_b = valid[s:e]
+        n_v = int(valid_b.sum())
+        if n_v == 0:
+            continue
+
+        # Build A_std for batch
+        var_b = [v[s:e] for v in var_flat_list]
+        X_poly_b = _build_poly_features(var_b, e - s, degree)
+        A_std_b = np.concatenate([
+            (X_poly_b - feature_mean) / feature_std,
+            np.ones((e - s, 1), dtype=np.float64)
+        ], axis=1)
+
+        A_v = A_std_b[valid_b]
+        if w_flat is not None:
+            sqrt_w = np.sqrt(np.clip(w_flat[s:e][valid_b], 0, None))
+            WA_v = A_v * sqrt_w[:, None]
+        else:
+            WA_v = A_v
+
+        AtWA += WA_v.T @ WA_v
+
+        p_v = phase_flat[s:e][valid_b]
+        if is_complex:
+            p_abs = np.abs(p_v)
+            with np.errstate(invalid='ignore', divide='ignore'):
+                b_v = np.where(p_abs > 0, p_v / p_abs, 0 + 0j)
+            b_v = np.nan_to_num(b_v, nan=0.0)
+        else:
+            b_v = np.nan_to_num(p_v, nan=0.0).astype(np.float64)
+
+        if w_flat is not None:
+            Wb_v = sqrt_w * b_v
+        else:
+            Wb_v = b_v
+        AtWb += WA_v.T.astype(cdtype) @ Wb_v
+
+    # Solve
+    reg = 1e-10 * np.eye(n_feat, dtype=np.float64)
+    try:
+        coeffs = np.linalg.solve(AtWA.astype(cdtype) + reg, AtWb)
+    except np.linalg.LinAlgError:
+        return phase_block
+
+    # Phase 2: Apply trend in batches
+    if detrend:
+        out_2d = phase_2d.copy()
+    else:
+        out_2d = np.empty((ny, nx), dtype=np.complex64 if is_complex else np.float32)
+
+    for bi in range(n_batches):
+        s = bi * batch_size
+        e = min((bi + 1) * batch_size, n_pixels)
+        sy, sx = divmod(s, nx)
+        ey, ex = divmod(e, nx)
+
+        var_b = [v[s:e] for v in var_flat_list]
+        X_poly_b = _build_poly_features(var_b, e - s, degree)
+        A_std_b = np.concatenate([
+            (X_poly_b - feature_mean) / feature_std,
+            np.ones((e - s, 1), dtype=np.float64)
+        ], axis=1)
+
+        trend_b = A_std_b.astype(cdtype) @ coeffs
+        if is_complex:
+            trend_abs = np.abs(trend_b)
+            with np.errstate(invalid='ignore', divide='ignore'):
+                trend_b = np.where(trend_abs > 0, trend_b / trend_abs, 0)
+            trend_b = np.asarray(trend_b, dtype=np.complex64)
+            trend_b[~np.isfinite(trend_b)] = 0
+        else:
+            trend_b = np.asarray(trend_b, dtype=np.float32)
+
+        out_flat = out_2d.ravel()
+        if detrend:
+            if is_complex:
+                out_flat[s:e] = phase_flat[s:e] * np.conj(trend_b)
+            else:
+                out_flat[s:e] = phase_flat[s:e] - trend_b
+        else:
+            out_flat[s:e] = trend_b
+
+    if is_3d:
+        return out_2d[np.newaxis, ...]
+    return out_2d
+
+
 def _neighbors_kernel_2d_for_dask(data_chunk, window_y, window_x, half_y, half_x, device):
     """Count valid neighbors for 2D data.
 
@@ -378,7 +576,7 @@ class BatchCore(dict):
         #print('BatchCore __init__ mapping', mapping or {}, '\n')
         super().__init__(mapping or {})
 
-    def from_dataset(self, data: xr.Dataset, allow_rechunk: bool = False) -> Batch:
+    def from_dataset(self, data: xr.Dataset, **kwargs) -> Batch:
         """
         Create a Batch by selecting each burst's coordinates from a merged Dataset.
 
@@ -389,11 +587,6 @@ class BatchCore(dict):
         ----------
         data : xr.Dataset
             The input data to split back into per-burst datasets.
-        allow_rechunk : bool, optional
-            If True (default), rechunk output bursts for efficient processing:
-            - 3D data: chunk size 1 for first dim (date/pair), auto for y,x
-            - 2D data: auto for y,x based on dask.config['array.chunk-size']
-            This is recommended since merged dataset chunks differ from optimal burst chunks.
 
         Returns
         -------
@@ -409,14 +602,11 @@ class BatchCore(dict):
         result = batch.from_dataset(processed)
         """
         from .Batch import Batch
-        from .utils_dask import get_dask_chunk_size_mb, rechunk2d
+        from .utils_dask import rechunk2d
 
         # Validate input type
         if not isinstance(data, xr.Dataset):
             raise TypeError(f"data must be xr.Dataset, got {type(data).__name__}")
-
-        note_printed = False
-        dask_chunk_mb = get_dask_chunk_size_mb()
 
         out = {}
         for key, ds in dict.items(self):
@@ -430,37 +620,18 @@ class BatchCore(dict):
                     selected = selected.isel({dim: slice(0, ds.sizes[dim])})
                     selected = selected.assign_coords({dim: ds.coords[dim]})
 
-            # Rechunk for burst processing (always convert to lazy dask arrays)
+            # Rechunk to match self's chunk structure per burst
             rechunked_vars = {}
-            for var in selected.data_vars:
-                arr = selected[var]
-                if not (arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x')):
-                    continue
-                if allow_rechunk:
-                    # Use rechunk2d for uniform chunk sizes
-                    y_size, x_size = arr.shape[-2], arr.shape[-1]
-                    element_bytes = arr.dtype.itemsize
-                    optimal = rechunk2d((y_size, x_size), element_bytes)
-                    if arr.ndim == 3:
-                        chunks = {arr.dims[0]: 1, 'y': optimal['y'], 'x': optimal['x']}
-                    else:
-                        chunks = {'y': optimal['y'], 'x': optimal['x']}
-                else:
-                    # Single spatial chunk
-                    if arr.ndim == 3:
-                        chunks = {arr.dims[0]: 1, 'y': -1, 'x': -1}
-                    else:
-                        chunks = {'y': -1, 'x': -1}
-                rechunked_vars[var] = arr.chunk(chunks)
+            for var_name in selected.data_vars:
+                arr = selected[var_name]
+                src = ds[var_name] if var_name in ds.data_vars else None
+                if src is not None and hasattr(src.data, 'chunks'):
+                    chunks = dict(zip(src.dims, src.data.chunks))
+                    if isinstance(arr.data, np.ndarray) or \
+                       (hasattr(arr.data, 'chunks') and dict(zip(arr.dims, arr.data.chunks)) != chunks):
+                        rechunked_vars[var_name] = arr.chunk(chunks)
             if rechunked_vars:
                 selected = selected.assign(rechunked_vars)
-            if not note_printed:
-                if allow_rechunk:
-                    print(f"NOTE from_dataset: rechunking to dask.config['array.chunk-size']={dask_chunk_mb} MB")
-                else:
-                    print(f"NOTE from_dataset: using single spatial chunk (allow_rechunk=False)")
-                note_printed = True
-
             out[key] = selected
         return Batch(out)
 
@@ -714,14 +885,20 @@ class BatchCore(dict):
                         result[k] = ds - self[[k]].polyval({k: val})[k]
                     elif has_pair_dim and len(val) == n_pairs:
                         # Multi-pair degree=0: [off0, off1, ...]
-                        offsets = xr.DataArray(val, dims=['pair'])
+                        # Handle both concrete scalars and dask 0-d arrays
+                        if any(hasattr(v, 'dask') for v in val):
+                            import dask.array as _da
+                            offsets = xr.DataArray(_da.stack(val), dims=['pair'])
+                        else:
+                            offsets = xr.DataArray(val, dims=['pair'])
                         result[k] = ds - offsets
                     else:
                         # Single pair degree=1: [ramp, offset] or other
                         result[k] = ds - val
-                elif isinstance(val, (int, float, np.floating, np.integer)):
-                    # Scalar subtraction: only apply to spatial variables (y, x dims)
-                    # to avoid errors with non-spatial variables like (date,) dims
+                elif isinstance(val, (int, float, np.floating, np.integer)) \
+                        or (hasattr(val, 'ndim') and val.ndim == 0):
+                    # Scalar subtraction (concrete or dask 0-d array):
+                    # only apply to spatial variables (y, x dims)
                     new_ds = ds.copy()
                     for var in ds.data_vars:
                         if 'y' in ds[var].dims and 'x' in ds[var].dims:
@@ -1174,7 +1351,8 @@ class BatchCore(dict):
         return type(self)(out)
 
     def trend2d(self, transform: 'BatchCore', weight: 'BatchUnit | None' = None,
-                degree: int = 1, device: str = 'auto', debug: bool = False) -> 'BatchCore':
+                degree: int = 1, device: str = 'auto', detrend: bool = False,
+                debug: bool = False) -> 'BatchCore':
         """
         Compute 2D polynomial trend (ramp) from data.
 
@@ -1192,6 +1370,10 @@ class BatchCore(dict):
             Polynomial degree (1=plane, 2=quadratic). Default 1.
         device : str
             PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
+        detrend : bool
+            If True, return detrended data instead of the trend surface.
+            Fuses fit+subtract into one blockwise call so the input phase is
+            referenced only once in the dask graph, avoiding memory pinning.
         debug : bool
             Print diagnostic information.
 
@@ -1208,7 +1390,6 @@ class BatchCore(dict):
         >>> trend = intf_complex.trend2d(stack.transform(), weight=corr)
         >>> detrended = intf_complex * trend.conj()
         """
-        import dask
         import dask.array as da
         import numpy as np
         import xarray as xr
@@ -1294,6 +1475,24 @@ class BatchCore(dict):
 
                 phase_dask = phase_da.data
 
+                # Handle 2D input by promoting to 3D
+                squeeze_pair = phase_dask.ndim == 2
+                if squeeze_pair:
+                    phase_dask = phase_dask[np.newaxis, ...]
+
+                # Merged chunking: dim 0 is a single chunk spanning all pairs.
+                # Skip rechunk to avoid expensive P2P shuffle — the kernels
+                # (_accumulate_chunk, _solve_chunk, _apply_chunk) all handle
+                # multi-pair blocks via internal loops.
+                dim0_merged = (len(phase_dask.chunks[0]) == 1
+                               and phase_dask.chunks[0][0] > 1)
+
+                # Per-pair chunking: ensure pair dimension is chunked to 1
+                if not dim0_merged and any(c != 1 for c in phase_dask.chunks[0]):
+                    phase_dask = phase_dask.rechunk({0: 1})
+
+                n_pairs = phase_dask.shape[0]
+
                 # Rechunk transform to match phase spatial chunks
                 phase_spatial_chunks = phase_dask.chunks[-2:]
                 var_dask_list = []
@@ -1303,48 +1502,347 @@ class BatchCore(dict):
                         var_dask = var_dask.rechunk(phase_spatial_chunks)
                     var_dask_list.append(var_dask)
 
-                def make_process_chunk(n_vars, device, degree):
-                    def process_chunk(*args):
-                        import torch
-                        phase_chunk = args[0]
-                        if len(args) == 1 + n_vars:
-                            weight_chunk = None
-                            var_chunks = args[1:]
+                # Phase 0: Compute global feature standardization (pair-independent)
+                feature_mean, feature_std = utils_detrend._compute_feature_stats(
+                    var_dask_list, degree)
+                n_poly = len(feature_mean)
+                n_feat = n_poly + 1  # +1 for bias
+                n_feat_b = 2 * n_feat if is_complex else n_feat
+                n_accum = n_feat * n_feat + n_feat_b + 1
+                n_coeff_out = 2 * n_feat if is_complex else n_feat
+
+                if debug:
+                    print(f"DEBUG {key}/{pol}: n_feat={n_feat}, n_accum={n_accum}, "
+                          f"n_coeff_out={n_coeff_out}, chunks={phase_dask.chunks}")
+
+                # Phase 1: Accumulate partial normal equations per (pair, tile)
+                n_vars = len(var_dask_list)
+                has_weight = weight_da is not None
+
+                def make_accumulate_fn(has_weight, n_vars, feature_mean,
+                                       feature_std, degree, is_complex):
+                    def fn(*args):
+                        phase_c = args[0]
+                        if has_weight:
+                            weight_c = args[1]
+                            var_cs = args[2:2 + n_vars]
                         else:
-                            weight_chunk = args[1]
-                            var_chunks = args[2:]
-                        if phase_chunk.ndim == 2:
-                            phase_chunk = phase_chunk[np.newaxis, ...]
-                            if weight_chunk is not None:
-                                weight_chunk = weight_chunk[np.newaxis, ...]
-                        result = utils_detrend.trend2d_array(
-                            phase_chunk, weight_chunk, list(var_chunks), torch.device(device), degree
-                        )
-                        return result
-                    return process_chunk
+                            weight_c = None
+                            var_cs = args[1:1 + n_vars]
+                        return utils_detrend._accumulate_chunk(
+                            phase_c, weight_c, var_cs,
+                            feature_mean, feature_std, degree, is_complex)
+                    return fn
 
-                process_fn = make_process_chunk(len(var_dask_list), str(device), degree)
-                dim_str = ''.join(chr(ord('a') + i) for i in range(phase_dask.ndim))
-                spatial_dim_str = dim_str[-2:]
+                accumulate_fn = make_accumulate_fn(
+                    has_weight, n_vars, feature_mean, feature_std,
+                    degree, is_complex)
 
-                task_resources = {'detrend': 1, 'gpu': 1} if device != 'cpu' else {'detrend': 1}
+                blockwise_args = [phase_dask, 'pyx']
+                if has_weight:
+                    weight_dask = weight_da.data
+                    if squeeze_pair:
+                        weight_dask = weight_dask[np.newaxis, ...]
+                    if weight_dask.chunks != phase_dask.chunks:
+                        weight_dask = weight_dask.rechunk(phase_dask.chunks)
+                    blockwise_args.extend([weight_dask, 'pyx'])
+                for v_dask in var_dask_list:
+                    blockwise_args.extend([v_dask, 'yx'])
+
+                partials = da.blockwise(
+                    accumulate_fn, 'pyxf',
+                    *blockwise_args,
+                    adjust_chunks={'y': 1, 'x': 1},
+                    new_axes={'f': n_accum},
+                    dtype=np.float64,
+                    meta=np.empty((0, 0, 0, 0), dtype=np.float64),
+                )
+
+                # Phase 2: Sum across spatial chunks (tree reduction)
+                summed = partials.sum(axis=(1, 2))  # (n_pairs, n_accum)
+
+                # Phase 3: Solve per pair
+                def make_solve_fn(n_feat, is_complex):
+                    def fn(block):
+                        return utils_detrend._solve_chunk(
+                            block, n_feat, is_complex)
+                    return fn
+
+                solve_fn = make_solve_fn(n_feat, is_complex)
+                coeffs = da.map_blocks(
+                    solve_fn, summed,
+                    dtype=np.float64,
+                    chunks=(summed.chunks[0], (n_coeff_out,)),
+                )  # (n_pairs, n_coeff_out)
+
+                # Phase 4: Apply trend per (pair, tile)
+                def make_apply_fn(n_vars, feature_mean, feature_std,
+                                  degree, is_complex, detrend_mode):
+                    def fn(*args):
+                        phase_c = args[0]
+                        coeffs_c = args[1]
+                        var_cs = args[2:2 + n_vars]
+                        return utils_detrend._apply_chunk(
+                            phase_c, coeffs_c, var_cs,
+                            feature_mean, feature_std,
+                            degree, is_complex, detrend_mode)
+                    return fn
+
+                apply_fn = make_apply_fn(
+                    n_vars, feature_mean, feature_std,
+                    degree, is_complex, detrend)
+
                 out_dtype = phase_da.dtype if is_complex else np.float32
-                meta = np.empty((0,) * phase_dask.ndim, dtype=out_dtype)
-                with dask.annotate(resources=task_resources):
-                    blockwise_args = [phase_dask, dim_str]
-                    if weight_da is not None:
-                        weight_dask = weight_da.data
-                        if weight_dask.chunks != phase_dask.chunks:
-                            weight_dask = weight_dask.rechunk(phase_dask.chunks)
-                        blockwise_args.extend([weight_dask, dim_str])
-                    for var_dask in var_dask_list:
-                        blockwise_args.extend([var_dask, spatial_dim_str])
+                blockwise_args_apply = [phase_dask, 'pyx', coeffs, 'pf']
+                for v_dask in var_dask_list:
+                    blockwise_args_apply.extend([v_dask, 'yx'])
+
+                result_dask = da.blockwise(
+                    apply_fn, 'pyx',
+                    *blockwise_args_apply,
+                    concatenate=True,
+                    dtype=out_dtype,
+                    meta=np.empty((0, 0, 0), dtype=out_dtype),
+                )
+
+                if squeeze_pair:
+                    result_dask = result_dask[0]
+
+                trend_da = xr.DataArray(
+                    result_dask,
+                    dims=phase_da.dims,
+                    coords=phase_da.coords
+                )
+
+                result_ds[pol] = trend_da
+
+            result[key] = xr.Dataset(result_ds, attrs=ds.attrs)
+
+        if is_complex:
+            return BatchComplex(result)
+        return Batch(result)
+
+    def trend2d_chunk(self, transform: 'BatchCore', weight: 'BatchUnit | None' = None,
+                       degree: int = 1, overlap: 'float | int | tuple | None' = None,
+                       device: str = 'auto', detrend: bool = False,
+                       debug: bool = False) -> 'BatchCore':
+        """
+        Compute 2D polynomial trend using overlapping-tile local fitting.
+
+        Fits independent local polynomials per overlapping tile using
+        da.map_overlap. Each tile sees neighbors via overlap for well-conditioned
+        fits at tile edges. No blending needed — dask trims overlap margins.
+
+        Parameters
+        ----------
+        transform : BatchCore
+            Coordinate transform from stack.transform() containing 'azi' and 'rng'.
+        weight : BatchUnit or None
+            Optional weight for the fitting (typically correlation).
+        degree : int
+            Polynomial degree (1=plane, 2=quadratic). Default 1.
+        overlap : float, int, or tuple
+            Overlap size. Float values are fractions of chunk size (e.g. 0.25 = 25%).
+            Int values are pixels. Tuple (overlap_y, overlap_x) allows different
+            overlap per axis. Default 0.25.
+        device : str
+            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
+        detrend : bool
+            If True, return detrended data instead of the trend surface.
+        debug : bool
+            Print diagnostic information.
+
+        Returns
+        -------
+        Batch or BatchComplex
+            Trend surface or detrended data (same type as input).
+
+        Examples
+        --------
+        >>> # Local polynomial trend removal
+        >>> trend = phase.trend2d_chunk(stack.transform(), weight=corr)
+        >>> # Detrend in one step (fused, memory-efficient)
+        >>> detrended = intf.trend2d_chunk(transform, weight=corr, detrend=True)
+        """
+        import dask
+        import dask.array as da
+        import numpy as np
+        import xarray as xr
+        from .Batch import Batch, BatchComplex
+
+        phase = self
+
+        # Validate lazy data
+        BatchCore._require_lazy(phase, 'trend2d_chunk')
+
+        # Auto-detect device
+        resolved = BatchCore._get_torch_device(device, debug=debug)
+        device = resolved.type
+
+        if debug:
+            print(f"DEBUG: trend2d_chunk using device={device}")
+
+        is_complex = isinstance(phase, BatchComplex)
+
+        if transform is None:
+            raise ValueError("transform is required for trend2d_chunk.")
+
+        # Unify transform keys to phase
+        transform = transform.sel(phase)
+
+        # Parse overlap into (ov_y, ov_x) — each is float or int
+        if overlap is None:
+            ov_y, ov_x = 0, 0
+        elif isinstance(overlap, tuple):
+            ov_y, ov_x = overlap
+        else:
+            ov_y, ov_x = overlap, overlap
+
+        result = {}
+        for key in phase.keys():
+            ds = phase[key]
+
+            pols = [v for v in ds.data_vars
+                   if 'y' in ds[v].dims and 'x' in ds[v].dims]
+
+            trans_ds = transform[key]
+            var_names = [v for v in trans_ds.data_vars
+                        if 'y' in trans_ds[v].dims and 'x' in trans_ds[v].dims]
+
+            # Check that transform shape matches phase
+            phase_da_ref = ds[pols[0]]
+            phase_shape = phase_da_ref.shape[-2:]
+
+            trans_da_ref = trans_ds[var_names[0]]
+            trans_shape = trans_da_ref.shape
+            if phase_shape != trans_shape:
+                phase_dy = float(phase_da_ref.y.diff('y')[0])
+                phase_dx = float(phase_da_ref.x.diff('x')[0])
+                trans_dy = float(trans_da_ref.y.diff('y')[0])
+                trans_dx = float(trans_da_ref.x.diff('x')[0])
+                raise ValueError(
+                    f"Transform shape {trans_shape} does not match phase shape {phase_shape}. "
+                    f"Phase spacing: dy={phase_dy:.1f}, dx={phase_dx:.1f}. "
+                    f"Transform spacing: dy={trans_dy:.1f}, dx={trans_dx:.1f}. "
+                    f"Use stack.transform()[['azi','rng','ele']].downsample(N) to match."
+                )
+
+            if weight is not None:
+                weight_ds = weight[key]
+                weight_pols = [v for v in weight_ds.data_vars
+                              if 'y' in weight_ds[v].dims and 'x' in weight_ds[v].dims]
+                if weight_pols:
+                    weight_da_ref = weight_ds[weight_pols[0]]
+                    weight_shape = weight_da_ref.shape[-2:]
+                    if phase_shape != weight_shape:
+                        raise ValueError(
+                            f"Weight shape {weight_shape} does not match phase shape {phase_shape}."
+                        )
+
+            if debug:
+                print(f"DEBUG {key}: variables={var_names}")
+
+            result_ds = {}
+            for pol in pols:
+                phase_da = ds[pol]
+                weight_da = weight[key][pol] if weight is not None else None
+
+                phase_dask = phase_da.data
+                has_weight = weight_da is not None
+                out_dtype = phase_da.dtype if is_complex else np.float32
+
+                # Prepare transform vars (2D) — rechunk to match phase spatial chunks
+                phase_spatial_chunks = phase_dask.chunks[-2:]
+                var_dask_list = []
+                for v in var_names:
+                    var_dask = trans_ds[v].data
+                    if var_dask.chunks != phase_spatial_chunks:
+                        var_dask = var_dask.rechunk(phase_spatial_chunks)
+                    var_dask_list.append(var_dask)
+                n_vars = len(var_dask_list)
+
+                # Prepare weight — rechunk to match phase if needed
+                if has_weight:
+                    weight_dask = weight_da.data
+                    if weight_dask.chunks != phase_dask.chunks:
+                        weight_dask = weight_dask.rechunk(phase_dask.chunks)
+
+                # Compute overlap depth from chunk sizes
+                cy0 = phase_dask.chunks[-2][0]
+                cx0 = phase_dask.chunks[-1][0]
+                depth_y = int(ov_y * cy0) if isinstance(ov_y, float) else int(ov_y)
+                depth_x = int(ov_x * cx0) if isinstance(ov_x, float) else int(ov_x)
+                if overlap is not None and overlap != 0 and overlap != (0, 0):
+                    depth_y = max(1, depth_y)
+                    depth_x = max(1, depth_x)
+
+                if debug:
+                    print(f"DEBUG {key}/{pol}: depth=({depth_y},{depth_x}), "
+                          f"chunks={phase_dask.chunksize}")
+
+                # Build kernel function for blockwise/map_overlap
+                def _make_kernel(nv, deg, det, hw):
+                    def kernel(phase_block, *args):
+                        var_arrays = args[:nv]
+                        weight_block = args[nv] if hw else None
+                        # Loop over pairs in dim 0
+                        results = []
+                        for pidx in range(phase_block.shape[0]):
+                            p = phase_block[pidx:pidx+1]
+                            kargs = list(var_arrays)
+                            if hw:
+                                kargs.append(weight_block[pidx:pidx+1])
+                            r = _trend2d_chunk_kernel(
+                                p, *kargs,
+                                var_count=nv, degree=deg,
+                                detrend=det, has_weight=hw)
+                            results.append(r)
+                        return np.concatenate(results, axis=0)
+                    return kernel
+                kernel = _make_kernel(n_vars, degree, detrend, has_weight)
+
+                if depth_y > 0 or depth_x > 0:
+                    # map_overlap path — needs all inputs to have same spatial chunks
+                    depth_3d = {0: 0, 1: depth_y, 2: depth_x}
+                    depth_2d = {0: depth_y, 1: depth_x}
+
+                    # Wrap kernel for map_overlap: unpack positional args
+                    def _make_overlap_fn(kern, nv, hw):
+                        def fn(phase_block, *args):
+                            # map_overlap passes blocks with overlap margins
+                            return kern(phase_block, *args)
+                        return fn
+                    overlap_fn = _make_overlap_fn(kernel, n_vars, has_weight)
+
+                    # Build args list for map_overlap
+                    overlap_args = []
+                    for v_dask in var_dask_list:
+                        overlap_args.append(v_dask)
+                    if has_weight:
+                        overlap_args.append(weight_dask)
+
+                    result_dask = da.map_overlap(
+                        overlap_fn,
+                        phase_dask, *overlap_args,
+                        depth=[depth_3d] + [depth_2d] * n_vars +
+                              ([depth_3d] if has_weight else []),
+                        boundary='none',
+                        dtype=out_dtype,
+                    )
+                else:
+                    # blockwise path — no overlap, same output chunks as input
+                    blockwise_args = [phase_dask, 'pyx']
+                    for v_dask in var_dask_list:
+                        blockwise_args.extend([v_dask, 'yx'])
+                    if has_weight:
+                        blockwise_args.extend([weight_dask, 'pyx'])
 
                     result_dask = da.blockwise(
-                        process_fn, dim_str,
+                        kernel, 'pyx',
                         *blockwise_args,
+                        concatenate=True,
                         dtype=out_dtype,
-                        meta=meta,
+                        meta=np.empty((0, 0, 0), dtype=out_dtype),
                     )
 
                 trend_da = xr.DataArray(
@@ -1444,7 +1942,8 @@ class BatchCore(dict):
         return output
 
     def trend1d(self, weight: 'BatchUnit | None' = None, baseline: str = 'BPR',
-                degree: int = 1, device: str = 'auto', debug: bool = False) -> 'Batch':
+                degree: int = 1, device: str = 'auto', detrend: bool = False,
+                debug: bool = False) -> 'Batch':
         """
         Fit 1D polynomial trend along perpendicular baseline at each (y, x) pixel.
 
@@ -1462,6 +1961,10 @@ class BatchCore(dict):
             Polynomial degree (1=linear, 2=quadratic). Default 1.
         device : str
             PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
+        detrend : bool
+            If True, return detrended data instead of the trend surface.
+            Fuses fit+subtract into one blockwise call to avoid double-referencing
+            the input data in the dask graph.
         debug : bool
             Print diagnostic information.
 
@@ -1557,61 +2060,67 @@ class BatchCore(dict):
                     if weight_da is not None:
                         weight_da = weight_da.transpose(stack_dim, ...)
 
-                def process_chunk(data_chunk, weight_chunk=None, baseline_values=baseline_values,
-                                  device=device, degree=degree):
+                def process_chunks(data_chunks, weight_chunks=None, baseline_values=baseline_values,
+                                   device=device, degree=degree, detrend_mode=detrend):
                     import torch
-                    squeeze = False
-                    if data_chunk.ndim == 2:
-                        data_chunk = data_chunk[np.newaxis, ...]
-                        if weight_chunk is not None:
-                            weight_chunk = weight_chunk[np.newaxis, ...]
-                        squeeze = True
-                    result = utils_detrend.trend1d_array(
-                        data_chunk, baseline_values, weight_chunk, torch.device(device), degree
+                    # Pass chunk lists directly to kernel — it handles
+                    # batch extraction without full input copy.
+                    trend = utils_detrend.trend1d_array(
+                        data_chunks, baseline_values, weight_chunks, torch.device(device), degree
                     )
-                    if squeeze:
-                        result = result[0]
+                    if detrend_mode:
+                        # Element-wise detrend per chunk — no full input concat
+                        result = np.empty_like(trend)
+                        offset = 0
+                        for c in data_chunks:
+                            c = np.asarray(c)
+                            cn = c.shape[0]
+                            t = trend[offset:offset+cn]
+                            if np.iscomplexobj(c):
+                                result[offset:offset+cn] = c * np.conj(t)
+                            else:
+                                result[offset:offset+cn] = c - t
+                            offset += cn
+                    else:
+                        result = trend
                     return result
 
-                # Rechunk: all samples together, optimal spatial chunks
+                # No rechunk on dim 0 — pass per-date delayed lists to kernel.
+                # Pixel batching inside trend1d_array handles memory.
                 n_samples = len(baseline_values)
-                from .utils_dask import rechunk2d
-                elem_bytes = n_samples * (16 if is_complex else 8)  # data + weight + torch overhead
-                optimal = rechunk2d((data_da.sizes['y'], data_da.sizes['x']), element_bytes=elem_bytes)
-                chunks_y, chunks_x = optimal['y'], optimal['x']
-
-                data_da = data_da.chunk({stack_dim: -1, 'y': chunks_y, 'x': chunks_x})
-                if weight_da is not None:
-                    weight_da = weight_da.chunk({stack_dim: -1, 'y': chunks_y, 'x': chunks_x})
 
                 data_dask = data_da.data
-                dim_str = ''.join(chr(ord('a') + i) for i in range(data_dask.ndim))
+                weight_dask = weight_da.data if weight_da is not None else None
 
-                task_resources = {'regression': 1, 'gpu': 1} if device != 'cpu' else {'regression': 1}
-                meta = np.empty((0,) * data_dask.ndim, dtype=out_dtype)
-                with dask.annotate(resources=task_resources):
-                    if weight_da is not None:
-                        weight_dask = weight_da.data
-                        def process_with_weight(data_block, weight_block):
-                            return process_chunk(data_block, weight_block)
-                        result_dask = da.blockwise(
-                            process_with_weight, dim_str,
-                            data_dask, dim_str,
-                            weight_dask, dim_str,
-                            dtype=out_dtype,
-                            meta=meta,
-                        )
-                    else:
-                        result_dask = da.blockwise(
-                            process_chunk, dim_str,
-                            data_dask, dim_str,
-                            dtype=out_dtype,
-                            meta=meta,
-                        )
+                y_chunks = data_dask.chunks[1]
+                x_chunks = data_dask.chunks[2]
+                y_breaks = [0] + list(np.cumsum(y_chunks))
+                x_breaks = [0] + list(np.cumsum(x_chunks))
 
-                # Rechunk back to per-slice for efficient downstream operations
-                if hasattr(result_dask, 'rechunk'):
-                    result_dask = result_dask.rechunk({0: 1})
+                blocks_rows = []
+                for bj in range(len(y_breaks) - 1):
+                    y0, y1 = y_breaks[bj], y_breaks[bj + 1]
+                    blocks_row = []
+                    for bk in range(len(x_breaks) - 1):
+                        x0, x1 = x_breaks[bk], x_breaks[bk + 1]
+                        td_list = data_dask[:, y0:y1, x0:x1].to_delayed().ravel().tolist()
+                        if weight_dask is not None:
+                            tw_list = weight_dask[:, y0:y1, x0:x1].to_delayed().ravel().tolist()
+                            block = da.from_delayed(
+                                dask.delayed(process_chunks)(td_list, tw_list),
+                                shape=(n_samples, y1 - y0, x1 - x0),
+                                dtype=out_dtype,
+                            )
+                        else:
+                            block = da.from_delayed(
+                                dask.delayed(process_chunks)(td_list),
+                                shape=(n_samples, y1 - y0, x1 - x0),
+                                dtype=out_dtype,
+                            )
+                        blocks_row.append(block)
+                    blocks_rows.append(blocks_row)
+
+                result_dask = da.block(blocks_rows)
 
                 fit_da = xr.DataArray(
                     result_dask,
@@ -1632,7 +2141,8 @@ class BatchCore(dict):
 
     def trend1d_pairs(self, weight: 'BatchUnit | None' = None, degree: int = 0,
                       days: int = 90, count: int | None = None,
-                      device: str = 'auto', debug: bool = False) -> 'Batch':
+                      device: str = 'auto', detrend: bool = False,
+                      debug: bool = False) -> 'Batch':
         """
         Fit 1D polynomial trend along temporal pairs for each date.
 
@@ -1658,6 +2168,10 @@ class BatchCore(dict):
             Maximum number of pairs per date to use. Default None.
         device : str
             PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
+        detrend : bool
+            If True, return detrended data instead of the trend surface.
+            Fuses fit+subtract into one blockwise call to avoid double-referencing
+            the input data in the dask graph.
         debug : bool
             Print diagnostic information.
 
@@ -1672,7 +2186,6 @@ class BatchCore(dict):
         >>> detrended = intf * trend.conj()  # complex
         >>> detrended = phase - trend        # real
         """
-        import dask
         import dask.array as da
         import numpy as np
         import xarray as xr
@@ -1723,61 +2236,73 @@ class BatchCore(dict):
                     if weight_da is not None:
                         weight_da = weight_da.transpose('pair', ...)
 
-                # Rechunk: all pairs together, optimal spatial chunks
+                # No rechunk on dim 0 — pass per-date delayed lists to kernel.
+                # Pixel batching inside trend1d_pairs_array handles memory.
+                import dask
                 n_pairs_val = len(ref_values)
-                from .utils_dask import rechunk2d
-                # Memory per pixel: data + weight + torch overhead per date loop
-                elem_bytes = n_pairs_val * (16 if is_complex else 8)
-                optimal = rechunk2d((data_da.sizes['y'], data_da.sizes['x']), element_bytes=elem_bytes)
-                chunks_y, chunks_x = optimal['y'], optimal['x']
-
-                data_da = data_da.chunk({'pair': -1, 'y': chunks_y, 'x': chunks_x})
-                if weight_da is not None:
-                    weight_da = weight_da.chunk({'pair': -1, 'y': chunks_y, 'x': chunks_x})
 
                 data_dask = data_da.data
+                weight_dask = weight_da.data if weight_da is not None else None
 
-                def make_wrapper(ref_vals, rep_vals, dev, deg, days_f, count_f):
-                    def process_chunk(data_block, weight_block=None):
+                y_chunks = data_dask.chunks[1]
+                x_chunks = data_dask.chunks[2]
+                y_breaks = [0] + list(np.cumsum(y_chunks))
+                x_breaks = [0] + list(np.cumsum(x_chunks))
+
+                def make_wrapper(ref_vals, rep_vals, dev, deg, days_f, count_f, detrend_mode):
+                    def process_chunks(data_chunks, weight_chunks=None):
                         import torch
-                        return utils_detrend.trend1d_pairs_array(
-                            data_block, weight_block, ref_vals, rep_vals,
+                        # Pass chunk lists directly to kernel — it extracts
+                        # only needed pairs without full input concatenation.
+                        trend = utils_detrend.trend1d_pairs_array(
+                            data_chunks, weight_chunks, ref_vals, rep_vals,
                             torch.device(dev), deg, days_f, count_f
                         )
-                    return process_chunk
+                        if detrend_mode:
+                            # Element-wise detrend per chunk — no full input concat
+                            result = np.empty_like(trend)
+                            offset = 0
+                            for c in data_chunks:
+                                c = np.asarray(c)
+                                cn = c.shape[0]
+                                t = trend[offset:offset+cn]
+                                if np.iscomplexobj(c):
+                                    result[offset:offset+cn] = c * np.conj(t)
+                                else:
+                                    result[offset:offset+cn] = c - t
+                                offset += cn
+                            return result
+                        return trend
+                    return process_chunks
 
-                wrapper = make_wrapper(ref_values, rep_values, str(device), degree, days, count)
+                wrapper = make_wrapper(ref_values, rep_values, str(device), degree, days, count, detrend)
 
-                dim_str = ''.join(chr(ord('a') + i) for i in range(data_dask.ndim))
+                blocks_rows = []
+                for bj in range(len(y_breaks) - 1):
+                    y0, y1 = y_breaks[bj], y_breaks[bj + 1]
+                    blocks_row = []
+                    for bk in range(len(x_breaks) - 1):
+                        x0, x1 = x_breaks[bk], x_breaks[bk + 1]
+                        td_list = data_dask[:, y0:y1, x0:x1] \
+                            .to_delayed().ravel().tolist()
+                        if weight_dask is not None:
+                            tw_list = weight_dask[:, y0:y1, x0:x1] \
+                                .to_delayed().ravel().tolist()
+                            block = da.from_delayed(
+                                dask.delayed(wrapper)(td_list, tw_list),
+                                shape=(n_pairs_val, y1 - y0, x1 - x0),
+                                dtype=out_dtype,
+                            )
+                        else:
+                            block = da.from_delayed(
+                                dask.delayed(wrapper)(td_list),
+                                shape=(n_pairs_val, y1 - y0, x1 - x0),
+                                dtype=out_dtype,
+                            )
+                        blocks_row.append(block)
+                    blocks_rows.append(blocks_row)
 
-                task_resources = {'regression': 1, 'gpu': 1} if device != 'cpu' else {'regression': 1}
-                meta = np.empty((0,) * data_dask.ndim, dtype=out_dtype)
-                with dask.annotate(resources=task_resources):
-                    if weight_da is not None:
-                        weight_dask = weight_da.data
-
-                        def make_weighted_wrapper(wrapper_fn):
-                            def process_with_weight(data_block, weight_block):
-                                return wrapper_fn(data_block, weight_block)
-                            return process_with_weight
-
-                        result_dask = da.blockwise(
-                            make_weighted_wrapper(wrapper), dim_str,
-                            data_dask, dim_str,
-                            weight_dask, dim_str,
-                            dtype=out_dtype,
-                            meta=meta,
-                        )
-                    else:
-                        result_dask = da.blockwise(
-                            wrapper, dim_str,
-                            data_dask, dim_str,
-                            dtype=out_dtype,
-                            meta=meta,
-                        )
-
-                if hasattr(result_dask, 'rechunk'):
-                    result_dask = result_dask.rechunk({0: 1})
+                result_dask = da.block(blocks_rows)
 
                 trend_da = xr.DataArray(
                     result_dask,
@@ -1833,7 +2358,6 @@ class BatchCore(dict):
         >>> dense_mask = nbrs >= 10
         """
         import torch
-        import dask
         import dask.array as da
 
         window_y, window_x = window
@@ -1888,21 +2412,15 @@ class BatchCore(dict):
                 if data.ndim != 2:
                     continue
 
-                # Rechunk for map_overlap using uniform chunk sizes
-                from .utils_dask import rechunk2d
-                optimal = rechunk2d(data.shape, element_bytes=4)  # float32
-                data_chunked = data.data.rechunk((optimal['y'], optimal['x']))
-
-                # Use map_overlap with module-level function via functools.partial
-                with dask.annotate(resources={'gpu': 1} if device_str != 'cpu' else {}):
-                    count_da = da.map_overlap(
-                        neighbors_func,
-                        data_chunked,
-                        depth={0: half_y, 1: half_x},
-                        boundary='none',
-                        trim=True,
-                        dtype=np.float32,
-                    )
+                # Use map_overlap on input chunks as-is
+                count_da = da.map_overlap(
+                    neighbors_func,
+                    data.data,
+                    depth={0: half_y, 1: half_x},
+                    boundary='none',
+                    trim=True,
+                    dtype=np.float32,
+                )
 
                 # Apply neighbors filtering if provided
                 if neighbors is not None:
@@ -2759,7 +3277,7 @@ class BatchCore(dict):
 
         return type(self)(out)
 
-    def chunk(self, chunks):
+    def chunk(self, chunks, p2p=False):
         """
         Rechunk the data in each burst dataset.
 
@@ -2768,6 +3286,12 @@ class BatchCore(dict):
         chunks : dict or 'auto'
             Chunk specification. If 'auto', uses chunk size 1 for first dimension
             (date/pair) and uniform chunking for spatial dimensions (y, x).
+        p2p : bool
+            Use P2P (peer-to-peer) rechunk for constant-memory rechunking.
+            Creates a materialization barrier that breaks shared upstream
+            dependencies. Useful when switching from space mode (pair=1)
+            to time mode (pair=-1) after operations with shared task graphs
+            like interferogram(). Default False.
 
         Returns
         -------
@@ -2781,37 +3305,200 @@ class BatchCore(dict):
 
         >>> # Auto: date=1, y/x=uniform based on dask.config['array.chunk-size']
         >>> batch.chunk('auto')
+
+        >>> # P2P rechunk: space→time mode with materialization barrier
+        >>> batch.chunk({'pair': -1, 'y': 256, 'x': 256}, p2p=True)
         """
+        import dask
         from .utils_dask import rechunk2d
 
-        # Only chunk spatial variables (y, x dims), leave non-spatial as-is
-        result = {}
-        for k, ds in self.items():
-            rechunked_vars = {}
-            for var in ds.data_vars:
-                arr = ds[var]
-                # Only touch spatial variables
-                if not (arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x')):
+        # P2P rechunk context: constant memory, acts as materialization barrier
+        if p2p:
+            ctx = dask.config.set({
+                "array.rechunk.method": "p2p",
+                "optimization.fuse.active": False,
+            })
+        else:
+            from contextlib import nullcontext
+            ctx = nullcontext()
+
+        with ctx:
+            # Only chunk spatial variables (y, x dims), leave non-spatial as-is
+            result = {}
+            for k, ds in self.items():
+                rechunked_vars = {}
+                for var in ds.data_vars:
+                    arr = ds[var]
+                    # Only touch spatial variables
+                    if not (arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x')):
+                        continue
+                    if chunks == 'auto':
+                        # Use rechunk2d for uniform chunk sizes
+                        y_size, x_size = arr.shape[-2], arr.shape[-1]
+                        element_bytes = arr.dtype.itemsize
+                        in_chunks = (arr.data.chunks[-2], arr.data.chunks[-1]) if hasattr(arr.data, 'chunks') else None
+                        optimal = rechunk2d((y_size, x_size), element_bytes, input_chunks=in_chunks)
+                        if arr.ndim == 3:
+                            var_chunks = {arr.dims[0]: 1, 'y': optimal['y'], 'x': optimal['x']}
+                        else:
+                            var_chunks = {'y': optimal['y'], 'x': optimal['x']}
+                    else:
+                        # Explicit chunks - add first dim=1 for 3D
+                        if arr.ndim == 3:
+                            var_chunks = {arr.dims[0]: 1, **chunks}
+                        else:
+                            var_chunks = chunks
+                    rechunked_vars[var] = arr.chunk(var_chunks)
+                if rechunked_vars:
+                    ds = ds.assign(rechunked_vars)
+                result[k] = ds
+        return type(self)(result)
+
+    def chunk2d(self, budget=None, p2p=False):
+        """
+        Rechunk for pair-based (2D) processing: dim-0=1, spatial dims sized to budget.
+
+        Computes optimal spatial chunk sizes so that each 2D slice (one pair/date)
+        fits within the specified memory budget.
+
+        Parameters
+        ----------
+        budget : str or None
+            Memory budget per chunk, e.g. '128MiB', '256MB', '1GiB'.
+            If None (default), uses dask.config['array.chunk-size'].
+        p2p : bool
+            Use P2P rechunk for constant-memory rechunking. Default False.
+
+        Returns
+        -------
+        BatchCore
+            New batch with rechunked data.
+
+        Examples
+        --------
+        >>> stack = Stack().load(zarr_path).chunk2d('128MiB')
+        >>> phase, corr = stack.phasediff_multilook(pairs, wavelength=200)
+        """
+        import dask
+        from .utils_dask import rechunk2d
+
+        target_mb = _parse_budget(budget) if budget is not None else None
+
+        if p2p:
+            ctx = dask.config.set({
+                "array.rechunk.method": "p2p",
+                "optimization.fuse.active": False,
+            })
+        else:
+            from contextlib import nullcontext
+            ctx = nullcontext()
+
+        with ctx:
+            result = {}
+            for k, ds in self.items():
+                # Compute spatial chunks once per burst using 8 bytes (complex64)
+                # so all variables get identical spatial chunks.
+                sample = None
+                for var in ds.data_vars:
+                    arr = ds[var]
+                    if arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x'):
+                        sample = arr
+                        break
+                if sample is None:
+                    result[k] = ds
                     continue
-                if chunks == 'auto':
-                    # Use rechunk2d for uniform chunk sizes
-                    y_size, x_size = arr.shape[-2], arr.shape[-1]
-                    element_bytes = arr.dtype.itemsize
-                    optimal = rechunk2d((y_size, x_size), element_bytes)
+                y_size, x_size = sample.shape[-2], sample.shape[-1]
+                in_chunks = (sample.data.chunks[-2], sample.data.chunks[-1]) if hasattr(sample.data, 'chunks') else None
+                optimal = rechunk2d((y_size, x_size), element_bytes=8,
+                                   input_chunks=in_chunks, target_mb=target_mb, merge=True)
+                rechunked_vars = {}
+                for var in ds.data_vars:
+                    arr = ds[var]
+                    if not (arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x')):
+                        continue
                     if arr.ndim == 3:
                         var_chunks = {arr.dims[0]: 1, 'y': optimal['y'], 'x': optimal['x']}
                     else:
                         var_chunks = {'y': optimal['y'], 'x': optimal['x']}
-                else:
-                    # Explicit chunks - add first dim=1 for 3D
+                    rechunked_vars[var] = arr.chunk(var_chunks)
+                if rechunked_vars:
+                    ds = ds.assign(rechunked_vars)
+                result[k] = ds
+        return type(self)(result)
+
+    def chunk1d(self, budget=None, p2p=False):
+        """
+        Rechunk for date-based (1D) processing: dim-0=-1, spatial dims sized to budget.
+
+        Computes optimal spatial chunk sizes so that the full date/pair stack
+        fits within the specified memory budget per spatial tile.
+
+        Parameters
+        ----------
+        budget : str
+            Memory budget per chunk, e.g. '128MiB', '256MB', '1GiB'.
+        p2p : bool
+            Use P2P rechunk for constant-memory rechunking. Default False.
+
+        Returns
+        -------
+        BatchCore
+            New batch with rechunked data.
+
+        Examples
+        --------
+        >>> data = Stack().snapshot('detrend2d_chunk').chunk1d('128MiB')
+        >>> displacement = data.detrend1d()
+        """
+        import dask
+        from .utils_dask import rechunk2d
+
+        target_mb = _parse_budget(budget) if budget is not None else None
+
+        if p2p:
+            ctx = dask.config.set({
+                "array.rechunk.method": "p2p",
+                "optimization.fuse.active": False,
+            })
+        else:
+            from contextlib import nullcontext
+            ctx = nullcontext()
+
+        with ctx:
+            result = {}
+            for k, ds in self.items():
+                # Find the largest dim-0 among 3D variables
+                n_stack = 0
+                sample = None
+                for var in ds.data_vars:
+                    arr = ds[var]
+                    if arr.ndim == 3 and arr.dims[-2:] == ('y', 'x'):
+                        if arr.shape[0] > n_stack:
+                            n_stack = arr.shape[0]
+                            sample = arr
+                if sample is None:
+                    result[k] = ds
+                    continue
+                # Divide budget by n_stack to get per-slice budget,
+                # then use rechunk2d (a 2D function) with per-slice element_bytes=8.
+                per_slice_mb = (target_mb / n_stack) if target_mb is not None else None
+                y_size, x_size = sample.shape[1], sample.shape[2]
+                in_chunks = (sample.data.chunks[1], sample.data.chunks[2]) if hasattr(sample.data, 'chunks') else None
+                optimal = rechunk2d((y_size, x_size), element_bytes=8,
+                                   input_chunks=in_chunks, target_mb=per_slice_mb, merge=True)
+                rechunked_vars = {}
+                for var in ds.data_vars:
+                    arr = ds[var]
+                    if not (arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x')):
+                        continue
                     if arr.ndim == 3:
-                        var_chunks = {arr.dims[0]: 1, **chunks}
+                        var_chunks = {'y': optimal['y'], 'x': optimal['x']}
                     else:
-                        var_chunks = chunks
-                rechunked_vars[var] = arr.chunk(var_chunks)
-            if rechunked_vars:
-                ds = ds.assign(rechunked_vars)
-            result[k] = ds
+                        var_chunks = {'y': optimal['y'], 'x': optimal['x']}
+                    rechunked_vars[var] = arr.chunk(var_chunks)
+                if rechunked_vars:
+                    ds = ds.assign(rechunked_vars)
+                result[k] = ds
         return type(self)(result)
 
     def pipe(self, func, *args, **kwargs):
@@ -2842,90 +3529,59 @@ class BatchCore(dict):
             result[key] = {var: ds[var].values for var in ds.data_vars}
         return result
 
-    def compute(self, load: bool = False, allow_rechunk: bool = False):
+    def compute(self):
         """
         Compute lazy data in the batch.
 
-        Parameters
-        ----------
-        load : bool, optional
-            If False (default), uses dask.persist() which keeps data as dask arrays
-            but triggers computation and caches results in distributed memory.
-            If True, fully loads data into numpy arrays (uses more memory but
-            ensures data is fully materialized for subsequent operations).
-        allow_rechunk : bool, optional
-            If True (default), auto-rechunk output for efficient further processing:
-            - 3D data: chunk size 1 for first dim (date/pair), auto for y,x
-            - 2D data: auto for y,x based on dask.config['array.chunk-size']
-            If False, use single spatial chunk (-1 for y,x).
+        Persists all bursts at once via dask.persist(). Data stays in
+        distributed worker memory (not pulled to client), letting the scheduler
+        optimize across the full graph. Rechunks results to match input chunk
+        structure. For memory-constrained sequential processing, use snapshot().
 
         Returns
         -------
         BatchCore
-            New batch with computed data.
+            New batch with computed data, rechunked to match input.
         """
         import dask
         from insardev_toolkit.progressbar import progressbar
-        from .utils_dask import get_dask_chunk_size_mb, rechunk2d
 
-        # Print NOTE before progress bar
-        dask_chunk_mb = get_dask_chunk_size_mb()
-        if allow_rechunk:
-            print(f"NOTE compute: rechunking to dask.config['array.chunk-size']={dask_chunk_mb} MB")
-        else:
-            print(f"NOTE compute: using single spatial chunk (allow_rechunk=False)")
+        # Save input chunk structure per burst
+        all_input_chunks = {}
+        for key, ds in self.items():
+            ic = {}
+            for var_name in ds.data_vars:
+                arr = ds[var_name]
+                if hasattr(arr.data, 'chunks'):
+                    ic[var_name] = dict(zip(arr.dims, arr.data.chunks))
+            all_input_chunks[key] = ic
 
-        if load:
-            # Fully load data to numpy arrays
-            progressbar(result := dask.compute(dict(self))[0], desc=f'Loading Batch...'.ljust(25))
-        else:
-            # Persist data (keep as dask arrays but computed/cached)
-            progressbar(result := dask.persist(dict(self))[0], desc=f'Computing Batch...'.ljust(25))
+        # Persist all bursts at once — single scheduler submission
+        # progressbar extracts futures and blocks until completion
+        progressbar(result := dask.persist(dict(self))[0], desc='Computing Batch...'.ljust(25))
 
-        # Ensure coordinates are also computed (not lazy dask arrays)
+        # Finalize: materialize coordinates and rechunk to match input
         computed = {}
-
         for key, ds in result.items():
-            # Compute any lazy coordinates, preserving their dims
             new_coords = {}
             for name, coord in ds.coords.items():
                 if hasattr(coord, 'data') and hasattr(coord.data, 'compute'):
-                    # Preserve original dims when assigning computed values
                     new_coords[name] = (coord.dims, coord.compute().values)
             if new_coords:
                 ds = ds.assign_coords(new_coords)
-
-            # Rechunk computed data for efficient further processing
-            # xarray's .chunk() handles both numpy and dask arrays
+            input_chunks = all_input_chunks[key]
             rechunked_vars = {}
-            for var in ds.data_vars:
-                arr = ds[var]
-                # Skip non-spatial variables
-                if not (arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x')):
-                    continue
-
-                if allow_rechunk:
-                    # Use rechunk2d for uniform chunk sizes
-                    y_size, x_size = arr.shape[-2], arr.shape[-1]
-                    element_bytes = arr.dtype.itemsize
-                    optimal = rechunk2d((y_size, x_size), element_bytes)
-                    if arr.ndim == 3:
-                        chunks = {arr.dims[0]: 1, 'y': optimal['y'], 'x': optimal['x']}
-                    else:
-                        chunks = {'y': optimal['y'], 'x': optimal['x']}
-                else:
-                    # Single spatial chunk
-                    if arr.ndim == 3:
-                        chunks = {arr.dims[0]: 1, 'y': -1, 'x': -1}
-                    else:
-                        chunks = {'y': -1, 'x': -1}
-
-                rechunked_vars[var] = arr.chunk(chunks)
-
-            # Update dataset with rechunked variables
+            for var_name in ds.data_vars:
+                arr = ds[var_name]
+                if var_name in input_chunks:
+                    chunks = input_chunks[var_name]
+                    if isinstance(arr.data, np.ndarray):
+                        arr = arr.chunk(chunks)
+                    elif hasattr(arr.data, 'chunks') and dict(zip(arr.dims, arr.data.chunks)) != chunks:
+                        arr = arr.chunk(chunks)
+                    rechunked_vars[var_name] = arr
             if rechunked_vars:
                 ds = ds.assign(rechunked_vars)
-
             computed[key] = ds
         return type(self)(computed)
 
@@ -3059,12 +3715,6 @@ class BatchCore(dict):
             return df.to_crs(crs)
         return df
     
-    def persist(self):
-        return type(self)({
-            k: ds.chunk(ds.chunks).persist()
-            for k, ds in self.items()
-        })
-
     @property
     def spacing(self) -> tuple[float, float]:
         """Return the (y, x) grid spacing."""
@@ -3090,11 +3740,41 @@ class BatchCore(dict):
             return self
         if debug:
             print (f'DEBUG: cell size in meters: y={dy:.1f}, x={dx:.1f} -> y={new_spacing[0]:.1f}, x={new_spacing[1]:.1f}')
-        return self.coarsen({'y': yscale, 'x': xscale}, boundary='trim').mean()
+
+        # Compute output chunk budget: input first chunk × 8 bytes / coarsen factors.
+        # This preserves the same spatial granularity (chunk count) after coarsening.
+        from .utils_dask import rechunk2d
+        sample_ds = next(iter(self.values()))
+        if hasattr(sample_ds, 'obj'):
+            sample_ds = sample_ds.obj
+        output_budget_mb = None
+        for v in sample_ds.data_vars:
+            arr = sample_ds[v]
+            if arr.ndim >= 2 and arr.dims[-2:] == ('y', 'x') and hasattr(arr.data, 'chunks'):
+                cy0 = arr.data.chunks[-2][0]
+                cx0 = arr.data.chunks[-1][0]
+                output_budget_mb = cy0 * cx0 * 8 / (1024 * 1024) / yscale / xscale
+                break
+
+        result = self.coarsen({'y': yscale, 'x': xscale}, boundary='trim').mean()
+
+        # Rechunk output to preserve input spatial granularity
+        if output_budget_mb is not None:
+            sample_ds = next(iter(result.values()))
+            for v in sample_ds.data_vars:
+                arr = sample_ds[v]
+                if arr.ndim >= 2 and arr.dims[-2:] == ('y', 'x') and hasattr(arr.data, 'chunks'):
+                    y_size, x_size = arr.shape[-2], arr.shape[-1]
+                    optimal = rechunk2d((y_size, x_size), element_bytes=8,
+                                       target_mb=output_budget_mb)
+                    result = result.chunk({'y': optimal['y'], 'x': optimal['x']})
+                    break
+
+        return result
 
     def save(self, store: str, storage_options: dict[str, str] | None = None,
-                caption: str | None = 'Saving...', n_jobs: int = -1, debug=False):
-        return utils_io.save(self, store=store, storage_options=storage_options, compat=False, caption=caption, n_jobs=n_jobs, debug=debug)
+                caption: str | None = 'Saving...', n_bursts: int = 2, debug=False):
+        return utils_io.save(self, store=store, storage_options=storage_options, compat=False, caption=caption, n_bursts=n_bursts, debug=debug)
 
     def open(self, store: str, storage_options: dict[str, str] | None = None, n_jobs: int = -1, debug=False):
         data = utils_io.open(store=store, storage_options=storage_options, compat=False, n_jobs=n_jobs, debug=debug)
@@ -3103,13 +3783,13 @@ class BatchCore(dict):
         return data
     
     def snapshot(self, store: str | None = None, storage_options: dict[str, str] | None = None,
-                caption: str | None = 'Snapshotting...', allow_rechunk: bool = False,
-                n_jobs: int = 1, debug=False):
+                caption: str | None = 'Snapshotting...',
+                n_bursts: int = 2, debug=False, **kwargs):
         # Only save if this batch has data; otherwise just open existing store
         if len(self) > 0:
-            utils_io.save(self, store=store, storage_options=storage_options, caption=caption, n_jobs=n_jobs, debug=debug)
+            utils_io.save(self, store=store, storage_options=storage_options, caption=caption, n_bursts=n_bursts, debug=debug)
         return utils_io.open(store=store, storage_options=storage_options, compat=False,
-                            allow_rechunk=allow_rechunk, n_jobs=-1, debug=debug)
+                            n_jobs=-1, debug=debug)
 
     def to_dataset(self, polarization=None, chunks='auto', compute: bool = False, debug: bool = False):
         """
@@ -3259,6 +3939,7 @@ class BatchCore(dict):
             # Use rechunk2d for uniform chunk sizes
             # Use 16 bytes to account for memory overhead (output + overlapping inputs)
             from .utils_dask import rechunk2d
+            # to_dataset creates a new output grid — no input chunks to align to
             optimal = rechunk2d((ys.size, xs.size), element_bytes=16)
             y_chunk_size = optimal['y']
             x_chunk_size = optimal['x']
@@ -3460,7 +4141,7 @@ class BatchCore(dict):
                                     # Then rechunk to single spatial chunk for the merge function
                                     tile_slice = datas_rechunked[burst_idx][s_idx:s_idx+1, by0:by1, bx0:bx1].rechunk({1: -1, 2: -1})
                                     # Convert to delayed - dask will auto-compute when merge is called
-                                    tile_delayed = tile_slice.to_delayed().ravel()[0]
+                                    tile_delayed = tile_slice.to_delayed(optimize_graph=False).ravel()[0]
                                     tiles_delayed.append(tile_delayed)
                                     offsets.append((y_off, x_off))
 
@@ -4373,7 +5054,6 @@ class BatchCore(dict):
         else:
             sigmas = None
 
-        import dask
         import dask.array as da
 
         # Resolve device ONCE here, not in every task
@@ -4381,11 +5061,6 @@ class BatchCore(dict):
         if device == 'auto':
             resolved_device = BatchCore._get_torch_device(device, debug=debug)
             device = resolved_device.type  # 'cpu', 'cuda', or 'mps' as string
-
-        # Resource annotation limits concurrent torch operations
-        # Workers must be configured with resources={'gaussian': N} to limit concurrency
-        use_gpu = device in ('cuda', 'mps')
-        task_resources = {'gaussian': 1, 'gpu': 1} if use_gpu else {'gaussian': 1}
 
         out = {}
         # loop over each key
@@ -4406,14 +5081,10 @@ class BatchCore(dict):
                 # Get weight dask array for this variable
                 weight_dask = w[var].data if w is not None and var in w.data_vars else None
 
-                # Require first dimension chunked as 1 (avoid hidden rechunking overhead)
-                chunks = data_arr.data.chunks
-                if data_arr.ndim == 3 and chunks[0][0] != 1:
-                    raise ValueError(
-                        f"gaussian() requires first dimension chunked as 1, got chunks {chunks[0]}. "
-                        f"Data should already have date=1 chunks from load()."
-                    )
+                # Ensure first dimension chunked as 1 for per-item spatial processing
                 dask_data = data_arr.data
+                if data_arr.ndim == 3 and dask_data.chunks[0][0] != 1:
+                    dask_data = dask_data.rechunk({0: 1})
 
                 # Calculate overlap depth from sigmas (truncate=4.0 is used in gaussian_numpy)
                 truncate = 4.0
@@ -4421,116 +5092,86 @@ class BatchCore(dict):
                 depth_x = int(np.ceil(sigmas[1] * truncate)) if sigmas is not None else 0
 
                 if debug:
-                    print(f'DEBUG: gaussian map_overlap depth=({depth_y}, {depth_x})')
-
-                # Ensure weight is a dask array (not numpy) for map_overlap
-                #if weight_dask is not None and not isinstance(weight_dask, da.Array):
-                #    weight_dask = da.from_array(weight_dask, chunks=weight_dask.shape)
-
-                with dask.annotate(resources=task_resources):
                     if data_arr.ndim == 3:
-                        depth_3d = {0: 0, 1: depth_y, 2: depth_x}
-                        depth_2d = {0: depth_y, 1: depth_x}
-                        if weight_dask is not None and weight_dask.ndim == 2:
-                            # 3D data with 2D weight: loop approach (process each date separately)
-                            slices = []
-                            for i in range(dask_data.shape[0]):
-                                data_slice = dask_data[i]  # 2D
-                                # Align weight chunks to data spatial chunks
-                                #weight_aligned = weight_dask.rechunk(data_slice.chunks)
-                                if weight_dask.chunks != data_slice.chunks:
-                                    raise ValueError(
-                                        f"gaussian() weight chunks {weight_dask.chunks} must match data chunks {data_slice.chunks}"
-                                    )
-                                result_slice = da.map_overlap(
-                                    _apply_gaussian_2d_for_dask,
-                                    data_slice,
-                                    weight_dask,
-                                    depth=depth_2d,
-                                    boundary='nearest',
-                                    dtype=out_dtype,
-                                    sigmas=sigmas,
-                                    threshold=threshold,
-                                    device=device,
-                                    pixel_sizes=(dy, dx),
-                                    out_dtype=out_dtype,
-                                )
-                                slices.append(result_slice)
-                            result_dask = da.stack(slices, axis=0)
-                        elif weight_dask is not None:
-                            # 3D data with 3D weight: require matching shape/chunks
-                            if weight_dask.shape != dask_data.shape:
-                                raise ValueError(
-                                    f"gaussian() weight shape {weight_dask.shape} must match data shape {dask_data.shape}"
-                                )
-                            if weight_dask.chunks != dask_data.chunks:
-                                raise ValueError(
-                                    f"gaussian() weight chunks {weight_dask.chunks} must match data chunks {dask_data.chunks}"
-                                )
-                            result_dask = da.map_overlap(
-                                _apply_gaussian_2d_for_dask,
-                                dask_data,
-                                weight_dask,
-                                depth=depth_3d,
-                                boundary='nearest',
-                                dtype=out_dtype,
-                                sigmas=sigmas,
-                                threshold=threshold,
-                                device=device,
-                                pixel_sizes=(dy, dx),
-                                out_dtype=out_dtype,
-                            )
-                        else:
-                            # No weight: single map_overlap on 3D data
-                            result_dask = da.map_overlap(
-                                _apply_gaussian_2d_for_dask,
-                                dask_data,
-                                depth=depth_3d,
-                                boundary='nearest',
-                                dtype=out_dtype,
-                                weight_block=None,
-                                sigmas=sigmas,
-                                threshold=threshold,
-                                device=device,
-                                pixel_sizes=(dy, dx),
-                                out_dtype=out_dtype,
-                            )
+                        _nc = (len(dask_data.chunks[1]), len(dask_data.chunks[2]))
                     else:
-                        # 2D data (y, x)
-                        depth_2d = {0: depth_y, 1: depth_x}
-                        if weight_dask is not None:
-                            #weight_aligned = weight_dask.rechunk(dask_data.chunks)
-                            if weight_dask.chunks != dask_data.chunks:
-                                raise ValueError(
-                                    f"gaussian() weight chunks {weight_dask.chunks} must match data chunks {dask_data.chunks}"
-                                )
-                            result_dask = da.map_overlap(
+                        _nc = (len(dask_data.chunks[0]), len(dask_data.chunks[1]))
+                    print(f'DEBUG: gaussian depth=({depth_y}, {depth_x}), n_chunks={_nc}')
+
+                if data_arr.ndim == 3:
+                    depth_3d = {0: 0, 1: depth_y, 2: depth_x}
+                    depth_2d = {0: depth_y, 1: depth_x}
+                    if weight_dask is not None and weight_dask.ndim == 2:
+                        # 3D data with 2D weight: loop approach (process each date separately)
+                        if weight_dask.chunks != dask_data[0].chunks:
+                            raise ValueError(
+                                f"gaussian() weight chunks {weight_dask.chunks} "
+                                f"must match data chunks {dask_data[0].chunks}")
+                        slices = []
+                        for i in range(dask_data.shape[0]):
+                            result_slice = da.map_overlap(
                                 _apply_gaussian_2d_for_dask,
-                                dask_data,
-                                weight_dask,
-                                depth=depth_2d,
-                                boundary='nearest',
+                                dask_data[i], weight_dask,
+                                depth=depth_2d, boundary='none',
                                 dtype=out_dtype,
-                                sigmas=sigmas,
-                                threshold=threshold,
-                                device=device,
-                                pixel_sizes=(dy, dx),
-                                out_dtype=out_dtype,
-                            )
-                        else:
-                            result_dask = da.map_overlap(
-                                _apply_gaussian_2d_for_dask,
-                                dask_data,
-                                depth=depth_2d,
-                                boundary='nearest',
-                                dtype=out_dtype,
-                                weight_block=None,
-                                sigmas=sigmas,
-                                threshold=threshold,
-                                device=device,
-                                pixel_sizes=(dy, dx),
-                                out_dtype=out_dtype,
-                            )
+                                sigmas=sigmas, threshold=threshold,
+                                device=device, pixel_sizes=(dy, dx),
+                                out_dtype=out_dtype)
+                            slices.append(result_slice)
+                        result_dask = da.stack(slices, axis=0)
+                    elif weight_dask is not None:
+                        # 3D data with 3D weight: require matching shape/chunks
+                        if weight_dask.shape != dask_data.shape:
+                            raise ValueError(
+                                f"gaussian() weight shape {weight_dask.shape} "
+                                f"must match data shape {dask_data.shape}")
+                        if weight_dask.chunks != dask_data.chunks:
+                            raise ValueError(
+                                f"gaussian() weight chunks {weight_dask.chunks} "
+                                f"must match data chunks {dask_data.chunks}")
+                        result_dask = da.map_overlap(
+                            _apply_gaussian_2d_for_dask,
+                            dask_data, weight_dask,
+                            depth=depth_3d, boundary='none',
+                            dtype=out_dtype,
+                            sigmas=sigmas, threshold=threshold,
+                            device=device, pixel_sizes=(dy, dx),
+                            out_dtype=out_dtype)
+                    else:
+                        # No weight: single map_overlap on 3D data
+                        result_dask = da.map_overlap(
+                            _apply_gaussian_2d_for_dask,
+                            dask_data,
+                            depth=depth_3d, boundary='none',
+                            dtype=out_dtype, weight_block=None,
+                            sigmas=sigmas, threshold=threshold,
+                            device=device, pixel_sizes=(dy, dx),
+                            out_dtype=out_dtype)
+                else:
+                    # 2D data (y, x)
+                    depth_2d = {0: depth_y, 1: depth_x}
+                    if weight_dask is not None:
+                        if weight_dask.chunks != dask_data.chunks:
+                            raise ValueError(
+                                f"gaussian() weight chunks {weight_dask.chunks} "
+                                f"must match data chunks {dask_data.chunks}")
+                        result_dask = da.map_overlap(
+                            _apply_gaussian_2d_for_dask,
+                            dask_data, weight_dask,
+                            depth=depth_2d, boundary='none',
+                            dtype=out_dtype,
+                            sigmas=sigmas, threshold=threshold,
+                            device=device, pixel_sizes=(dy, dx),
+                            out_dtype=out_dtype)
+                    else:
+                        result_dask = da.map_overlap(
+                            _apply_gaussian_2d_for_dask,
+                            dask_data,
+                            depth=depth_2d, boundary='none',
+                            dtype=out_dtype, weight_block=None,
+                            sigmas=sigmas, threshold=threshold,
+                            device=device, pixel_sizes=(dy, dx),
+                            out_dtype=out_dtype)
 
                 new_vars[var] = xr.DataArray(
                     result_dask,
@@ -4919,6 +5560,10 @@ class BatchCore(dict):
             extents[bid] = (y_coords.min(), y_coords.max(), x_coords.min(), x_coords.max())
             x_centers[bid] = float(np.mean(x_coords))
 
+        # Detect coordinate ordering for .sel() slicing
+        _sample_y = self[ids[0]].coords['y'].values
+        _y_descending = len(_sample_y) > 1 and _sample_y[0] > _sample_y[-1]
+
         def extents_overlap(e1, e2):
             y1_min, y1_max, x1_min, x1_max = e1
             y2_min, y2_max, x2_min, x2_max = e2
@@ -4926,26 +5571,32 @@ class BatchCore(dict):
             x_overlap = not (x1_max < x2_min or x2_max < x1_min)
             return y_overlap and x_overlap
 
-        def process_phase_diff(phase, id1, id2, pair_idx):
-            """Process a computed phase difference to extract offset and optionally ramp."""
-            all_valid = phase.values.ravel()
+        def process_phase_diff(diff_np, x_coords, id1, id2, pair_idx):
+            """Process overlap numpy array to extract offset and optionally ramp.
+
+            Parameters
+            ----------
+            diff_np : numpy.ndarray
+                2D array of phase differences in the overlap region.
+            x_coords : numpy.ndarray
+                1D array of x coordinate values for columns.
+            """
+            all_valid = diff_np.ravel()
             all_valid = all_valid[np.isfinite(all_valid)]
 
             if len(all_valid) < MIN_OVERLAP_PIXELS:
                 return None
 
-            if 'y' not in phase.dims or 'x' not in phase.dims:
+            if diff_np.ndim < 2:
                 return None
-
-            x_coords = phase.coords['x'].values
 
             # Row-wise processing
             row_phases = []
             row_x_centroids = []
             row_weights = []
 
-            for y_idx in range(phase.shape[0]):
-                row = phase.values[y_idx, :]
+            for y_idx in range(diff_np.shape[0]):
+                row = diff_np[y_idx, :]
                 valid_mask = np.isfinite(row)
                 n_valid = np.sum(valid_mask)
                 if n_valid >= MIN_ROW_PIXELS:
@@ -5035,254 +5686,212 @@ class BatchCore(dict):
             if degree == 1 and cross_subswath_skipped > 0:
                 print(f'  (skipped {cross_subswath_skipped} same-path cross-subswath pairs for ramp estimation)', flush=True)
 
-        # Build all lazy phase differences (dask graphs)
-        jobs = []
-        lazy_diffs = []
+        # Build delayed overlap statistics using to_delayed pattern.
+        # Each overlap is pre-selected via .sel() so only overlap chunks
+        # enter the dask graph — NOT the full burst pipeline.
+        import dask.array as _da
+
+        delayed_stats = []
         for id1, id2 in all_overlap_pairs:
-            i1 = self[id1][polarization]
-            i2 = self[id2][polarization]
+            e1, e2 = extents[id1], extents[id2]
+            # Overlap bounding box
+            y_min, y_max = max(e1[0], e2[0]), min(e1[1], e2[1])
+            x_min, x_max = max(e1[2], e2[2]), min(e1[3], e2[3])
+            y_slice = slice(y_max, y_min) if _y_descending else slice(y_min, y_max)
+            x_slice = slice(x_min, x_max)
+
+            # Select only the overlap region — restricts dask graph to overlap chunks
+            i1 = self[id1][polarization].sel(y=y_slice, x=x_slice)
+            i2 = self[id2][polarization].sel(y=y_slice, x=x_slice)
 
             for pair_idx in range(n_pairs):
-                i1_p = i1.isel(pair=pair_idx) if 'pair' in i1.dims else i1
-                i2_p = i2.isel(pair=pair_idx) if 'pair' in i2.dims else i2
-                phase_diff_val = i2_p - i1_p
-                jobs.append((id1, id2, pair_idx))
-                lazy_diffs.append(phase_diff_val)
+                i1_p = i1.isel(pair=pair_idx) if has_pair_dim else i1
+                i2_p = i2.isel(pair=pair_idx) if has_pair_dim else i2
+                # Lazy difference — xarray aligns to common overlap coordinates
+                diff = i2_p - i1_p
+                x_coords = diff.coords['x'].values
+                # Convert to delayed numpy via to_delayed
+                diff_delayed = diff.data.rechunk(-1, -1).to_delayed().ravel()[0]
+                # Delayed numpy processing
+                stat = dask.delayed(process_phase_diff)(
+                    diff_delayed, x_coords, id1, id2, pair_idx
+                )
+                delayed_stats.append(stat)
 
         if debug:
-            print(f'Computing {len(lazy_diffs)} phase differences...', flush=True)
+            print(f'Building lazy graph for {len(delayed_stats)} overlap statistics...', flush=True)
 
-        # Compute all phase differences at once - dask schedules efficiently
-        computed_diffs = dask.compute(*lazy_diffs)
+        # Solve function — runs inside dask.delayed, receives concrete stats.
+        # Captures only small metadata (ids, id_to_idx, x_centers, etc.).
+        def _fit_solve(stats_list):
+            from scipy import sparse as _sparse
+            from scipy.sparse.linalg import lsqr as _lsqr
+            from scipy.sparse.csgraph import connected_components as _cc
 
-        # Process computed results
-        results = []
-        rejection_counts = {'too_few_pixels': 0, 'missing_dims': 0, 'too_few_rows': 0, 'no_ramp': 0}
-        for (id1, id2, pair_idx), phase in zip(jobs, computed_diffs):
-            result = process_phase_diff(phase, id1, id2, pair_idx)
-            if result is not None:
-                results.append(result)
-            else:
-                # Count rejections (only for pair_idx==0 to avoid double counting)
-                if pair_idx == 0:
-                    all_valid = phase.values.ravel()
-                    all_valid = all_valid[np.isfinite(all_valid)]
-                    if len(all_valid) < MIN_OVERLAP_PIXELS:
-                        rejection_counts['too_few_pixels'] += 1
-                    elif 'y' not in phase.dims or 'x' not in phase.dims:
-                        rejection_counts['missing_dims'] += 1
+            valid_stats = [s for s in stats_list if s is not None]
+
+            _pbp = {p: [] for p in range(n_pairs)}
+            for st in valid_stats:
+                _id1, _id2, _pidx, _off, _rv, _xc, _nu = st
+                _w = np.sqrt(_nu)
+                if degree == 0:
+                    _pbp[_pidx].append((_id1, _id2, _off, _w))
+                else:
+                    if _rv is not None:
+                        _pbp[_pidx].append((_id1, _id2, _off, _rv, _xc, _w))
+
+            def _solve_one(pidx):
+                pairs = _pbp[pidx]
+                if len(pairs) == 0:
+                    if degree == 0:
+                        return {bid: np.float32(0.0) for bid in ids}
                     else:
-                        rejection_counts['too_few_rows'] += 1
+                        return {bid: [np.float32(0.0), np.float32(0.0)] for bid in ids}
 
-        if debug:
-            n_valid = len([r for r in results if r[2] == 0])  # count for pair_idx=0
-            n_rejected = len(all_overlap_pairs) - n_valid
-            print(f'  Rejections: {rejection_counts}', flush=True)
-            if degree == 1:
-                # Count how many had no ramp computed
-                no_ramp = sum(1 for r in results if r[2] == 0 and r[4] is None)
-                print(f'  Valid pairs with no ramp (x_range too small): {no_ramp}', flush=True)
+                adj = _sparse.lil_matrix((n_bursts, n_bursts))
+                for p in pairs:
+                    adj[id_to_idx[p[0]], id_to_idx[p[1]]] = 1
+                    adj[id_to_idx[p[1]], id_to_idx[p[0]]] = 1
+                n_comp_all, labels = _cc(adj.tocsr(), directed=False)
 
-        # Organize results by pair_idx
-        pairs_by_pair_idx = {p: [] for p in range(n_pairs)}
-        for result in results:
-            if result is None:
-                continue
-            id1, id2, pair_idx, offset, ramp_val, x_centroid, n_used = result
-            weight = np.sqrt(n_used)
-            if degree == 0:
-                pairs_by_pair_idx[pair_idx].append((id1, id2, offset, weight))
-            else:
-                if ramp_val is not None:
-                    pairs_by_pair_idx[pair_idx].append((id1, id2, offset, ramp_val, x_centroid, weight))
-
-        def solve_for_pair(pair_idx):
-            """Solve least-squares for a single pair index."""
-            pairs = pairs_by_pair_idx[pair_idx]
-
-            if len(pairs) == 0:
                 if degree == 0:
-                    return {bid: np.float32(0.0) for bid in ids}
+                    out = {}
+                    for comp in range(n_comp_all):
+                        ci = np.where(labels == comp)[0]
+                        cids = [ids[ii] for ii in ci]
+                        cmap = {bid: ii for ii, bid in enumerate(cids)}
+                        nc = len(cids)
+                        if nc == 1:
+                            out[cids[0]] = np.float32(0.0)
+                            continue
+                        cp = [(a, b, o, w) for a, b, o, w in pairs
+                              if a in cmap and b in cmap]
+                        if not cp:
+                            for bid in cids:
+                                out[bid] = np.float32(0.0)
+                            continue
+                        ncp = len(cp)
+                        Am = _sparse.lil_matrix((ncp + 1, nc))
+                        bv = np.zeros(ncp + 1)
+                        Wv = np.zeros(ncp + 1)
+                        for kk, (a, b, o, w) in enumerate(cp):
+                            Am[kk, cmap[a]] = -1
+                            Am[kk, cmap[b]] = +1
+                            bv[kk] = o
+                            Wv[kk] = w
+                        cw = np.sum(Wv[:-1]) * 100 if np.sum(Wv[:-1]) > 0 else 1e6
+                        Am[ncp, 0] = 1
+                        Wv[ncp] = cw
+                        sqW = np.sqrt(Wv)
+                        res = _lsqr(_sparse.diags(sqW) @ Am.tocsr(), sqW * bv)
+                        for ii, bid in enumerate(cids):
+                            out[bid] = np.float32(round(float(maybe_wrap(res[0][ii])),
+                                                        OUTPUT_PRECISION))
+                    return out
                 else:
-                    return {bid: [np.float32(0.0), np.float32(0.0)] for bid in ids}
+                    out = {}
+                    for comp in range(n_comp_all):
+                        ci = np.where(labels == comp)[0]
+                        cids = [ids[ii] for ii in ci]
+                        cmap = {bid: ii for ii, bid in enumerate(cids)}
+                        nc = len(cids)
+                        if nc == 1:
+                            out[cids[0]] = [np.float32(0.0), np.float32(0.0)]
+                            continue
+                        cp = [(a, b, o, r, xc, w) for a, b, o, r, xc, w in pairs
+                              if a in cmap and b in cmap]
+                        if not cp:
+                            for bid in cids:
+                                out[bid] = [np.float32(0.0), np.float32(0.0)]
+                            continue
+                        ncp = len(cp)
+                        Am = _sparse.lil_matrix((ncp + 1, nc))
+                        bv = np.zeros(ncp + 1)
+                        Wv = np.zeros(ncp + 1)
+                        for kk, (a, b, o, rd, xc, w) in enumerate(cp):
+                            Am[kk, cmap[a]] = -1
+                            Am[kk, cmap[b]] = +1
+                            bv[kk] = rd
+                            Wv[kk] = w
+                        cw = np.sum(Wv[:-1]) * 100 if np.sum(Wv[:-1]) > 0 else 1e6
+                        Am[ncp, 0] = 1
+                        Wv[ncp] = cw
+                        sqW = np.sqrt(Wv)
+                        res = _lsqr(_sparse.diags(sqW) @ Am.tocsr(), sqW * bv)
+                        for ii, bid in enumerate(cids):
+                            ramp = np.float32(round(float(res[0][ii]), RAMP_PRECISION))
+                            intercept = np.float32(round(-ramp * x_centers[bid],
+                                                         OUTPUT_PRECISION))
+                            out[bid] = [ramp, intercept]
+                    return out
 
-            # Build connectivity graph
-            adjacency = sparse.lil_matrix((n_bursts, n_bursts))
-            for p in pairs:
-                id1, id2 = p[0], p[1]
-                i, j = id_to_idx[id1], id_to_idx[id2]
-                adjacency[i, j] = 1
-                adjacency[j, i] = 1
+            rpp = [_solve_one(p) for p in range(n_pairs)]
 
-            n_components, labels = connected_components(adjacency.tocsr(), directed=False)
-
-            if debug and pair_idx == 0:  # Only print for first pair to avoid spam
-                print(f'  Found {n_components} connected component(s) for {len(pairs)} valid pairs', flush=True)
-                for comp in range(n_components):
-                    comp_indices = np.where(labels == comp)[0]
-                    comp_ids = [ids[i] for i in comp_indices]
-                    # Try to extract subswath info from burst IDs
-                    subswaths = set()
-                    paths = set()
-                    for bid in comp_ids:
-                        if '_IW' in bid:
-                            sw = bid.split('_IW')[1][0]
-                            subswaths.add(f'IW{sw}')
-                        parts = bid.split('_')
-                        if len(parts) >= 1 and parts[0].isdigit():
-                            paths.add(parts[0])
-                    print(f'    Component {comp}: {len(comp_ids)} bursts, paths={paths}, subswaths={subswaths}', flush=True)
-
-            if degree == 0:
-                offsets_out = {}
-
-                for comp in range(n_components):
-                    comp_indices = np.where(labels == comp)[0]
-                    comp_ids = [ids[i] for i in comp_indices]
-                    comp_id_to_local = {bid: i for i, bid in enumerate(comp_ids)}
-                    n_comp = len(comp_ids)
-
-                    if n_comp == 1:
-                        offsets_out[comp_ids[0]] = np.float32(0.0)
-                        continue
-
-                    comp_pairs = [(id1, id2, off, w) for id1, id2, off, w in pairs
-                                  if id1 in comp_id_to_local and id2 in comp_id_to_local]
-
-                    if len(comp_pairs) == 0:
-                        for bid in comp_ids:
-                            offsets_out[bid] = np.float32(0.0)
-                        continue
-
-                    n_pairs_comp = len(comp_pairs)
-                    A = sparse.lil_matrix((n_pairs_comp + 1, n_comp))
-                    b = np.zeros(n_pairs_comp + 1)
-                    W = np.zeros(n_pairs_comp + 1)
-
-                    for k, (id1, id2, off, w) in enumerate(comp_pairs):
-                        i = comp_id_to_local[id1]
-                        j = comp_id_to_local[id2]
-                        A[k, i] = -1
-                        A[k, j] = +1
-                        b[k] = off
-                        W[k] = w
-
-                    constraint_weight = np.sum(W[:-1]) * 100 if np.sum(W[:-1]) > 0 else 1e6
-                    A[n_pairs_comp, 0] = 1
-                    b[n_pairs_comp] = 0
-                    W[n_pairs_comp] = constraint_weight
-
-                    sqrt_W = np.sqrt(W)
-                    result = lsqr(sparse.diags(sqrt_W) @ A.tocsr(), sqrt_W * b)
-
-                    for i, bid in enumerate(comp_ids):
-                        offsets_out[bid] = np.float32(round(float(maybe_wrap(result[0][i])), OUTPUT_PRECISION))
-
-                return offsets_out
-
-            else:  # degree == 1
-                ramps_out = {}
-
-                for comp in range(n_components):
-                    comp_indices = np.where(labels == comp)[0]
-                    comp_ids = [ids[i] for i in comp_indices]
-                    comp_id_to_local = {bid: i for i, bid in enumerate(comp_ids)}
-                    n_comp = len(comp_ids)
-
-                    if n_comp == 1:
-                        ramps_out[comp_ids[0]] = [np.float32(0.0), np.float32(0.0)]
-                        continue
-
-                    comp_pairs = [(id1, id2, off, r, xc, w) for id1, id2, off, r, xc, w in pairs
-                                  if id1 in comp_id_to_local and id2 in comp_id_to_local]
-
-                    if len(comp_pairs) == 0:
-                        for bid in comp_ids:
-                            ramps_out[bid] = [np.float32(0.0), np.float32(0.0)]
-                        continue
-
-                    n_pairs_comp = len(comp_pairs)
-                    A = sparse.lil_matrix((n_pairs_comp + 1, n_comp))
-                    b = np.zeros(n_pairs_comp + 1)
-                    W = np.zeros(n_pairs_comp + 1)
-
-                    for k, (id1, id2, off, ramp_diff, xc, w) in enumerate(comp_pairs):
-                        i = comp_id_to_local[id1]
-                        j = comp_id_to_local[id2]
-                        A[k, i] = -1
-                        A[k, j] = +1
-                        b[k] = ramp_diff
-                        W[k] = w
-
-                    constraint_weight = np.sum(W[:-1]) * 100 if np.sum(W[:-1]) > 0 else 1e6
-                    A[n_pairs_comp, 0] = 1
-                    b[n_pairs_comp] = 0
-                    W[n_pairs_comp] = constraint_weight
-
-                    sqrt_W = np.sqrt(W)
-                    result = lsqr(sparse.diags(sqrt_W) @ A.tocsr(), sqrt_W * b)
-
-                    for i, bid in enumerate(comp_ids):
-                        ramp = np.float32(round(float(result[0][i]), RAMP_PRECISION))
-                        intercept = np.float32(round(-ramp * x_centers[bid], OUTPUT_PRECISION))
-                        ramps_out[bid] = [ramp, intercept]
-
-                return ramps_out
-
-        # Solve for each pair
-        results_per_pair = [solve_for_pair(p) for p in range(n_pairs)]
-
-        # Compute residuals from the pairwise offsets (before correction)
-        # This uses the same overlap data we already computed
-        residuals_out = None
-        if return_residuals:
-            # Calculate weighted mean absolute offset per pair
-            disc_per_pair = []
-            for p in range(n_pairs):
-                pairs_p = pairs_by_pair_idx[p]
-                if len(pairs_p) == 0:
-                    disc_per_pair.append(0.0)
-                    continue
-
-                # Extract offsets and weights
-                if degree == 0:
-                    # pairs_p = [(id1, id2, offset, weight), ...]
-                    offsets = [abs(maybe_wrap(t[2])) for t in pairs_p]
-                    weights = [t[3] for t in pairs_p]
-                else:
-                    # pairs_p = [(id1, id2, offset, ramp, x_centroid, weight), ...]
-                    offsets = [abs(maybe_wrap(t[2])) for t in pairs_p]
-                    weights = [t[5] for t in pairs_p]
-
-                total_weight = sum(weights)
-                if total_weight > 0:
-                    weighted_sum = sum(o * w for o, w in zip(offsets, weights))
-                    disc_per_pair.append(round(weighted_sum / total_weight, 3))
-                else:
-                    disc_per_pair.append(0.0)
-
+            # Format output
             if n_pairs == 1 and not has_pair_dim:
-                residuals_out = disc_per_pair[0]
+                offsets = rpp[0]
             else:
-                residuals_out = disc_per_pair
+                offsets = {bid: [rpp[p][bid] for p in range(n_pairs)] for bid in ids}
 
+            # Residuals (if requested)
+            residuals = None
+            if return_residuals:
+                disc = []
+                for p in range(n_pairs):
+                    pp = _pbp[p]
+                    if not pp:
+                        disc.append(0.0)
+                        continue
+                    if degree == 0:
+                        offs = [abs(maybe_wrap(t[2])) for t in pp]
+                        ws = [t[3] for t in pp]
+                    else:
+                        offs = [abs(maybe_wrap(t[2])) for t in pp]
+                        ws = [t[5] for t in pp]
+                    tw = sum(ws)
+                    disc.append(round(sum(o * w for o, w in zip(offs, ws)) / tw, 3)
+                                if tw > 0 else 0.0)
+                residuals = disc[0] if (n_pairs == 1 and not has_pair_dim) else disc
+
+            return {'offsets': offsets, 'residuals': residuals}
+
+        # Delayed solve — fully lazy, NO dask.compute()
+        solve_result = dask.delayed(_fit_solve)(delayed_stats)
+
+        # Extract per-burst dask 0-d arrays from delayed solve result
+        offsets_part = solve_result['offsets']
+
+        if n_pairs == 1 and not has_pair_dim:
+            if degree == 0:
+                coeffs = {bid: _da.from_delayed(offsets_part[bid],
+                          shape=(), dtype=np.float32) for bid in ids}
+            else:
+                coeffs = {bid: [
+                    _da.from_delayed(offsets_part[bid][0], shape=(), dtype=np.float32),
+                    _da.from_delayed(offsets_part[bid][1], shape=(), dtype=np.float32),
+                ] for bid in ids}
+        else:
+            if degree == 0:
+                coeffs = {bid: [
+                    _da.from_delayed(offsets_part[bid][p], shape=(), dtype=np.float32)
+                    for p in range(n_pairs)
+                ] for bid in ids}
+            else:
+                coeffs = {bid: [
+                    [_da.from_delayed(offsets_part[bid][p][0], shape=(), dtype=np.float32),
+                     _da.from_delayed(offsets_part[bid][p][1], shape=(), dtype=np.float32)]
+                    for p in range(n_pairs)
+                ] for bid in ids}
+
+        if return_residuals:
+            # Residuals require concrete values — triggers the solve chain
+            print('fit(return_residuals=True): computing residuals breaks lazy chain, use for diagnostics only', flush=True)
+            residuals_out = solve_result['residuals'].compute()
             if debug:
                 print(f'Input residuals: {residuals_out}', flush=True)
+            return (coeffs, residuals_out)
 
-        # If single pair, return simple dict
-        if n_pairs == 1 and not has_pair_dim:
-            coeffs = results_per_pair[0]
-            return (coeffs, residuals_out) if return_residuals else coeffs
-
-        # Multiple pairs: combine into list per burst
-        combined = {}
-        for bid in ids:
-            if degree == 0:
-                combined[bid] = [results_per_pair[p][bid] for p in range(n_pairs)]
-            else:
-                combined[bid] = [results_per_pair[p][bid] for p in range(n_pairs)]
-
-        return (combined, residuals_out) if return_residuals else combined
+        return coeffs
 
     def align(self,
               degree: int = 0,
@@ -5363,22 +5972,10 @@ class BatchCore(dict):
         cross-contamination between the two.
         """
         from .Batch import Batch, BatchWrap
-        import warnings
 
         # Validate class type
         if not isinstance(self, (Batch, BatchWrap)):
             raise TypeError(f"align() only works with Batch (unwrapped) or BatchWrap (wrapped) phase data, not {type(self).__name__}")
-
-        # Warn if data is lazy (has dask arrays) - align() triggers expensive recomputation
-        if len(self) > 0:
-            first_ds = next(iter(self.values()))
-            has_dask = any(hasattr(var.data, 'dask') for var in first_ds.data_vars.values())
-            if has_dask:
-                warnings.warn(
-                    "align() called on lazy data. This triggers expensive recomputation. "
-                    "Consider calling .compute() before .align() for better performance.",
-                    UserWarning
-                )
 
         # Auto-detect polarization if not specified
         if polarization is None:
@@ -5580,12 +6177,10 @@ class BatchCore(dict):
 
                 # Check if 3D (has stack dimension like 'pair')
                 if len(da_current.dims) > 2:
-                    # Require first dim chunked as 1 for efficient per-slice processing
+                    # Ensure first dim chunked as 1 for per-slice processing
                     if hasattr(da_current.data, 'chunks') and da_current.data.chunks[0][0] != 1:
-                        raise ValueError(
-                            f"dissolve() requires first dimension chunked as 1, got chunks {da_current.data.chunks[0]}. "
-                            f"Data should already have date=1 chunks from load()."
-                        )
+                        da_current = da_current.chunk({da_current.dims[0]: 1})
+                        das_others = [d.chunk({d.dims[0]: 1}) for d in das_others]
                     stackvar = da_current.dims[0]
                     n_stack = da_current.sizes[stackvar]
                     shape_2d = da_current.shape[1:]
@@ -5608,8 +6203,7 @@ class BatchCore(dict):
                         delayed_slices.append(delayed_slice)
 
                     # Concatenate along axis 0 - each slice is already (1, y, x)
-                    # Rechunk to date=1 only (preserve user's spatial chunks)
-                    delayed_array = da.concatenate(delayed_slices, axis=0).rechunk({0: 1})
+                    delayed_array = da.concatenate(delayed_slices, axis=0)
                 else:
                     # 2D case - single delayed array
                     # Use module-level function to avoid dask serialization issues

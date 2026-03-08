@@ -11,6 +11,22 @@
 from .Stack_unwrap1d import Stack_unwrap1d
 from . import utils_unwrap2d
 import numpy as np
+import rioxarray
+import threading
+
+# Limit concurrent PyTorch IRLS calls (per-process, affects high-thread configs like 1w16t):
+# - CPU: semaphore limits concurrent torch tasks; transparent when threads < semaphore value
+# - GPU: lock serializes MPS access — prevents overconcurrency crashes
+_irls_gpu_lock = threading.Lock()
+_irls_cpu_semaphores = {}
+_irls_cpu_semaphores_lock = threading.Lock()
+
+def _get_irls_semaphore(value):
+    """Get or create a per-process CPU semaphore with the given value."""
+    with _irls_cpu_semaphores_lock:
+        if value not in _irls_cpu_semaphores:
+            _irls_cpu_semaphores[value] = threading.Semaphore(value)
+        return _irls_cpu_semaphores[value]
 
 
 def _irls_process_chunk_with_tuple(phase_chunk, weight_chunk, params_tuple):
@@ -18,8 +34,8 @@ def _irls_process_chunk_with_tuple(phase_chunk, weight_chunk, params_tuple):
 
     Returns tuple of (unwrapped, conncomp) arrays, each with shape (1, y, x).
     """
-    # Unpack params tuple: (device, max_iter, tol, cg_max_iter, cg_tol, epsilon, conncomp_size, debug)
-    device, max_iter, tol, cg_max_iter, cg_tol, epsilon, conncomp_size, debug = params_tuple
+    # Unpack params tuple
+    device, max_iter, tol, cg_max_iter, cg_tol, epsilon, conncomp_size, debug, semaphore = params_tuple
 
     if debug:
         print(f'DEBUG _irls_process_chunk: phase_chunk.shape={phase_chunk.shape}, device={device!r}')
@@ -44,12 +60,13 @@ def _irls_process_chunk_with_tuple(phase_chunk, weight_chunk, params_tuple):
         conncomp = np.zeros_like(phase_2d, dtype=np.uint16)
         return unwrapped[np.newaxis, ...], conncomp[np.newaxis, ...]
 
-    # Call utils function directly - no object references
-    unwrapped, conncomp = utils_unwrap2d.irls_unwrap_2d(
-        phase_2d, weight=weight_2d, device=device,
-        max_iter=max_iter, tol=tol, cg_max_iter=cg_max_iter,
-        cg_tol=cg_tol, epsilon=epsilon, conncomp_size=conncomp_size, debug=debug
-    )
+    sem = _get_irls_semaphore(semaphore) if str(device) == 'cpu' else _irls_gpu_lock
+    with sem:
+        unwrapped, conncomp = utils_unwrap2d.irls_unwrap_2d(
+            phase_2d, weight=weight_2d, device=device,
+            max_iter=max_iter, tol=tol, cg_max_iter=cg_max_iter,
+            cg_tol=cg_tol, epsilon=epsilon, conncomp_size=conncomp_size, debug=debug
+        )
     # Add pair dim back: (y, x) -> (1, y, x)
     return unwrapped[np.newaxis, ...], conncomp[np.newaxis, ...]
 
@@ -80,6 +97,37 @@ def _irls_process_with_weight_conncomp(phase_chunk, weight_chunk, params_tuple):
     # Stack: (1, y, x) + (1, y, x) -> (1, 2, y, x) for blockwise with 'pcyx' output
     stacked = np.stack([unwrapped[0].astype(np.float32), conncomp[0].astype(np.float32)], axis=0)
     return stacked[np.newaxis, ...]  # (1, 2, y, x)
+
+
+def _irls_overlap_kernel(phase_block, weight_or_params, params_tuple=None):
+    """Kernel for da.map_overlap: unwrap each (1, y, x) slice independently."""
+    if params_tuple is None:
+        # Called as (phase, params) — no weight
+        params_tuple = weight_or_params
+        weight_block = None
+    else:
+        # Called as (phase, weight, params)
+        weight_block = weight_or_params
+    device, max_iter, tol, cg_max_iter, cg_tol, epsilon, conncomp_size, debug, semaphore = params_tuple
+
+    results = []
+    for pidx in range(phase_block.shape[0]):
+        phase_2d = phase_block[pidx]
+        weight_2d = weight_block[pidx] if weight_block is not None else None
+
+        if np.all(np.isnan(phase_2d)):
+            results.append(phase_2d.astype(np.float32)[np.newaxis, ...])
+            continue
+
+        sem = _get_irls_semaphore(semaphore) if str(device) == 'cpu' else _irls_gpu_lock
+        with sem:
+            unwrapped, _ = utils_unwrap2d.irls_unwrap_2d(
+                phase_2d, weight=weight_2d, device=device,
+                max_iter=max_iter, tol=tol, cg_max_iter=cg_max_iter,
+                cg_tol=cg_tol, epsilon=epsilon, conncomp_size=conncomp_size, debug=debug
+            )
+        results.append(unwrapped[np.newaxis, ...])
+    return np.concatenate(results, axis=0)
 
 
 class Stack_unwrap2d(Stack_unwrap1d):
@@ -704,7 +752,7 @@ class Stack_unwrap2d(Stack_unwrap1d):
 
     def unwrap2d_irls(self, phase, weight=None, device='auto',
                       max_iter=50, tol=1e-2, cg_max_iter=10, cg_tol=1e-3, epsilon=1e-2,
-                      conncomp_size=30, debug=False):
+                      conncomp_size=30, semaphore=8, debug=False):
         """
         Unwrap phase using GPU-accelerated IRLS algorithm (L¹ norm).
 
@@ -745,6 +793,10 @@ class Stack_unwrap2d(Stack_unwrap1d):
         conncomp_size : int, optional
             Minimum connected component size in pixels. Components smaller than this
             are marked invalid (label 0). Default is 30.
+        semaphore : int, optional
+            Maximum concurrent CPU IRLS tasks per process. Limits PyTorch thread
+            contention in high-thread configs (e.g. 1w16t). Transparent when
+            threads_per_worker < semaphore. Default is 8.
         debug : bool, optional
             If True, print diagnostic information. Default is False.
 
@@ -811,15 +863,29 @@ class Stack_unwrap2d(Stack_unwrap1d):
                 phase_da = phase_ds[var]
                 weight_da = weight_ds[var] if weight_ds is not None else None
 
-                # Ensure pair dimension is chunked as 1
+                # Save original spatial chunks to restore after unwrapping
+                orig_y_chunks = None
+                orig_x_chunks = None
+                if hasattr(phase_da.data, 'chunks'):
+                    orig_y_chunks = phase_da.data.chunks[-2]
+                    orig_x_chunks = phase_da.data.chunks[-1]
+
+                # Ensure pair dimension is chunked as 1 and spatial dims are single chunk
+                rechunk_dict = {}
                 if 'pair' in phase_da.dims:
                     chunks = phase_da.data.chunks
                     if chunks[0][0] != 1:
-                        phase_da = phase_da.chunk({'pair': 1})
+                        rechunk_dict['pair'] = 1
+                if hasattr(phase_da.data, 'chunks'):
+                    chunks = phase_da.data.chunks
+                    if len(chunks[-2]) > 1:
+                        rechunk_dict['y'] = -1
+                    if len(chunks[-1]) > 1:
+                        rechunk_dict['x'] = -1
+                if rechunk_dict:
+                    phase_da = phase_da.chunk(rechunk_dict)
                     if weight_da is not None:
-                        weight_chunks = weight_da.data.chunks
-                        if weight_chunks[0][0] != 1:
-                            weight_da = weight_da.chunk({'pair': 1})
+                        weight_da = weight_da.chunk(rechunk_dict)
 
                 # Save non-dimension coords along pair (ref, rep, BPR) for output
                 pair_coords = {}
@@ -843,45 +909,40 @@ class Stack_unwrap2d(Stack_unwrap1d):
                 phase_dask = phase_da.data
                 weight_dask = weight_da.data if weight_da is not None else None
 
-                # Resource annotation limits concurrent unwrap2d operations
-                # Workers must be configured with resources={'unwrap2d': N, 'gpu': M} to limit concurrency
-                use_gpu = device != 'cpu'
-                task_resources = {'unwrap2d': 1, 'gpu': 1} if use_gpu else {'unwrap2d': 1}
                 # Provide meta to avoid calling process_wrapper during graph construction
                 meta = np.empty((0, 0, 0), dtype=np.float32)
 
                 # Create params tuple - simple immutable structure for reliable serialization
                 # Use str() to create a fresh string copy
-                params_tuple = (str(device), max_iter, tol, cg_max_iter, cg_tol, epsilon, conncomp_size, debug)
+                params_tuple = (str(device), max_iter, tol, cg_max_iter, cg_tol, epsilon, conncomp_size, debug, semaphore)
 
                 if debug:
-                    print(f'DEBUG creating params tuple with device={params_tuple[0]!r}')
+                    print(f'DEBUG creating params tuple with device={params_tuple[0]!r}, semaphore={semaphore}')
 
                 # Use conncomp versions that return stacked (1, 2, y, x) per chunk
                 # Output shape is (n_pairs, 2, y, x)
                 meta_stacked = np.empty((0, 0, 0, 0), dtype=np.float32)
 
-                with dask.annotate(resources=task_resources):
-                    if weight_dask is None:
-                        # Pass params tuple as scalar through blockwise
-                        result_dask = dask.array.blockwise(
-                            _irls_process_no_weight_conncomp, 'pcyx',
-                            phase_dask, 'pyx',
-                            params_tuple, None,  # None index means scalar (not broadcasted)
-                            dtype=np.float32,
-                            meta=meta_stacked,
-                            new_axes={'c': 2},  # Output has new axis of size 2
-                        )
-                    else:
-                        result_dask = dask.array.blockwise(
-                            _irls_process_with_weight_conncomp, 'pcyx',
-                            phase_dask, 'pyx',
-                            weight_dask, 'pyx',
-                            params_tuple, None,
-                            dtype=np.float32,
-                            meta=meta_stacked,
-                            new_axes={'c': 2},
-                        )
+                if weight_dask is None:
+                    # Pass params tuple as scalar through blockwise
+                    result_dask = dask.array.blockwise(
+                        _irls_process_no_weight_conncomp, 'pcyx',
+                        phase_dask, 'pyx',
+                        params_tuple, None,  # None index means scalar (not broadcasted)
+                        dtype=np.float32,
+                        meta=meta_stacked,
+                        new_axes={'c': 2},  # Output has new axis of size 2
+                    )
+                else:
+                    result_dask = dask.array.blockwise(
+                        _irls_process_with_weight_conncomp, 'pcyx',
+                        phase_dask, 'pyx',
+                        weight_dask, 'pyx',
+                        params_tuple, None,
+                        dtype=np.float32,
+                        meta=meta_stacked,
+                        new_axes={'c': 2},
+                    )
 
                 # Split stacked result: (n_pairs, 2, y, x) -> unwrapped (n_pairs, y, x), conncomp (n_pairs, y, x)
                 unwrapped_dask = result_dask[:, 0, :, :]  # First channel is unwrapped phase
@@ -909,6 +970,11 @@ class Stack_unwrap2d(Stack_unwrap1d):
                     unwrap_da = unwrap_da.assign_coords(**pair_coords)
                     conncomp_da = conncomp_da.assign_coords(**pair_coords)
 
+                # Restore original spatial chunks (split is cheap)
+                if orig_y_chunks is not None and (len(orig_y_chunks) > 1 or len(orig_x_chunks) > 1):
+                    unwrap_da = unwrap_da.chunk({'y': orig_y_chunks, 'x': orig_x_chunks})
+                    conncomp_da = conncomp_da.chunk({'y': orig_y_chunks, 'x': orig_x_chunks})
+
                 unwrap_vars[var] = unwrap_da
                 conncomp_vars[var] = conncomp_da
 
@@ -922,6 +988,152 @@ class Stack_unwrap2d(Stack_unwrap1d):
 
         from .Batch import BatchUnit, Batches
         return Batches((Batch(unwrap_result), BatchUnit(conncomp_result)))
+
+    def unwrap2d_chunk(self, phase, weight=None, overlap=None,
+                       device='auto', semaphore=8, debug=False, **kwargs):
+        """
+        Unwrap phase per spatial chunk with overlap using IRLS algorithm.
+
+        Unlike unwrap2d() which requires a single spatial chunk (global unwrapping),
+        this method unwraps each spatial chunk independently with overlap margins
+        for edge continuity. Suitable for large rasters where global unwrapping
+        would exceed memory.
+
+        Parameters
+        ----------
+        phase : BatchWrap
+            Batch of wrapped phase datasets with 'pair' dimension.
+        weight : BatchUnit, optional
+            Batch of correlation values for weighting.
+        overlap : float, int, or tuple, optional
+            Overlap size. Float values are fractions of chunk size (e.g. 0.25 = 25%).
+            Int values are pixels. Tuple (overlap_y, overlap_x) allows different
+            overlap per axis. Default 0 (no overlap, fast estimation).
+        device : str, optional
+            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
+        semaphore : int, optional
+            Maximum concurrent CPU IRLS tasks per process. Default is 8.
+        debug : bool, optional
+            Print diagnostic information.
+        **kwargs
+            Additional arguments: max_iter, tol, cg_max_iter, cg_tol, epsilon,
+            conncomp_size.
+
+        Returns
+        -------
+        Batch
+            Batch of unwrapped phase.
+        """
+        import dask.array as da
+        import xarray as xr
+        from .Batch import Batch, BatchWrap, BatchUnit
+        from .BatchCore import BatchCore
+
+        assert isinstance(phase, BatchWrap), 'ERROR: phase should be a BatchWrap object'
+        assert weight is None or isinstance(weight, BatchUnit), 'ERROR: weight should be a BatchUnit object'
+
+        BatchCore._require_lazy(phase, 'unwrap2d_chunk')
+
+        resolved = Stack_unwrap2d._get_torch_device(device, debug=debug)
+        device = resolved.type
+
+        # Parse overlap
+        if overlap is None:
+            ov_y, ov_x = 0, 0
+        elif isinstance(overlap, tuple):
+            ov_y, ov_x = overlap
+        else:
+            ov_y, ov_x = overlap, overlap
+
+        # IRLS params
+        max_iter = kwargs.get('max_iter', 50)
+        tol = kwargs.get('tol', 1e-2)
+        cg_max_iter = kwargs.get('cg_max_iter', 10)
+        cg_tol = kwargs.get('cg_tol', 1e-3)
+        epsilon = kwargs.get('epsilon', 1e-2)
+        conncomp_size = kwargs.get('conncomp_size', 30)
+        params_tuple = (str(device), max_iter, tol, cg_max_iter, cg_tol,
+                        epsilon, conncomp_size, debug, semaphore)
+
+        result = {}
+        for key in phase.keys():
+            ds = phase[key]
+            weight_ds = weight[key] if weight is not None and key in weight else None
+
+            data_vars = [v for v in ds.data_vars
+                        if 'y' in ds[v].dims and 'x' in ds[v].dims]
+
+            unwrap_vars = {}
+            for var in data_vars:
+                phase_da = ds[var]
+                weight_da = weight_ds[var] if weight_ds is not None else None
+
+                phase_dask = phase_da.data
+                has_weight = weight_da is not None
+
+                # Ensure pair dim chunked to 1
+                if 'pair' in phase_da.dims and phase_dask.chunks[0][0] != 1:
+                    phase_da = phase_da.chunk({'pair': 1})
+                    phase_dask = phase_da.data
+                    if has_weight:
+                        weight_da = weight_da.chunk({'pair': 1})
+
+                # Match weight chunks to phase
+                if has_weight:
+                    weight_dask = weight_da.data
+                    if weight_dask.chunks != phase_dask.chunks:
+                        weight_dask = weight_dask.rechunk(phase_dask.chunks)
+                else:
+                    weight_dask = None
+
+                # Compute overlap depth
+                cy0 = phase_dask.chunks[-2][0]
+                cx0 = phase_dask.chunks[-1][0]
+                depth_y = max(1, int(ov_y * cy0) if isinstance(ov_y, float) else int(ov_y))
+                depth_x = max(1, int(ov_x * cx0) if isinstance(ov_x, float) else int(ov_x))
+
+                depth_3d = {0: 0, 1: depth_y, 2: depth_x}
+
+                if debug:
+                    print(f"unwrap2d_chunk {key}/{var}: depth=({depth_y},{depth_x}), "
+                          f"chunks={phase_dask.chunksize}")
+
+                # Capture params in closure (map_overlap doesn't support scalar args)
+                def _make_kernel(pt, hw):
+                    def fn(phase_block, *args):
+                        w = args[0] if hw else None
+                        return _irls_overlap_kernel(phase_block, w, pt) if hw \
+                            else _irls_overlap_kernel(phase_block, pt)
+                    return fn
+                kernel = _make_kernel(params_tuple, has_weight)
+
+                overlap_args = []
+                depths = [depth_3d]
+                if has_weight:
+                    overlap_args.append(weight_dask)
+                    depths.append(depth_3d)
+
+                result_dask = da.map_overlap(
+                    kernel,
+                    phase_dask, *overlap_args,
+                    depth=depths,
+                    boundary='none',
+                    dtype=np.float32,
+                )
+
+                unwrap_da = xr.DataArray(
+                    result_dask,
+                    dims=phase_da.dims,
+                    coords=phase_da.coords
+                )
+                unwrap_da.attrs['units'] = 'radians'
+                unwrap_vars[var] = unwrap_da
+
+            result[key] = xr.Dataset(unwrap_vars, attrs=ds.attrs)
+            if ds.rio.crs is not None:
+                result[key].rio.write_crs(ds.rio.crs, inplace=True)
+
+        return Batch(result)
 
     def _process_irls_slice(self, phase_np, weight_np, device,
                             max_iter, tol, cg_max_iter, cg_tol, epsilon, conncomp_size, debug):
@@ -1356,31 +1568,27 @@ DEFOMAX_CYCLE  {defomax}
                 phase_dask = phase_da.data
                 dim_str = ''.join(chr(ord('a') + i) for i in range(phase_dask.ndim))
 
-                # Resource annotation limits concurrent snaphu operations
-                # Workers must be configured with resources={'snaphu': N} to limit concurrency
-                task_resources = {'snaphu': 1}
                 # Provide meta to avoid calling wrapper during graph construction
                 meta = np.empty((0,) * phase_dask.ndim, dtype=np.float32)
 
-                with dask.annotate(resources=task_resources):
-                    if corr_da is None:
-                        result_dask = dask.array.blockwise(
-                            wrapper, dim_str,
-                            phase_dask, dim_str,
-                            dtype=np.float32,
-                            meta=meta,
-                        )
-                    else:
-                        corr_dask = corr_da.data
-                        def wrapper_with_corr(phase_chunk, corr_chunk):
-                            return wrapper(phase_chunk, corr_chunk)
-                        result_dask = dask.array.blockwise(
-                            wrapper_with_corr, dim_str,
-                            phase_dask, dim_str,
-                            corr_dask, dim_str,
-                            dtype=np.float32,
-                            meta=meta,
-                        )
+                if corr_da is None:
+                    result_dask = dask.array.blockwise(
+                        wrapper, dim_str,
+                        phase_dask, dim_str,
+                        dtype=np.float32,
+                        meta=meta,
+                    )
+                else:
+                    corr_dask = corr_da.data
+                    def wrapper_with_corr(phase_chunk, corr_chunk):
+                        return wrapper(phase_chunk, corr_chunk)
+                    result_dask = dask.array.blockwise(
+                        wrapper_with_corr, dim_str,
+                        phase_dask, dim_str,
+                        corr_dask, dim_str,
+                        dtype=np.float32,
+                        meta=meta,
+                    )
 
                 unwrap_da = xr.DataArray(
                     result_dask,

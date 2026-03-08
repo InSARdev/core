@@ -151,41 +151,71 @@ class Stack_stl(Stack_sbas):
         n_dates_out = len(dt_periodic)
         n_dates_in = data.date.size
 
-        # Use rechunk2d for uniform chunk sizes based on memory
-        # Multiplier accounts for STL internal memory (trend, seasonal, resid, weights, etc.)
-        # Effective memory: 8 * n_dates_in * 16 bytes (complex128) per pixel
-        from .utils_dask import rechunk2d
-        mem_per_pixel = 8 * n_dates_in * 16  # complex128 = 16 bytes
-        optimal = rechunk2d((data.y.size, data.x.size), element_bytes=mem_per_pixel)
-        chunks_y, chunks_x = optimal['y'], optimal['x']
+        # No rechunk on dim 0 — pass per-date delayed lists to kernel.
+        data_dask = data.data
 
-        # Rechunk: all dates together (-1), auto-chunked y,x
-        first_dim = data.dims[0]
-        data = data.chunk({first_dim: -1, 'y': chunks_y, 'x': chunks_x})
+        y_chunks = data_dask.chunks[1]
+        x_chunks = data_dask.chunks[2]
+        y_breaks = [0] + list(np.cumsum(y_chunks))
+        x_breaks = [0] + list(np.cumsum(x_chunks))
 
-        # Use blockwise to avoid embedding large arrays in the graph
-        def process_block(data_block):
-            # data_block: (n_dates, y_chunk, x_chunk)
-            # transpose to (y, x, n_dates) for vectorized STL
-            data_transposed = data_block.transpose(1, 2, 0)
+        def process_chunks(data_chunks):
+            import math
+            from .utils_dask import get_dask_chunk_size_mb
+            chunks = [np.asarray(c) for c in data_chunks]
+            ny, nx = chunks[0].shape[1], chunks[0].shape[2]
+            n_dates_in_local = sum(c.shape[0] for c in chunks)
+            result = np.empty((3, n_dates_out, ny, nx), dtype=np.float32)
             vec_stl = np.vectorize(
                 lambda ts: utils_stl.stl1d(ts, dt, dt_periodic, periods, robust),
                 signature='(n)->(m),(m),(m)'
             )
-            # result: (3, y, x, n_dates_out) after asarray
-            block = np.asarray(vec_stl(data_transposed))
-            del vec_stl, data_transposed
-            # transpose to (3, n_dates_out, y, x)
-            return block.transpose(0, 3, 1, 2).astype(np.float32)
+            # Calculate sub-tile size from dask chunk budget.
+            # Per sub-tile memory: input (n_dates_in × sub_pixels × 4) + output (3 × n_dates_out × sub_pixels × 4)
+            per_pixel_bytes = (n_dates_in_local + 3 * n_dates_out) * 4
+            budget_bytes = int(get_dask_chunk_size_mb() * 1024 * 1024)
+            max_sub_pixels = max(256, budget_bytes // max(1, per_pixel_bytes))
+            sub_side = int(math.sqrt(max_sub_pixels))
+            sub_h = min(sub_side, ny)
+            sub_w = min(sub_side, nx)
+            for ty0 in range(0, ny, sub_h):
+                ty1 = min(ty0 + sub_h, ny)
+                for tx0 in range(0, nx, sub_w):
+                    tx1 = min(tx0 + sub_w, nx)
+                    if len(chunks) == 1:
+                        tile = chunks[0][:, ty0:ty1, tx0:tx1]
+                    else:
+                        tile = np.concatenate(
+                            [c[:, ty0:ty1, tx0:tx1] for c in chunks], axis=0
+                        )
+                    # (n_dates, sub_h, sub_w) -> (sub_h, sub_w, n_dates)
+                    tile_t = tile.transpose(1, 2, 0)
+                    del tile
+                    # result: (3, sub_h, sub_w, n_dates_out) after asarray
+                    block = np.asarray(vec_stl(tile_t))
+                    del tile_t
+                    # (3, sub_h, sub_w, n_dates_out) -> (3, n_dates_out, sub_h, sub_w)
+                    result[:, :, ty0:ty1, tx0:tx1] = block.transpose(0, 3, 1, 2)
+                    del block
+            del vec_stl
+            return result
 
-        data_dask = data.data
-        models = dask.array.map_blocks(
-            process_block, data_dask,
-            dtype=np.float32,
-            drop_axis=0,
-            new_axis=[0, 1],
-            chunks=(3, n_dates_out) + data_dask.chunks[1:],
-        )
+        blocks_rows = []
+        for bj in range(len(y_breaks) - 1):
+            y0, y1 = y_breaks[bj], y_breaks[bj + 1]
+            blocks_row = []
+            for bk in range(len(x_breaks) - 1):
+                x0, x1 = x_breaks[bk], x_breaks[bk + 1]
+                td_list = data_dask[:, y0:y1, x0:x1].to_delayed().ravel().tolist()
+                block = dask.array.from_delayed(
+                    dask.delayed(process_chunks)(td_list),
+                    shape=(3, n_dates_out, y1 - y0, x1 - x0),
+                    dtype=np.float32,
+                )
+                blocks_row.append(block)
+            blocks_rows.append(dask.array.concatenate(blocks_row, axis=3))
+
+        models = dask.array.concatenate(blocks_rows, axis=2)
 
         coords = {'date': dt_periodic.astype('datetime64[ns]'), 'y': data.y, 'x': data.x}
 
@@ -194,9 +224,6 @@ class Stack_stl(Stack_sbas):
         keys_vars = {}
         for varidx, varname in enumerate(varnames):
             var_data = models[varidx]
-            # Rechunk to date=1 for efficient per-slice downstream operations (preserve spatial chunks)
-            if hasattr(var_data, 'rechunk'):
-                var_data = var_data.rechunk({0: 1})
             keys_vars[varname] = xr.DataArray(var_data, coords=coords)
         model = xr.Dataset({**keys_vars})
         del models

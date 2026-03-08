@@ -25,7 +25,7 @@ zarr.config.set({'array.write_empty_chunks': True})
 
 def snapshot(*args, store: str | None = None, storage_options: dict[str, str] | None = None,
                 compat: bool = True, caption: str | None = 'Snapshotting...',
-                allow_rechunk: bool = False, n_jobs: int = 1, debug=False):
+                n_bursts: int = 2, debug=False, **kwargs):
     """
     Save and open a Zarr store or just open it when no data arguments are provided.
     This function wraps save(...) and open(...) functions.
@@ -45,24 +45,20 @@ def snapshot(*args, store: str | None = None, storage_options: dict[str, str] | 
         If False, only allow a dictionary of datasets. Default is True.
     caption : str, optional
         Caption for the progress bar. Default is 'Snapshotting...'.
-    allow_rechunk : bool, optional
-        If True, rechunk loaded data to optimal chunk sizes based on dask.config['array.chunk-size'].
-        If False (default), rechunk to single spatial chunks (-1 for y,x) for MPS/GPU compatibility.
-    n_jobs : int, optional
-        Number of bursts to process in parallel during save. Default is 1 (sequential).
-        Higher values increase parallelism but also memory usage and file descriptors.
+    n_bursts : int, optional
+        Number of bursts to process in parallel during save. Default 2.
     debug : bool, optional
         If True, print debug information. Default is False.
     """
     # call the function without data arguments to only open existing store
     if len(args) > 0:
-        save(*args, store=store, storage_options=storage_options, compat=compat, caption=caption, n_jobs=n_jobs, debug=debug)
+        save(*args, store=store, storage_options=storage_options, compat=compat, caption=caption, n_bursts=n_bursts, debug=debug)
     # Always use -1 for open (fast parallel loading)
     return open(store=store, storage_options=storage_options, compat=compat,
-                allow_rechunk=allow_rechunk, n_jobs=-1, debug=debug)
+                n_jobs=-1, debug=debug)
 
 def save(*args, store, storage_options: dict[str, str] | None = None, compat: bool = True,
-            caption: str | None = 'Saving...', n_jobs: int = 1, debug=False):
+            caption: str | None = 'Saving...', n_bursts: int = 2, debug=False):
     """
     Save multiple xarray.Datasets into one Zarr store, each under its own subgroup.
 
@@ -80,9 +76,8 @@ def save(*args, store, storage_options: dict[str, str] | None = None, compat: bo
     compat : bool, optional
         If True, automatically pack datasets saved as a list or a single dataset into a dictionary.
         If False, only allow a dictionary of datasets. Default is True.
-    n_jobs : int, optional
-        Number of bursts to process in parallel. Default is 1 (sequential).
-        Higher values increase parallelism but also memory usage and file descriptors.
+    n_bursts : int, optional
+        Number of bursts to process in parallel. Default 2.
         Interleaved dependent outputs (e.g., phase+conncomp) are always written together
         to share upstream computation.
     debug : bool, optional
@@ -94,14 +89,18 @@ def save(*args, store, storage_options: dict[str, str] | None = None, compat: bo
     Interleaved outputs from the same burst are written together to avoid
     duplicate computation.
     """
+    import warnings
     import xarray as xr
     import dask
     import dask.array as da
     import numpy as np
     import zarr
     import gc
-    from dask.distributed import get_client
+    from dask.distributed import get_client, wait
     from tqdm.auto import tqdm
+
+    # Suppress zarr v3 consolidated metadata and .DS_Store warnings
+    warnings.filterwarnings('ignore', category=UserWarning, module='zarr')
 
     interleave = len(args) > 1
 
@@ -151,11 +150,30 @@ def save(*args, store, storage_options: dict[str, str] | None = None, compat: bo
         burst_groups.setdefault(burst_id, []).append((grp, ds))
 
     burst_ids = list(burst_groups.keys())
-    n_bursts = len(burst_ids)
+    n_bursts_total = len(burst_ids)
 
-    # Process bursts in batches of n_jobs
-    for batch_start in tqdm(range(0, n_bursts, n_jobs), desc=caption.ljust(25), total=(n_bursts + n_jobs - 1) // n_jobs):
-        batch_burst_ids = burst_ids[batch_start:batch_start + n_jobs]
+    # Get dask distributed client (if available)
+    try:
+        _client = get_client()
+    except ValueError:
+        _client = None
+
+    # Pre-scan to get total pairs for progress bar
+    n_pairs = 0
+    for grp, ds in burst_groups[burst_ids[0]]:
+        for var_name in ds.data_vars:
+            da_xr = ds[var_name]
+            if hasattr(da_xr.data, 'dask') and da_xr.ndim >= 3:
+                n_pairs = da_xr.shape[0]
+                break
+        if n_pairs > 0:
+            break
+    total = n_bursts_total * max(n_pairs, 1)
+
+    # Process bursts in batches of n_bursts
+    pbar = tqdm(desc=caption.ljust(25), total=total)
+    for batch_start in range(0, n_bursts_total, n_bursts):
+        batch_burst_ids = burst_ids[batch_start:batch_start + n_bursts]
 
         # Collect all datasets for this batch
         batch_datas = {}
@@ -163,7 +181,7 @@ def save(*args, store, storage_options: dict[str, str] | None = None, compat: bo
             for grp, ds in burst_groups[burst_id]:
                 batch_datas[grp] = ds
 
-        # Write this batch using dask.array.store() for shared computation
+        # Prepare zarr targets for dask arrays
         sources = []
         targets = []
         grp_info = []  # Track (grp, ds, grp_store) for metadata writing
@@ -186,8 +204,12 @@ def save(*args, store, storage_options: dict[str, str] | None = None, compat: bo
                 # Get dimension names for zarr v3 metadata
                 dim_names = list(da_xr.dims)
                 if hasattr(da_xr.data, 'dask'):
-                    # Create zarr array target with proper shape/chunks/dtype and dimension_names
+                    # Use dask array's spatial chunk sizes for zarr storage,
+                    # but always store pair/date dim as 1 so snapshots work
+                    # for both 1D (along pairs) and 2D (per pair) processing.
                     chunks = da_xr.data.chunksize
+                    if da_xr.ndim >= 3:
+                        chunks = (1,) * (da_xr.ndim - 2) + chunks[-2:]
                     z = ds_grp.create_array(
                         var_name,
                         shape=da_xr.shape,
@@ -209,9 +231,131 @@ def save(*args, store, storage_options: dict[str, str] | None = None, compat: bo
                         overwrite=True
                     )
 
-        # Store all dask arrays in this batch together - shares upstream computation
+        # Write 3D data in batches of ~2*n_workers.
+        # Two paths depending on pair-chunk structure:
+        #   Per-pair (chunksize[0]==1): batch by pairs — many pair-chunks,
+        #     few spatial blocks. Joint optimize is safe (different vars have
+        #     independent source layers).
+        #   Merged (chunksize[0]>1): batch by spatial blocks — few pair-chunks,
+        #     many spatial blocks. Each slice optimized SEPARATELY (joint
+        #     optimize merges shared layers, cull can't remove tasks).
+        # Both paths use optimize_graph=False on client.compute to prevent
+        # the client from re-merging separately-culled graphs.
         if sources:
-            da.store(sources, targets, lock=False)
+            idx_3d = [i for i, s in enumerate(sources) if s.ndim >= 3]
+            idx_2d = [i for i, s in enumerate(sources) if s.ndim < 3]
+            # 2D sources: small, write directly
+            if idx_2d:
+                da.store([sources[i] for i in idx_2d],
+                         [targets[i] for i in idx_2d], lock=False)
+            # 3D sources: write to zarr
+            if idx_3d:
+                n_pairs = sources[idx_3d[0]].shape[0]
+                n_batch_progress = len(batch_burst_ids) * n_pairs
+
+                n_vars = max(len(idx_3d) // len(batch_burst_ids), 1)
+                if _client is not None:
+                    n_workers = max(len(_client.nthreads()), 1)
+                else:
+                    n_workers = 1
+                batch_size = max(n_workers // n_vars, 1)
+
+                all_per_pair = all(sources[i].chunksize[0] == 1 for i in idx_3d)
+
+                if all_per_pair:
+                    # --- Per-pair path: batch by pairs ---
+                    batch_tgt = [targets[i] for i in idx_3d]
+                    if _client is not None:
+                        for k in range(0, n_pairs, batch_size):
+                            k_end = min(k + batch_size, n_pairs)
+                            batch_src = list(dask.optimize(
+                                *[sources[i][k:k_end] for i in idx_3d]))
+                            batch_reg = [(slice(k, k_end),)] * len(idx_3d)
+                            d = da.store(batch_src, batch_tgt,
+                                         regions=batch_reg,
+                                         lock=False, compute=False)
+                            futures = _client.compute(d,
+                                                      optimize_graph=False)
+                            wait(futures)
+                            pbar.update((k_end - k) * len(batch_burst_ids))
+                    else:
+                        for k in range(0, n_pairs, batch_size):
+                            k_end = min(k + batch_size, n_pairs)
+                            batch_src = list(dask.optimize(
+                                *[sources[i][k:k_end] for i in idx_3d]))
+                            batch_reg = [(slice(k, k_end),)] * len(idx_3d)
+                            da.store(batch_src, batch_tgt,
+                                     regions=batch_reg, lock=False)
+                            pbar.update((k_end - k) * len(batch_burst_ids))
+                else:
+                    # Merged pairs (from blockwise ops like trend1d).
+                    # Batch by spatial tiles (y-chunk × x-chunk).
+                    # Optimize full sources once upfront — slicing the
+                    # optimized graph per tile is cheap, while calling
+                    # dask.optimize per batch on a deep graph is O(graph).
+                    if _client is not None:
+                        n_workers = max(len(_client.nthreads()), 1)
+                    else:
+                        n_workers = 1
+                    n_vars = max(len(idx_3d) // len(batch_burst_ids), 1)
+                    tiles_per_batch = max(n_workers // n_vars, 1)
+
+                    # Optimize once
+                    opt_sources = list(dask.optimize(
+                        *[sources[i] for i in idx_3d]))
+
+                    y_chunks = opt_sources[0].chunks[1]
+                    x_chunks = opt_sources[0].chunks[2]
+                    y_offsets = [0] + list(np.cumsum(y_chunks))
+                    x_offsets = [0] + list(np.cumsum(x_chunks))
+                    tiles = [(y_offsets[iy], y_offsets[iy+1],
+                              x_offsets[ix], x_offsets[ix+1])
+                             for iy in range(len(y_chunks))
+                             for ix in range(len(x_chunks))]
+                    n_tiles = len(tiles)
+                    opt_targets = [targets[i] for i in idx_3d]
+
+                    if _client is not None:
+                        done_tiles = 0
+                        for tb in range(0, n_tiles, tiles_per_batch):
+                            tb_end = min(tb + tiles_per_batch, n_tiles)
+                            batch_src_all = []
+                            batch_tgt_all = []
+                            batch_reg_all = []
+                            for t in range(tb, tb_end):
+                                ys, ye, xs, xe = tiles[t]
+                                for vi, src in enumerate(opt_sources):
+                                    batch_src_all.append(src[:, ys:ye, xs:xe])
+                                    batch_tgt_all.append(opt_targets[vi])
+                                    batch_reg_all.append((slice(None), slice(ys, ye), slice(xs, xe)))
+                            d = da.store(batch_src_all, batch_tgt_all, lock=False,
+                                         regions=batch_reg_all, compute=False)
+                            with dask.config.set(delayed_optimize=None):
+                                futures = _client.compute(d)
+                            wait(futures)
+                            new_done = n_pairs * tb_end // n_tiles
+                            pbar.update(new_done - done_tiles)
+                            done_tiles = new_done
+                    else:
+                        done_tiles = 0
+                        for tb in range(0, n_tiles, tiles_per_batch):
+                            tb_end = min(tb + tiles_per_batch, n_tiles)
+                            batch_src_all = []
+                            batch_tgt_all = []
+                            batch_reg_all = []
+                            for t in range(tb, tb_end):
+                                ys, ye, xs, xe = tiles[t]
+                                for vi, src in enumerate(opt_sources):
+                                    batch_src_all.append(src[:, ys:ye, xs:xe])
+                                    batch_tgt_all.append(opt_targets[vi])
+                                    batch_reg_all.append((slice(None), slice(ys, ye), slice(xs, xe)))
+                            da.store(batch_src_all, batch_tgt_all, lock=False,
+                                     regions=batch_reg_all)
+                            new_done = n_pairs * tb_end // n_tiles
+                            pbar.update(new_done - done_tiles)
+                            done_tiles = new_done
+            else:
+                pbar.update(1)
 
         # Write xarray metadata (coords, attrs) AFTER data is written
         for grp, ds, grp_store in grp_info:
@@ -229,6 +373,8 @@ def save(*args, store, storage_options: dict[str, str] | None = None, compat: bo
         del sources, targets, batch_datas, grp_info
         gc.collect()
 
+    pbar.close()
+
     # consolidate metadata for the groups in the store
     zarr.consolidate_metadata(store, zarr_format=3)
     del datas, burst_groups
@@ -240,7 +386,7 @@ def save(*args, store, storage_options: dict[str, str] | None = None, compat: bo
         pass
 
 def open(store: str, storage_options: dict[str, str] | None = None, compat: bool = True,
-            caption: str | None = 'Opening...', allow_rechunk: bool = False, n_jobs: int = -1, debug=False):
+            caption: str | None = 'Opening...', n_jobs: int = -1, debug=False, **kwargs):
     """
     Load a Zarr store created by save(...).
 
@@ -253,9 +399,6 @@ def open(store: str, storage_options: dict[str, str] | None = None, compat: bool
     compat : bool, optional
         If True, automatically unpack datasets saved as a list or a single dataset.
         If False, return a dictionary of datasets. Default is True.
-    allow_rechunk : bool, optional
-        If True, rechunk to optimal chunk sizes based on dask.config['array.chunk-size'].
-        If False (default), rechunk to single spatial chunks (-1 for y,x) for MPS/GPU compatibility.
     n_jobs : int, optional
         Number of parallel jobs to use for opening. Default is -1 (use all available cores).
     debug : bool, optional
@@ -266,13 +409,15 @@ def open(store: str, storage_options: dict[str, str] | None = None, compat: bool
     Stack or Batch or Batches
     """
     import os
+    import warnings
     import dask
     import zarr
     import xarray as xr
     import joblib
     from tqdm.auto import tqdm
     from pydoc import locate
-    from .utils_dask import rechunk2d
+    # Suppress zarr v3 consolidated metadata and .DS_Store warnings
+    warnings.filterwarnings('ignore', category=UserWarning, module='zarr')
 
     # Check if store is a string path or a store object
     is_store_object = not isinstance(store, str)
@@ -311,42 +456,38 @@ def open(store: str, storage_options: dict[str, str] | None = None, compat: bool
     dss = dict(results)
     del results
 
-    # Apply rechunking based on allow_rechunk setting
-    # allow_rechunk=True: rechunk to dask config size (for efficient processing)
-    # allow_rechunk=False: rechunk to single spatial chunks (for MPS/GPU compatibility)
-    for key, ds in dss.items():
-        rechunked_vars = {}
-        for var_name in ds.data_vars:
-            arr = ds[var_name]
-            if not (arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x')):
-                continue
+    # Rechunk spatial dims to match dask config chunk-size budget,
+    # similar to Stack.load(). Split or merge zarr disk chunks so
+    # each dask chunk is close to the configured memory budget.
+    from .utils_dask import rechunk2d, get_dask_chunk_size_mb
+    _target_mb = get_dask_chunk_size_mb()
 
-            if allow_rechunk:
-                # Rechunk to dask config size
-                y_size, x_size = arr.shape[-2], arr.shape[-1]
-                element_bytes = arr.dtype.itemsize
-                optimal = rechunk2d((y_size, x_size), element_bytes)
-                if arr.ndim == 3:
-                    chunks = {arr.dims[0]: 1, 'y': optimal['y'], 'x': optimal['x']}
-                else:
-                    chunks = optimal
-            else:
-                # Single spatial chunk for MPS/GPU compatibility
-                if arr.ndim == 3:
-                    chunks = {arr.dims[0]: 1, 'y': -1, 'x': -1}
-                else:
-                    chunks = {'y': -1, 'x': -1}
-
-            rechunked_vars[var_name] = arr.chunk(chunks)
-        if rechunked_vars:
-            dss[key] = ds.assign(rechunked_vars)
-
-    if debug:
-        if allow_rechunk:
-            dask_chunk_mb = int(dask.config.get('array.chunk-size', '128 MiB').replace(' MiB', '').replace(' MB', ''))
-            print(f"NOTE open: rechunking to dask.config['array.chunk-size']={dask_chunk_mb} MB")
-        else:
-            print(f"NOTE open: using single spatial chunk (allow_rechunk=False)")
+    for grp_key, ds in dss.items():
+        # Find the heaviest 3D variable to compute element_bytes
+        max_elem = 0
+        spatial_shape = None
+        spatial_chunks = None
+        dim0_name = None
+        for vname in ds.data_vars:
+            da_var = ds[vname]
+            if da_var.ndim >= 3 and 'y' in da_var.dims and 'x' in da_var.dims:
+                d0 = da_var.dims[0]
+                d0_chunk = da_var.data.chunks[0][0] if hasattr(da_var.data, 'chunks') else da_var.sizes[d0]
+                eb = d0_chunk * da_var.dtype.itemsize
+                if eb > max_elem:
+                    max_elem = eb
+                    spatial_shape = (da_var.sizes['y'], da_var.sizes['x'])
+                    yi = da_var.dims.index('y')
+                    xi = da_var.dims.index('x')
+                    spatial_chunks = (da_var.data.chunks[yi], da_var.data.chunks[xi])
+                    dim0_name = d0
+        if max_elem > 0 and spatial_shape is not None:
+            _opt = rechunk2d(spatial_shape, element_bytes=max_elem,
+                             input_chunks=spatial_chunks, target_mb=_target_mb,
+                             merge=True)
+            if _opt['y'] != spatial_chunks[0] or _opt['x'] != spatial_chunks[1]:
+                rechunk_dict = {'y': _opt['y'], 'x': _opt['x']}
+                dss[grp_key] = ds.chunk(rechunk_dict)
 
     if interleave:
         # unpack interleaved datasets and return as Batches for chaining

@@ -7,7 +7,7 @@
 #
 # See the LICENSE file in the insardev_pygmtsar directory for license terms.
 # ----------------------------------------------------------------------------
-__version__ = '2026.2.11'
+__version__ = '2026.3.8'
 
 # radar parameters management
 from .PRM import PRM

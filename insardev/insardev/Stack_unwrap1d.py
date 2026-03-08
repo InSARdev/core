@@ -107,6 +107,7 @@ class Stack_unwrap1d(BatchCore):
 
             result_ds = xr.Dataset(result_vars)
             result_ds.attrs = ds.attrs
+            import rioxarray
             if ds.rio.crs is not None:
                 result_ds = result_ds.rio.write_crs(ds.rio.crs)
             results[key] = result_ds
@@ -117,7 +118,6 @@ class Stack_unwrap1d(BatchCore):
         """Internal method for lstsq on DataArray - LAZY dask processing."""
         import xarray as xr
         import pandas as pd
-        import dask
         import dask.array as da
 
         # Extract pairs from data coords (inline _get_pairs logic for DataArray)
@@ -132,57 +132,65 @@ class Stack_unwrap1d(BatchCore):
         n_dates = len(dates)
         n_pairs = len(pair_dates)
 
-        # Use rechunk2d for uniform chunk sizes based on actual memory usage
-        # WA tensor is (n_pixels, n_pairs, n_intervals) - dominant memory consumer
-        # Memory per pixel = n_pairs * n_intervals * 4 bytes
-        from .utils_dask import rechunk2d
-        n_intervals = n_dates - 1
-        mem_per_pixel = n_pairs * n_intervals * 4
-        optimal = rechunk2d((data.y.size, data.x.size), element_bytes=mem_per_pixel)
-        chunks_y, chunks_x = optimal['y'], optimal['x']
+        # No rechunk on dim 0 — pass per-date delayed lists to kernel.
+        # Pixel batching inside lstsq_to_dates_numpy handles memory.
+        import dask
 
-        # Rechunk: all pairs together (-1), auto-chunked y,x
-        first_dim = data.dims[0]
-        data = data.chunk({first_dim: -1, 'y': chunks_y, 'x': chunks_x})
+        data_dask = data.data
         if weight is not None:
-            weight = weight.chunk({first_dim: -1, 'y': chunks_y, 'x': chunks_x})
+            weight_dask = weight.data
+            if weight_dask.chunks[1] != data_dask.chunks[1] or weight_dask.chunks[2] != data_dask.chunks[2]:
+                import warnings
+                warnings.warn(
+                    f'lstsq: weight spatial chunks {weight_dask.chunks[1:]} differ from data {data_dask.chunks[1:]}, '
+                    f'rechunking weight to match.',
+                    stacklevel=4,
+                )
+                weight_dask = weight_dask.rechunk({1: data_dask.chunks[1], 2: data_dask.chunks[2]})
+        else:
+            weight_dask = None
 
-        # Use blockwise to avoid embedding large arrays in the graph
-        def process_block(data_block, weight_block=None):
+        y_chunks = data_dask.chunks[1]
+        x_chunks = data_dask.chunks[2]
+        y_breaks = [0] + list(np.cumsum(y_chunks))
+        x_breaks = [0] + list(np.cumsum(x_chunks))
+
+        def process_chunks(data_chunks, weight_chunks=None):
             """Process a spatial block - all pairs, subset of y,x."""
-            # PyTorch batched weighted least squares
+            # Pass chunk lists directly to kernel — it handles
+            # flattening without 3D intermediate copy.
             ts_block, _ = utils_unwrap1d.lstsq_to_dates_numpy(
-                data_block, weight_block, pair_dates,
+                data_chunks, weight_chunks, pair_dates,
                 device=device, cumsum=cumsum, debug=False
             )
             return ts_block.astype(np.float32)
 
-        data_dask = data.data
-        task_resources = {'lstsq': 1, 'gpu': 1} if device != 'cpu' else {'lstsq': 1}
-        if weight is not None:
-            weight_dask = weight.data
-            with dask.annotate(resources=task_resources):
-                result_dask = da.map_blocks(
-                    process_block, data_dask, weight_dask,
-                    dtype=np.float32,
-                    drop_axis=0,
-                    new_axis=0,
-                    chunks=(n_dates,) + data_dask.chunks[1:],
-                )
-        else:
-            def process_block_no_weight(data_block):
-                return process_block(data_block, None)
-            with dask.annotate(resources=task_resources):
-                result_dask = da.map_blocks(
-                    process_block_no_weight, data_dask,
-                    dtype=np.float32,
-                    drop_axis=0,
-                    new_axis=0,
-                    chunks=(n_dates,) + data_dask.chunks[1:],
-                )
+        blocks_rows = []
+        for bj in range(len(y_breaks) - 1):
+            y0, y1 = y_breaks[bj], y_breaks[bj + 1]
+            blocks_row = []
+            for bk in range(len(x_breaks) - 1):
+                x0, x1 = x_breaks[bk], x_breaks[bk + 1]
+                td_list = data_dask[:, y0:y1, x0:x1] \
+                    .to_delayed().ravel().tolist()
+                if weight_dask is not None:
+                    tw_list = weight_dask[:, y0:y1, x0:x1] \
+                        .to_delayed().ravel().tolist()
+                    block = da.from_delayed(
+                        dask.delayed(process_chunks)(td_list, tw_list),
+                        shape=(n_dates, y1 - y0, x1 - x0),
+                        dtype=np.float32,
+                    )
+                else:
+                    block = da.from_delayed(
+                        dask.delayed(process_chunks)(td_list),
+                        shape=(n_dates, y1 - y0, x1 - x0),
+                        dtype=np.float32,
+                    )
+                blocks_row.append(block)
+            blocks_rows.append(blocks_row)
 
-        # Rechunk to date=1 for efficient per-slice downstream operations (preserve spatial chunks)
-        ts_dask = result_dask.rechunk({0: 1})
+        result_dask = da.block(blocks_rows)
 
         # Build coordinates
         coords = {
@@ -192,7 +200,7 @@ class Stack_unwrap1d(BatchCore):
         }
 
         return xr.DataArray(
-            ts_dask,
+            result_dask,
             coords=coords,
             dims=('date', 'y', 'x'),
             name='displacement'
@@ -289,6 +297,7 @@ class Stack_unwrap1d(BatchCore):
 
             result_ds = xr.Dataset(result_vars)
             result_ds.attrs = ds.attrs
+            import rioxarray
             if ds.rio.crs is not None:
                 result_ds = result_ds.rio.write_crs(ds.rio.crs)
             results[key] = result_ds
@@ -300,7 +309,6 @@ class Stack_unwrap1d(BatchCore):
         """Internal method for IRLS unwrapping on DataArray returning pairs - LAZY."""
         import xarray as xr
         import pandas as pd
-        import dask
         import dask.array as da
 
         # Extract pairs from data coords (inline _get_pairs logic for DataArray)
@@ -325,59 +333,66 @@ class Stack_unwrap1d(BatchCore):
             else:
                 original_coords[k] = vals
 
-        # Use rechunk2d for uniform chunk sizes based on memory
-        # Per-pixel memory in unwrap1d_pairs_numpy:
-        #   phases_flat (view of input), weights_flat (view or ones_like),
-        #   unwrapped_flat (new allocation) — all n_pairs * float32
-        # Torch batch tensors are bounded by batch_size, not n_pixels
-        from .utils_dask import rechunk2d
-        mem_per_pixel = n_pairs * 12  # 3 arrays × n_pairs × 4 bytes (float32)
-        optimal = rechunk2d((data.y.size, data.x.size), element_bytes=mem_per_pixel)
-        chunks_y, chunks_x = optimal['y'], optimal['x']
+        # No rechunk on dim 0 — pass per-date delayed lists to kernel.
+        # Pixel batching inside unwrap1d_pairs_numpy handles memory.
+        import dask
 
-        # Rechunk: all pairs together (-1), auto-chunked y,x
-        first_dim = data.dims[0]
-        data = data.chunk({first_dim: -1, 'y': chunks_y, 'x': chunks_x})
+        data_dask = data.data
         if weight is not None:
-            weight = weight.chunk({first_dim: -1, 'y': chunks_y, 'x': chunks_x})
+            weight_dask = weight.data
+            if weight_dask.chunks[1] != data_dask.chunks[1] or weight_dask.chunks[2] != data_dask.chunks[2]:
+                import warnings
+                warnings.warn(
+                    f'unwrap1d: weight spatial chunks {weight_dask.chunks[1:]} differ from data {data_dask.chunks[1:]}, '
+                    f'rechunking weight to match.',
+                    stacklevel=4,
+                )
+                weight_dask = weight_dask.rechunk({1: data_dask.chunks[1], 2: data_dask.chunks[2]})
+        else:
+            weight_dask = None
 
-        # Use blockwise to avoid embedding large arrays in the graph
-        def process_block(data_block, weight_block=None):
+        y_chunks = data_dask.chunks[1]
+        x_chunks = data_dask.chunks[2]
+        y_breaks = [0] + list(np.cumsum(y_chunks))
+        x_breaks = [0] + list(np.cumsum(x_chunks))
+
+        def process_chunks(data_chunks, weight_chunks=None):
             """Process a spatial block - all pairs, subset of y,x."""
+            # Pass chunk lists directly to kernel — it handles
+            # flattening without 3D intermediate copy.
             unwrapped_block = utils_unwrap1d.unwrap1d_pairs_numpy(
-                data_block, weight_block, pair_dates,
+                data_chunks, weight_chunks, pair_dates,
                 device=device, max_iter=max_iter, epsilon=epsilon,
                 batch_size=batch_size, debug=False
             )
             return unwrapped_block.astype(np.float32)
 
-        data_dask = data.data
-        # Resource annotation limits concurrent unwrap operations
-        task_resources = {'unwrap1d': 1, 'gpu': 1} if device != 'cpu' else {'unwrap1d': 1}
-        meta = np.empty((0, 0, 0), dtype=np.float32)
-        if weight is not None:
-            weight_dask = weight.data
-            with dask.annotate(resources=task_resources):
-                unwrapped_dask = da.blockwise(
-                    process_block, 'pyx',
-                    data_dask, 'pyx',
-                    weight_dask, 'pyx',
-                    dtype=np.float32,
-                    meta=meta,
-                )
-        else:
-            def process_block_no_weight(data_block):
-                return process_block(data_block, None)
-            with dask.annotate(resources=task_resources):
-                unwrapped_dask = da.blockwise(
-                    process_block_no_weight, 'pyx',
-                    data_dask, 'pyx',
-                    dtype=np.float32,
-                    meta=meta,
-                )
+        blocks_rows = []
+        for bj in range(len(y_breaks) - 1):
+            y0, y1 = y_breaks[bj], y_breaks[bj + 1]
+            blocks_row = []
+            for bk in range(len(x_breaks) - 1):
+                x0, x1 = x_breaks[bk], x_breaks[bk + 1]
+                td_list = data_dask[:, y0:y1, x0:x1] \
+                    .to_delayed().ravel().tolist()
+                if weight_dask is not None:
+                    tw_list = weight_dask[:, y0:y1, x0:x1] \
+                        .to_delayed().ravel().tolist()
+                    block = da.from_delayed(
+                        dask.delayed(process_chunks)(td_list, tw_list),
+                        shape=(n_pairs, y1 - y0, x1 - x0),
+                        dtype=np.float32,
+                    )
+                else:
+                    block = da.from_delayed(
+                        dask.delayed(process_chunks)(td_list),
+                        shape=(n_pairs, y1 - y0, x1 - x0),
+                        dtype=np.float32,
+                    )
+                blocks_row.append(block)
+            blocks_rows.append(blocks_row)
 
-        # Rechunk to pair=1 for efficient per-slice downstream operations (preserve spatial chunks)
-        unwrapped_dask = unwrapped_dask.rechunk({0: 1})
+        unwrapped_dask = da.block(blocks_rows)
 
         result = xr.DataArray(
             unwrapped_dask,

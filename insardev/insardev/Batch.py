@@ -476,9 +476,6 @@ class Batch(BatchCore):
         # Get CRS from input batch
         crs = self.crs
 
-        # Resource annotation for GPU tasks
-        task_resources = {'gpu': 1} if device != 'cpu' else {}
-
         vel_results = {}
         int_results = {}
         for key, ds in self.items():
@@ -517,14 +514,13 @@ class Batch(BatchCore):
                 def process_block(data_block):
                     return _apply_velocity_block(data_block, times_years, min_valid, device)
 
-                with dask.annotate(resources=task_resources):
-                    result_dask = da.map_blocks(
-                        process_block, data_dask,
-                        dtype=np.float32,
-                        drop_axis=0,
-                        new_axis=0,
-                        chunks=(2,) + data_dask.chunks[1:],
-                    )
+                result_dask = da.map_blocks(
+                    process_block, data_dask,
+                    dtype=np.float32,
+                    drop_axis=0,
+                    new_axis=0,
+                    chunks=(2,) + data_dask.chunks[1:],
+                )
 
                 # Unpack velocity (index 0) and intercept (index 1)
                 vel_da = xr.DataArray(
@@ -1013,7 +1009,12 @@ class BatchWrap(BatchCore):
                         result[k] = ds - self[[k]].polyval({k: val})[k]
                     elif has_pair_dim and len(val) == n_pairs:
                         # Multi-pair degree=0: [off0, off1, ...]
-                        offsets = xr.DataArray(val, dims=['pair'])
+                        # Use da.stack for dask 0-d arrays to avoid triggering .compute()
+                        if any(hasattr(v, 'dask') for v in val):
+                            import dask.array as _da
+                            offsets = xr.DataArray(_da.stack(val), dims=['pair'])
+                        else:
+                            offsets = xr.DataArray(val, dims=['pair'])
                         result[k] = ds - offsets
                     elif len(val) == 1:
                         # Single value wrapped in list: [offset]
@@ -1021,6 +1022,10 @@ class BatchWrap(BatchCore):
                     else:
                         # Single pair degree=1: [ramp, offset]
                         result[k] = ds - self[[k]].polyval({k: val})[k]
+                elif isinstance(val, (int, float)) \
+                        or (hasattr(val, 'ndim') and val.ndim == 0):
+                    # Scalar subtraction (concrete or dask 0-d array)
+                    result[k] = ds - val
                 else:
                     result[k] = ds - val
         return type(self)(result)
@@ -1289,10 +1294,45 @@ class BatchWrap(BatchCore):
                                        conncomp_linkcount=conncomp_linkcount, device=device,
                                        debug=debug, **kwargs)
 
+    def unwrap2d_chunk(self, weight: 'BatchUnit | None' = None, overlap=None,
+                       device: str = 'auto', debug: bool = False, **kwargs) -> 'Batch':
+        """
+        Unwrap phase per spatial chunk with overlap using IRLS algorithm.
+
+        Unlike unwrap2d() which requires a single spatial chunk (global unwrapping),
+        this method unwraps each spatial chunk independently with overlap margins.
+        Suitable for large rasters where global unwrapping would exceed memory.
+
+        Parameters
+        ----------
+        weight : BatchUnit or None
+            Optional weight for the unwrapping (typically correlation).
+        overlap : float, int, or tuple, optional
+            Overlap size. Float = fraction of chunk size (0.25 = 25%).
+            Int = pixels. Tuple (y, x) for different overlap per axis. Default 0.25.
+        device : str
+            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
+        debug : bool
+            Print diagnostic information.
+        **kwargs
+            Additional arguments: max_iter, tol, cg_max_iter, cg_tol, epsilon,
+            conncomp_size.
+
+        Returns
+        -------
+        Batch
+            Batch of unwrapped phase.
+        """
+        from .Stack_unwrap2d import Stack_unwrap2d
+
+        return Stack_unwrap2d.unwrap2d_chunk(Stack_unwrap2d(), self, weight=weight,
+                                              overlap=overlap, device=device,
+                                              debug=debug, **kwargs)
+
     def unwrap2d_irls(self, weight: 'BatchUnit | None' = None, device: str = 'auto',
                       max_iter: int = 50, tol: float = 1e-2, cg_max_iter: int = 10,
                       cg_tol: float = 1e-3, epsilon: float = 1e-2,
-                      conncomp_size: int = 30, debug: bool = False) -> 'Batches':
+                      conncomp_size: int = 30, semaphore: int = 8, debug: bool = False) -> 'Batches':
         """
         Unwrap phase using GPU-accelerated IRLS algorithm (L1 norm).
 
@@ -1318,6 +1358,8 @@ class BatchWrap(BatchCore):
         conncomp_size : int
             Minimum connected component size in pixels. Components smaller than this
             are marked invalid (label 0). Default 30.
+        semaphore : int
+            Maximum concurrent CPU IRLS tasks per process. Default 8.
         debug : bool
             Print diagnostic information.
 
@@ -1345,7 +1387,7 @@ class BatchWrap(BatchCore):
                                             device=device, max_iter=max_iter, tol=tol,
                                             cg_max_iter=cg_max_iter, cg_tol=cg_tol,
                                             epsilon=epsilon, conncomp_size=conncomp_size,
-                                            debug=debug)
+                                            semaphore=semaphore, debug=debug)
 
     def unwrap2d_link(self, conncomp_size: int = 10_000, conncomp_gap: int | None = None,
                       conncomp_linksize: int = 5, conncomp_linkcount: int = 30,
@@ -1668,7 +1710,6 @@ class BatchComplex(BatchCore):
             New batch with filtered phase values
         """
         import numpy as np
-        import dask
         import dask.array as da
 
         if debug:
@@ -1694,11 +1735,6 @@ class BatchComplex(BatchCore):
         if device == 'auto':
             resolved_device = BatchCore._get_torch_device(device, debug=debug)
             device = resolved_device.type  # 'cpu', 'cuda', or 'mps' as string
-
-        # Resource annotation limits concurrent torch operations
-        # Workers must be configured with resources={'goldstein': N} to limit concurrency
-        use_gpu = device in ('cuda', 'mps')
-        task_resources = {'goldstein': 1, 'gpu': 1} if use_gpu else {'goldstein': 1}
 
         # Apply Goldstein filter to each dataset
         result = {}
@@ -1729,34 +1765,19 @@ class BatchComplex(BatchCore):
                     if debug:
                         print(f'DEBUG: goldstein map_overlap depth=({depth_y}, {depth_x})')
 
-                    # Require corr to have same shape as phase
-                    if corr_dask.shape != phase_dask.shape:
-                        raise ValueError(
-                            f"goldstein() requires corr shape {corr_dask.shape} to match phase shape {phase_dask.shape}. "
-                            f"Correlation should have the same dimensions as phase data."
-                        )
-
-                    # Require corr to have same chunks as phase (no hidden rechunking)
-                    if hasattr(corr_dask, 'chunks') and corr_dask.chunks != phase_dask.chunks:
-                        raise ValueError(
-                            f"goldstein() requires corr chunks {corr_dask.chunks} to match phase chunks {phase_dask.chunks}. "
-                            f"Use .chunk() to align chunks before calling goldstein()."
-                        )
-
-                    with dask.annotate(resources=task_resources):
-                        depth_2d = {0: depth_y, 1: depth_x}
-                        depth_3d = {0: 0, 1: depth_y, 2: depth_x}
-                        filtered_dask = da.map_overlap(
-                            _apply_goldstein_2d_for_dask,
-                            phase_dask,
-                            corr_dask,
-                            depth= depth_3d if var_data.ndim == 3 else depth_2d,
-                            boundary='nearest',
-                            dtype=np.complex64,
-                            psize=window,
-                            threshold=threshold,
-                            device=device,
-                        )
+                    depth_2d = {0: depth_y, 1: depth_x}
+                    depth_3d = {0: 0, 1: depth_y, 2: depth_x}
+                    filtered_dask = da.map_overlap(
+                        _apply_goldstein_2d_for_dask,
+                        phase_dask,
+                        corr_dask,
+                        depth= depth_3d if var_data.ndim == 3 else depth_2d,
+                        boundary='none',
+                        dtype=np.complex64,
+                        psize=window,
+                        threshold=threshold,
+                        device=device,
+                    )
 
                     filtered_vars[var_name] = xr.DataArray(
                         filtered_dask,
@@ -1812,8 +1833,8 @@ class Batches(tuple):
         return target
 
     def snapshot(self, store: str | None = None, storage_options: dict[str, str] | None = None,
-                 caption: str | None = None, allow_rechunk: bool = False,
-                 n_jobs: int = 1, debug: bool = False):
+                 caption: str | None = None,
+                 n_bursts: int = 2, debug: bool = False, **kwargs):
         """Save or open a Batches snapshot.
 
         When called on a Batches with data, saves all batches to Zarr store.
@@ -1827,11 +1848,8 @@ class Batches(tuple):
             Storage options for cloud stores.
         caption : str, optional
             Progress bar caption.
-        allow_rechunk : bool
-            If True, rechunk loaded data to optimal chunk sizes.
-            If False (default), preserve single spatial chunks for MPS/GPU compatibility.
-        n_jobs : int
-            Number of bursts to process in parallel (default 1 = sequential).
+        n_bursts : int
+            Number of bursts to process in parallel. Default 2.
         debug : bool
             Print debug information.
 
@@ -1853,19 +1871,19 @@ class Batches(tuple):
             # Open mode - no data args
             result = utils_io.snapshot(store=store, storage_options=storage_options,
                                        compat=True, caption=caption or 'Opening...',
-                                       allow_rechunk=allow_rechunk, n_jobs=n_jobs, debug=debug)
+                                       n_bursts=n_bursts, debug=debug)
         else:
             # Save mode - pass batches directly to preserve types
             result = utils_io.snapshot(*self, store=store, storage_options=storage_options,
                                        compat=True, caption=caption or 'Snapshotting...',
-                                       allow_rechunk=allow_rechunk, n_jobs=n_jobs, debug=debug)
+                                       n_bursts=n_bursts, debug=debug)
 
         if isinstance(result, tuple):
             return result
         return (result,)
 
     def archive(self, store: str, caption: str | None = None, compression: int = 6,
-                n_jobs: int = -1, debug: bool = False):
+                n_bursts: int = 2, debug: bool = False):
         """Save or open a Batches archive as a single ZIP file.
 
         Wrapper around snapshot() that uses ZipStore for single-file storage.
@@ -1880,8 +1898,8 @@ class Batches(tuple):
         compression : int
             ZIP compression level 0-9 (0=no compression, 9=max). Default 6.
             Higher values produce smaller files but take longer.
-        n_jobs : int
-            Number of parallel jobs (-1 for all cores).
+        n_bursts : int
+            Number of bursts to process in parallel. Default 2.
         debug : bool
             Print debug information.
 
@@ -1923,7 +1941,7 @@ class Batches(tuple):
                 raise FileNotFoundError(f"Archive not found: {store}")
             # Use ZipStore directly for reading
             zip_store = zarr.storage.ZipStore(store, mode='r')
-            result = self.snapshot(store=zip_store, caption=caption or 'Opening archive...', n_jobs=n_jobs, debug=debug)
+            result = self.snapshot(store=zip_store, caption=caption or 'Opening archive...', n_bursts=n_bursts, debug=debug)
             zip_store.close()
             return result
         else:
@@ -1931,7 +1949,7 @@ class Batches(tuple):
             # This avoids ZipStore's duplicate entry problem
             temp_dir = tempfile.mkdtemp()
             try:
-                result = self.snapshot(store=temp_dir, caption=caption or 'Archiving...', n_jobs=n_jobs, debug=debug)
+                result = self.snapshot(store=temp_dir, caption=caption or 'Archiving...', n_bursts=n_bursts, debug=debug)
                 # Create zip with specified compression level
                 # Use fsspec for cloud storage support
                 with fsspec.open(store, 'wb') as f:
@@ -1949,6 +1967,18 @@ class Batches(tuple):
     def downsample(self, *args, **kwargs):
         """Apply downsample to all batches."""
         return Batches([b.downsample(*args, **kwargs) for b in self])
+
+    def chunk(self, *args, **kwargs):
+        """Apply chunk to all batches."""
+        return Batches([b.chunk(*args, **kwargs) for b in self])
+
+    def chunk2d(self, *args, **kwargs):
+        """Apply chunk2d to all batches."""
+        return Batches([b.chunk2d(*args, **kwargs) for b in self])
+
+    def chunk1d(self, *args, **kwargs):
+        """Apply chunk1d to all batches."""
+        return Batches([b.chunk1d(*args, **kwargs) for b in self])
 
     def where(self, cond, other=np.nan, **kwargs):
         """Apply where mask to all batches."""
@@ -2107,33 +2137,29 @@ class Batches(tuple):
                 'Use BatchUnit(stack.from_dataset(data)) to convert a single DataArray.'
             )
 
-        # Resource annotation limits concurrent interferogram operations
-        # Workers must be configured with resources={'interferogram': N} to limit concurrency
-        import dask
-        with dask.annotate(resources={'interferogram': 1}):
-            intf = ref * rep.conj()
-            if phase is not None:
-                if isinstance(phase, BatchComplex):
-                    intf = intf * phase
-                else:
-                    intf = intf * phase.iexp(-1)
-
-            if wavelength is not None:
-                intf_look = intf.gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold, device=device)
-                intensity_ref = ref.power().gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold, device=device)
-                intensity_rep = rep.power().gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold, device=device)
-                del ref, rep
-                corr_look = (intf_look.abs() / (intensity_ref * intensity_rep).sqrt()).clip(0, 1)
-                del intensity_ref, intensity_rep
+        intf = ref * rep.conj()
+        if phase is not None:
+            if isinstance(phase, BatchComplex):
+                intf = intf * phase
             else:
-                intf_look = intf
-                corr_look = None
-                del ref, rep
-            del intf
+                intf = intf * phase.iexp(-1)
 
-            if weight is not None:
-                intf_look = intf_look.where(weight.isfinite())
-                corr_look = corr_look.where(weight.isfinite()) if corr_look else None
+        if wavelength is not None:
+            intf_look = intf.gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold, device=device)
+            intensity_ref = ref.power().gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold, device=device)
+            intensity_rep = rep.power().gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold, device=device)
+            del ref, rep
+            corr_look = (intf_look.abs() / (intensity_ref * intensity_rep).sqrt()).clip(0, 1)
+            del intensity_ref, intensity_rep
+        else:
+            intf_look = intf
+            corr_look = None
+            del ref, rep
+        del intf
+
+        if weight is not None:
+            intf_look = intf_look.where(weight.isfinite())
+            corr_look = corr_look.where(weight.isfinite()) if corr_look else None
 
         if corr_look is None:
             return Batches([intf_look])
@@ -2149,21 +2175,13 @@ class Batches(tuple):
             "interferogram2() requires insardev_polsar extension"
         )
 
-    def compute(self, allow_rechunk: bool = False):
-        """Compute all batches efficiently with sequential burst processing.
+    def compute(self):
+        """Compute all batches at once via dask.persist().
 
-        Iterates through bursts sequentially, computing all dependent variables
-        (e.g., intf and corr) together for each burst. This preserves shared
-        computations within a burst while limiting memory usage by not holding
-        all bursts in memory simultaneously.
-
-        Parameters
-        ----------
-        allow_rechunk : bool, optional
-            If True (default), auto-rechunk output for efficient further processing:
-            - 3D data: chunk size 1 for first dim (date/pair), auto for y,x
-            - 2D data: auto for y,x based on dask.config['array.chunk-size']
-            If False, use single spatial chunk (-1 for y,x).
+        Persists all bursts across all batches in a single scheduler
+        submission. Data stays in worker memory. Preserves shared computation
+        between dependent batches (e.g., phase and correlation). For
+        memory-constrained sequential processing, use snapshot().
 
         Returns
         -------
@@ -2171,113 +2189,60 @@ class Batches(tuple):
             Computed batches with data in memory.
         """
         import dask
-        from tqdm.auto import tqdm
-        from .utils_dask import get_dask_chunk_size_mb, rechunk2d
+        import numpy as np
+        from insardev_toolkit.progressbar import progressbar
 
         # Get all burst keys (should be same across all batches)
         keys = list(self[0].keys())
+        n_batches = len(self)
 
-        # Initialize result dicts for each batch
-        computed_dicts = [{} for _ in self]
+        # Save input chunk structure per batch per burst
+        all_input_chunks = []  # list of {burst_key: {var_name: chunks_dict}}
+        for batch in self:
+            batch_chunks = {}
+            for key, ds in batch.items():
+                ic = {}
+                for var_name in ds.data_vars:
+                    arr = ds[var_name]
+                    if hasattr(arr.data, 'chunks'):
+                        ic[var_name] = dict(zip(arr.dims, arr.data.chunks))
+                batch_chunks[key] = ic
+            all_input_chunks.append(batch_chunks)
 
-        # Print NOTE before progress bar
-        dask_chunk_mb = get_dask_chunk_size_mb()
-        if allow_rechunk:
-            print(f"NOTE compute: rechunking to dask.config['array.chunk-size']={dask_chunk_mb} MB")
-        else:
-            print(f"NOTE compute: using single spatial chunk (allow_rechunk=False)")
+        # Persist all batches at once — single scheduler submission
+        # progressbar extracts futures and blocks until completion
+        all_dicts = [dict(batch) for batch in self]
+        all_results = list(dask.persist(*all_dicts))
+        progressbar(all_results, desc='Computing bursts'.ljust(25))
 
-        # Process one burst at a time across all batches
-        for key in tqdm(keys, desc='Computing bursts'.ljust(25)):
-            # Collect datasets for this burst from all batches
-            burst_datasets = [batch[key] for batch in self]
-
-            # Compute all datasets for this burst together (preserves shared computation)
-            computed_datasets = dask.compute(*burst_datasets)
-
-            # Store results and materialize coordinates
-            for i, ds in enumerate(computed_datasets):
-                # Materialize coordinates to local memory
+        # Finalize: materialize coordinates and rechunk to match input
+        computed_batches = []
+        for bi in range(n_batches):
+            result = all_results[bi]
+            computed = {}
+            for key, ds in result.items():
                 new_coords = {}
                 for name, coord in ds.coords.items():
                     if hasattr(coord, 'data') and hasattr(coord.data, 'compute'):
                         new_coords[name] = (coord.dims, coord.compute().values)
                 if new_coords:
                     ds = ds.assign_coords(new_coords)
-
-                # Rechunk computed data for efficient further processing
-                # xarray's .chunk() handles both numpy and dask arrays
+                input_chunks = all_input_chunks[bi][key]
                 rechunked_vars = {}
-                for var in ds.data_vars:
-                    arr = ds[var]
-                    # Skip non-spatial variables
-                    if not (arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x')):
-                        continue
-
-                    if allow_rechunk:
-                        # Use rechunk2d for uniform chunk sizes
-                        y_size, x_size = arr.shape[-2], arr.shape[-1]
-                        element_bytes = arr.dtype.itemsize
-                        optimal = rechunk2d((y_size, x_size), element_bytes)
-                        if arr.ndim == 3:
-                            chunks = {arr.dims[0]: 1, 'y': optimal['y'], 'x': optimal['x']}
-                        else:
-                            chunks = {'y': optimal['y'], 'x': optimal['x']}
-                    else:
-                        # Single spatial chunk
-                        if arr.ndim == 3:
-                            chunks = {arr.dims[0]: 1, 'y': -1, 'x': -1}
-                        else:
-                            chunks = {'y': -1, 'x': -1}
-
-                    rechunked_vars[var] = arr.chunk(chunks)
-
-                # Update dataset with rechunked variables
+                for var_name in ds.data_vars:
+                    arr = ds[var_name]
+                    if var_name in input_chunks:
+                        chunks = input_chunks[var_name]
+                        if isinstance(arr.data, np.ndarray):
+                            arr = arr.chunk(chunks)
+                        elif hasattr(arr.data, 'chunks') and dict(zip(arr.dims, arr.data.chunks)) != chunks:
+                            arr = arr.chunk(chunks)
+                        rechunked_vars[var_name] = arr
                 if rechunked_vars:
                     ds = ds.assign(rechunked_vars)
-
-                computed_dicts[i][key] = ds
-
-        # Reconstruct batches with correct types
-        computed_batches = [type(self[i])(computed_dicts[i]) for i in range(len(self))]
+                computed[key] = ds
+            computed_batches.append(type(self[bi])(computed))
         return Batches(computed_batches)
-
-    def persist(self):
-        """Persist all batches efficiently with sequential burst processing.
-
-        Iterates through bursts sequentially, persisting all dependent variables
-        (e.g., intf and corr) together for each burst. This preserves shared
-        computations within a burst while limiting memory usage.
-
-        Returns
-        -------
-        Batches
-            Persisted batches with data in cluster memory.
-        """
-        import dask
-        from tqdm.auto import tqdm
-
-        # Get all burst keys (should be same across all batches)
-        keys = list(self[0].keys())
-
-        # Initialize result dicts for each batch
-        persisted_dicts = [{} for _ in self]
-
-        # Process one burst at a time across all batches
-        for key in tqdm(keys, desc='Persisting bursts'.ljust(25)):
-            # Collect datasets for this burst from all batches
-            burst_datasets = [batch[key] for batch in self]
-
-            # Persist all datasets for this burst together (preserves shared computation)
-            persisted_datasets = dask.persist(*burst_datasets)
-
-            # Store results
-            for i, ds in enumerate(persisted_datasets):
-                persisted_dicts[i][key] = ds
-
-        # Reconstruct batches with correct types
-        persisted_batches = [type(self[i])(persisted_dicts[i]) for i in range(len(self))]
-        return Batches(persisted_batches)
 
     def unwrap2d(self, conncomp=False, conncomp_size=1000, conncomp_gap=None,
                  conncomp_linksize=5, conncomp_linkcount=30, device='auto', debug=False, **kwargs):
@@ -2332,6 +2297,52 @@ class Batches(tuple):
                               conncomp_gap=conncomp_gap, conncomp_linksize=conncomp_linksize,
                               conncomp_linkcount=conncomp_linkcount, device=device,
                               debug=debug, **kwargs)
+
+    def unwrap2d_chunk(self, overlap=None, device='auto', debug=False, **kwargs):
+        """
+        Unwrap phase per spatial chunk with overlap using IRLS algorithm.
+
+        Expects Batches with [BatchWrap (phase), BatchUnit (weight, optional)].
+
+        Unlike unwrap2d() which requires a single spatial chunk, this method
+        unwraps each spatial chunk independently with overlap margins.
+
+        Parameters
+        ----------
+        overlap : float, int, or tuple, optional
+            Overlap size. Float = fraction of chunk size. Default 0.25.
+        device : str
+            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
+        debug : bool
+            Print diagnostic information.
+        **kwargs
+            Additional arguments: max_iter, tol, cg_max_iter, cg_tol, epsilon,
+            conncomp_size.
+
+        Returns
+        -------
+        Batches
+            Batches with [unwrapped_phase, weight] preserving original types.
+
+        Examples
+        --------
+        >>> phase, corr = stack.pairs(baseline).interferogram(wavelength=30).angle()
+        >>> unwrapped, corr = phase.chunk2d('128MiB').unwrap2d_chunk()
+        """
+        if len(self) < 1:
+            raise ValueError("unwrap2d_chunk() requires Batches with at least 1 element: [phase]")
+
+        phase = self[0]
+        weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
+
+        if not isinstance(phase, BatchWrap):
+            raise TypeError(f"First element must be BatchWrap, got {type(phase).__name__}")
+
+        unwrapped = phase.unwrap2d_chunk(weight=weight, overlap=overlap,
+                                          device=device, debug=debug, **kwargs)
+
+        elements = [unwrapped] + list(self[1:])
+        return Batches(elements)
 
     def unwrap1d(self, device='auto', debug=False, **kwargs):
         """
@@ -2409,17 +2420,70 @@ class Batches(tuple):
         if not isinstance(phase, (Batch, BatchComplex)):
             raise TypeError(f"First element must be Batch or BatchComplex, got {type(phase).__name__}")
 
-        trend = phase.trend2d(transform, weight=weight, degree=degree, device=device, debug=debug)
-
-        if isinstance(phase, BatchComplex):
-            detrended = phase * trend.conj()
-        else:
-            detrended = phase - trend
+        # Fuse fit+subtract into one blockwise call (detrend=True) so the input
+        # phase is referenced only once in the dask graph. Without fusion, phase
+        # is referenced both by the full-spatial rechunk inside trend2d AND by the
+        # phase * trend.conj() multiplication — pinning all Gaussian chunks in
+        # memory until both consumers finish, causing 50GB+ per worker.
+        detrended = phase.trend2d(transform, weight=weight, degree=degree,
+                                  device=device, detrend=True, debug=debug)
 
         # Preserve non-spatial variables (e.g. BPR) that may be dropped by arithmetic
         detrended = Batches._preserve_nonspatial(phase, detrended)
 
         # Rebuild Batches preserving all original elements except first
+        elements = [detrended] + list(self[1:])
+        return Batches(elements)
+
+    def detrend2d_chunk(self, transform, degree=1, overlap=None,
+                         device='auto', debug=False):
+        """
+        Windowed detrend2d using overlapping-tile local polynomial fitting.
+
+        Fits independent local polynomials per overlapping tile. Each tile sees
+        neighbors via overlap for well-conditioned fits at tile edges. Suitable
+        for large rasters where local fitting better captures spatially-varying
+        trends (e.g. tropospheric delay with local variations).
+
+        Parameters
+        ----------
+        transform : BatchCore
+            Coordinate transform from stack.transform().
+        degree : int
+            Polynomial degree (1=plane, 2=quadratic). Default 1.
+        overlap : float, int, or tuple
+            Overlap size. Float values are fractions of chunk size (e.g. 0.25 = 25%).
+            Int values are pixels. Tuple (overlap_y, overlap_x) allows different
+            overlap per axis. Default 0.25.
+        device : str
+            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
+        debug : bool
+            Print diagnostic information.
+
+        Returns
+        -------
+        Batches
+            Batches with [detrended_phase, weight] preserving original types.
+
+        Examples
+        --------
+        >>> intf, corr = stack.pairs(baseline).interferogram(wavelength=30).detrend2d_chunk(transform)
+        """
+        if len(self) < 1:
+            raise ValueError("detrend2d_chunk() requires Batches with at least 1 element: [phase]")
+
+        phase = self[0]
+        weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
+
+        if not isinstance(phase, (Batch, BatchComplex)):
+            raise TypeError(f"First element must be Batch or BatchComplex, got {type(phase).__name__}")
+
+        detrended = phase.trend2d_chunk(
+            transform, weight=weight, degree=degree, overlap=overlap,
+            device=device, detrend=True, debug=debug)
+
+        detrended = Batches._preserve_nonspatial(phase, detrended)
+
         elements = [detrended] + list(self[1:])
         return Batches(elements)
 
@@ -2465,13 +2529,10 @@ class Batches(tuple):
         if not isinstance(phase, (Batch, BatchComplex)):
             raise TypeError(f"First element must be Batch or BatchComplex, got {type(phase).__name__}")
 
-        trend = phase.trend1d(weight=weight, baseline=baseline, degree=degree,
-                              device=device, debug=debug)
-
-        if isinstance(phase, BatchComplex):
-            detrended = phase * trend.conj()
-        else:
-            detrended = phase - trend
+        # Fuse fit+subtract into one blockwise call (detrend=True) so the input
+        # phase is referenced only once in the dask graph.
+        detrended = phase.trend1d(weight=weight, baseline=baseline, degree=degree,
+                                  device=device, detrend=True, debug=debug)
 
         # Preserve non-spatial variables (e.g. BPR) that may be dropped by arithmetic
         detrended = Batches._preserve_nonspatial(phase, detrended)
@@ -2567,13 +2628,10 @@ class Batches(tuple):
         if not isinstance(phase, (Batch, BatchComplex)):
             raise TypeError(f"First element must be Batch or BatchComplex, got {type(phase).__name__}")
 
-        trend = phase.trend1d_pairs(weight=weight, degree=degree, days=days, count=count,
-                                    device=device, debug=debug)
-
-        if isinstance(phase, BatchComplex):
-            detrended = phase * trend.conj()
-        else:
-            detrended = phase - trend
+        # Fuse fit+subtract into one blockwise call (detrend=True) so the input
+        # phase is referenced only once in the dask graph.
+        detrended = phase.trend1d_pairs(weight=weight, degree=degree, days=days, count=count,
+                                        device=device, detrend=True, debug=debug)
 
         # Preserve non-spatial variables (e.g. BPR) that may be dropped by arithmetic
         detrended = Batches._preserve_nonspatial(phase, detrended)
