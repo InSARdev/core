@@ -415,12 +415,11 @@ def unwrap1d_to_dates_numpy(phase_stack, weight_stack, pair_dates, device='auto'
         elif dev.type == 'cuda':
             torch.cuda.empty_cache()
 
-    # Build time series
+    # Build time series — np.cumsum propagates NaN (all-NaN pixels stay NaN)
+    ts = np.zeros((len(dates), n_pixels), dtype=np.float32)
     if cumsum:
-        ts = np.zeros((len(dates), n_pixels), dtype=np.float32)
         ts[1:, :] = np.cumsum(increments_flat, axis=0)
     else:
-        ts = np.zeros((len(dates), n_pixels), dtype=np.float32)
         ts[1:, :] = increments_flat
 
     # Reshape: (n_dates, n_pixels) -> (n_dates, height, width)
@@ -560,12 +559,11 @@ def lstsq_to_dates_numpy(phase_stack, weight_stack, pair_dates, device='auto',
 
         del phases_block, weights_block
 
-    # Build time series
+    # Build time series — np.cumsum propagates NaN (all-NaN pixels stay NaN)
+    ts = np.zeros((n_pixels, n_dates), dtype=np.float32)
     if cumsum:
-        ts = np.zeros((n_pixels, n_dates), dtype=np.float32)
-        ts[:, 1:] = np.nancumsum(increments, axis=1)
+        ts[:, 1:] = np.cumsum(increments, axis=1)
     else:
-        ts = np.zeros((n_pixels, n_dates), dtype=np.float32)
         ts[:, 1:] = increments
 
     # Reshape: (n_pixels, n_dates) -> (n_dates, height, width)
