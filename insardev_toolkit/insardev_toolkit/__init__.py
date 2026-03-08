@@ -7,7 +7,7 @@
 #
 # See the LICENSE file in the insardev_toolkit directory for license terms.
 # ----------------------------------------------------------------------------
-__version__ = '2026.3.8'
+__version__ = '2026.3.8.post1'
 
 # unified progress indicators
 from .progressbar_joblib import progressbar_joblib
@@ -30,3 +30,5 @@ from .XYZTiles import XYZTiles
 from .MultiInstanceManager import MultiInstanceManager
 # downloading tools
 from .HTTP import download, unzip
+# Jupyter notebook UI styling
+from .UI import UI

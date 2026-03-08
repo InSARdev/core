@@ -5,7 +5,7 @@ class UI:
         Set dark mode styling for matplotlib plots and Jupyter widgets.
 
         Example:
-            from insardev.UI import UI
+            from insardev_toolkit.UI import UI
             UI('dark')
         """
         import matplotlib.pyplot as plt
