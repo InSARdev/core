@@ -3019,6 +3019,34 @@ class BatchCore(dict):
     def rename(self, **kw):
         return type(self)({k: ds.rename(**kw) for k, ds in self.items()})
 
+    def merge(self, other: 'BatchCore') -> 'Batch':
+        """Merge variables from another Batch into this one (per burst xr.merge).
+
+        Both Batches must share the same burst keys and compatible coordinates.
+        Use rename() first to avoid variable name conflicts.
+        Always returns Batch (plain real-valued) since mixed types should not
+        support specialized operations (e.g., wrapped phase arithmetic).
+
+        Parameters
+        ----------
+        other : BatchCore
+            Batch with additional variables to merge.
+
+        Returns
+        -------
+        Batch
+            Merged batch containing variables from both.
+
+        Examples
+        --------
+        >>> corr_mean = mcorr.mean('pair').rename(VV='VV_cor')
+        >>> combined = corr_mean.merge(rmse_mm.rename(VV='VV_rmse_mm'))
+        >>> df = combined.to_dataframe()
+        """
+        import xarray as xr
+        from .Batch import Batch
+        return Batch({k: xr.merge([ds, other[k]]) for k, ds in self.items() if k in other})
+
     def reindex(self, **kw):
         return type(self)({k: ds.reindex(**kw) for k, ds in self.items()})
 
@@ -3049,6 +3077,9 @@ class BatchCore(dict):
                 out[key] = fn(dim=dim, **kwargs)
             else:
                 out[key] = fn(**kwargs)
+            # Preserve attrs (xarray aggregations drop them by default)
+            if hasattr(obj, 'attrs') and hasattr(out[key], 'attrs'):
+                out[key].attrs = obj.attrs
 
         # filter out collapsed dimensions
         sample = next(iter(out.values()), None)
@@ -3150,7 +3181,7 @@ class BatchCore(dict):
                 else:
                     rmse_val = np.sqrt(err_sq.mean('pair'))
                 rmse_vars[var] = rmse_val.astype('float32')
-            out[key] = xr.Dataset(rmse_vars)
+            out[key] = xr.Dataset(rmse_vars, attrs=self[key].attrs)
 
         return Batch(out)
 
@@ -3655,99 +3686,130 @@ class BatchCore(dict):
         if not self:
             return pd.DataFrame()
 
-        # Detect CRS from data if auto
-        if crs is not None and isinstance(crs, str) and crs == 'auto':
-            sample = next(iter(self.values()))
-            crs = sample.attrs.get('crs', 4326)
-
-        # Detect polarizations
+        # Detect native CRS from data
         sample = next(iter(self.values()))
-        polarizations = [pol for pol in ['VV', 'VH', 'HH', 'HV'] if pol in sample.data_vars]
+        native_crs = self.crs
+        if native_crs is None:
+            raise ValueError('Batch has no CRS. Check the processing pipeline that produced this Batch.')
+        if crs is not None and isinstance(crs, str) and crs == 'auto':
+            crs = native_crs
 
-        # Detect dimension: 'date' for BatchComplex, 'pair' for others
-        dim = 'date' if 'date' in sample.dims else 'pair'
+        # Detect spatial data variables (skip 1D/0D vars like converted attributes)
+        spatial_vars = [v for v in sample.data_vars if sample[v].ndim >= 2]
+        ndims = {sample[v].ndim for v in spatial_vars}
+        if len(ndims) > 1:
+            raise ValueError(f'Mixed 2D and 3D variables not supported: {{{", ".join(f"{v}: {sample[v].ndim}D" for v in spatial_vars)}}}')
+
+        # Detect dimension: 'date' for BatchComplex, 'pair' for others, None for spatial-only
+        if 'date' in sample.dims:
+            dim = 'date'
+        elif 'pair' in sample.dims:
+            dim = 'pair'
+        else:
+            dim = None
 
         # Define the attribute order matching Stack.to_dataframe
-        # Order: fullBurstID, burst, startTime, polarization, flightDirection, pathNumber, subswath, mission, beamModeType, BPR, geometry
-        attr_order = ['fullBurstID', 'burst', 'startTime', 'polarization', 'flightDirection', 
-                      'pathNumber', 'subswath', 'mission', 'beamModeType', 'BPR', 'geometry']
+        attr_order = ['fullBurstID', 'burst', 'startTime', 'polarization', 'flightDirection',
+                      'pathNumber', 'subswath', 'mission', 'beamModeType', 'BPR']
 
-        # Make attributes dataframe from data
-        processed_attrs = []
+        # Spatial-only data (e.g., RMSE, elevation): one row per pixel with data values
+        if dim is None:
+            frames = []
+            for key, ds in self.items():
+                # Get spatial data variables (skip 1D/0D vars)
+                spatial_vars = [v for v in ds.data_vars if ds[v].ndim >= 2]
+                if not spatial_vars:
+                    continue
+                df_burst = ds[spatial_vars].to_dataframe().reset_index()
+                # Drop all-NaN rows
+                df_burst = df_burst.dropna(subset=spatial_vars, how='all')
+                # Add burst metadata from attrs
+                for attr_name in attr_order:
+                    if attr_name in ds.attrs:
+                        value = ds.attrs[attr_name]
+                        if attr_name == 'startTime':
+                            value = pd.Timestamp(value)
+                        df_burst[attr_name] = value
+                frames.append(df_burst)
+
+            if not frames:
+                return pd.DataFrame()
+            df = pd.concat(frames, ignore_index=True)
+
+            # Create Point geometry in data's native CRS
+            df['geometry'] = gpd.points_from_xy(df['x'], df['y'])
+            df = gpd.GeoDataFrame(df, crs=native_crs)
+
+            # Reorder: burst metadata first, then data, then geometry
+            meta_cols = [c for c in attr_order if c in df.columns]
+            data_cols = ['y', 'x'] + spatial_vars
+            ordered = meta_cols + data_cols + ['geometry']
+            df = df[[c for c in ordered if c in df.columns]]
+
+            if 'fullBurstID' in df.columns and 'burst' in df.columns:
+                df = df.sort_values(by=['fullBurstID', 'burst']).set_index(['fullBurstID', 'burst'])
+
+            if crs is not None and crs != native_crs:
+                df = df.to_crs(crs)
+            return df
+
+        # Date/pair-based data: one row per pixel per date/pair with data values
+        spatial_vars = [v for v in sample.data_vars
+                       if 'y' in sample[v].dims and 'x' in sample[v].dims]
+        frames = []
         for key, ds in self.items():
             for idx in range(ds.dims[dim]):
-                processed_attr = {}
-                
-                # Get ref/rep for pair dimension
+                # Extract 2D slice for this date/pair
+                ds_slice = ds[spatial_vars].isel({dim: idx})
+                df_slice = ds_slice.to_dataframe().reset_index()
+                # Drop all-NaN rows
+                df_slice = df_slice.dropna(subset=spatial_vars, how='all')
+
+                # Add date/pair info
                 if dim == 'pair':
                     if 'ref' in ds.coords:
-                        processed_attr['ref'] = pd.Timestamp(ds['ref'].values[idx])
+                        df_slice['ref'] = pd.Timestamp(ds['ref'].values[idx])
                     if 'rep' in ds.coords:
-                        processed_attr['rep'] = pd.Timestamp(ds['rep'].values[idx])
-                else:
-                    processed_attr['date'] = pd.Timestamp(ds[dim].values[idx])
-                
-                # Extract attributes from ds.attrs
+                        df_slice['rep'] = pd.Timestamp(ds['rep'].values[idx])
+                elif dim == 'date':
+                    df_slice['date'] = pd.Timestamp(ds[dim].values[idx])
+
+                # Add burst metadata from attrs
                 for attr_name in attr_order:
-                    if attr_name in ds.attrs and attr_name not in processed_attr:
+                    if attr_name in ds.attrs:
                         value = ds.attrs[attr_name]
-                        if attr_name == 'geometry' and isinstance(value, str):
-                            processed_attr[attr_name] = wkt.loads(value)
-                        elif attr_name == 'startTime':
-                            processed_attr[attr_name] = pd.Timestamp(value)
-                        else:
-                            processed_attr[attr_name] = value
-                
-                processed_attrs.append(processed_attr)
+                        if attr_name == 'startTime':
+                            value = pd.Timestamp(value)
+                        df_slice[attr_name] = value
 
-        if not processed_attrs:
+                frames.append(df_slice)
+
+        if not frames:
             return pd.DataFrame()
+        df = pd.concat(frames, ignore_index=True)
 
-        # Check if we have geometry column for GeoDataFrame
-        has_geometry = 'geometry' in processed_attrs[0]
-        
-        if has_geometry:
-            df = gpd.GeoDataFrame(processed_attrs, crs=4326)
+        # Create Point geometry in data's native CRS
+        df['geometry'] = gpd.points_from_xy(df['x'], df['y'])
+        df = gpd.GeoDataFrame(df, crs=native_crs)
+
+        # Reorder columns: burst metadata, date/pair info, coordinates, data, geometry
+        if dim == 'pair':
+            time_cols = ['ref', 'rep']
         else:
-            df = pd.DataFrame(processed_attrs)
+            time_cols = ['date']
+        meta_cols = [c for c in attr_order if c in df.columns]
+        time_cols = [c for c in time_cols if c in df.columns]
+        data_cols = ['y', 'x'] + spatial_vars
+        ordered = meta_cols + time_cols + data_cols + ['geometry']
+        df = df[[c for c in ordered if c in df.columns]]
 
-        # Add polarization info if not already present
-        if 'polarization' not in df.columns and polarizations:
-            df['polarization'] = ','.join(map(str, polarizations))
-
-        # Round BPR for readability
-        if 'BPR' in df.columns:
-            df['BPR'] = df['BPR'].round(1)
-
-        # Reorder columns to match Stack.to_dataframe format
-        # For pair data: fullBurstID, burst (index), then ref, rep, then rest
         if 'fullBurstID' in df.columns and 'burst' in df.columns:
-            # Build column order
-            if dim == 'pair':
-                # ref, rep first after index, then startTime, polarization, etc.
-                first_cols = ['fullBurstID', 'burst', 'ref', 'rep']
-            else:
-                first_cols = ['fullBurstID', 'burst', 'date']
-            
-            # Rest of columns in attr_order, excluding index columns and ref/rep/date
-            other_cols = [c for c in attr_order if c not in first_cols and c in df.columns]
-            
-            # Reorder
-            ordered_cols = [c for c in first_cols if c in df.columns] + other_cols
-            df = df[ordered_cols]
-            
-            # Sort and set index
             df = df.sort_values(by=['fullBurstID', 'burst']).set_index(['fullBurstID', 'burst'])
-            
-            # Move geometry to end if present
-            if has_geometry and 'geometry' in df.columns:
-                df = df.loc[:, df.columns.drop("geometry").tolist() + ["geometry"]]
 
-        # Convert CRS if requested and we have a GeoDataFrame
-        if has_geometry and crs is not None:
-            return df.to_crs(crs)
+        if crs is not None and crs != native_crs:
+            df = df.to_crs(crs)
         return df
-    
+
     @property
     def spacing(self) -> tuple[float, float]:
         """Return the (y, x) grid spacing."""
