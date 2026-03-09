@@ -116,11 +116,10 @@ def _dissolve_pol_for_dask(da_current, das_others, wrap, extend, weight):
         w_other = (1.0 - weight) / n_others if n_others > 0 else 0.0
 
     # Reindex das_others to match da_current coordinates
-    # Use interp for floating point coordinate matching instead of reindex
+    # Grids are consistent with exactly matched coordinates in overlap areas
     das_reindexed = []
     for d in das_others:
-        # Use interp with nearest to avoid issues with floating point coordinate matching
-        das_reindexed.append(d.interp(y=ys, x=xs, method='nearest', kwargs={'fill_value': np.nan}))
+        das_reindexed.append(d.reindex(y=ys, x=xs, fill_value=np.nan))
 
     current_vals = da_current.values
     current_valid = np.isfinite(current_vals)
@@ -129,12 +128,12 @@ def _dissolve_pol_for_dask(da_current, das_others, wrap, extend, weight):
         warnings.simplefilter('ignore', RuntimeWarning)
 
         if wrap:
-            weighted_sum = np.where(current_valid, np.exp(1j * current_vals) * w_current, 0.0)
+            weighted_sum = np.where(current_valid, np.exp(1j * current_vals).astype(np.complex64) * w_current, np.complex64(0))
             weight_sum = np.where(current_valid, w_current, 0.0)
             for d in das_reindexed:
                 vals = d.values
                 valid = np.isfinite(vals)
-                weighted_sum += np.where(valid, np.exp(1j * vals) * w_other, 0.0)
+                weighted_sum += np.where(valid, np.exp(1j * vals).astype(np.complex64) * w_other, np.complex64(0))
                 weight_sum += np.where(valid, w_other, 0.0)
             valid_weights = weight_sum > 0
             normalized = np.divide(weighted_sum, weight_sum, out=np.zeros_like(weighted_sum), where=valid_weights)
@@ -162,6 +161,40 @@ def _dissolve_pol_3d_for_dask(da_slice, das_others_slice, wrap, extend, weight):
     Defined at module level to avoid dask serialization issues with nested functions.
     """
     return _dissolve_pol_for_dask(da_slice, das_others_slice, wrap, extend, weight)[np.newaxis, ...]
+
+
+def _dissolve_raw_for_dask(current_arr, current_y, current_x,
+                            others_arrs, others_ys, others_xs,
+                            wrap, extend, weight):
+    """
+    Dissolve using raw numpy arrays + coordinates.
+
+    Receives raw arrays (dask resolves them to numpy before calling) and
+    numpy coordinate arrays. Reconstructs minimal xarray DataArrays for
+    the interp-based coordinate matching, then delegates to _dissolve_pol_for_dask.
+
+    For 3D arrays (pair, y, x), iterates over first dim.
+    """
+    import xarray as xr
+
+    if current_arr.ndim > 2:
+        n_stack = current_arr.shape[0]
+        slices = []
+        for i in range(n_stack):
+            da_c = xr.DataArray(current_arr[i], dims=['y', 'x'],
+                                coords={'y': current_y, 'x': current_x})
+            das_o = [xr.DataArray(arr[i], dims=['y', 'x'],
+                                  coords={'y': y, 'x': x})
+                     for arr, y, x in zip(others_arrs, others_ys, others_xs)]
+            slices.append(_dissolve_pol_for_dask(da_c, das_o, wrap, extend, weight))
+        return np.stack(slices, axis=0)
+    else:
+        da_c = xr.DataArray(current_arr, dims=['y', 'x'],
+                            coords={'y': current_y, 'x': current_x})
+        das_o = [xr.DataArray(arr, dims=['y', 'x'],
+                              coords={'y': y, 'x': x})
+                 for arr, y, x in zip(others_arrs, others_ys, others_xs)]
+        return _dissolve_pol_for_dask(da_c, das_o, wrap, extend, weight)
 
 
 def _apply_gaussian_for_dask(block, weight_block, sigmas, threshold, device, pixel_sizes, out_dtype):
@@ -5686,59 +5719,60 @@ class BatchCore(dict):
             if degree == 1 and cross_subswath_skipped > 0:
                 print(f'  (skipped {cross_subswath_skipped} same-path cross-subswath pairs for ramp estimation)', flush=True)
 
-        # Build delayed overlap statistics using to_delayed pattern.
-        # Each overlap is pre-selected via .sel() so only overlap chunks
-        # enter the dask graph — NOT the full burst pipeline.
+        # Pass raw burst data arrays (not pre-computed diffs) to a single
+        # delayed task. This creates N_bursts graph dependencies instead of
+        # N_overlaps*3 layers from xarray diff operations, keeping the graph
+        # minimal for downstream dissolve().
         import dask.array as _da
 
-        delayed_stats = []
-        for id1, id2 in all_overlap_pairs:
-            e1, e2 = extents[id1], extents[id2]
-            # Overlap bounding box
-            y_min, y_max = max(e1[0], e2[0]), min(e1[1], e2[1])
-            x_min, x_max = max(e1[2], e2[2]), min(e1[3], e2[3])
-            y_slice = slice(y_max, y_min) if _y_descending else slice(y_min, y_max)
-            x_slice = slice(x_min, x_max)
-
-            # Select only the overlap region — restricts dask graph to overlap chunks
-            i1 = self[id1][polarization].sel(y=y_slice, x=x_slice)
-            i2 = self[id2][polarization].sel(y=y_slice, x=x_slice)
-
-            for pair_idx in range(n_pairs):
-                i1_p = i1.isel(pair=pair_idx) if has_pair_dim else i1
-                i2_p = i2.isel(pair=pair_idx) if has_pair_dim else i2
-                # Lazy difference — xarray aligns to common overlap coordinates
-                diff = i2_p - i1_p
-                x_coords = diff.coords['x'].values
-                # Convert to delayed numpy via to_delayed
-                diff_delayed = diff.data.rechunk(-1, -1).to_delayed().ravel()[0]
-                # Delayed numpy processing
-                stat = dask.delayed(process_phase_diff)(
-                    diff_delayed, x_coords, id1, id2, pair_idx
-                )
-                delayed_stats.append(stat)
+        # Collect burst data + coordinates (coordinates are numpy, not dask)
+        burst_data = [self[bid][polarization].data for bid in ids]
+        burst_y = [self[bid][polarization].y.values for bid in ids]
+        burst_x = [self[bid][polarization].x.values for bid in ids]
 
         if debug:
-            print(f'Building lazy graph for {len(delayed_stats)} overlap statistics...', flush=True)
+            print(f'Building lazy graph for {len(all_overlap_pairs)} overlap pairs, {len(ids)} bursts...', flush=True)
 
-        # Solve function — runs inside dask.delayed, receives concrete stats.
-        # Captures only small metadata (ids, id_to_idx, x_centers, etc.).
-        def _fit_solve(stats_list):
+        # Single delayed task: receives resolved burst numpy arrays,
+        # computes overlaps + diffs internally, then solves.
+        def _fit_all(*burst_data_arrays):
+            import xarray as xr
             from scipy import sparse as _sparse
             from scipy.sparse.linalg import lsqr as _lsqr
             from scipy.sparse.csgraph import connected_components as _cc
 
-            valid_stats = [s for s in stats_list if s is not None]
-
+            # Compute overlap diffs and process statistics
             _pbp = {p: [] for p in range(n_pairs)}
-            for st in valid_stats:
-                _id1, _id2, _pidx, _off, _rv, _xc, _nu = st
-                _w = np.sqrt(_nu)
-                if degree == 0:
-                    _pbp[_pidx].append((_id1, _id2, _off, _w))
-                else:
-                    if _rv is not None:
-                        _pbp[_pidx].append((_id1, _id2, _off, _rv, _xc, _w))
+            for id1, id2 in all_overlap_pairs:
+                i1_idx = id_to_idx[id1]
+                i2_idx = id_to_idx[id2]
+                d1 = np.asarray(burst_data_arrays[i1_idx])
+                d2 = np.asarray(burst_data_arrays[i2_idx])
+
+                for pair_idx in range(n_pairs):
+                    d1_p = d1[pair_idx] if has_pair_dim else d1
+                    d2_p = d2[pair_idx] if has_pair_dim else d2
+
+                    # Build xarray DataArrays for coordinate-aware overlap
+                    da1 = xr.DataArray(d1_p, dims=['y', 'x'],
+                                       coords={'y': burst_y[i1_idx],
+                                               'x': burst_x[i1_idx]})
+                    da2 = xr.DataArray(d2_p, dims=['y', 'x'],
+                                       coords={'y': burst_y[i2_idx],
+                                               'x': burst_x[i2_idx]})
+                    diff = da2 - da1
+                    stat = process_phase_diff(diff.values,
+                                              diff.coords['x'].values,
+                                              id1, id2, pair_idx)
+                    if stat is None:
+                        continue
+                    _id1s, _id2s, _pidxs, _off, _rv, _xcent, _nu = stat
+                    _w = np.sqrt(_nu)
+                    if degree == 0:
+                        _pbp[_pidxs].append((_id1s, _id2s, _off, _w))
+                    else:
+                        if _rv is not None:
+                            _pbp[_pidxs].append((_id1s, _id2s, _off, _rv, _xcent, _w))
 
             def _solve_one(pidx):
                 pairs = _pbp[pidx]
@@ -5855,8 +5889,9 @@ class BatchCore(dict):
 
             return {'offsets': offsets, 'residuals': residuals}
 
-        # Delayed solve — fully lazy, NO dask.compute()
-        solve_result = dask.delayed(_fit_solve)(delayed_stats)
+        # Single delayed call — dask resolves burst data arrays before calling.
+        # Graph has ~N_bursts layers (not ~N_overlaps*3 from xarray diffs).
+        solve_result = dask.delayed(_fit_all, pure=True)(*burst_data)
 
         # Extract per-burst dask 0-d arrays from delayed solve result
         offsets_part = solve_result['offsets']
@@ -6155,9 +6190,11 @@ class BatchCore(dict):
             total_overlaps = sum(len(v) for v in overlapping_map.values())
             print(f'dissolve: STRtree found {total_overlaps} burst overlaps', flush=True)
 
-        # Build output - per burst, replace pol variables with lazy arrays
-        # Note: dissolve functions are defined at module level (_dissolve_pol_for_dask, _dissolve_pol_3d_for_dask)
-        # to avoid dask serialization issues with nested function closures in distributed environments
+        # Build output — one dask.delayed task per burst per pol.
+        # Pass raw dask arrays (not xarray DataArrays) to avoid expensive
+        # xarray __dask_graph__() calls during dask.delayed graph construction.
+        # The _dissolve_raw_for_dask function receives numpy arrays (dask resolves
+        # them) and reconstructs minimal xarray DataArrays for coord matching.
         output = {}
         for burst_idx, bid in enumerate(burst_ids):
             overlapping_indices = overlapping_map[burst_idx]
@@ -6169,52 +6206,42 @@ class BatchCore(dict):
 
             ds_others = [self[burst_ids[idx]] for idx in overlapping_indices]
 
-            # Copy dataset and replace each pol with lazy dissolved version
             new_ds = ds_current.copy()
             for pol in polarizations:
                 da_current = ds_current[pol]
                 das_others = [ds[pol] for ds in ds_others]
 
-                # Check if 3D (has stack dimension like 'pair')
-                if len(da_current.dims) > 2:
-                    # Ensure first dim chunked as 1 for per-slice processing
-                    if hasattr(da_current.data, 'chunks') and da_current.data.chunks[0][0] != 1:
-                        da_current = da_current.chunk({da_current.dims[0]: 1})
-                        das_others = [d.chunk({d.dims[0]: 1}) for d in das_others]
-                    stackvar = da_current.dims[0]
-                    n_stack = da_current.sizes[stackvar]
-                    shape_2d = da_current.shape[1:]
+                # Extract raw arrays and numpy coordinates.
+                # Raw dask arrays have O(1) __dask_graph__() (direct attribute),
+                # vs xarray DataArrays which create temp Dataset each call.
+                current_arr = da_current.data
+                current_y = da_current.y.values
+                current_x = da_current.x.values
 
-                    # Create separate delayed array for each stack element for parallelization
-                    # Use module-level function to avoid dask serialization issues
-                    delayed_slices = []
-                    for i in range(n_stack):
-                        da_slice = da_current.isel({stackvar: i})
-                        das_others_slice = tuple(d.isel({stackvar: i}) for d in das_others)
-                        # Create 3D delayed array with shape (1, y, x) and chunks (1, -1, -1)
-                        # Use pure=True for deterministic behavior in distributed environments
-                        delayed_slice = da.from_delayed(
-                            dask.delayed(_dissolve_pol_3d_for_dask, pure=True)(
-                                da_slice, das_others_slice, wrap, extend, weight
-                            ),
-                            shape=(1,) + shape_2d,
-                            dtype=da_current.dtype
-                        )
-                        delayed_slices.append(delayed_slice)
+                if not isinstance(current_arr, da.Array):
+                    current_arr = da.from_array(current_arr, chunks=current_arr.shape)
 
-                    # Concatenate along axis 0 - each slice is already (1, y, x)
-                    delayed_array = da.concatenate(delayed_slices, axis=0)
-                else:
-                    # 2D case - single delayed array
-                    # Use module-level function to avoid dask serialization issues
-                    # Use pure=True for deterministic behavior in distributed environments
-                    delayed_array = da.from_delayed(
-                        dask.delayed(_dissolve_pol_for_dask, pure=True)(
-                            da_current, tuple(das_others), wrap, extend, weight
-                        ),
-                        shape=da_current.shape,
-                        dtype=da_current.dtype
-                    )
+                others_arrs = []
+                others_ys = []
+                others_xs = []
+                for d in das_others:
+                    arr = d.data
+                    if not isinstance(arr, da.Array):
+                        arr = da.from_array(arr, chunks=arr.shape)
+                    others_arrs.append(arr)
+                    others_ys.append(d.y.values)
+                    others_xs.append(d.x.values)
+
+                delayed_result = dask.delayed(_dissolve_raw_for_dask, pure=True)(
+                    current_arr, current_y, current_x,
+                    others_arrs, others_ys, others_xs,
+                    wrap, extend, weight
+                )
+                delayed_array = da.from_delayed(
+                    delayed_result,
+                    shape=da_current.shape,
+                    dtype=da_current.dtype
+                )
                 new_ds[pol] = da_current.copy(data=delayed_array)
 
             output[bid] = new_ds
