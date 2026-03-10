@@ -2127,27 +2127,27 @@ class BatchCore(dict):
 
                 y_chunks = data_dask.chunks[1]
                 x_chunks = data_dask.chunks[2]
-                y_breaks = [0] + list(np.cumsum(y_chunks))
-                x_breaks = [0] + list(np.cumsum(x_chunks))
+
+                # Optimize full graph once, then partition into delayed objects
+                data_delayed = data_dask.to_delayed(optimize_graph=True)
+                weight_delayed = weight_dask.to_delayed(optimize_graph=True) if weight_dask is not None else None
 
                 blocks_rows = []
-                for bj in range(len(y_breaks) - 1):
-                    y0, y1 = y_breaks[bj], y_breaks[bj + 1]
+                for bj in range(len(y_chunks)):
                     blocks_row = []
-                    for bk in range(len(x_breaks) - 1):
-                        x0, x1 = x_breaks[bk], x_breaks[bk + 1]
-                        td_list = data_dask[:, y0:y1, x0:x1].to_delayed().ravel().tolist()
-                        if weight_dask is not None:
-                            tw_list = weight_dask[:, y0:y1, x0:x1].to_delayed().ravel().tolist()
+                    for bk in range(len(x_chunks)):
+                        td_list = data_delayed[:, bj, bk].ravel().tolist()
+                        if weight_delayed is not None:
+                            tw_list = weight_delayed[:, bj, bk].ravel().tolist()
                             block = da.from_delayed(
                                 dask.delayed(process_chunks)(td_list, tw_list),
-                                shape=(n_samples, y1 - y0, x1 - x0),
+                                shape=(n_samples, y_chunks[bj], x_chunks[bk]),
                                 dtype=out_dtype,
                             )
                         else:
                             block = da.from_delayed(
                                 dask.delayed(process_chunks)(td_list),
-                                shape=(n_samples, y1 - y0, x1 - x0),
+                                shape=(n_samples, y_chunks[bj], x_chunks[bk]),
                                 dtype=out_dtype,
                             )
                         blocks_row.append(block)
@@ -2279,8 +2279,6 @@ class BatchCore(dict):
 
                 y_chunks = data_dask.chunks[1]
                 x_chunks = data_dask.chunks[2]
-                y_breaks = [0] + list(np.cumsum(y_chunks))
-                x_breaks = [0] + list(np.cumsum(x_chunks))
 
                 def make_wrapper(ref_vals, rep_vals, dev, deg, days_f, count_f, detrend_mode):
                     def process_chunks(data_chunks, weight_chunks=None):
@@ -2310,26 +2308,26 @@ class BatchCore(dict):
 
                 wrapper = make_wrapper(ref_values, rep_values, str(device), degree, days, count, detrend)
 
+                # Optimize full graph once, then partition into delayed objects
+                data_delayed = data_dask.to_delayed(optimize_graph=True)
+                weight_delayed = weight_dask.to_delayed(optimize_graph=True) if weight_dask is not None else None
+
                 blocks_rows = []
-                for bj in range(len(y_breaks) - 1):
-                    y0, y1 = y_breaks[bj], y_breaks[bj + 1]
+                for bj in range(len(y_chunks)):
                     blocks_row = []
-                    for bk in range(len(x_breaks) - 1):
-                        x0, x1 = x_breaks[bk], x_breaks[bk + 1]
-                        td_list = data_dask[:, y0:y1, x0:x1] \
-                            .to_delayed().ravel().tolist()
-                        if weight_dask is not None:
-                            tw_list = weight_dask[:, y0:y1, x0:x1] \
-                                .to_delayed().ravel().tolist()
+                    for bk in range(len(x_chunks)):
+                        td_list = data_delayed[:, bj, bk].ravel().tolist()
+                        if weight_delayed is not None:
+                            tw_list = weight_delayed[:, bj, bk].ravel().tolist()
                             block = da.from_delayed(
                                 dask.delayed(wrapper)(td_list, tw_list),
-                                shape=(n_pairs_val, y1 - y0, x1 - x0),
+                                shape=(n_pairs_val, y_chunks[bj], x_chunks[bk]),
                                 dtype=out_dtype,
                             )
                         else:
                             block = da.from_delayed(
                                 dask.delayed(wrapper)(td_list),
-                                shape=(n_pairs_val, y1 - y0, x1 - x0),
+                                shape=(n_pairs_val, y_chunks[bj], x_chunks[bk]),
                                 dtype=out_dtype,
                             )
                         blocks_row.append(block)

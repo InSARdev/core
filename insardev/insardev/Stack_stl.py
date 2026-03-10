@@ -156,8 +156,6 @@ class Stack_stl(Stack_sbas):
 
         y_chunks = data_dask.chunks[1]
         x_chunks = data_dask.chunks[2]
-        y_breaks = [0] + list(np.cumsum(y_chunks))
-        x_breaks = [0] + list(np.cumsum(x_chunks))
 
         def process_chunks(data_chunks):
             import math
@@ -200,16 +198,17 @@ class Stack_stl(Stack_sbas):
             del vec_stl
             return result
 
+        # Optimize full graph once, then partition into delayed objects
+        data_delayed = data_dask.to_delayed(optimize_graph=True)
+
         blocks_rows = []
-        for bj in range(len(y_breaks) - 1):
-            y0, y1 = y_breaks[bj], y_breaks[bj + 1]
+        for bj in range(len(y_chunks)):
             blocks_row = []
-            for bk in range(len(x_breaks) - 1):
-                x0, x1 = x_breaks[bk], x_breaks[bk + 1]
-                td_list = data_dask[:, y0:y1, x0:x1].to_delayed().ravel().tolist()
+            for bk in range(len(x_chunks)):
+                td_list = data_delayed[:, bj, bk].ravel().tolist()
                 block = dask.array.from_delayed(
                     dask.delayed(process_chunks)(td_list),
-                    shape=(3, n_dates_out, y1 - y0, x1 - x0),
+                    shape=(3, n_dates_out, y_chunks[bj], x_chunks[bk]),
                     dtype=np.float32,
                 )
                 blocks_row.append(block)
