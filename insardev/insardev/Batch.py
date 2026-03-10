@@ -2251,7 +2251,8 @@ class Batches(tuple):
         """
         Unwrap phase using GPU-accelerated IRLS algorithm (L¹ norm).
 
-        Expects Batches with [BatchWrap (phase), BatchUnit (weight, optional)].
+        Expects Batches with [BatchWrap or BatchComplex (phase), BatchUnit (weight, optional)].
+        If the first element is BatchComplex, .angle() is called automatically.
 
         Parameters
         ----------
@@ -2291,8 +2292,12 @@ class Batches(tuple):
         phase = self[0]
         weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
 
+        # Auto-convert complex phase to wrapped phase
+        if isinstance(phase, BatchComplex):
+            phase = phase.angle()
+
         if not isinstance(phase, BatchWrap):
-            raise TypeError(f"First element must be BatchWrap, got {type(phase).__name__}")
+            raise TypeError(f"First element must be BatchWrap or BatchComplex, got {type(phase).__name__}")
 
         # Delegate to BatchWrap.unwrap2d
         return phase.unwrap2d(weight=weight, conncomp=conncomp, conncomp_size=conncomp_size,
@@ -2304,7 +2309,8 @@ class Batches(tuple):
         """
         Unwrap phase per spatial chunk with overlap using IRLS algorithm.
 
-        Expects Batches with [BatchWrap (phase), BatchUnit (weight, optional)].
+        Expects Batches with [BatchWrap or BatchComplex (phase), BatchUnit (weight, optional)].
+        If the first element is BatchComplex, .angle() is called automatically.
 
         Unlike unwrap2d() which requires a single spatial chunk, this method
         unwraps each spatial chunk independently with overlap margins.
@@ -2337,8 +2343,12 @@ class Batches(tuple):
         phase = self[0]
         weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
 
+        # Auto-convert complex phase to wrapped phase
+        if isinstance(phase, BatchComplex):
+            phase = phase.angle()
+
         if not isinstance(phase, BatchWrap):
-            raise TypeError(f"First element must be BatchWrap, got {type(phase).__name__}")
+            raise TypeError(f"First element must be BatchWrap or BatchComplex, got {type(phase).__name__}")
 
         unwrapped = phase.unwrap2d_chunk(weight=weight, overlap=overlap,
                                           device=device, debug=debug, **kwargs)
@@ -2350,7 +2360,8 @@ class Batches(tuple):
         """
         1D temporal phase unwrapping using IRLS optimization.
 
-        Expects Batches with [BatchWrap (phase), BatchUnit (weight, optional)].
+        Expects Batches with [BatchWrap or BatchComplex (phase), BatchUnit (weight, optional)].
+        If the first element is BatchComplex, .angle() is called automatically.
 
         Parameters
         ----------
@@ -2368,8 +2379,11 @@ class Batches(tuple):
 
         Examples
         --------
-        >>> phase, corr = stack.pairs(baseline.tolist()).phasediff(wavelength=30).angle()
+        >>> # With explicit .angle()
+        >>> phase, corr = mintfcorr.detrend1d().angle()
         >>> unwrapped, corr = Batches([phase, corr]).unwrap1d()
+        >>> # Or directly from complex phase (angle applied automatically)
+        >>> unwrapped, corr = mintfcorr.detrend1d().unwrap1d()
         """
         if len(self) < 1:
             raise ValueError("unwrap1d() requires Batches with at least 1 element: [phase]")
@@ -2377,8 +2391,12 @@ class Batches(tuple):
         phase = self[0]
         weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
 
+        # Auto-convert complex phase to wrapped phase
+        if isinstance(phase, BatchComplex):
+            phase = phase.angle()
+
         if not isinstance(phase, BatchWrap):
-            raise TypeError(f"First element must be BatchWrap, got {type(phase).__name__}")
+            raise TypeError(f"First element must be BatchWrap or BatchComplex, got {type(phase).__name__}")
 
         # Delegate to BatchWrap.unwrap1d
         unwrapped = phase.unwrap1d(weight=weight, device=device, debug=debug, **kwargs)
@@ -2585,6 +2603,31 @@ class Batches(tuple):
         result = data.lstsq(weight=weight, device=device, cumsum=cumsum, debug=debug)
 
         # Rebuild Batches preserving all original elements except first
+        elements = [result] + list(self[1:])
+        return Batches(elements)
+
+    def displacement_los(self, transform):
+        """
+        Convert phase to line-of-sight displacement (meters).
+
+        Applies Batch.displacement_los() to the first element.
+
+        Parameters
+        ----------
+        transform : Batch or Stack
+            Transform batch or Stack providing radar_wavelength.
+
+        Returns
+        -------
+        Batches
+            Batches with [displacement Batch] preserving other elements.
+
+        Examples
+        --------
+        >>> disp, corr = mintfcorr.detrend1d().unwrap1d().lstsq().displacement_los(stack.transform())
+        """
+        data = self[0]
+        result = data.displacement_los(transform)
         elements = [result] + list(self[1:])
         return Batches(elements)
 
