@@ -151,26 +151,20 @@ class Stack_stl(Stack_sbas):
         n_dates_out = len(dt_periodic)
         n_dates_in = data.date.size
 
-        # No rechunk on dim 0 — pass per-date delayed lists to kernel.
         data_dask = data.data
 
-        y_chunks = data_dask.chunks[1]
-        x_chunks = data_dask.chunks[2]
-
-        def process_chunks(data_chunks):
+        def _stl_block(data_block, _dt=dt, _dt_periodic=dt_periodic,
+                       _n_dates_out=n_dates_out, _periods=periods, _robust=robust):
             import math
             from .utils_dask import get_dask_chunk_size_mb
-            chunks = [np.asarray(c) for c in data_chunks]
-            ny, nx = chunks[0].shape[1], chunks[0].shape[2]
-            n_dates_in_local = sum(c.shape[0] for c in chunks)
-            result = np.empty((3, n_dates_out, ny, nx), dtype=np.float32)
+            ny, nx = data_block.shape[1], data_block.shape[2]
+            n_dates_in_local = data_block.shape[0]
+            result = np.empty((3, _n_dates_out, ny, nx), dtype=np.float32)
             vec_stl = np.vectorize(
-                lambda ts: utils_stl.stl1d(ts, dt, dt_periodic, periods, robust),
+                lambda ts: utils_stl.stl1d(ts, _dt, _dt_periodic, _periods, _robust),
                 signature='(n)->(m),(m),(m)'
             )
-            # Calculate sub-tile size from dask chunk budget.
-            # Per sub-tile memory: input (n_dates_in × sub_pixels × 4) + output (3 × n_dates_out × sub_pixels × 4)
-            per_pixel_bytes = (n_dates_in_local + 3 * n_dates_out) * 4
+            per_pixel_bytes = (n_dates_in_local + 3 * _n_dates_out) * 4
             budget_bytes = int(get_dask_chunk_size_mb() * 1024 * 1024)
             max_sub_pixels = max(256, budget_bytes // max(1, per_pixel_bytes))
             sub_side = int(math.sqrt(max_sub_pixels))
@@ -180,41 +174,24 @@ class Stack_stl(Stack_sbas):
                 ty1 = min(ty0 + sub_h, ny)
                 for tx0 in range(0, nx, sub_w):
                     tx1 = min(tx0 + sub_w, nx)
-                    if len(chunks) == 1:
-                        tile = chunks[0][:, ty0:ty1, tx0:tx1]
-                    else:
-                        tile = np.concatenate(
-                            [c[:, ty0:ty1, tx0:tx1] for c in chunks], axis=0
-                        )
-                    # (n_dates, sub_h, sub_w) -> (sub_h, sub_w, n_dates)
+                    tile = data_block[:, ty0:ty1, tx0:tx1]
                     tile_t = tile.transpose(1, 2, 0)
                     del tile
-                    # result: (3, sub_h, sub_w, n_dates_out) after asarray
                     block = np.asarray(vec_stl(tile_t))
                     del tile_t
-                    # (3, sub_h, sub_w, n_dates_out) -> (3, n_dates_out, sub_h, sub_w)
                     result[:, :, ty0:ty1, tx0:tx1] = block.transpose(0, 3, 1, 2)
                     del block
             del vec_stl
             return result
 
-        # Optimize full graph once, then partition into delayed objects
-        data_delayed = data_dask.to_delayed(optimize_graph=True)
-
-        blocks_rows = []
-        for bj in range(len(y_chunks)):
-            blocks_row = []
-            for bk in range(len(x_chunks)):
-                td_list = data_delayed[:, bj, bk].ravel().tolist()
-                block = dask.array.from_delayed(
-                    dask.delayed(process_chunks)(td_list),
-                    shape=(3, n_dates_out, y_chunks[bj], x_chunks[bk]),
-                    dtype=np.float32,
-                )
-                blocks_row.append(block)
-            blocks_rows.append(dask.array.concatenate(blocks_row, axis=3))
-
-        models = dask.array.concatenate(blocks_rows, axis=2)
+        models = dask.array.blockwise(
+            _stl_block, 'cdyx',
+            data_dask, 'pyx',
+            new_axes={'c': 3, 'd': n_dates_out},
+            concatenate=True,
+            dtype=np.float32,
+            meta=np.empty((0, 0, 0, 0), dtype=np.float32),
+        )
 
         coords = {'date': dt_periodic.astype('datetime64[ns]'), 'y': data.y, 'x': data.x}
 

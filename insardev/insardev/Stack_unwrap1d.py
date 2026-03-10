@@ -132,60 +132,38 @@ class Stack_unwrap1d(BatchCore):
         n_dates = len(dates)
         n_pairs = len(pair_dates)
 
-        # No rechunk on dim 0 — pass per-date delayed lists to kernel.
-        # Pixel batching inside lstsq_to_dates_numpy handles memory.
-        import dask
-
         data_dask = data.data
         if weight is not None:
             weight_dask = weight.data
-            if weight_dask.chunks[1:] != data_dask.chunks[1:]:
-                raise ValueError(
-                    f'lstsq: weight spatial chunks {weight_dask.chunks[1:]} '
-                    f'must match data {data_dask.chunks[1:]}'
-                )
         else:
             weight_dask = None
 
-        y_chunks = data_dask.chunks[1]
-        x_chunks = data_dask.chunks[2]
-
-        def process_chunks(data_chunks, weight_chunks=None):
-            """Process a spatial block - all pairs, subset of y,x."""
-            # Pass chunk lists directly to kernel — it handles
-            # flattening without 3D intermediate copy.
+        def _lstsq_block(data_block, weight_block=None):
             ts_block, _ = utils_unwrap1d.lstsq_to_dates_numpy(
-                data_chunks, weight_chunks, pair_dates,
-                device=device, cumsum=cumsum, debug=False
+                [data_block], [weight_block] if weight_block is not None else None,
+                pair_dates, device=device, cumsum=cumsum, debug=False
             )
             return ts_block.astype(np.float32)
 
-        # Optimize full graph once, then partition into delayed objects
-        data_delayed = data_dask.to_delayed(optimize_graph=True)
-        weight_delayed = weight_dask.to_delayed(optimize_graph=True) if weight_dask is not None else None
-
-        blocks_rows = []
-        for bj in range(len(y_chunks)):
-            blocks_row = []
-            for bk in range(len(x_chunks)):
-                td_list = data_delayed[:, bj, bk].ravel().tolist()
-                if weight_delayed is not None:
-                    tw_list = weight_delayed[:, bj, bk].ravel().tolist()
-                    block = da.from_delayed(
-                        dask.delayed(process_chunks)(td_list, tw_list),
-                        shape=(n_dates, y_chunks[bj], x_chunks[bk]),
-                        dtype=np.float32,
-                    )
-                else:
-                    block = da.from_delayed(
-                        dask.delayed(process_chunks)(td_list),
-                        shape=(n_dates, y_chunks[bj], x_chunks[bk]),
-                        dtype=np.float32,
-                    )
-                blocks_row.append(block)
-            blocks_rows.append(blocks_row)
-
-        result_dask = da.block(blocks_rows)
+        if weight_dask is not None:
+            result_dask = da.blockwise(
+                _lstsq_block, 'dyx',
+                data_dask, 'pyx',
+                weight_dask, 'pyx',
+                new_axes={'d': n_dates},
+                concatenate=True,
+                dtype=np.float32,
+                meta=np.empty((0, 0, 0), dtype=np.float32),
+            )
+        else:
+            result_dask = da.blockwise(
+                _lstsq_block, 'dyx',
+                data_dask, 'pyx',
+                new_axes={'d': n_dates},
+                concatenate=True,
+                dtype=np.float32,
+                meta=np.empty((0, 0, 0), dtype=np.float32),
+            )
 
         # Build coordinates
         coords = {
@@ -328,61 +306,39 @@ class Stack_unwrap1d(BatchCore):
             else:
                 original_coords[k] = vals
 
-        # No rechunk on dim 0 — pass per-date delayed lists to kernel.
-        # Pixel batching inside unwrap1d_pairs_numpy handles memory.
-        import dask
-
         data_dask = data.data
         if weight is not None:
             weight_dask = weight.data
-            if weight_dask.chunks[1:] != data_dask.chunks[1:]:
-                raise ValueError(
-                    f'unwrap1d: weight spatial chunks {weight_dask.chunks[1:]} '
-                    f'must match data {data_dask.chunks[1:]}'
-                )
         else:
             weight_dask = None
 
-        y_chunks = data_dask.chunks[1]
-        x_chunks = data_dask.chunks[2]
-
-        def process_chunks(data_chunks, weight_chunks=None):
-            """Process a spatial block - all pairs, subset of y,x."""
-            # Pass chunk lists directly to kernel — it handles
-            # flattening without 3D intermediate copy.
-            unwrapped_block = utils_unwrap1d.unwrap1d_pairs_numpy(
-                data_chunks, weight_chunks, pair_dates,
-                device=device, max_iter=max_iter, epsilon=epsilon,
-                batch_size=batch_size, debug=False
+        def _unwrap_block(data_block, weight_block=None):
+            unwrapped = utils_unwrap1d.unwrap1d_pairs_numpy(
+                [data_block], [weight_block] if weight_block is not None else None,
+                pair_dates, device=device, max_iter=max_iter,
+                epsilon=epsilon, batch_size=batch_size, debug=False
             )
-            return unwrapped_block.astype(np.float32)
+            return unwrapped.astype(np.float32)
 
-        # Optimize full graph once, then partition into delayed objects
-        data_delayed = data_dask.to_delayed(optimize_graph=True)
-        weight_delayed = weight_dask.to_delayed(optimize_graph=True) if weight_dask is not None else None
-
-        blocks_rows = []
-        for bj in range(len(y_chunks)):
-            blocks_row = []
-            for bk in range(len(x_chunks)):
-                td_list = data_delayed[:, bj, bk].ravel().tolist()
-                if weight_delayed is not None:
-                    tw_list = weight_delayed[:, bj, bk].ravel().tolist()
-                    block = da.from_delayed(
-                        dask.delayed(process_chunks)(td_list, tw_list),
-                        shape=(n_pairs, y_chunks[bj], x_chunks[bk]),
-                        dtype=np.float32,
-                    )
-                else:
-                    block = da.from_delayed(
-                        dask.delayed(process_chunks)(td_list),
-                        shape=(n_pairs, y_chunks[bj], x_chunks[bk]),
-                        dtype=np.float32,
-                    )
-                blocks_row.append(block)
-            blocks_rows.append(blocks_row)
-
-        unwrapped_dask = da.block(blocks_rows)
+        if weight_dask is not None:
+            unwrapped_dask = da.blockwise(
+                _unwrap_block, 'dyx',
+                data_dask, 'pyx',
+                weight_dask, 'pyx',
+                new_axes={'d': n_pairs},
+                concatenate=True,
+                dtype=np.float32,
+                meta=np.empty((0, 0, 0), dtype=np.float32),
+            )
+        else:
+            unwrapped_dask = da.blockwise(
+                _unwrap_block, 'dyx',
+                data_dask, 'pyx',
+                new_axes={'d': n_pairs},
+                concatenate=True,
+                dtype=np.float32,
+                meta=np.empty((0, 0, 0), dtype=np.float32),
+            )
 
         result = xr.DataArray(
             unwrapped_dask,

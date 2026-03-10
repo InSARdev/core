@@ -2093,67 +2093,45 @@ class BatchCore(dict):
                     if weight_da is not None:
                         weight_da = weight_da.transpose(stack_dim, ...)
 
-                def process_chunks(data_chunks, weight_chunks=None, baseline_values=baseline_values,
-                                   device=device, degree=degree, detrend_mode=detrend):
-                    import torch
-                    # Pass chunk lists directly to kernel — it handles
-                    # batch extraction without full input copy.
-                    trend = utils_detrend.trend1d_array(
-                        data_chunks, baseline_values, weight_chunks, torch.device(device), degree
-                    )
-                    if detrend_mode:
-                        # Element-wise detrend per chunk — no full input concat
-                        result = np.empty_like(trend)
-                        offset = 0
-                        for c in data_chunks:
-                            c = np.asarray(c)
-                            cn = c.shape[0]
-                            t = trend[offset:offset+cn]
-                            if np.iscomplexobj(c):
-                                result[offset:offset+cn] = c * np.conj(t)
-                            else:
-                                result[offset:offset+cn] = c - t
-                            offset += cn
-                    else:
-                        result = trend
-                    return result
-
-                # No rechunk on dim 0 — pass per-date delayed lists to kernel.
-                # Pixel batching inside trend1d_array handles memory.
-                n_samples = len(baseline_values)
-
                 data_dask = data_da.data
                 weight_dask = weight_da.data if weight_da is not None else None
+                n_stack = data_dask.shape[0]
 
-                y_chunks = data_dask.chunks[1]
-                x_chunks = data_dask.chunks[2]
-
-                # Optimize full graph once, then partition into delayed objects
-                data_delayed = data_dask.to_delayed(optimize_graph=True)
-                weight_delayed = weight_dask.to_delayed(optimize_graph=True) if weight_dask is not None else None
-
-                blocks_rows = []
-                for bj in range(len(y_chunks)):
-                    blocks_row = []
-                    for bk in range(len(x_chunks)):
-                        td_list = data_delayed[:, bj, bk].ravel().tolist()
-                        if weight_delayed is not None:
-                            tw_list = weight_delayed[:, bj, bk].ravel().tolist()
-                            block = da.from_delayed(
-                                dask.delayed(process_chunks)(td_list, tw_list),
-                                shape=(n_samples, y_chunks[bj], x_chunks[bk]),
-                                dtype=out_dtype,
-                            )
+                def _trend1d_block(data_block, weight_block=None,
+                                   _bv=baseline_values, _dev=device,
+                                   _deg=degree, _detrend=detrend, _dtype=out_dtype):
+                    import torch
+                    trend = utils_detrend.trend1d_array(
+                        [data_block], _bv,
+                        [weight_block] if weight_block is not None else None,
+                        torch.device(_dev), _deg
+                    )
+                    if _detrend:
+                        if np.iscomplexobj(data_block):
+                            return (data_block * np.conj(trend)).astype(_dtype)
                         else:
-                            block = da.from_delayed(
-                                dask.delayed(process_chunks)(td_list),
-                                shape=(n_samples, y_chunks[bj], x_chunks[bk]),
-                                dtype=out_dtype,
-                            )
-                        blocks_row.append(block)
-                    blocks_rows.append(blocks_row)
+                            return (data_block - trend).astype(_dtype)
+                    return trend.astype(_dtype)
 
-                result_dask = da.block(blocks_rows)
+                if weight_dask is not None:
+                    result_dask = da.blockwise(
+                        _trend1d_block, 'dyx',
+                        data_dask, 'pyx',
+                        weight_dask, 'pyx',
+                        new_axes={'d': n_stack},
+                        concatenate=True,
+                        dtype=out_dtype,
+                        meta=np.empty((0, 0, 0), dtype=out_dtype),
+                    )
+                else:
+                    result_dask = da.blockwise(
+                        _trend1d_block, 'dyx',
+                        data_dask, 'pyx',
+                        new_axes={'d': n_stack},
+                        concatenate=True,
+                        dtype=out_dtype,
+                        meta=np.empty((0, 0, 0), dtype=out_dtype),
+                    )
 
                 fit_da = xr.DataArray(
                     result_dask,
@@ -2269,71 +2247,47 @@ class BatchCore(dict):
                     if weight_da is not None:
                         weight_da = weight_da.transpose('pair', ...)
 
-                # No rechunk on dim 0 — pass per-date delayed lists to kernel.
-                # Pixel batching inside trend1d_pairs_array handles memory.
-                import dask
-                n_pairs_val = len(ref_values)
-
                 data_dask = data_da.data
                 weight_dask = weight_da.data if weight_da is not None else None
+                n_pairs_val = len(ref_values)
 
-                y_chunks = data_dask.chunks[1]
-                x_chunks = data_dask.chunks[2]
-
-                def make_wrapper(ref_vals, rep_vals, dev, deg, days_f, count_f, detrend_mode):
-                    def process_chunks(data_chunks, weight_chunks=None):
-                        import torch
-                        # Pass chunk lists directly to kernel — it extracts
-                        # only needed pairs without full input concatenation.
-                        trend = utils_detrend.trend1d_pairs_array(
-                            data_chunks, weight_chunks, ref_vals, rep_vals,
-                            torch.device(dev), deg, days_f, count_f
-                        )
-                        if detrend_mode:
-                            # Element-wise detrend per chunk — no full input concat
-                            result = np.empty_like(trend)
-                            offset = 0
-                            for c in data_chunks:
-                                c = np.asarray(c)
-                                cn = c.shape[0]
-                                t = trend[offset:offset+cn]
-                                if np.iscomplexobj(c):
-                                    result[offset:offset+cn] = c * np.conj(t)
-                                else:
-                                    result[offset:offset+cn] = c - t
-                                offset += cn
-                            return result
-                        return trend
-                    return process_chunks
-
-                wrapper = make_wrapper(ref_values, rep_values, str(device), degree, days, count, detrend)
-
-                # Optimize full graph once, then partition into delayed objects
-                data_delayed = data_dask.to_delayed(optimize_graph=True)
-                weight_delayed = weight_dask.to_delayed(optimize_graph=True) if weight_dask is not None else None
-
-                blocks_rows = []
-                for bj in range(len(y_chunks)):
-                    blocks_row = []
-                    for bk in range(len(x_chunks)):
-                        td_list = data_delayed[:, bj, bk].ravel().tolist()
-                        if weight_delayed is not None:
-                            tw_list = weight_delayed[:, bj, bk].ravel().tolist()
-                            block = da.from_delayed(
-                                dask.delayed(wrapper)(td_list, tw_list),
-                                shape=(n_pairs_val, y_chunks[bj], x_chunks[bk]),
-                                dtype=out_dtype,
-                            )
+                def _trend1d_pairs_block(data_block, weight_block=None,
+                                         _ref=ref_values, _rep=rep_values,
+                                         _dev=str(device), _deg=degree,
+                                         _days=days, _count=count,
+                                         _detrend=detrend, _dtype=out_dtype):
+                    import torch
+                    trend = utils_detrend.trend1d_pairs_array(
+                        [data_block],
+                        [weight_block] if weight_block is not None else None,
+                        _ref, _rep, torch.device(_dev), _deg, _days, _count
+                    )
+                    if _detrend:
+                        if np.iscomplexobj(data_block):
+                            return (data_block * np.conj(trend)).astype(_dtype)
                         else:
-                            block = da.from_delayed(
-                                dask.delayed(wrapper)(td_list),
-                                shape=(n_pairs_val, y_chunks[bj], x_chunks[bk]),
-                                dtype=out_dtype,
-                            )
-                        blocks_row.append(block)
-                    blocks_rows.append(blocks_row)
+                            return (data_block - trend).astype(_dtype)
+                    return trend.astype(_dtype)
 
-                result_dask = da.block(blocks_rows)
+                if weight_dask is not None:
+                    result_dask = da.blockwise(
+                        _trend1d_pairs_block, 'dyx',
+                        data_dask, 'pyx',
+                        weight_dask, 'pyx',
+                        new_axes={'d': n_pairs_val},
+                        concatenate=True,
+                        dtype=out_dtype,
+                        meta=np.empty((0, 0, 0), dtype=out_dtype),
+                    )
+                else:
+                    result_dask = da.blockwise(
+                        _trend1d_pairs_block, 'dyx',
+                        data_dask, 'pyx',
+                        new_axes={'d': n_pairs_val},
+                        concatenate=True,
+                        dtype=out_dtype,
+                        meta=np.empty((0, 0, 0), dtype=out_dtype),
+                    )
 
                 trend_da = xr.DataArray(
                     result_dask,
