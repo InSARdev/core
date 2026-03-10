@@ -2566,14 +2566,14 @@ class Batches(tuple):
 
         Returns
         -------
-        Batch
-            Phase time series with 'date' dimension instead of 'pair'.
+        Batches
+            Batches with [displacement Batch] preserving original elements except first.
 
         Examples
         --------
         >>> phase, corr = stack.pairs(baseline.tolist()).phasediff(wavelength=30).angle()
-        >>> unwrapped = Batches([phase, corr]).unwrap1d()
-        >>> disp = Batches([unwrapped, corr]).lstsq()
+        >>> unwrapped, corr = Batches([phase, corr]).unwrap1d()
+        >>> disp, corr = Batches([unwrapped, corr]).lstsq()
         """
         if len(self) < 1:
             raise ValueError("lstsq() requires Batches with at least 1 element: [data]")
@@ -2582,7 +2582,11 @@ class Batches(tuple):
         weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
 
         # Delegate to Batch.lstsq
-        return data.lstsq(weight=weight, device=device, cumsum=cumsum, debug=debug)
+        result = data.lstsq(weight=weight, device=device, cumsum=cumsum, debug=debug)
+
+        # Rebuild Batches preserving all original elements except first
+        elements = [result] + list(self[1:])
+        return Batches(elements)
 
     def regression1d_baseline(self, *args, **kwargs):
         raise NotImplementedError("Batches.regression1d_baseline() is removed. Use Batches.detrend1d() or Batch.trend1d() instead.")
