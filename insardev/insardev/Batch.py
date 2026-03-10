@@ -1730,6 +1730,8 @@ class BatchComplex(BatchCore):
 
         if isinstance(window, int):
             window = {'y': window, 'x': window}
+        elif isinstance(window, (tuple, list)):
+            window = {'y': window[0], 'x': window[1]}
 
         # Resolve device ONCE here, not in every task
         if device == 'auto':
