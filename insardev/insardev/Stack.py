@@ -168,124 +168,6 @@ class Stack(Stack_plot, BatchCore):
         """Compute incidence angle for each burst via linear polynomial fit."""
         return self.transform().incidence()
 
-    def adi2(self, angle_coarse: float = 15, angle_fine: float = 5, device: str = 'auto') -> "Batches":
-        """
-        Polarimetric ADI optimization for dual-pol data (VV/VH or HH/HV).
-
-        NOTE: Requires insardev_polsar extension.
-
-        Finds optimal polarimetric combination that minimizes Amplitude Dispersion
-        Index (ADI) for each pixel. Uses coarse-to-fine search for efficiency:
-        ~7x faster than exhaustive grid search with <0.1% PS loss.
-
-        Parameters
-        ----------
-        angle_coarse : float
-            Coarse grid step in degrees. Default 15°.
-            Smaller = more accurate coarse pass but slower.
-        angle_fine : float
-            Fine grid step in degrees. Default 5°.
-            This is the final angular precision of the result.
-        device : str
-            PyTorch device: 'auto', 'cuda', 'mps', or 'cpu'.
-
-        Returns
-        -------
-        Batches
-            [S_opt, adi, psi] where:
-
-            - **S_opt** (Stack): Optimized SLC stack with mixed VV/VH signal.
-              Preserves all original variables (BPR, coords, attrs).
-              Use for interferograms: ``S_opt.pairs(baseline).phasediff()``
-
-            - **adi** (Batch): Minimum ADI values per pixel.
-              Use for PS selection: ``ps_mask = adi < 0.25``
-
-            - **psi** (Batch): Optimal mixing angle per pixel (radians).
-              ψ=0 means VV was optimal, ψ>0 means VH contributed.
-              Use to identify where dual-pol helped: ``vh_helped = psi > 0.1``
-
-        Examples
-        --------
-        Basic PS selection with dual-pol optimization:
-
-        >>> S_opt, adi, psi = stack.adi2()
-        >>> ps_mask = adi < 0.25
-
-        Higher precision (slower):
-
-        >>> S_opt, adi, psi = stack.adi2(angle_coarse=10, angle_fine=2)
-
-        Faster but less accurate:
-
-        >>> S_opt, adi, psi = stack.adi2(angle_coarse=20, angle_fine=5)
-
-        Compare with single-pol to see improvement:
-
-        >>> adi_vv = stack.adi()  # Single-pol VV
-        >>> new_ps = (adi < 0.25) & (adi_vv > 0.25)  # PS found only by dual-pol
-        >>> print(f"New PS from dual-pol: {new_ps.sum().compute()}")
-
-        Use optimized stack for interferograms:
-
-        >>> phase, corr = S_opt.pairs(baseline).phasediff()
-
-        Notes
-        -----
-        - For pixels where ψ≈0, S_opt≈VV (no benefit from VH)
-        - For pixels where ψ>0, S_opt phase should be more stable than VV
-        - For DS processing, use ``phasediff2()`` instead (better coherence optimization)
-        - Improvement varies by scene type; urban areas may see less benefit
-
-        Algorithm
-        ---------
-        Uses coarse-to-fine (CTF) search:
-        1. Search at angle_coarse step over full (ψ, φ) space
-        2. Refine within ±angle_coarse at angle_fine step around best
-
-        Default (15°, 5°) uses ~200 combinations vs ~1400 for full 5° grid.
-
-        References
-        ----------
-        Ramirez et al. (2023), "Extending polarimetric optimization of multi-temporal
-        InSAR techniques on dual polarized Sentinel-1 data"
-        https://doi.org/10.1016/j.asr.2023.03.007
-        """
-        # Detect polarizations
-        sample_ds = next(iter(self.values()))
-        if 'VV' in sample_ds.data_vars and 'VH' in sample_ds.data_vars:
-            pols = ['VV', 'VH']
-        elif 'HH' in sample_ds.data_vars and 'HV' in sample_ds.data_vars:
-            pols = ['HH', 'HV']
-        else:
-            raise ValueError("Dual-pol data required (VV+VH or HH+HV)")
-
-        # Import implementation from insardev_polsar
-        try:
-            from insardev_polsar.adi2 import adi2 as _adi2_impl
-        except ImportError:
-            raise ImportError("adi2() requires insardev_polsar extension. Install it first.")
-
-        # Get dual-pol subset as BatchComplex
-        batch_complex = self[pols]
-
-        # Call internal adi2 implementation
-        s_opt_batch, adi_batch, psi_batch = _adi2_impl(batch_complex, angle_coarse, angle_fine, device)
-
-        # Merge S_opt back into original stack structure (preserves BPR, etc.)
-        # Replace VV/VH with optimized output, keep all other variables
-        output_pol = pols[0]  # VV or HH
-        s_opt_dict = {}
-        for burst_id, orig_ds in self.items():
-            s_opt_ds = s_opt_batch[burst_id]
-            # Drop original pols, add optimized output
-            merged = orig_ds.drop_vars(pols).assign({output_pol: s_opt_ds[output_pol]})
-            s_opt_dict[burst_id] = merged
-
-        s_opt_stack = type(self)(s_opt_dict)
-
-        return Batches([s_opt_stack, adi_batch, psi_batch])
-
     def optimize2(self, angle_coarse: float = 15, angle_fine: float = 5, device: str = 'auto') -> "Stack":
         """
         Polarimetric amplitude optimization with original co-pol phase.
@@ -297,9 +179,8 @@ class Stack(Stack_plot, BatchCore):
 
             S_opt(t) = |cos(ψ)·VV(t) + sin(ψ)·exp(iφ)·VH(t)| · exp(i·arg(VV(t)))
 
-        Unlike adi2() which returns mixed VV+VH phase, optimize2() preserves
-        the original VV phase so standard interferometric processing works
-        directly on the result.
+        Preserves the original VV phase so standard interferometric processing
+        works directly on the result.
 
         Parameters
         ----------
@@ -326,9 +207,9 @@ class Stack(Stack_plot, BatchCore):
 
         Notes
         -----
-        Use adi2() when you need the ADI and psi maps directly.
-        Use optimize2() when you want to feed the result into standard
-        interferometric pipelines (phasediff, unwrap, etc.).
+        Use optimize2() to feed the result into standard interferometric
+        pipelines (phasediff, unwrap, etc.). Use stack.adi() after
+        optimize2().compute() to get ADI values.
         """
         # Detect polarizations
         sample_ds = next(iter(self.values()))
@@ -408,7 +289,7 @@ class Stack(Stack_plot, BatchCore):
         NOTE: Requires insardev_polsar extension.
 
         Wrapper that calls BatchComplex.similarity() on complex variables.
-        Use with adi2()-optimized stack for best results.
+        Use with optimize2()-optimized stack for best results.
 
         Parameters
         ----------
@@ -910,7 +791,7 @@ class Stack(Stack_plot, BatchCore):
         >>> stack_opt = stack.optimize2().compute()  # compute Stack itself
         """
         if not batches:
-            return BatchCore.compute(self, n_bursts=n_bursts)
+            return BatchCore.compute(self)
         from .Batch import Batches
         return Batches(batches).compute(n_bursts=n_bursts)
 
