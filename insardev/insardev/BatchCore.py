@@ -1976,7 +1976,7 @@ class BatchCore(dict):
 
     def trend1d(self, weight: 'BatchUnit | None' = None, baseline: str = 'BPR',
                 degree: int = 1, device: str = 'auto', detrend: bool = False,
-                debug: bool = False) -> 'Batch':
+                remove_intercept: bool = True, debug: bool = False) -> 'Batch':
         """
         Fit 1D polynomial trend along perpendicular baseline at each (y, x) pixel.
 
@@ -2099,12 +2099,14 @@ class BatchCore(dict):
 
                 def _trend1d_block(data_block, weight_block=None,
                                    _bv=baseline_values, _dev=device,
-                                   _deg=degree, _detrend=detrend, _dtype=out_dtype):
+                                   _deg=degree, _detrend=detrend, _dtype=out_dtype,
+                                   _remove_intercept=remove_intercept):
                     import torch
                     trend = utils_detrend.trend1d_array(
                         [data_block], _bv,
                         [weight_block] if weight_block is not None else None,
-                        torch.device(_dev), _deg
+                        torch.device(_dev), _deg,
+                        remove_intercept=(_remove_intercept and _detrend)
                     )
                     if _detrend:
                         if np.iscomplexobj(data_block):

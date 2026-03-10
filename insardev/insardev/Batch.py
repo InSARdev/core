@@ -2550,13 +2550,15 @@ class Batches(tuple):
         phase = self[0]
         weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
 
-        if not isinstance(phase, (Batch, BatchComplex)):
-            raise TypeError(f"First element must be Batch or BatchComplex, got {type(phase).__name__}")
+        if not isinstance(phase, BatchComplex):
+            raise TypeError(f"detrend1d() requires complex phase (BatchComplex), got {type(phase).__name__}. "
+                            f"Call detrend1d() before unwrap1d().")
 
         # Fuse fit+subtract into one blockwise call (detrend=True) so the input
         # phase is referenced only once in the dask graph.
         detrended = phase.trend1d(weight=weight, baseline=baseline, degree=degree,
-                                  device=device, detrend=True, debug=debug)
+                                  device=device, detrend=True,
+                                  remove_intercept=True, debug=debug)
 
         # Preserve non-spatial variables (e.g. BPR) that may be dropped by arithmetic
         detrended = Batches._preserve_nonspatial(phase, detrended)

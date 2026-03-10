@@ -23,7 +23,7 @@ _linalg_init_lock = threading.Lock()
 _linalg_initialized = False
 
 
-def trend1d_array(data, dim_values, weight, device, degree=1):
+def trend1d_array(data, dim_values, weight, device, degree=1, remove_intercept=False):
     """
     Fit 1D polynomial along first dimension at each (y, x) pixel using PyTorch.
 
@@ -189,6 +189,10 @@ def trend1d_array(data, dim_values, weight, device, degree=1):
             fit = (X_t.to(cdtype) @ coeffs.squeeze(-1).T).T
             fit_abs = fit.abs().clamp(min=1e-10)
             fit = fit / fit_abs
+            if remove_intercept:
+                c0 = coeffs.squeeze(-1)[:, 0]
+                c0_unit = c0 / c0.abs().clamp(min=1e-10)
+                fit = fit * c0_unit.conj().unsqueeze(-1)
             result_flat[:, idx] = fit.T.cpu().numpy().astype(out_dtype)
         else:
             if has_weight:
@@ -201,6 +205,9 @@ def trend1d_array(data, dim_values, weight, device, degree=1):
                 coeffs = (XtX_inv_Xt @ data_b).T.unsqueeze(-1)
 
             fit = (X_t @ coeffs.squeeze(-1).T).T
+            if remove_intercept:
+                c0 = coeffs.squeeze(-1)[:, 0]
+                fit = fit - c0.unsqueeze(-1)
             result_flat[:, idx] = fit.T.cpu().numpy().astype(out_dtype)
 
     out = result_flat.reshape(n_samples, ny, nx)
