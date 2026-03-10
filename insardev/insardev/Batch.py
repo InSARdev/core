@@ -2363,13 +2363,13 @@ class Batches(tuple):
 
         Returns
         -------
-        Batch
-            Temporally unwrapped phase.
+        Batches
+            Batches with [unwrapped Batch, weight] preserving original elements.
 
         Examples
         --------
         >>> phase, corr = stack.pairs(baseline.tolist()).phasediff(wavelength=30).angle()
-        >>> unwrapped = Batches([phase, corr]).unwrap1d()
+        >>> unwrapped, corr = Batches([phase, corr]).unwrap1d()
         """
         if len(self) < 1:
             raise ValueError("unwrap1d() requires Batches with at least 1 element: [phase]")
@@ -2381,7 +2381,11 @@ class Batches(tuple):
             raise TypeError(f"First element must be BatchWrap, got {type(phase).__name__}")
 
         # Delegate to BatchWrap.unwrap1d
-        return phase.unwrap1d(weight=weight, device=device, debug=debug, **kwargs)
+        unwrapped = phase.unwrap1d(weight=weight, device=device, debug=debug, **kwargs)
+
+        # Rebuild Batches preserving all original elements except first
+        elements = [unwrapped] + list(self[1:])
+        return Batches(elements)
 
     def detrend2d(self, transform, degree=1, device='auto', debug=False):
         """
