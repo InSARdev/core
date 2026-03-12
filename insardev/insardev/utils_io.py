@@ -449,6 +449,27 @@ def open(store: str, storage_options: dict[str, str] | None = None, compat: bool
                 crs_wkt = spatial_ref_attrs.get('crs_wkt') or spatial_ref_attrs.get('spatial_ref')
                 if crs_wkt:
                     ds = ds.rio.write_crs(crs_wkt)
+        # xr.open_zarr does not preserve coordinate ordering — reorder to
+        # match the dimension order of data variables so that downstream
+        # code (e.g. plot.scatter) picks the correct default axis.
+        # Zero-cost: reuses same dask arrays, only rebuilds metadata.
+        dim_order = None
+        for vname in ds.data_vars:
+            if ds[vname].ndim >= 2:
+                dim_order = list(ds[vname].dims)
+                break
+        if dim_order is not None:
+            dim_coords = [c for c in dim_order if c in ds.coords]
+            non_dim_coords = [c for c in ds.coords if c not in set(dim_order)]
+            ordered = dim_coords + non_dim_coords
+            if list(ds.coords) != ordered:
+                new_vars = {v: (ds[v].dims, ds[v].data, ds[v].attrs) for v in ds.data_vars}
+                new_coords = {}
+                for c in ordered:
+                    coord = ds.coords[c]
+                    new_coords[c] = (coord.dims, coord.values, coord.attrs) if coord.dims \
+                        else xr.Variable((), coord.values, coord.attrs)
+                ds = xr.Dataset(new_vars, coords=new_coords, attrs=ds.attrs)
         return grp, ds
 
     with progressbar_joblib.progressbar_joblib(tqdm(desc=caption.ljust(25), total=len(groups))) as progress_bar:
