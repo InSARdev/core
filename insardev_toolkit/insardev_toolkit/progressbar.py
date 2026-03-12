@@ -8,14 +8,32 @@
 # See the LICENSE file in the insardev_toolkit directory for license terms.
 # ----------------------------------------------------------------------------
 
-# Patch tqdm.auto to use text mode globally (fixes white background in VSCode dark theme)
-import tqdm.auto
-import tqdm.std
-tqdm.auto.tqdm = tqdm.std.tqdm
+import math
+import tqdm.auto as _tqdm_auto
+import tqdm.std as _tqdm_std
+from tqdm.std import tqdm as _tqdm
+
+class tqdm(_tqdm):
+    """tqdm subclass that floors the percentage instead of rounding.
+
+    Prevents showing 100% when not all items are complete (e.g. 3536/3537).
+    """
+    @staticmethod
+    def format_meter(n, total, elapsed, **kwargs):
+        s = _tqdm.format_meter(n, total, elapsed, **kwargs)
+        if total and total > 0 and n < total:
+            rounded_pct = int(round(n / total * 100))
+            floored_pct = int(math.floor(n / total * 100))
+            if rounded_pct != floored_pct:
+                s = s.replace(f'{rounded_pct:3d}%|', f'{floored_pct:3d}%|', 1)
+        return s
+
+# Patch tqdm.auto to use text mode with floor percentage globally
+_tqdm_auto.tqdm = tqdm
+_tqdm_std.tqdm = tqdm
 
 from distributed.diagnostics.progressbar import ProgressBar
 from distributed.utils import LoopRunner
-from tqdm.std import tqdm
 from tornado.ioloop import IOLoop
 
 class TqdmDaskProgress(ProgressBar):
