@@ -4450,8 +4450,11 @@ class BatchCore(dict):
 
         os.makedirs(path, exist_ok=True)
 
-        # Merge bursts into unified dataset(s) per variable
-        merged = self.to_dataset()
+        # Merge bursts into unified dataset(s) per variable.
+        # Compute eagerly — VTK export needs all data in memory anyway,
+        # and computing here avoids dask graph issues (stale rechunk keys
+        # when downsample/coarsen layers are combined with to_dataset mosaic).
+        merged = self.to_dataset(compute=True)
         if isinstance(merged, xr.DataArray):
             merged = merged.to_dataset()
 
@@ -4484,7 +4487,7 @@ class BatchCore(dict):
                 selected = tfm_ds.isel(y=y_idx, x=x_idx)
                 selected = selected.assign_coords(y=tgt_ds.y, x=tgt_ds.x)
                 decimated[k] = selected
-            topo_merged = Batch(decimated).to_dataset()
+            topo_merged = Batch(decimated).to_dataset(compute=True)
 
         data_vars = list(merged.data_vars)
 
