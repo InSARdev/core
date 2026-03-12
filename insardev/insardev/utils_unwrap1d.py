@@ -429,11 +429,13 @@ def unwrap1d_to_dates_numpy(phase_stack, weight_stack, pair_dates, device='auto'
 
 
 def lstsq_to_dates_numpy(phase_stack, weight_stack, pair_dates, device='auto',
-                         cumsum=True, debug=False):
+                         cumsum=True, max_iter=5, epsilon=0.1,
+                         debug=False):
     """
-    Weighted least squares network inversion from pairs to dates.
+    L1-norm IRLS network inversion from pairs to dates.
 
-    Uses PyTorch batched least squares for GPU acceleration.
+    Uses iteratively reweighted least squares (IRLS) with L1-norm to be
+    robust against outlier pairs (e.g. from unwrapping errors).
 
     Parameters
     ----------
@@ -447,6 +449,10 @@ def lstsq_to_dates_numpy(phase_stack, weight_stack, pair_dates, device='auto',
         PyTorch device ('auto', 'cuda', 'mps', 'cpu').
     cumsum : bool
         If True, return cumulative displacement.
+    max_iter : int
+        Maximum IRLS iterations. Default 5.
+    epsilon : float
+        IRLS regularization (larger = faster convergence, less L1-like).
     debug : bool
         Print debug information.
 
@@ -500,8 +506,9 @@ def lstsq_to_dates_numpy(phase_stack, weight_stack, pair_dates, device='auto',
     # Gather size: pixel columns to concatenate at once (~dask chunk budget)
     gather_size = max(batch_size, (get_dask_chunk_size_mb() * 1024 * 1024) // max(1, n_pairs * 4))
 
-    A_t = torch.from_numpy(A.astype(np.float32)).to(dev)
-    reg = 1e-4 * torch.eye(n_intervals, device='cpu')
+    A_cpu = torch.from_numpy(A.astype(np.float32))
+    reg_cpu = 1e-4 * torch.eye(n_intervals)
+    A_dev = A_cpu.to(dev)
 
     increments = np.full((n_pixels, n_intervals), np.nan, dtype=np.float32)
 
@@ -525,7 +532,7 @@ def lstsq_to_dates_numpy(phase_stack, weight_stack, pair_dates, device='auto',
 
             phi_b = torch.from_numpy(phases_block[:, b_start:b_end].astype(np.float32)).to(dev)
             nan_mask_b = torch.isnan(phi_b)
-            phi_b = torch.where(nan_mask_b, torch.zeros_like(phi_b), phi_b)
+            phi_clean = torch.where(nan_mask_b, torch.zeros_like(phi_b), phi_b)
 
             if weights_block is not None:
                 w_batch = weights_block[:, b_start:b_end].astype(np.float32)
@@ -536,26 +543,57 @@ def lstsq_to_dates_numpy(phase_stack, weight_stack, pair_dates, device='auto',
                 nan_mask_b = nan_mask_b | nan_mask_w
                 W_b = torch.where(nan_mask_b, torch.zeros_like(W_b), W_b)
                 W_clamped = torch.clamp(W_b, 0.0, 0.9999)
-                W_lstsq_b = W_clamped / torch.sqrt(1 - W_clamped**2)
+                W_corr = W_clamped / torch.sqrt(1 - W_clamped**2)
             else:
-                W_lstsq_b = torch.where(nan_mask_b, torch.zeros(1, device=dev),
-                                         torch.ones(1, device=dev)).expand(n_pairs, b_len)
+                W_corr = torch.where(nan_mask_b, torch.zeros(1, device=dev),
+                                     torch.ones(1, device=dev)).expand(n_pairs, b_len)
 
-            phi_T = phi_b.T
-            W_T = W_lstsq_b.T
+            # Zero weight for NaN pixels
+            W_corr = torch.where(nan_mask_b, torch.zeros_like(W_corr), W_corr)
 
-            WA = W_T.unsqueeze(2) * A_t.unsqueeze(0)
-            Wb = (W_T * phi_T).unsqueeze(2)
+            # IRLS iterations for L1-norm robust estimation
+            W_irls = torch.ones(n_pairs, b_len, device=dev)
 
-            WA_cpu = torch.nan_to_num(WA.cpu(), nan=0.0, posinf=0.0, neginf=0.0)
-            Wb_cpu = torch.nan_to_num(Wb.cpu(), nan=0.0, posinf=0.0, neginf=0.0)
+            for iteration in range(max_iter):
+                W = W_irls * W_corr  # (n_pairs, b_len)
+                W_T = W.T            # (b_len, n_pairs)
 
-            result = torch.linalg.lstsq(WA_cpu, Wb_cpu)
-            x = result.solution.squeeze(2)
+                # Move to CPU for batched solve
+                W_T_cpu = W_T.cpu()
+                phi_cpu = phi_clean.cpu()
+                W_cpu = W.cpu()
+
+                # AtWA[p,i,j] = sum_k W[p,k] * A[k,i] * A[k,j]
+                AtWA = torch.einsum('pk,ki,kj->pij', W_T_cpu, A_cpu, A_cpu)
+                AtWA = AtWA + reg_cpu
+
+                # RHS: A^T W phi
+                Wphi = W_cpu * phi_cpu  # (n_pairs, b_len)
+                AtWphi = (A_cpu.T @ Wphi).T  # (b_len, n_unknowns)
+
+                # CPU batched solve
+                x = torch.linalg.solve(AtWA, AtWphi.unsqueeze(2)).squeeze(2)
+                # x: (b_len, n_unknowns)
+
+                # Reconstruct and compute residuals on device
+                x_dev = x.to(dev)
+                phi_recon = (A_dev @ x_dev.T)  # (n_pairs, b_len)
+                residuals = phi_clean - phi_recon
+
+                # Update IRLS weights (L1: W = 1/|r| + eps)
+                W_irls_new = 1.0 / (torch.abs(residuals) + epsilon)
+                W_irls_new = torch.where(nan_mask_b, torch.zeros_like(W_irls_new), W_irls_new)
+
+                # Check convergence
+                weight_change = torch.abs(W_irls_new - W_irls).mean()
+                if weight_change < 1e-3:
+                    break
+
+                W_irls = W_irls_new
 
             all_nan = nan_mask_b.all(dim=0).cpu()
             x[all_nan, :] = float('nan')
-            increments[g_start + b_start:g_start + b_end] = x.numpy()
+            increments[g_start + b_start:g_start + b_end] = x.cpu().numpy()
 
         del phases_block, weights_block
 
@@ -565,6 +603,9 @@ def lstsq_to_dates_numpy(phase_stack, weight_stack, pair_dates, device='auto',
         ts[:, 1:] = np.cumsum(increments, axis=1)
     else:
         ts[:, 1:] = increments
+    # Set first date to NaN when all increments are NaN
+    all_nan_pixels = np.all(np.isnan(increments), axis=1)
+    ts[all_nan_pixels, 0] = np.nan
 
     # Reshape: (n_pixels, n_dates) -> (n_dates, height, width)
     time_series = ts.T.reshape(n_dates, height, width)

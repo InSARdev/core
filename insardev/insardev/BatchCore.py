@@ -1976,7 +1976,8 @@ class BatchCore(dict):
 
     def trend1d(self, weight: 'BatchUnit | None' = None, baseline: str = 'BPR',
                 degree: int = 1, device: str = 'auto', detrend: bool = False,
-                remove_intercept: bool = True, debug: bool = False) -> 'Batch':
+                intercept: bool = False, slope: bool = True,
+                debug: bool = False) -> 'Batch':
         """
         Fit 1D polynomial trend along perpendicular baseline at each (y, x) pixel.
 
@@ -2100,13 +2101,13 @@ class BatchCore(dict):
                 def _trend1d_block(data_block, weight_block=None,
                                    _bv=baseline_values, _dev=device,
                                    _deg=degree, _detrend=detrend, _dtype=out_dtype,
-                                   _remove_intercept=remove_intercept):
+                                   _intercept=intercept, _slope=slope):
                     import torch
                     trend = utils_detrend.trend1d_array(
                         [data_block], _bv,
                         [weight_block] if weight_block is not None else None,
                         torch.device(_dev), _deg,
-                        remove_intercept=(_remove_intercept and _detrend)
+                        intercept=_intercept, slope=_slope,
                     )
                     if _detrend:
                         if np.iscomplexobj(data_block):
@@ -2152,12 +2153,15 @@ class BatchCore(dict):
     # Backward compatibility alias
     regression1d_baseline = trend1d
 
-    def trend1d_pairs(self, weight: 'BatchUnit | None' = None, degree: int = 0,
-                      days: int = 90, count: int | None = None,
+    def trend1d_pairs(self, weight: 'BatchUnit | None' = None, degree: int = 1,
                       device: str = 'auto', detrend: bool = False,
                       debug: bool = False) -> 'Batch':
         """
         Fit 1D polynomial trend along temporal pairs for each date.
+
+        For each date, gathers all pairs sharing that date, fits a polynomial
+        to phase vs temporal baseline, and evaluates the model. Uses all pairs
+        (no temporal filtering) to maximize the fit constraint.
 
         Two modes:
         - Complex input (BatchComplex): unit-circle fitting per date,
@@ -2171,14 +2175,7 @@ class BatchCore(dict):
         weight : BatchUnit or None
             Optional weight for the fitting (typically correlation).
         degree : int
-            Polynomial degree (0=mean, 1=linear). Default 0.
-        days : int or None
-            Maximum time interval (±days symmetric window) to include.
-            Default 90. Controls temporal high-pass: only pairs within ±days
-            contribute to the per-date atmospheric estimate.
-            Set to None to use all pairs (risk of removing deformation signal).
-        count : int or None
-            Maximum number of pairs per date to use. Default None.
+            Polynomial degree (0=mean, 1=linear). Default 1.
         device : str
             PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
         detrend : bool
@@ -2195,7 +2192,7 @@ class BatchCore(dict):
 
         Examples
         --------
-        >>> trend = intf.trend1d_pairs(degree=0, days=100)
+        >>> trend = intf.trend1d_pairs(degree=1)
         >>> detrended = intf * trend.conj()  # complex
         >>> detrended = phase - trend        # real
         """
@@ -2256,13 +2253,13 @@ class BatchCore(dict):
                 def _trend1d_pairs_block(data_block, weight_block=None,
                                          _ref=ref_values, _rep=rep_values,
                                          _dev=str(device), _deg=degree,
-                                         _days=days, _count=count,
-                                         _detrend=detrend, _dtype=out_dtype):
+                                         _detrend=detrend,
+                                         _dtype=out_dtype):
                     import torch
                     trend = utils_detrend.trend1d_pairs_array(
                         [data_block],
                         [weight_block] if weight_block is not None else None,
-                        _ref, _rep, torch.device(_dev), _deg, _days, _count
+                        _ref, _rep, torch.device(_dev), _deg
                     )
                     if _detrend:
                         if np.iscomplexobj(data_block):

@@ -23,7 +23,7 @@ _linalg_init_lock = threading.Lock()
 _linalg_initialized = False
 
 
-def trend1d_array(data, dim_values, weight, device, degree=1, remove_intercept=False):
+def trend1d_array(data, dim_values, weight, device, degree=1, intercept=True, slope=True):
     """
     Fit 1D polynomial along first dimension at each (y, x) pixel using PyTorch.
 
@@ -45,6 +45,10 @@ def trend1d_array(data, dim_values, weight, device, degree=1, remove_intercept=F
         PyTorch device
     degree : int
         Polynomial degree (1=linear, 2=quadratic, etc.)
+    intercept : bool
+        If True, include intercept (constant term) in output. If False, zero it out.
+    slope : bool
+        If True, include slope (and higher-order terms) in output. If False, zero them out.
 
     Returns
     -------
@@ -53,6 +57,9 @@ def trend1d_array(data, dim_values, weight, device, degree=1, remove_intercept=F
         Complex input returns complex64 unit-magnitude trend.
         Real input returns float32 trend.
     """
+    if degree == 0 and slope:
+        raise ValueError("slope=True requires degree >= 1 (degree=0 has no slope to fit)")
+
     import torch
     from .utils_dask import get_dask_chunk_size_mb
 
@@ -96,12 +103,10 @@ def trend1d_array(data, dim_values, weight, device, degree=1, remove_intercept=F
         dtype = torch.float32
     cdtype = torch.complex128 if dtype == torch.float64 else torch.complex64
 
-    # Normalize dim_values to [-1, 1] for numerical stability
-    dim_min = dim_values.min()
-    dim_max = dim_values.max()
-    dim_range = dim_max - dim_min
-    if dim_range > 0:
-        dim_norm = 2 * (dim_values - dim_min) / dim_range - 1
+    # Normalize dim_values so that 0 maps to 0 (intercept = value at dim=0)
+    dim_absmax = np.max(np.abs(dim_values))
+    if dim_absmax > 0:
+        dim_norm = dim_values / dim_absmax
     else:
         dim_norm = np.zeros_like(dim_values)
 
@@ -109,21 +114,27 @@ def trend1d_array(data, dim_values, weight, device, degree=1, remove_intercept=F
     X = np.column_stack([dim_norm**d for d in range(degree + 1)])
     X_t = torch.tensor(X, dtype=dtype, device=device)
 
-    # Compute valid mask incrementally from chunks (no full flat array)
-    valid_mask = np.ones(n_pixels, dtype=bool)
+    # Compute per-pixel valid sample count; require degree+2 minimum for fit
+    # (degree+1 gives exact fit with zero residual — not meaningful).
+    # NaN samples get zero weight automatically (partial NaN always handled).
+    min_valid = degree + 2
+
+    valid_count = np.zeros(n_pixels, dtype=np.int32)
     if is_complex:
         any_nonzero = np.zeros(n_pixels, dtype=bool)
         for fc in flat_chunks:
-            valid_mask &= np.all(np.isfinite(fc.real) & np.isfinite(fc.imag), axis=0)
-            any_nonzero |= np.any(fc != 0, axis=0)
-        valid_mask &= any_nonzero
+            finite = np.isfinite(fc.real) & np.isfinite(fc.imag)
+            valid_count += np.sum(finite, axis=0).astype(np.int32)
+            any_nonzero |= np.any((fc != 0) & finite, axis=0)
+        valid_mask = (valid_count >= min_valid) & any_nonzero
         del any_nonzero
     else:
         for fc in flat_chunks:
-            valid_mask &= np.all(np.isfinite(fc), axis=0)
-    if flat_w_chunks is not None:
-        for wc in flat_w_chunks:
-            valid_mask &= np.all(np.isfinite(wc), axis=0)
+            valid_count += np.sum(np.isfinite(fc), axis=0).astype(np.int32)
+        valid_mask = valid_count >= min_valid
+
+    has_partial_nan = np.any(valid_count < n_samples) if valid_mask.any() else False
+    del valid_count
 
     valid_indices = np.where(valid_mask)[0]
     n_valid = len(valid_indices)
@@ -158,43 +169,106 @@ def trend1d_array(data, dim_values, weight, device, degree=1, remove_intercept=F
         batch_data = _gather_cols(flat_chunks, idx)
 
         if is_complex:
-            # Unit-circle normalization on batch only
+            # For complex data: extract angles and fit with iterative 2π jump
+            # correction (same principle as irls_solve_1d in unwrap1d).
+            # 1. Fit polynomial to angles + jumps*2π with IRLS weights
+            # 2. Update jumps: k = round((fit - angles) / 2π)
+            # 3. Wrapped residuals → update IRLS weights: 1/(|r| + ε)
+            # 4. Converge when jumps stabilize
             batch_abs = np.abs(batch_data)
             with np.errstate(invalid='ignore', divide='ignore'):
-                batch_data = np.where(batch_abs > 0, batch_data / batch_abs, 0 + 0j)
-            del batch_abs
-            data_b = torch.tensor(batch_data, dtype=cdtype, device=device)
+                angles_np = np.where(batch_abs > 0, np.angle(batch_data), np.nan)
+            del batch_abs, batch_data
+
+            angles_raw = torch.tensor(angles_np, dtype=dtype, device=device)
+            del angles_np
+            nan_mask = ~torch.isfinite(angles_raw)
+            angles_safe = torch.where(nan_mask, torch.zeros(1, dtype=dtype, device=device), angles_raw)
+            del angles_raw
+
+            # Setup correlation weight + NaN masking (constant across iterations)
+            has_weight_corr = flat_w_chunks is not None
+            if has_weight_corr:
+                batch_w = _gather_cols(flat_w_chunks, idx)
+                sqrt_w_corr = torch.sqrt(torch.tensor(batch_w, dtype=dtype, device=device))
+                del batch_w
+            else:
+                sqrt_w_corr = torch.ones_like(angles_safe)
+
+            if has_partial_nan:
+                sqrt_w_corr = sqrt_w_corr * (~nan_mask).to(dtype)
+
+            # IRLS iteration with jump correction
+            epsilon = 0.1
+            convergence_threshold = 1e-3
+            jumps = torch.zeros_like(angles_safe)  # (n_samples, batch_pixels)
+            W_irls = torch.ones_like(angles_safe)   # (n_samples, batch_pixels)
+
+            for iteration in range(10):
+                data_b = angles_safe + jumps * (2 * np.pi)
+                sqrt_w = sqrt_w_corr * torch.sqrt(W_irls)
+
+                # Weighted polynomial fit
+                y_w = (data_b * sqrt_w).T  # (batch, samp)
+                X_wi = X_t[None, :, :] * sqrt_w.T[:, :, None]
+                XtX_wi = X_wi.transpose(1, 2) @ X_wi + reg
+                Xty = X_wi.transpose(1, 2) @ y_w.unsqueeze(-1)
+                coeffs = torch.linalg.solve(XtX_wi, Xty)
+
+                fit_raw = X_t @ coeffs.squeeze(-1).T  # (n_samples, batch_pixels)
+
+                # Update integer 2π jumps
+                new_jumps = torch.round((fit_raw - angles_safe) / (2 * np.pi))
+                new_jumps[nan_mask] = 0
+
+                # Wrapped residuals → IRLS weights (L1-norm, same as unwrap1d)
+                residuals = data_b - fit_raw
+                residuals = torch.atan2(torch.sin(residuals), torch.cos(residuals))
+                W_irls_new = 1.0 / (torch.abs(residuals) + epsilon)
+                W_irls_new[nan_mask] = 0
+
+                # Check convergence: jumps stabilized and weights converged
+                weight_change = torch.abs(W_irls_new - W_irls).mean()
+                jumps_stable = (new_jumps == jumps).all()
+                if jumps_stable and weight_change < convergence_threshold:
+                    break
+
+                jumps = new_jumps
+                W_irls = W_irls_new
+
+            if not intercept and not slope:
+                fit_raw = torch.zeros_like(fit_raw)
+            elif not intercept:
+                c0 = coeffs.squeeze(-1)[:, 0]  # (batch_pixels,)
+                fit_raw = fit_raw - c0[None, :]
+            elif not slope:
+                c0 = coeffs.squeeze(-1)[:, 0]
+                fit_raw = c0[None, :].expand_as(fit_raw)
+
+            result_flat[:, idx] = torch.exp(1j * fit_raw.to(cdtype)).cpu().numpy().astype(out_dtype)
+
         else:
             data_b = torch.tensor(batch_data, dtype=dtype, device=device)
-        del batch_data
+            del batch_data
 
-        has_weight = flat_w_chunks is not None
-        if has_weight:
-            batch_w = _gather_cols(flat_w_chunks, idx)
-            sqrt_w = torch.sqrt(torch.tensor(batch_w, dtype=dtype, device=device))
-            del batch_w
-
-        if is_complex:
+            has_weight = flat_w_chunks is not None
             if has_weight:
-                z_weighted = (data_b * sqrt_w).T
-                X_batch = X_t[None, :, :] * sqrt_w.T[:, :, None]
-                XtX_b = X_batch.transpose(1, 2) @ X_batch
-                Xtz = X_batch.transpose(1, 2).to(cdtype) @ z_weighted.unsqueeze(-1)
-                coeffs = torch.linalg.solve(
-                    (XtX_b + reg).to(cdtype).cpu(), Xtz.cpu()
-                ).to(device)
-            else:
-                coeffs = (XtX_inv_Xt.to(cdtype) @ data_b).T.unsqueeze(-1)
+                batch_w = _gather_cols(flat_w_chunks, idx)
+                sqrt_w = torch.sqrt(torch.tensor(batch_w, dtype=dtype, device=device))
+                del batch_w
 
-            fit = (X_t.to(cdtype) @ coeffs.squeeze(-1).T).T
-            fit_abs = fit.abs().clamp(min=1e-10)
-            fit = fit / fit_abs
-            if remove_intercept:
-                c0 = coeffs.squeeze(-1)[:, 0]
-                c0_unit = c0 / c0.abs().clamp(min=1e-10)
-                fit = fit * c0_unit.conj().unsqueeze(-1)
-            result_flat[:, idx] = fit.T.cpu().numpy().astype(out_dtype)
-        else:
+            # Handle partial NaN: zero out NaN values and give them zero weight
+            if has_partial_nan:
+                nan_mask = ~torch.isfinite(data_b)
+                data_b = torch.where(nan_mask, torch.zeros(1, dtype=dtype, device=device), data_b)
+                nan_w = (~nan_mask).to(dtype)  # 1 for valid, 0 for NaN
+                if has_weight:
+                    sqrt_w = sqrt_w * nan_w
+                else:
+                    sqrt_w = nan_w
+                    has_weight = True
+
+            # Real polynomial fit
             if has_weight:
                 y_weighted = (data_b * sqrt_w).T
                 X_batch = X_t[None, :, :] * sqrt_w.T[:, :, None]
@@ -205,9 +279,15 @@ def trend1d_array(data, dim_values, weight, device, degree=1, remove_intercept=F
                 coeffs = (XtX_inv_Xt @ data_b).T.unsqueeze(-1)
 
             fit = (X_t @ coeffs.squeeze(-1).T).T
-            if remove_intercept:
+            if not intercept and not slope:
+                fit = torch.zeros_like(fit)
+            elif not intercept:
                 c0 = coeffs.squeeze(-1)[:, 0]
                 fit = fit - c0.unsqueeze(-1)
+            elif not slope:
+                c0 = coeffs.squeeze(-1)[:, 0]
+                fit = c0.unsqueeze(-1).expand_as(fit)
+
             result_flat[:, idx] = fit.T.cpu().numpy().astype(out_dtype)
 
     out = result_flat.reshape(n_samples, ny, nx)
@@ -453,8 +533,10 @@ def polyfit1d_pytorch(data, time_values, weight, sign, device, degree=0):
     Fit 1D polynomial along first dimension at each pixel using PyTorch.
 
     Two modes:
-    - Complex input: unit-circle fitting (normalize to unit magnitude, apply sign
-      via conj for rep dates, fit complex polynomial, normalize result)
+    - Complex input: extract angles, apply IRLS with 2π jump correction
+      (same principle as irls_solve_1d in unwrap1d). Normalize time by
+      t_absmax so t=0 maps to 0 and the intercept = model at the date.
+      Returns exp(i * intercept) as unit-magnitude complex model.
     - Real input: standard polynomial fit with sign applied multiplicatively
 
     Parameters
@@ -467,7 +549,7 @@ def polyfit1d_pytorch(data, time_values, weight, sign, device, degree=0):
         Weight array (real), same shape as data
     sign : np.ndarray
         Sign array (n_samples,): +1 for ref dates, -1 for rep dates.
-        Real: multiplied into data. Complex: -1 triggers conj().
+        Real: multiplied into data. Complex: -1 negates angle.
     device : torch.device
         PyTorch device
     degree : int
@@ -476,7 +558,7 @@ def polyfit1d_pytorch(data, time_values, weight, sign, device, degree=0):
     Returns
     -------
     np.ndarray
-        Model coefficients (ny, nx). complex64 for complex input, float32 for real.
+        Model at date (ny, nx). complex64 for complex input, float32 for real.
     """
     import torch
     from .utils_dask import get_dask_chunk_size_mb
@@ -493,81 +575,200 @@ def polyfit1d_pytorch(data, time_values, weight, sign, device, degree=0):
     else:
         dtype = torch.float32
 
-    # Prepare source data in numpy (avoid full torch tensor allocation)
     if is_complex:
-        cdtype = torch.complex128 if dtype == torch.float64 else torch.complex64
-        work_data = data.copy()
-        with np.errstate(invalid='ignore'):
-            work_data /= np.abs(work_data)
+        # Extract angles, negate for rep dates (equivalent to conj)
+        data_abs = np.abs(data)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            angles_np = np.where(data_abs > 0, np.angle(data), np.nan)
+        del data_abs
         for s in range(n_samples):
             if sign[s] < 0:
-                work_data[s] = np.conj(work_data[s])
+                angles_np[s] = -angles_np[s]
+
+        # Flatten spatial: (n_samples, n_pixels)
+        angles_flat = angles_np.reshape(n_samples, n_pixels)
+        del angles_np
+
+        # Weight array flattened (correlation weights, not yet applied)
+        if weight is not None:
+            weight_flat = weight.reshape(n_samples, n_pixels)
+        else:
+            weight_flat = None
+
+        # Valid mask: at least degree+2 finite samples per pixel
+        min_valid = degree + 2
+        finite_count = np.sum(np.isfinite(angles_flat), axis=0)
+        valid_mask = finite_count >= min_valid
+        has_partial_nan = np.any(finite_count[valid_mask] < n_samples) if valid_mask.any() else False
+        valid_indices = np.where(valid_mask)[0]
+        n_valid = len(valid_indices)
+
+        if n_valid == 0:
+            return np.full((ny, nx), nan_val, dtype=out_dtype)
+
+        # Normalize time: t / absmax so t=0 maps to 0, intercept = value at date
+        t_absmax = np.max(np.abs(time_values))
+        if t_absmax > 0:
+            t_norm = time_values / t_absmax
+        else:
+            t_norm = np.zeros_like(time_values)
+
+        # Build design matrix: [1, t, t^2, ...]
+        X = np.column_stack([t_norm**d for d in range(degree + 1)])
+        X_t = torch.tensor(X, dtype=dtype, device=device)
+        reg = 1e-10 * torch.eye(degree + 1, dtype=dtype, device=device)
+
+        # Compute pixel batch size from dask block budget
+        elem_bytes = n_samples * 8  # float64 angles
+        budget_bytes = get_dask_chunk_size_mb() * 1024 * 1024
+        batch_pixels = max(1024, budget_bytes // elem_bytes)
+
+        # Initialize output in numpy
+        result_np = np.full((n_pixels,), nan_val, dtype=out_dtype)
+
+        # Process valid pixels in batches with IRLS + jump correction
+        for b_start in range(0, n_valid, batch_pixels):
+            b_end = min(b_start + batch_pixels, n_valid)
+            idx = valid_indices[b_start:b_end]
+
+            angles_raw = torch.tensor(angles_flat[:, idx], dtype=dtype, device=device)
+            nan_mask = ~torch.isfinite(angles_raw)
+            angles_safe = torch.where(nan_mask, torch.zeros(1, dtype=dtype, device=device), angles_raw)
+            del angles_raw
+
+            # Correlation weight + NaN masking
+            if weight_flat is not None:
+                sqrt_w_corr = torch.sqrt(torch.tensor(weight_flat[:, idx], dtype=dtype, device=device))
+            else:
+                sqrt_w_corr = torch.ones_like(angles_safe)
+
+            if has_partial_nan:
+                sqrt_w_corr = sqrt_w_corr * (~nan_mask).to(dtype)
+
+            # IRLS iteration with jump correction
+            epsilon = 0.1
+            jumps = torch.zeros_like(angles_safe)
+            W_irls = torch.ones_like(angles_safe)
+
+            for iteration in range(10):
+                data_b = angles_safe + jumps * (2 * np.pi)
+                sqrt_w = sqrt_w_corr * torch.sqrt(W_irls)
+
+                # Weighted polynomial fit: per-pixel solve
+                y_w = (data_b * sqrt_w).T  # (batch, samp)
+                X_wi = X_t[None, :, :] * sqrt_w.T[:, :, None]
+                XtX_wi = X_wi.transpose(1, 2) @ X_wi + reg
+                Xty = X_wi.transpose(1, 2) @ y_w.unsqueeze(-1)
+                coeffs = torch.linalg.solve(XtX_wi, Xty)  # (batch, deg+1, 1)
+
+                fit_raw = X_t @ coeffs.squeeze(-1).T  # (n_samples, batch)
+
+                # Update integer 2π jumps
+                new_jumps = torch.round((fit_raw - angles_safe) / (2 * np.pi))
+                new_jumps[nan_mask] = 0
+
+                # Wrapped residuals → IRLS weights
+                residuals = data_b - fit_raw
+                residuals = torch.atan2(torch.sin(residuals), torch.cos(residuals))
+                W_irls_new = 1.0 / (torch.abs(residuals) + epsilon)
+                W_irls_new[nan_mask] = 0
+
+                # Convergence check
+                weight_change = torch.abs(W_irls_new - W_irls).mean()
+                jumps_stable = (new_jumps == jumps).all()
+                if jumps_stable and weight_change < 1e-3:
+                    break
+
+                jumps = new_jumps
+                W_irls = W_irls_new
+
+            # Intercept c0 = model at date (t=0 maps to t_norm=0)
+            c0 = coeffs.squeeze(-1)[:, 0]  # (batch,)
+            result_np[idx] = np.exp(1j * c0.cpu().numpy()).astype(out_dtype)
+
+        result_np = result_np.reshape(ny, nx)
+
     else:
+        # Real data path — don't pre-weight; IRLS loop handles all weighting
         work_data = data * sign[:, None, None]
 
-    if weight is not None:
-        work_data = work_data * np.sqrt(weight)
-
-    # Normalize time values to [-1, 1] for numerical stability
-    t_min, t_max = time_values.min(), time_values.max()
-    t_range = t_max - t_min
-    if t_range > 0:
-        t_norm = 2 * (time_values - t_min) / t_range - 1
-    else:
-        t_norm = np.zeros_like(time_values)
-
-    # Build design matrix: [1, t, t^2, ...]
-    X = np.column_stack([t_norm**d for d in range(degree + 1)])
-    X_t = torch.tensor(X, dtype=dtype, device=device)
-
-    # Flatten spatial dimensions
-    data_flat = work_data.reshape(n_samples, n_pixels)
-    del work_data
-
-    # Compute valid mask from numpy
-    if is_complex:
-        valid_mask = np.all(np.isfinite(data_flat.real) & np.isfinite(data_flat.imag), axis=0)
-    else:
-        valid_mask = np.all(np.isfinite(data_flat), axis=0)
-
-    valid_indices = np.where(valid_mask)[0]
-    n_valid = len(valid_indices)
-
-    if n_valid == 0:
-        return np.full((ny, nx), nan_val, dtype=out_dtype)
-
-    # Precompute pseudo-inverse (tiny: degree+1 × n_samples)
-    XtX = X_t.T @ X_t
-    reg = 1e-10 * torch.eye(XtX.shape[0], dtype=dtype, device=device)
-    XtX_inv_Xt = torch.linalg.inv(XtX + reg) @ X_t.T
-
-    # Compute pixel batch size from dask block budget
-    elem_bytes = n_samples * (16 if is_complex else 8)
-    budget_bytes = get_dask_chunk_size_mb() * 1024 * 1024
-    batch_pixels = max(1024, budget_bytes // elem_bytes)
-
-    # Initialize output in numpy
-    result_np = np.full((n_pixels,), nan_val, dtype=out_dtype)
-
-    # Process valid pixels in batches
-    for b_start in range(0, n_valid, batch_pixels):
-        b_end = min(b_start + batch_pixels, n_valid)
-        idx = valid_indices[b_start:b_end]
-
-        if is_complex:
-            data_b = torch.tensor(data_flat[:, idx], dtype=cdtype, device=device)
-            coeffs = (XtX_inv_Xt.to(cdtype) @ data_b).T  # (batch, degree+1)
-            coeff = coeffs[:, degree]
-            coeff_abs = coeff.abs()
-            coeff = torch.where(coeff_abs > 0, coeff / coeff_abs, coeff)
+        # Normalize time: t / absmax so t=0 maps to 0, intercept = value at date
+        t_absmax = np.max(np.abs(time_values))
+        if t_absmax > 0:
+            t_norm = time_values / t_absmax
         else:
+            t_norm = np.zeros_like(time_values)
+
+        # Build design matrix: [1, t, t^2, ...]
+        X = np.column_stack([t_norm**d for d in range(degree + 1)])
+        X_t = torch.tensor(X, dtype=dtype, device=device)
+
+        # Flatten spatial dimensions
+        data_flat = work_data.reshape(n_samples, n_pixels)
+        del work_data
+
+        valid_mask = np.all(np.isfinite(data_flat), axis=0)
+        valid_indices = np.where(valid_mask)[0]
+        n_valid = len(valid_indices)
+
+        if n_valid == 0:
+            return np.full((ny, nx), nan_val, dtype=out_dtype)
+
+        reg = 1e-10 * torch.eye(degree + 1, dtype=dtype, device=device)
+
+        # Compute pixel batch size from dask block budget
+        elem_bytes = n_samples * 8
+        budget_bytes = get_dask_chunk_size_mb() * 1024 * 1024
+        batch_pixels = max(1024, budget_bytes // elem_bytes)
+
+        # Weight array flattened
+        if weight is not None:
+            weight_flat = np.sqrt(weight).reshape(n_samples, n_pixels)
+        else:
+            weight_flat = None
+
+        # Initialize output in numpy
+        result_np = np.full((n_pixels,), nan_val, dtype=out_dtype)
+
+        # IRLS parameters
+        epsilon = 0.1
+        max_irls = 5
+
+        # Process valid pixels in batches with IRLS L1
+        for b_start in range(0, n_valid, batch_pixels):
+            b_end = min(b_start + batch_pixels, n_valid)
+            idx = valid_indices[b_start:b_end]
             data_b = torch.tensor(data_flat[:, idx], dtype=dtype, device=device)
-            coeffs = (XtX_inv_Xt @ data_b).T
-            coeff = coeffs[:, degree]
 
-        result_np[idx] = coeff.cpu().numpy().astype(out_dtype)
+            # Correlation weights
+            if weight_flat is not None:
+                sqrt_w_corr = torch.tensor(weight_flat[:, idx], dtype=dtype, device=device)
+            else:
+                sqrt_w_corr = torch.ones_like(data_b)
 
-    result_np = result_np.reshape(ny, nx)
+            W_irls = torch.ones_like(data_b)
+
+            for iteration in range(max_irls):
+                sqrt_w = sqrt_w_corr * torch.sqrt(W_irls)
+                y_w = (data_b * sqrt_w).T  # (batch, samp)
+                X_wi = X_t[None, :, :] * sqrt_w.T[:, :, None]
+                XtX_wi = X_wi.transpose(1, 2) @ X_wi + reg
+                Xty = X_wi.transpose(1, 2) @ y_w.unsqueeze(-1)
+                coeffs = torch.linalg.solve(XtX_wi, Xty)  # (batch, deg+1, 1)
+
+                fit = (X_t @ coeffs.squeeze(-1).T)  # (n_samples, batch)
+                residuals = data_b - fit
+                W_irls_new = 1.0 / (torch.abs(residuals) + epsilon)
+                weight_change = torch.abs(W_irls_new - W_irls).mean()
+                if weight_change < 1e-3:
+                    break
+                W_irls = W_irls_new
+
+            # Intercept c0 = model at date (t=0 maps to t_norm=0)
+            c0 = coeffs.squeeze(-1)[:, 0]
+            result_np[idx] = c0.cpu().numpy().astype(out_dtype)
+
+        result_np = result_np.reshape(ny, nx)
 
     # Cleanup GPU memory
     if device.type == 'mps':
@@ -579,9 +780,14 @@ def polyfit1d_pytorch(data, time_values, weight, sign, device, degree=0):
 
 
 def trend1d_pairs_array(data_chunk, weight_chunk, ref_values, rep_values,
-                         device, degree, days_filter, count_filter):
+                         device, degree):
     """
     Process a spatial chunk for trend1d_pairs.
+
+    For each unique date, gathers all pairs sharing that date, fits a
+    polynomial to phase vs temporal baseline using all pairs, and stores
+    the model at zero temporal baseline (intercept). Pair trends are
+    reconstructed as model[ref] op model[rep].
 
     Two modes:
     - Complex input: unit-circle fitting per date, reconstruct pair trend as
@@ -603,10 +809,6 @@ def trend1d_pairs_array(data_chunk, weight_chunk, ref_values, rep_values,
         PyTorch device
     degree : int
         Polynomial degree (0=mean, 1=linear)
-    days_filter : int or None
-        Maximum time interval filter
-    count_filter : int or None
-        Maximum pairs per date filter
 
     Returns
     -------
@@ -695,25 +897,6 @@ def trend1d_pairs_array(data_chunk, weight_chunk, ref_values, rep_values,
 
         time_values = np.array(time_values, dtype=np.float32)
         signs = np.array(signs, dtype=np.float32)
-
-        # Sort by absolute time interval
-        sort_idx = np.argsort(np.abs(time_values))
-        time_values = time_values[sort_idx]
-        signs = signs[sort_idx]
-        pair_indices = pair_indices[sort_idx]
-
-        # Apply count filter
-        if count_filter is not None and len(pair_indices) > count_filter:
-            time_values = time_values[:count_filter]
-            signs = signs[:count_filter]
-            pair_indices = pair_indices[:count_filter]
-
-        # Apply days filter
-        if days_filter is not None:
-            keep = np.abs(time_values) <= days_filter
-            time_values = time_values[keep]
-            signs = signs[keep]
-            pair_indices = pair_indices[keep]
 
         if len(pair_indices) == 0:
             continue

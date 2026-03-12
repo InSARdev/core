@@ -629,12 +629,14 @@ class Batch(BatchCore):
         return BatchComplex(self.map_da(lambda da: xr.ufuncs.exp(sign * 1j * da), **kwargs))
 
     def lstsq(self, weight: 'BatchUnit | None' = None, device: str = 'auto',
-              cumsum: bool = True, debug: bool = False) -> 'Batch':
+              cumsum: bool = True, max_iter: int = 5, epsilon: float = 0.1,
+              debug: bool = False) -> 'Batch':
         """
-        Weighted least squares network inversion to date-based time series.
+        L1-norm IRLS network inversion to date-based time series.
 
         Takes unwrapped pair phases and inverts the network to get per-date
-        accumulated phase.
+        accumulated phase. Uses IRLS with L1-norm for robustness against
+        outlier pairs.
 
         Parameters
         ----------
@@ -645,6 +647,10 @@ class Batch(BatchCore):
         cumsum : bool
             If True (default), return cumulative displacement time series.
             If False, return incremental phase changes between dates.
+        max_iter : int
+            Maximum IRLS iterations. Default 5.
+        epsilon : float
+            IRLS regularization parameter. Default 0.1.
         debug : bool
             Print debug information.
 
@@ -662,7 +668,9 @@ class Batch(BatchCore):
         from .Stack_unwrap1d import Stack_unwrap1d
 
         return Stack_unwrap1d.lstsq(Stack_unwrap1d(), self, weight=weight,
-                                    device=device, cumsum=cumsum, debug=debug)
+                                    device=device, cumsum=cumsum,
+                                    max_iter=max_iter, epsilon=epsilon,
+                                    debug=debug)
 
     def displacement_los(self, transform: 'Batch | Stack') -> 'Batch':
         """Compute line-of-sight displacement (meters) from unwrapped phase.
@@ -1998,6 +2006,112 @@ class Batches(tuple):
         """Apply isel to all batches."""
         return Batches([b.isel(*args, **kwargs) for b in self])
 
+    def filter(self, days=None, meters=None, date=None, pair=None, count=None,
+               min_connections=2, cleanup=True):
+        """Filter pairs in the baseline network.
+
+        Selects pairs matching the given temporal/spatial criteria. By default,
+        removes degraded dates (hanging or single-side connected).
+
+        Parameters
+        ----------
+        days : int, optional
+            Maximum temporal separation in days. If None, no temporal limit.
+        meters : float, optional
+            Maximum perpendicular baseline in meters. If None, no limit.
+        date : str or list, optional
+            Date(s) to exclude. Accepts a single date string or a list,
+            any format parseable by ``pd.to_datetime``.
+        pair : str or list, optional
+            Pair(s) to exclude. Each pair is a string ``'YYYY-MM-DD YYYY-MM-DD'``.
+            Accepts a single pair string or a list.
+        count : int, optional
+            Remove dates with fewer than this many connections.
+        min_connections : int, optional
+            Minimum pairs per date for cleanup. Default is 2.
+        cleanup : bool, optional
+            If True (default), iteratively remove hanging dates and dates
+            connected only to predecessors or only to successors.
+            Set to False to keep the raw network for testing.
+
+        Returns
+        -------
+        Batches
+            Filtered Batches with valid pairs only.
+
+        Examples
+        --------
+        >>> intfcorr.filter(days=100, meters=80).detrend1d().unwrap1d().lstsq()
+        >>> intfcorr.filter(date='2024-12-30').detrend1d().unwrap1d().lstsq()
+        >>> intfcorr.filter(date=['2024-12-30', '2024-06-21'])
+        >>> intfcorr.filter(pair='2024-06-21 2024-12-30')
+        >>> intfcorr.filter(count=3)  # remove dates with < 3 connections
+        >>> intfcorr.filter(days=100, meters=80, cleanup=False)  # raw network
+        """
+        import numpy as np
+        import pandas as pd
+
+        if days is None and meters is None and date is None and pair is None and count is None:
+            return self
+
+        # Get pair coordinates from the first batch element
+        first_batch = self[0]
+        first_key = next(iter(first_batch.keys()))
+        ds = first_batch[first_key]
+        ref = pd.DatetimeIndex(ds.coords['ref'].values).normalize()
+        rep = pd.DatetimeIndex(ds.coords['rep'].values).normalize()
+        bpr = ds.coords['BPR'].values
+        n_pairs = len(ref)
+
+        # Build mask of valid pairs
+        mask = np.ones(n_pairs, dtype=bool)
+
+        if days is not None:
+            duration = (rep - ref).days
+            mask &= duration <= days
+
+        if meters is not None:
+            mask &= np.abs(bpr) <= meters
+
+        if date is not None:
+            if isinstance(date, str):
+                date = [date]
+            exclude_dates = pd.to_datetime(date).normalize()
+            mask &= ~ref.isin(exclude_dates) & ~rep.isin(exclude_dates)
+
+        if pair is not None:
+            if isinstance(pair, str):
+                pair = [pair]
+            exclude_pairs = set()
+            for p in pair:
+                parts = str(p).split()
+                r, s = pd.Timestamp(parts[0]).normalize(), pd.Timestamp(parts[1]).normalize()
+                exclude_pairs.add((r, s))
+            for i in range(n_pairs):
+                if (ref[i], rep[i]) in exclude_pairs:
+                    mask[i] = False
+
+        # Build DataFrame for pruning
+        df = pd.DataFrame({'ref': ref[mask], 'rep': rep[mask],
+                           'idx': np.where(mask)[0]})
+
+        if len(df) > 0:
+            from .Baseline import _cleanup_network
+            min_conn = max(min_connections, count) if count is not None else min_connections
+            if cleanup:
+                df = _cleanup_network(df, min_connections=min_conn)
+            elif count is not None:
+                counts = pd.concat([df['ref'], df['rep']]).value_counts()
+                low_dates = set(counts[counts < count].index)
+                df = df[~df['ref'].isin(low_dates) & ~df['rep'].isin(low_dates)]
+
+        if len(df) == 0:
+            raise ValueError("No valid pairs remain after filtering. "
+                             "Try increasing 'days' or 'meters'.")
+
+        valid_idx = df['idx'].values
+        return self.isel(pair=valid_idx)
+
     def coherent(self, threshold=0.5):
         """Mask low-coherence pixels using mean correlation.
 
@@ -2401,6 +2515,9 @@ class Batches(tuple):
         # Delegate to BatchWrap.unwrap1d
         unwrapped = phase.unwrap1d(weight=weight, device=device, debug=debug, **kwargs)
 
+        # Preserve non-spatial variables (e.g. BPR) that may be dropped by unwrapping
+        unwrapped = Batches._preserve_nonspatial(phase, unwrapped)
+
         # Rebuild Batches preserving all original elements except first
         elements = [unwrapped] + list(self[1:])
         return Batches(elements)
@@ -2511,7 +2628,8 @@ class Batches(tuple):
         elements = [detrended] + list(self[1:])
         return Batches(elements)
 
-    def detrend1d(self, baseline='BPR', degree=1, device='auto', debug=False):
+    def detrend1d(self, baseline='BPR', degree=1, intercept=False, slope=True,
+                  device='auto', debug=False):
         """
         Detrend 1D polynomial trend along perpendicular baseline and return Batches.
 
@@ -2527,6 +2645,12 @@ class Batches(tuple):
             Variable name to regress against (default 'BPR' for perpendicular baseline).
         degree : int
             Polynomial degree (1=linear, 2=quadratic). Default 1.
+        intercept : bool
+            If True, include intercept in the trend to subtract.
+            If False (default), zero out the intercept (preserve it in data).
+        slope : bool
+            If True (default), include slope in the trend to subtract.
+            If False, zero out the slope (preserve it in data).
         device : str
             PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
         debug : bool
@@ -2539,10 +2663,10 @@ class Batches(tuple):
 
         Examples
         --------
-        >>> # Complex interferogram: multiplicative detrend (like detrend2d)
+        >>> # Remove both intercept and slope (full trend removal)
         >>> intf, corr = stack.pairs(baseline).interferogram(wavelength=30).detrend1d()
-        >>> # Full pipeline: detrend2d (spatial) then detrend1d (baseline)
-        >>> result = stack.pairs(bl).interferogram(wavelength=30).detrend2d(transform).detrend1d()
+        >>> # Remove only slope, preserve intercept (displacement signal)
+        >>> intf, corr = intfcorr.detrend1d(intercept=False)
         """
         if len(self) < 1:
             raise ValueError("detrend1d() requires Batches with at least 1 element: [phase]")
@@ -2558,7 +2682,7 @@ class Batches(tuple):
         # phase is referenced only once in the dask graph.
         detrended = phase.trend1d(weight=weight, baseline=baseline, degree=degree,
                                   device=device, detrend=True,
-                                  remove_intercept=True, debug=debug)
+                                  intercept=intercept, slope=slope, debug=debug)
 
         # Preserve non-spatial variables (e.g. BPR) that may be dropped by arithmetic
         detrended = Batches._preserve_nonspatial(phase, detrended)
@@ -2567,12 +2691,14 @@ class Batches(tuple):
         elements = [detrended] + list(self[1:])
         return Batches(elements)
 
-    def lstsq(self, device='auto', cumsum=True, debug=False):
+    def lstsq(self, device='auto', cumsum=True,
+              max_iter=5, epsilon=0.1, debug=False):
         """
-        Weighted least squares network inversion to date-based time series.
+        L1-norm IRLS network inversion to date-based time series.
 
         Takes unwrapped pair phases and inverts the network to get per-date
-        accumulated phase. Expects Batches with [Batch (unwrapped phase), BatchUnit (weight, optional)].
+        accumulated phase. Uses IRLS with L1-norm for robustness against
+        outlier pairs. Expects Batches with [Batch (unwrapped phase), BatchUnit (weight, optional)].
 
         Parameters
         ----------
@@ -2581,6 +2707,10 @@ class Batches(tuple):
         cumsum : bool
             If True (default), return cumulative displacement time series.
             If False, return incremental phase changes between dates.
+        max_iter : int
+            Maximum IRLS iterations. Default 5.
+        epsilon : float
+            IRLS regularization parameter. Default 0.1.
         debug : bool
             Print debug information.
 
@@ -2602,7 +2732,8 @@ class Batches(tuple):
         weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
 
         # Delegate to Batch.lstsq
-        result = data.lstsq(weight=weight, device=device, cumsum=cumsum, debug=debug)
+        result = data.lstsq(weight=weight, device=device, cumsum=cumsum,
+                            max_iter=max_iter, epsilon=epsilon, debug=debug)
 
         # Rebuild Batches preserving all original elements except first
         elements = [result] + list(self[1:])
@@ -2636,13 +2767,13 @@ class Batches(tuple):
     def regression1d_baseline(self, *args, **kwargs):
         raise NotImplementedError("Batches.regression1d_baseline() is removed. Use Batches.detrend1d() or Batch.trend1d() instead.")
 
-    def detrend1d_pairs(self, degree=0, days=90, count=None,
-                        device='auto', debug=False):
+    def detrend1d_pairs(self, degree=1, device='auto', debug=False):
         """
         Detrend 1D polynomial trend along temporal pairs and return Batches.
 
-        Removes per-date temporal trend from pair data. Mirrors detrend1d()/detrend2d()
-        pattern: auto-detects input type.
+        For each date, fits a polynomial to phase vs temporal baseline across
+        all pairs sharing that date, then subtracts the fit. This removes
+        constant atmospheric delay (intercept at zero temporal baseline).
 
         For complex input (BatchComplex): unit-circle fitting, detrend multiplicatively (phase * trend.conj())
         For real input (Batch): standard polynomial, subtract (phase - trend)
@@ -2650,13 +2781,7 @@ class Batches(tuple):
         Parameters
         ----------
         degree : int
-            Polynomial degree (0=mean, 1=linear). Default 0.
-        days : int
-            Maximum time interval (±days symmetric window) to include.
-            Default 90. Controls temporal high-pass: only pairs within ±days
-            contribute to the per-date atmospheric estimate.
-        count : int or None
-            Maximum number of pairs per date to use. Default None (all pairs).
+            Polynomial degree (0=mean, 1=linear). Default 1.
         device : str
             PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
         debug : bool
@@ -2669,10 +2794,7 @@ class Batches(tuple):
 
         Examples
         --------
-        >>> # Complex interferogram detrending (chained)
         >>> intf, corr = stack.pairs(baseline).interferogram(wavelength=30).detrend1d_pairs()
-        >>> # Real detrending
-        >>> result = Batches([unwrapped, corr]).detrend1d_pairs(degree=0, days=100)
         """
         if len(self) < 1:
             raise ValueError("detrend1d_pairs() requires Batches with at least 1 element: [phase]")
@@ -2685,7 +2807,7 @@ class Batches(tuple):
 
         # Fuse fit+subtract into one blockwise call (detrend=True) so the input
         # phase is referenced only once in the dask graph.
-        detrended = phase.trend1d_pairs(weight=weight, degree=degree, days=days, count=count,
+        detrended = phase.trend1d_pairs(weight=weight, degree=degree,
                                         device=device, detrend=True, debug=debug)
 
         # Preserve non-spatial variables (e.g. BPR) that may be dropped by arithmetic

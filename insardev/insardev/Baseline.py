@@ -13,6 +13,42 @@ import pandas as pd
 import numpy as np
 
 
+def _cleanup_network(df, min_connections=2):
+    """Iteratively remove degraded dates from a baseline network.
+
+    Removes:
+    1. Dates with fewer than ``min_connections`` pairs
+    2. Internal dates connected only as ref (not rep) — except the first date
+    3. Internal dates connected only as rep (not ref) — except the last date
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must have 'ref' and 'rep' columns (datetime).
+    min_connections : int
+        Minimum pairs per date. Dates below this are removed.
+
+    Returns
+    -------
+    pd.DataFrame
+        Filtered DataFrame (same columns as input).
+    """
+    while len(df) > 0:
+        all_dates = sorted(set(df['ref']) | set(df['rep']))
+        if len(all_dates) < 2:
+            break
+        first_date, last_date = all_dates[0], all_dates[-1]
+        counts = pd.concat([df['ref'], df['rep']]).value_counts()
+        hanging = set(counts[counts < min_connections].index)
+        ref_only = set(df['ref'].unique()) - set(df['rep'].unique()) - {first_date}
+        rep_only = set(df['rep'].unique()) - set(df['ref'].unique()) - {last_date}
+        bad_dates = hanging | ref_only | rep_only
+        if not bad_dates:
+            break
+        df = df[~df['ref'].isin(bad_dates) & ~df['rep'].isin(bad_dates)]
+    return df
+
+
 class Baseline(pd.DataFrame):
     """DataFrame subclass for InSAR baseline pairs with custom plotting methods.
 
@@ -27,9 +63,9 @@ class Baseline(pd.DataFrame):
 
     Examples
     --------
-    >>> baseline = stack.baseline(days=100)
+    >>> baseline = stack.baseline()
     >>> baseline.plot()  # Plot baseline network
-    >>> baseline.hist()  # Plot duration histogram
+    >>> baseline.filter(days=100).plot()  # Plot filtered network
     """
 
     # Preserve subclass through pandas operations
@@ -135,13 +171,28 @@ class Baseline(pd.DataFrame):
             columns=['date', 'baseline']
         ).drop_duplicates()
 
-        # Plot date points
-        ax.scatter(df_points['date'], df_points['baseline'], marker='o', c='b', s=40, zorder=10)
+        # Count connections per date
+        date_counts = pd.concat([self['ref'], self['rep']]).value_counts()
 
         # Plot pair connections
         for _, row in self.iterrows():
             ax.plot([row['ref'], row['rep']], [row['ref_baseline'], row['rep_baseline']],
-                    c='#30a2da', lw=0.5, zorder=5)
+                    c='#6cc0e8', lw=0.5, zorder=5)
+
+        # Plot date points colored by connection count
+        colors = []
+        for date in df_points['date']:
+            n = date_counts.get(date, 0)
+            if n <= 1:
+                colors.append('red')
+            elif n == 2:
+                colors.append('yellow')
+            elif n == 3:
+                colors.append('orange')
+            else:
+                colors.append('#6cc0e8')
+        ax.scatter(df_points['date'], df_points['baseline'], marker='o', c=colors, s=40,
+                   edgecolors='white', linewidths=0.5, zorder=10)
 
         # Add date labels
         if show_labels:
@@ -158,7 +209,9 @@ class Baseline(pd.DataFrame):
 
         ax.set_xlabel('Timeline')
         ax.set_ylabel('Perpendicular Baseline [m]')
-        ax.set_title(caption)
+        n_pairs = len(self)
+        n_dates = len(df_points)
+        ax.set_title(f'{caption}\n{n_pairs} pairs, {n_dates} dates')
         ax.grid(True)
 
         # Format x-axis labels: short date format without century, rotated
@@ -269,8 +322,9 @@ class Baseline(pd.DataFrame):
 
         return ax
 
-    def filter(self, days: int | None = None, meters: float | None = None) -> "Baseline":
-        """Filter baseline pairs by temporal and spatial criteria.
+    def filter(self, days=None, meters=None, date=None, pair=None, count=None,
+               min_connections=2, cleanup=True) -> "Baseline":
+        """Filter baseline pairs by temporal/spatial criteria and date/pair exclusion.
 
         Parameters
         ----------
@@ -278,53 +332,74 @@ class Baseline(pd.DataFrame):
             Maximum temporal separation in days.
         meters : float, optional
             Maximum baseline difference in meters.
+        date : str or list, optional
+            Date(s) to exclude. Accepts a single date string or a list.
+        pair : str or list, optional
+            Pair(s) to exclude. Each pair is ``'YYYY-MM-DD YYYY-MM-DD'``.
+        count : int, optional
+            Remove dates with fewer than this many connections.
+        min_connections : int, optional
+            Minimum pairs per date for cleanup. Default is 2.
+        cleanup : bool, optional
+            If True (default), iteratively remove hanging and single-side
+            connected dates. Set to False for raw network.
 
         Returns
         -------
         Baseline
             Filtered baseline pairs.
+
+        Examples
+        --------
+        >>> bl = stack.baseline()
+        >>> bl.filter(days=100, meters=80).plot()
+        >>> bl.filter(date='2024-12-30').plot()
+        >>> bl.filter(pair='2024-06-21 2024-12-30')
+        >>> bl.filter(count=3)  # remove dates with < 3 connections
         """
-        result = self.copy()
+        if days is None and meters is None and date is None and pair is None and count is None:
+            return self
+
+        df = self.copy()
 
         if days is not None:
-            result = result[result['duration'] <= days]
+            df = df[df['duration'] <= days]
 
         if meters is not None:
-            result = result[np.abs(result['baseline']) <= meters]
+            df = df[np.abs(df['baseline']) <= meters]
 
-        return Baseline(result, burst_id=self._burst_id, dates=self._dates)
+        if date is not None:
+            if isinstance(date, str):
+                date = [date]
+            exclude_dates = pd.to_datetime(date).normalize()
+            df = df[~df['ref'].isin(exclude_dates) & ~df['rep'].isin(exclude_dates)]
 
-    def limit(self, n: int = 2, iterations: int = 1) -> "Baseline":
-        """Limit pairs to ensure each date has at least n connections.
+        if pair is not None:
+            if isinstance(pair, str):
+                pair = [pair]
+            exclude_pairs = set()
+            for p in pair:
+                parts = str(p).split()
+                r, s = pd.Timestamp(parts[0]).normalize(), pd.Timestamp(parts[1]).normalize()
+                exclude_pairs.add((r, s))
+            mask = [True] * len(df)
+            for i, (_, row) in enumerate(df.iterrows()):
+                if (row['ref'], row['rep']) in exclude_pairs:
+                    mask[i] = False
+            df = df[mask]
 
-        Parameters
-        ----------
-        n : int, optional
-            Minimum number of pairs per date. Default is 2.
-        iterations : int, optional
-            Number of filtering iterations. Default is 1.
+        if len(df) > 0:
+            min_conn = max(min_connections, count) if count is not None else min_connections
+            if cleanup:
+                df = _cleanup_network(df, min_connections=min_conn)
+            elif count is not None:
+                counts = pd.concat([df['ref'], df['rep']]).value_counts()
+                low_dates = set(counts[counts < count].index)
+                df = df[~df['ref'].isin(low_dates) & ~df['rep'].isin(low_dates)]
 
-        Returns
-        -------
-        Baseline
-            Filtered baseline pairs.
-        """
-        result = self.copy()
+        if len(df) == 0:
+            raise ValueError("No valid baseline pairs remain after filtering. "
+                             "Try increasing 'days' or 'meters'.")
 
-        for _ in range(iterations):
-            # Count connections per date
-            ref_counts = result['ref'].value_counts()
-            rep_counts = result['rep'].value_counts()
-            all_dates = set(result['ref'].unique()) | set(result['rep'].unique())
+        return Baseline(df.reset_index(drop=True), burst_id=self._burst_id, dates=self._dates)
 
-            # Filter dates with too few connections
-            valid_dates = []
-            for date in all_dates:
-                count = ref_counts.get(date, 0) + rep_counts.get(date, 0)
-                if count >= n:
-                    valid_dates.append(date)
-
-            # Keep pairs where both dates are valid
-            result = result[result['ref'].isin(valid_dates) & result['rep'].isin(valid_dates)]
-
-        return Baseline(result, burst_id=self._burst_id, dates=self._dates)

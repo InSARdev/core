@@ -2479,20 +2479,37 @@ class Stack(Stack_plot, BatchCore):
         return type(self)(dict(self))
 
     def baseline(self, days: int | None = None, meters: float | None = None,
-                 invert: bool = False) -> "Baseline":
+                 invert: bool = False,
+                 min_connections: int = 2, cleanup: bool = True) -> "Baseline":
         """Generate baseline pairs table from the Stack.
 
         Creates a Baseline DataFrame containing all valid interferometric pairs
-        with their temporal and spatial baselines.
+        with their temporal and spatial baselines. Use ``.filter()`` on the
+        result to exclude specific dates or pairs.
+
+        .. deprecated::
+            ``days`` and ``meters`` parameters are deprecated. Generate the
+            full network with ``stack.baseline()`` then use
+            ``baseline.filter(days=..., meters=...)`` to filter. This ensures
+            you preview the full network first to spot extreme baselines or
+            missing dates.
 
         Parameters
         ----------
         days : int, optional
-            Maximum temporal separation in days. If None, no temporal limit.
+            *Deprecated.* Maximum temporal separation in days.
+            Use ``baseline.filter(days=...)`` instead.
         meters : float, optional
-            Maximum perpendicular baseline difference in meters. If None, no limit.
+            *Deprecated.* Maximum perpendicular baseline difference in meters.
+            Use ``baseline.filter(meters=...)`` instead.
         invert : bool, optional
             If True, invert reference and repeat dates. Default is False.
+        min_connections : int, optional
+            Minimum pairs per date for cleanup. Default is 2.
+        cleanup : bool, optional
+            If True (default), iteratively remove hanging dates and dates
+            connected only to predecessors or only to successors.
+            Set to False to keep the raw network for testing.
 
         Returns
         -------
@@ -2502,16 +2519,9 @@ class Stack(Stack_plot, BatchCore):
 
         Examples
         --------
-        >>> # Get all baseline pairs
         >>> bl = stack.baseline()
-        >>> bl.plot()  # Plot baseline network
-        >>> bl.hist()  # Plot duration histogram
-
-        >>> # Filter by temporal separation
-        >>> bl = stack.baseline(days=48)
-
-        >>> # Filter by baseline
-        >>> bl = stack.baseline(meters=100)
+        >>> bl.plot()  # preview full network first
+        >>> bl = bl.filter(days=48, meters=100)  # then filter
         """
         import numpy as np
         import pandas as pd
@@ -2570,9 +2580,20 @@ class Stack(Stack_plot, BatchCore):
                     })
 
         if not data:
-            return Baseline(burst_id=first_key, dates=dates)
+            raise ValueError("No valid baseline pairs found. "
+                             "Try increasing 'days' or 'meters'.")
 
         df = pd.DataFrame(data).sort_values(['ref', 'rep']).reset_index(drop=True)
+
+        if cleanup:
+            from .Baseline import _cleanup_network
+            df = _cleanup_network(df, min_connections=min_connections)
+
+        if len(df) == 0:
+            raise ValueError("No valid baseline pairs remain after filtering. "
+                             "Try increasing 'days' or 'meters'.")
+
+        df = df.reset_index(drop=True)
         df = df.assign(
             pair=[f'{ref.date()} {rep.date()}' for ref, rep in zip(df['ref'], df['rep'])],
             baseline=df['rep_baseline'] - df['ref_baseline'],

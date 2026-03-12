@@ -25,16 +25,18 @@ import numpy as np
 class Stack_unwrap1d(BatchCore):
     """1D phase unwrapping along the temporal dimension using L1-norm IRLS."""
 
-    def lstsq(self, data, weight=None, device='auto', cumsum=True, debug=False):
+    def lstsq(self, data, weight=None, device='auto', cumsum=True,
+              max_iter=5, epsilon=0.1, debug=False):
         """
-        Weighted least squares network inversion to date-based time series.
+        L1-norm IRLS network inversion to date-based time series.
 
         .. deprecated::
             Use ``data.lstsq(weight=corr)`` on Batch instead.
             This Stack method will be removed in a future version.
 
         Takes unwrapped pair phases and inverts the network to get per-date
-        accumulated phase. Uses PyTorch batched least squares for GPU acceleration.
+        accumulated phase. Uses IRLS with L1-norm for robustness against
+        outlier pairs (e.g. from unwrapping errors).
 
         Parameters
         ----------
@@ -47,6 +49,10 @@ class Stack_unwrap1d(BatchCore):
         cumsum : bool, optional
             If True (default), return cumulative displacement time series.
             If False, return incremental phase changes between dates.
+        max_iter : int, optional
+            Maximum IRLS iterations. Default 5.
+        epsilon : float, optional
+            IRLS regularization parameter. Default 0.1.
         debug : bool, optional
             Print debug information.
 
@@ -102,7 +108,8 @@ class Stack_unwrap1d(BatchCore):
                 da = ds[pol]
                 w_da = w_ds[pol] if w_ds is not None else None
 
-                result = self._lstsq_dataarray(da, w_da, device, cumsum, debug)
+                result = self._lstsq_dataarray(da, w_da, device, cumsum,
+                                               max_iter, epsilon, debug)
                 result_vars[pol] = result
 
             result_ds = xr.Dataset(result_vars)
@@ -114,7 +121,8 @@ class Stack_unwrap1d(BatchCore):
 
         return Batch(results)
 
-    def _lstsq_dataarray(self, data, weight, device, cumsum, debug):
+    def _lstsq_dataarray(self, data, weight, device, cumsum,
+                         max_iter, epsilon, debug):
         """Internal method for lstsq on DataArray - LAZY dask processing."""
         import xarray as xr
         import pandas as pd
@@ -138,10 +146,12 @@ class Stack_unwrap1d(BatchCore):
         else:
             weight_dask = None
 
-        def _lstsq_block(data_block, weight_block=None):
+        def _lstsq_block(data_block, weight_block=None,
+                         _max_iter=max_iter, _epsilon=epsilon):
             ts_block, _ = utils_unwrap1d.lstsq_to_dates_numpy(
                 [data_block], [weight_block] if weight_block is not None else None,
-                pair_dates, device=device, cumsum=cumsum, debug=False
+                pair_dates, device=device, cumsum=cumsum,
+                max_iter=_max_iter, epsilon=_epsilon, debug=False
             )
             return ts_block.astype(np.float32)
 
