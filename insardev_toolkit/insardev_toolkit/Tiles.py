@@ -209,9 +209,16 @@ class Tiles(datagrid, progressbar_joblib):
                                 (base_url, path_id, tile_id, file_id, archive, filetype, product, x, y, debug)\
                                 for x in range(left, right + 1) for y in range(bottom, top + 1))
 
+        n_total = len(tile_xarrays)
         tile_xarrays = [tile for tile in tile_xarrays if tile is not None]
+        n_failed = n_total - len(tile_xarrays)
         if len(tile_xarrays) == 0:
-            return
+            raise ValueError(f'ERROR: All {n_total} tiles failed to download. '
+                             'Check network connectivity and server availability.')
+        if n_failed > 0:
+            import warnings
+            warnings.warn(f'{n_failed} of {n_total} tiles failed to download. '
+                          'Result may have gaps.')
         shapes = [tile.shape for tile in tile_xarrays]
         assert len(np.unique(shapes)) == 1, (
             f'ERROR: Inconsistent tile shapes detected: {shapes}. '
