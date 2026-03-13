@@ -2155,20 +2155,18 @@ class BatchCore(dict):
 
     def trend1d_pairs(self, weight: 'BatchUnit | None' = None, degree: int = 1,
                       device: str = 'auto', detrend: bool = False,
+                      max_refine: int = 3,
                       debug: bool = False) -> 'Batch':
         """
-        Fit 1D polynomial trend along temporal pairs for each date.
+        Fit 1D atmospheric phase trend along temporal pairs for each date.
 
         For each date, gathers all pairs sharing that date, fits a polynomial
         to phase vs temporal baseline, and evaluates the model. Uses all pairs
         (no temporal filtering) to maximize the fit constraint.
 
-        Two modes:
-        - Complex input (BatchComplex): unit-circle fitting per date,
-          reconstruct pair trend as model[ref] * conj(model[rep]).
-          Returns BatchComplex with unit-magnitude complex trend.
-        - Real input (Batch): standard polynomial fit per date,
-          reconstruct as model[ref] - model[rep]. Returns Batch.
+        Requires complex input (BatchComplex): unit-circle fitting per date,
+        reconstruct pair trend as model[ref] * conj(model[rep]).
+        Returns BatchComplex with unit-magnitude complex trend.
 
         Parameters
         ----------
@@ -2182,31 +2180,38 @@ class BatchCore(dict):
             If True, return detrended data instead of the trend surface.
             Fuses fit+subtract into one blockwise call to avoid double-referencing
             the input data in the dask graph.
+        max_refine : int
+            Maximum refinement iterations (0 = single-pass). Default 3.
         debug : bool
             Print diagnostic information.
 
         Returns
         -------
-        Batch or BatchComplex
+        BatchComplex
             Fitted trend values, same shape as input data.
 
         Examples
         --------
         >>> trend = intf.trend1d_pairs(degree=1)
-        >>> detrended = intf * trend.conj()  # complex
-        >>> detrended = phase - trend        # real
+        >>> detrended = intf * trend.conj()
         """
         import dask.array as da
         import numpy as np
         import xarray as xr
         import pandas as pd
         from . import utils_detrend
-        from .Batch import Batch, BatchComplex
+        from .Batch import BatchComplex
 
         data = self
 
         # Validate lazy data
         BatchCore._require_lazy(data, 'trend1d_pairs')
+
+        if not isinstance(data, BatchComplex):
+            raise TypeError(
+                "trend1d_pairs() requires BatchComplex (complex wrapped phase). "
+                "Place detrend1d_pairs() before unwrapping in the pipeline."
+            )
 
         # Auto-detect device
         resolved = BatchCore._get_torch_device(device, debug=debug)
@@ -2215,12 +2220,7 @@ class BatchCore(dict):
         if debug:
             print(f"DEBUG: trend1d_pairs using device={device}")
 
-        is_complex = isinstance(data, BatchComplex)
-
-        if not isinstance(data, (Batch, BatchComplex)):
-            raise TypeError(f"trend1d_pairs() requires Batch or BatchComplex, got {type(data).__name__}")
-
-        out_dtype = np.complex64 if is_complex else np.float32
+        out_dtype = np.complex64
 
         results = {}
         for burst_id in data.keys():
@@ -2254,18 +2254,17 @@ class BatchCore(dict):
                                          _ref=ref_values, _rep=rep_values,
                                          _dev=str(device), _deg=degree,
                                          _detrend=detrend,
+                                         _max_refine=max_refine,
                                          _dtype=out_dtype):
                     import torch
                     trend = utils_detrend.trend1d_pairs_array(
                         [data_block],
                         [weight_block] if weight_block is not None else None,
-                        _ref, _rep, torch.device(_dev), _deg
+                        _ref, _rep, torch.device(_dev), _deg,
+                        max_refine=_max_refine
                     )
                     if _detrend:
-                        if np.iscomplexobj(data_block):
-                            return (data_block * np.conj(trend)).astype(_dtype)
-                        else:
-                            return (data_block - trend).astype(_dtype)
+                        return (data_block * np.conj(trend)).astype(_dtype)
                     return trend.astype(_dtype)
 
                 if weight_dask is not None:
@@ -2297,9 +2296,7 @@ class BatchCore(dict):
 
             results[burst_id] = xr.Dataset(result_ds, attrs=burst_ds.attrs)
 
-        if is_complex:
-            return BatchComplex(results)
-        return Batch(results)
+        return BatchComplex(results)
 
     def regression1d_pairs(self, *args, **kwargs):
         raise NotImplementedError("regression1d_pairs() is removed. Use trend1d_pairs() instead.")

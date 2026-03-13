@@ -984,8 +984,8 @@ class BatchWrap(BatchCore):
 
     def trend1d_pairs(self, *args, **kwargs):
         raise TypeError(
-            "trend1d_pairs() does not support wrapped phase (BatchWrap). "
-            "Use BatchComplex for complex phase fitting, or unwrap first."
+            "trend1d_pairs() requires BatchComplex (complex wrapped phase). "
+            "Place detrend1d_pairs() before unwrapping in the pipeline."
         )
 
     def __add__(self, other: Batch):
@@ -2767,7 +2767,7 @@ class Batches(tuple):
     def regression1d_baseline(self, *args, **kwargs):
         raise NotImplementedError("Batches.regression1d_baseline() is removed. Use Batches.detrend1d() or Batch.trend1d() instead.")
 
-    def detrend1d_pairs(self, degree=1, device='auto', debug=False):
+    def detrend1d_pairs(self, degree=1, device='auto', max_refine=3, debug=False):
         """
         Detrend 1D polynomial trend along temporal pairs and return Batches.
 
@@ -2775,8 +2775,12 @@ class Batches(tuple):
         all pairs sharing that date, then subtracts the fit. This removes
         constant atmospheric delay (intercept at zero temporal baseline).
 
-        For complex input (BatchComplex): unit-circle fitting, detrend multiplicatively (phase * trend.conj())
-        For real input (Batch): standard polynomial, subtract (phase - trend)
+        Iterative refinement (max_refine > 0): re-estimates atmospheric phase
+        after removing current pair-wise model from the data. Each pass
+        reduces cross-date bias by ~sqrt(N_dates).
+
+        Requires complex input (BatchComplex): unit-circle fitting, detrend
+        multiplicatively (phase * trend.conj()). Must be placed before unwrapping.
 
         Parameters
         ----------
@@ -2784,6 +2788,8 @@ class Batches(tuple):
             Polynomial degree (0=mean, 1=linear). Default 1.
         device : str
             PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
+        max_refine : int
+            Maximum refinement iterations (0 = single-pass). Default 3.
         debug : bool
             Print diagnostic information.
 
@@ -2802,13 +2808,17 @@ class Batches(tuple):
         phase = self[0]
         weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
 
-        if not isinstance(phase, (Batch, BatchComplex)):
-            raise TypeError(f"First element must be Batch or BatchComplex, got {type(phase).__name__}")
+        if not isinstance(phase, BatchComplex):
+            raise TypeError(
+                f"detrend1d_pairs() requires BatchComplex (complex wrapped phase), "
+                f"got {type(phase).__name__}. Place detrend1d_pairs() before unwrapping."
+            )
 
         # Fuse fit+subtract into one blockwise call (detrend=True) so the input
         # phase is referenced only once in the dask graph.
         detrended = phase.trend1d_pairs(weight=weight, degree=degree,
-                                        device=device, detrend=True, debug=debug)
+                                        device=device, detrend=True,
+                                        max_refine=max_refine, debug=debug)
 
         # Preserve non-spatial variables (e.g. BPR) that may be dropped by arithmetic
         detrended = Batches._preserve_nonspatial(phase, detrended)

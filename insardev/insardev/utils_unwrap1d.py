@@ -17,6 +17,16 @@ and least squares network inversion.
 import numpy as np
 
 
+def _round_half_away(x):
+    """Round to nearest integer, breaking ties away from zero.
+
+    torch.round() uses banker's rounding (round half to even), which
+    rounds 0.5 → 0. For 2π jump correction we need round(±0.5) = ±1.
+    """
+    import torch
+    return torch.sign(x) * torch.floor(torch.abs(x) + 0.5)
+
+
 def wrap(data_pairs):
     """Wrap phase to [-pi, pi] range."""
     import xarray as xr
@@ -62,12 +72,17 @@ def build_incidence_matrix(pair_dates):
 
 
 def irls_solve_1d(phi, W_corr, A_t, dev, max_iter=5, epsilon=0.1,
-                  convergence_threshold=1e-3, return_increments=False):
+                  convergence_threshold=1e-3, return_increments=False,
+                  max_closure=3):
     """
-    Optimized IRLS solver using CPU batched operations.
+    Optimized IRLS solver with network closure correction.
 
     Uses CPU for batched linear solve (much faster than MPS/CUDA for small matrices)
     while keeping other operations on the specified device.
+
+    After the initial IRLS unwrapping, iteratively corrects wrong 2pi decisions
+    using network redundancy: a single weighted least squares re-inversion
+    reconstructs pairs from dates and fixes any pair where |residual| > pi.
 
     Parameters
     ----------
@@ -87,6 +102,9 @@ def irls_solve_1d(phi, W_corr, A_t, dev, max_iter=5, epsilon=0.1,
         Stop when weight change is below this.
     return_increments : bool
         If True, return phase increments instead of corrected pairs.
+    max_closure : int
+        Maximum closure correction iterations. Each iteration uses a single
+        weighted least squares solve (cheap) to detect and fix wrong 2pi.
 
     Returns
     -------
@@ -159,19 +177,44 @@ def irls_solve_1d(phi, W_corr, A_t, dev, max_iter=5, epsilon=0.1,
 
         W_irls = W_irls_new
 
+    # Apply 2pi corrections
+    corrections = _round_half_away((phi_recon - phi_clean) / (2 * np.pi))
+    unwrapped = phi_clean + corrections * 2 * np.pi
+
+    # Closure correction: use network redundancy to fix wrong 2pi decisions.
+    # Each iteration does a single cheap WLS solve (no IRLS needed since
+    # data is already unwrapped — residuals are not wrapped).
+    for closure_iter in range(max_closure):
+        # Single weighted least squares on unwrapped data
+        W_cpu2 = W_corr_clean.cpu()
+        uw_cpu = unwrapped.cpu()
+        W_T_cpu2 = W_cpu2.T
+
+        AtWA2 = torch.einsum('pk,ki,kj->pij', W_T_cpu2, A_cpu, A_cpu)
+        AtWA2 = AtWA2 + reg_cpu
+        Wphi2 = W_cpu2 * uw_cpu
+        AtWphi2 = (A_cpu.T @ Wphi2).T
+
+        x2 = torch.linalg.solve(AtWA2, AtWphi2.unsqueeze(2)).squeeze(2)
+        x2 = x2.T.to(dev)
+        phi_recon2 = A_t @ x2
+
+        # Find pairs where unwrapped differs from reconstruction by > pi
+        delta = _round_half_away((phi_recon2 - unwrapped) / (2 * np.pi))
+        n_fixes = (delta != 0).sum().item()
+        if n_fixes == 0:
+            x = x2
+            break
+
+        unwrapped = unwrapped + delta * 2 * np.pi
+        x = x2
+
     if return_increments:
-        # Return phase increments per date interval
-        result = x  # (n_intervals, n_pixels)
-        # Mark pixels with all NaN as NaN
+        result = x
         all_nan = nan_mask.all(dim=0)
         result[:, all_nan] = float('nan')
         return result
     else:
-        # Return corrected pair phases
-        # Integer correction: k = round((φ_recon - φ) / 2π)
-        corrections = torch.round((phi_recon - phi_clean) / (2 * np.pi))
-        unwrapped = phi_clean + corrections * 2 * np.pi
-
         # Restore NaN
         unwrapped = torch.where(nan_mask, torch.full_like(unwrapped, float('nan')), unwrapped)
         return unwrapped
