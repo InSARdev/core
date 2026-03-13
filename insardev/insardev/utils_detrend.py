@@ -23,6 +23,18 @@ _linalg_init_lock = threading.Lock()
 _linalg_initialized = False
 
 
+def _round_half_away(x):
+    """Round to nearest integer, breaking ties away from zero.
+
+    torch.round() uses banker's rounding (round half to even), which
+    rounds 0.5 → 0 and 1.5 → 2. For 2π jump correction we need
+    round(±0.5) = ±1, otherwise corrections near the wrapping boundary
+    (atmospheric phase ≈ ±π) never fire.
+    """
+    import torch
+    return torch.sign(x) * torch.floor(torch.abs(x) + 0.5)
+
+
 def trend1d_array(data, dim_values, weight, device, degree=1, intercept=True, slope=True):
     """
     Fit 1D polynomial along first dimension at each (y, x) pixel using PyTorch.
@@ -201,7 +213,13 @@ def trend1d_array(data, dim_values, weight, device, degree=1, intercept=True, sl
             # IRLS iteration with jump correction
             epsilon = 0.1
             convergence_threshold = 1e-3
-            jumps = torch.zeros_like(angles_safe)  # (n_samples, batch_pixels)
+            # Initialize jumps from circular mean (handles wrapping correctly).
+            circ_mean = torch.atan2(
+                torch.mean(torch.sin(angles_safe), dim=0),
+                torch.mean(torch.cos(angles_safe), dim=0),
+            )  # (batch_pixels,)
+            jumps = _round_half_away((circ_mean.unsqueeze(0) - angles_safe) / (2 * np.pi))
+            jumps[nan_mask] = 0
             W_irls = torch.ones_like(angles_safe)   # (n_samples, batch_pixels)
 
             for iteration in range(10):
@@ -218,7 +236,7 @@ def trend1d_array(data, dim_values, weight, device, degree=1, intercept=True, sl
                 fit_raw = X_t @ coeffs.squeeze(-1).T  # (n_samples, batch_pixels)
 
                 # Update integer 2π jumps
-                new_jumps = torch.round((fit_raw - angles_safe) / (2 * np.pi))
+                new_jumps = _round_half_away((fit_raw - angles_safe) / (2 * np.pi))
                 new_jumps[nan_mask] = 0
 
                 # Wrapped residuals → IRLS weights (L1-norm, same as unwrap1d)
@@ -647,8 +665,18 @@ def polyfit1d_pytorch(data, time_values, weight, sign, device, degree=0):
 
             # IRLS iteration with jump correction
             epsilon = 0.1
-            jumps = torch.zeros_like(angles_safe)
             W_irls = torch.ones_like(angles_safe)
+
+            # Initialize jumps from circular mean (handles wrapping correctly).
+            # Without this, when atmospheric phase is near ±pi, wrapped angles
+            # split into two clusters and the initial fit averages to ~0,
+            # making round((fit-angle)/2pi)=0 so jumps never activate.
+            circ_mean = torch.atan2(
+                torch.mean(torch.sin(angles_safe), dim=0),
+                torch.mean(torch.cos(angles_safe), dim=0),
+            )  # (n_pixels_batch,)
+            jumps = _round_half_away((circ_mean.unsqueeze(0) - angles_safe) / (2 * np.pi))
+            jumps[nan_mask] = 0
 
             for iteration in range(10):
                 data_b = angles_safe + jumps * (2 * np.pi)
@@ -664,7 +692,7 @@ def polyfit1d_pytorch(data, time_values, weight, sign, device, degree=0):
                 fit_raw = X_t @ coeffs.squeeze(-1).T  # (n_samples, batch)
 
                 # Update integer 2π jumps
-                new_jumps = torch.round((fit_raw - angles_safe) / (2 * np.pi))
+                new_jumps = _round_half_away((fit_raw - angles_safe) / (2 * np.pi))
                 new_jumps[nan_mask] = 0
 
                 # Wrapped residuals → IRLS weights
@@ -780,7 +808,7 @@ def polyfit1d_pytorch(data, time_values, weight, sign, device, degree=0):
 
 
 def trend1d_pairs_array(data_chunk, weight_chunk, ref_values, rep_values,
-                         device, degree):
+                         device, degree, max_refine=3):
     """
     Process a spatial chunk for trend1d_pairs.
 
@@ -788,6 +816,12 @@ def trend1d_pairs_array(data_chunk, weight_chunk, ref_values, rep_values,
     polynomial to phase vs temporal baseline using all pairs, and stores
     the model at zero temporal baseline (intercept). Pair trends are
     reconstructed as model[ref] op model[rep].
+
+    Iterative refinement (max_refine > 0): after the initial per-date fit,
+    pair-wise corrections from accumulated models are subtracted from the
+    original data, and the per-date fit is repeated on the corrected data.
+    This block-coordinate-descent approach reduces cross-date bias in the
+    atmospheric phase estimates by a factor of ~sqrt(N_dates) per iteration.
 
     Two modes:
     - Complex input: unit-circle fitting per date, reconstruct pair trend as
@@ -809,6 +843,8 @@ def trend1d_pairs_array(data_chunk, weight_chunk, ref_values, rep_values,
         PyTorch device
     degree : int
         Polynomial degree (0=mean, 1=linear)
+    max_refine : int
+        Maximum refinement iterations (0 = single-pass). Default 3.
 
     Returns
     -------
@@ -868,74 +904,103 @@ def trend1d_pairs_array(data_chunk, weight_chunk, ref_values, rep_values,
     all_days = np.concatenate([ref_days, rep_days])
     unique_days = np.unique(all_days)
 
-    # Build per-date models
-    models = {}
+    out_dtype = np.complex64 if is_complex else np.float32
 
+    # Pre-compute per-date pair indices, time values, and signs (reused across iterations)
+    date_info = {}
     for date_day in unique_days:
-        # Find pairs containing this date
-        is_ref = np.isclose(ref_days, date_day)
-        is_rep = np.isclose(rep_days, date_day)
-        mask = is_ref | is_rep
+        is_ref_d = np.isclose(ref_days, date_day)
+        is_rep_d = np.isclose(rep_days, date_day)
+        mask = is_ref_d | is_rep_d
         pair_indices = np.where(mask)[0]
-
         if len(pair_indices) == 0:
             continue
-
-        # Compute time intervals (days) and signs
-        time_values = []
-        signs = []
+        time_vals = []
+        sgns = []
         for idx in pair_indices:
-            if is_rep[idx]:
-                # date is rep, pair goes ref -> date
-                days_val = date_day - ref_days[idx]
-                signs.append(-1.0)
+            if is_rep_d[idx]:
+                # Signed time: negative (ref < date for rep pairs)
+                # so that velocity slope is consistent (+v) across
+                # both ref and rep pairs after sign-correcting data.
+                time_vals.append(ref_days[idx] - date_day)
+                sgns.append(-1.0)
             else:
-                # date is ref, pair goes date -> rep
-                days_val = rep_days[idx] - date_day
-                signs.append(1.0)
-            time_values.append(days_val)
-
-        time_values = np.array(time_values, dtype=np.float32)
-        signs = np.array(signs, dtype=np.float32)
-
-        if len(pair_indices) == 0:
-            continue
-
-        # Extract only selected pairs from chunks (no full concatenation)
-        selected_data = _select(pair_indices)
-        selected_weight = _select_w(pair_indices) if _select_w is not None else None
-
-        # Fit polynomial using PyTorch
-        models[date_day] = polyfit1d_pytorch(
-            selected_data, time_values, selected_weight, signs,
-            device, degree=degree
+                time_vals.append(rep_days[idx] - date_day)
+                sgns.append(1.0)
+        date_info[date_day] = (
+            pair_indices,
+            np.array(time_vals, dtype=np.float32),
+            np.array(sgns, dtype=np.float32),
         )
 
+    # Pre-map pair index → exact unique_days key for fast lookup
+    ref_day_keys = unique_days[np.searchsorted(unique_days, ref_days)]
+    rep_day_keys = unique_days[np.searchsorted(unique_days, rep_days)]
+
+    # Materialize full data array for iterative refinement
+    if max_refine > 0:
+        if isinstance(data_chunk, list):
+            full_data = np.concatenate([np.asarray(c) for c in data_chunk], axis=0)
+        else:
+            full_data = np.asarray(data_chunk)
+
+    # --- Iterative fitting: pass 0 = initial, passes 1..max_refine = refinement ---
+    models = {}
+    for iteration in range(1 + max_refine):
+
+        # For iteration > 0: correct original data by removing current model
+        if iteration > 0:
+            current_data = full_data.copy()
+            for i in range(n_pairs):
+                rk, rpk = ref_day_keys[i], rep_day_keys[i]
+                rm = models.get(rk)
+                rp = models.get(rpk)
+                if rm is not None and rp is not None:
+                    if is_complex:
+                        current_data[i] *= np.conj(rm) * rp
+                    else:
+                        current_data[i] -= rm - rp
+            _select_iter = lambda indices, _cd=current_data: _cd[indices]
+        else:
+            _select_iter = _select
+
+        # Fit per-date models (signed time ensures consistent velocity slope
+        # across ref/rep pairs, so degree=1 refinement is stable)
+        new_models = {}
+        for date_day, (pair_indices, time_values, signs) in date_info.items():
+            selected_data = _select_iter(pair_indices)
+            selected_weight = _select_w(pair_indices) if _select_w is not None else None
+            new_models[date_day] = polyfit1d_pytorch(
+                selected_data, time_values, selected_weight, signs,
+                device, degree=degree
+            )
+
+        # Accumulate models
+        if iteration == 0:
+            models = new_models
+        else:
+            for d, delta in new_models.items():
+                if d in models:
+                    if is_complex:
+                        models[d] = models[d] * delta
+                    else:
+                        models[d] = models[d] + delta
+                else:
+                    models[d] = delta
+
     # Reconstruct pair-wise trends
-    out_dtype = np.complex64 if is_complex else np.float32
     nan_val = np.nan + 0j if is_complex else np.nan
     trend_data = np.full((n_pairs, ny, nx), nan_val, dtype=out_dtype)
 
     for i in range(n_pairs):
-        ref_day = ref_days[i]
-        rep_day = rep_days[i]
-
-        # Find matching keys (use isclose for float comparison)
-        ref_key = None
-        rep_key = None
-        for key in models.keys():
-            if np.isclose(key, ref_day):
-                ref_key = key
-            if np.isclose(key, rep_day):
-                rep_key = key
-
-        if ref_key is None or rep_key is None:
+        rm = models.get(ref_day_keys[i])
+        rp = models.get(rep_day_keys[i])
+        if rm is None or rp is None:
             continue
-
         if is_complex:
-            trend_data[i] = models[ref_key] * np.conj(models[rep_key])
+            trend_data[i] = rm * np.conj(rp)
         else:
-            trend_data[i] = models[ref_key] - models[rep_key]
+            trend_data[i] = rm - rp
 
     return trend_data
 
