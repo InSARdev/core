@@ -2761,7 +2761,7 @@ class Batches(tuple):
     def regression1d_baseline(self, *args, **kwargs):
         raise NotImplementedError("Batches.regression1d_baseline() is removed. Use Batches.detrend1d() or Batch.trend1d() instead.")
 
-    def detrend1d_pairs(self, degree=1, max_refine=9, threshold=0.5, debug=False):
+    def detrend1d_pairs(self, degree=1, max_refine=3, threshold=1.2, debug=False):
         """
         Detrend 1D polynomial trend along temporal pairs and return Batches.
 
