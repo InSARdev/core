@@ -277,6 +277,8 @@ def save(*args, store, storage_options: dict[str, str] | None = None, compat: bo
                             futures = _client.compute(d,
                                                       optimize_graph=False)
                             wait(futures)
+                            # Raise if any task failed (otherwise zarr chunk stays at fill_value=0)
+                            _client.gather(futures)
                             pbar.update((k_end - k) * len(batch_burst_ids))
                     else:
                         for k in range(0, n_pairs, batch_size):
@@ -333,6 +335,8 @@ def save(*args, store, storage_options: dict[str, str] | None = None, compat: bo
                             with dask.config.set(delayed_optimize=None):
                                 futures = _client.compute(d)
                             wait(futures)
+                            # Raise if any task failed (otherwise zarr chunk stays at fill_value=0)
+                            _client.gather(futures)
                             new_done = n_pairs * tb_end // n_tiles
                             pbar.update(new_done - done_tiles)
                             done_tiles = new_done

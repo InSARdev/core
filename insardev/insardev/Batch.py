@@ -628,9 +628,9 @@ class Batch(BatchCore):
         import xarray as xr
         return BatchComplex(self.map_da(lambda da: xr.ufuncs.exp(sign * 1j * da), **kwargs))
 
-    def lstsq(self, weight: 'BatchUnit | None' = None, device: str = 'auto',
+    def lstsq(self, weight: 'BatchUnit | None' = None,
               cumsum: bool = True, max_iter: int = 5, epsilon: float = 0.1,
-              debug: bool = False) -> 'Batch':
+              x_tol: float = 0.001, debug: bool = False) -> 'Batch':
         """
         L1-norm IRLS network inversion to date-based time series.
 
@@ -642,8 +642,6 @@ class Batch(BatchCore):
         ----------
         weight : BatchUnit or None
             Optional weight for the inversion (typically correlation).
-        device : str
-            PyTorch device ('auto', 'cuda', 'mps', 'cpu'). Default 'auto'.
         cumsum : bool
             If True (default), return cumulative displacement time series.
             If False, return incremental phase changes between dates.
@@ -651,6 +649,8 @@ class Batch(BatchCore):
             Maximum IRLS iterations. Default 5.
         epsilon : float
             IRLS regularization parameter. Default 0.1.
+        x_tol : float
+            Solution convergence tolerance. Default 0.001.
         debug : bool
             Print debug information.
 
@@ -668,9 +668,9 @@ class Batch(BatchCore):
         from .Stack_unwrap1d import Stack_unwrap1d
 
         return Stack_unwrap1d.lstsq(Stack_unwrap1d(), self, weight=weight,
-                                    device=device, cumsum=cumsum,
+                                    cumsum=cumsum,
                                     max_iter=max_iter, epsilon=epsilon,
-                                    debug=debug)
+                                    x_tol=x_tol, debug=debug)
 
     def displacement_los(self, transform: 'Batch | Stack') -> 'Batch':
         """Compute line-of-sight displacement (meters) from unwrapped phase.
@@ -1442,7 +1442,7 @@ class BatchWrap(BatchCore):
                                             conncomp_linkcount=conncomp_linkcount,
                                             debug=debug)
 
-    def unwrap1d(self, weight: 'BatchUnit | None' = None, device: str = 'auto',
+    def unwrap1d(self, weight: 'BatchUnit | None' = None,
                  debug: bool = False, **kwargs) -> 'Batch':
         """
         1D temporal phase unwrapping using triplet pre-filtering and IRLS.
@@ -1451,12 +1451,10 @@ class BatchWrap(BatchCore):
         ----------
         weight : BatchUnit or None
             Optional weight for the unwrapping (typically correlation).
-        device : str
-            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
         debug : bool
             Print diagnostic information.
         **kwargs
-            Additional arguments: max_iter, epsilon, batch_size, threshold.
+            Additional arguments: max_iter, epsilon, threshold.
 
         Returns
         -------
@@ -1472,7 +1470,7 @@ class BatchWrap(BatchCore):
         from .Stack_unwrap1d import Stack_unwrap1d
 
         return Stack_unwrap1d.unwrap1d(Stack_unwrap1d(), self, weight=weight,
-                                       device=device, debug=debug, **kwargs)
+                                       debug=debug, **kwargs)
 
 class BatchUnit(BatchCore):
     """
@@ -1890,7 +1888,7 @@ class Batches(tuple):
 
         if isinstance(result, tuple):
             return result
-        return (result,)
+        return Batches((result,))
 
     def archive(self, store: str, caption: str | None = None, compression: int = 6,
                 n_bursts: int = 2, debug: bool = False):
@@ -2470,7 +2468,7 @@ class Batches(tuple):
         elements = [unwrapped] + list(self[1:])
         return Batches(elements)
 
-    def unwrap1d(self, device='auto', debug=False, **kwargs):
+    def unwrap1d(self, debug=False, **kwargs):
         """
         1D temporal phase unwrapping using IRLS optimization.
 
@@ -2479,12 +2477,10 @@ class Batches(tuple):
 
         Parameters
         ----------
-        device : str
-            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
         debug : bool
             Print diagnostic information.
         **kwargs
-            Additional arguments: max_iter, epsilon, batch_size.
+            Additional arguments: max_iter, epsilon, threshold.
 
         Returns
         -------
@@ -2513,7 +2509,7 @@ class Batches(tuple):
             raise TypeError(f"First element must be BatchWrap or BatchComplex, got {type(phase).__name__}")
 
         # Delegate to BatchWrap.unwrap1d
-        unwrapped = phase.unwrap1d(weight=weight, device=device, debug=debug, **kwargs)
+        unwrapped = phase.unwrap1d(weight=weight, debug=debug, **kwargs)
 
         # Preserve non-spatial variables (e.g. BPR) that may be dropped by unwrapping
         unwrapped = Batches._preserve_nonspatial(phase, unwrapped)
@@ -2628,31 +2624,23 @@ class Batches(tuple):
         elements = [detrended] + list(self[1:])
         return Batches(elements)
 
-    def detrend1d(self, baseline='BPR', degree=1, intercept=False, slope=True,
-                  device='auto', debug=False):
+    def detrend1d(self, baseline='BPR', intercept=False, slope=True, debug=False):
         """
-        Detrend 1D polynomial trend along perpendicular baseline and return Batches.
+        Detrend linear trend along perpendicular baseline and return Batches.
 
         Removes DEM residual phase proportional to perpendicular baseline at each pixel.
-        Mirrors detrend2d() pattern: auto-detects input type.
-
-        For complex input (BatchComplex): unit-circle fitting, detrend multiplicatively (phase * trend.conj())
-        For real input (Batch): standard polynomial, subtract
+        Uses numba per-pixel IRLS with analytical 2x2 solve.
 
         Parameters
         ----------
         baseline : str
             Variable name to regress against (default 'BPR' for perpendicular baseline).
-        degree : int
-            Polynomial degree (1=linear, 2=quadratic). Default 1.
         intercept : bool
             If True, include intercept in the trend to subtract.
             If False (default), zero out the intercept (preserve it in data).
         slope : bool
             If True (default), include slope in the trend to subtract.
             If False, zero out the slope (preserve it in data).
-        device : str
-            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
         debug : bool
             Print diagnostic information.
 
@@ -2680,8 +2668,8 @@ class Batches(tuple):
 
         # Fuse fit+subtract into one blockwise call (detrend=True) so the input
         # phase is referenced only once in the dask graph.
-        detrended = phase.trend1d(weight=weight, baseline=baseline, degree=degree,
-                                  device=device, detrend=True,
+        detrended = phase.trend1d(weight=weight, baseline=baseline,
+                                  detrend=True,
                                   intercept=intercept, slope=slope, debug=debug)
 
         # Preserve non-spatial variables (e.g. BPR) that may be dropped by arithmetic
@@ -2691,8 +2679,8 @@ class Batches(tuple):
         elements = [detrended] + list(self[1:])
         return Batches(elements)
 
-    def lstsq(self, device='auto', cumsum=True,
-              max_iter=5, epsilon=0.1, debug=False):
+    def lstsq(self, cumsum=True,
+              max_iter=5, epsilon=0.1, x_tol=0.001, debug=False):
         """
         L1-norm IRLS network inversion to date-based time series.
 
@@ -2702,8 +2690,6 @@ class Batches(tuple):
 
         Parameters
         ----------
-        device : str
-            PyTorch device ('auto', 'cuda', 'mps', 'cpu'). Default 'auto'.
         cumsum : bool
             If True (default), return cumulative displacement time series.
             If False, return incremental phase changes between dates.
@@ -2711,6 +2697,8 @@ class Batches(tuple):
             Maximum IRLS iterations. Default 5.
         epsilon : float
             IRLS regularization parameter. Default 0.1.
+        x_tol : float
+            Solution convergence tolerance. Default 0.001.
         debug : bool
             Print debug information.
 
@@ -2732,8 +2720,9 @@ class Batches(tuple):
         weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
 
         # Delegate to Batch.lstsq
-        result = data.lstsq(weight=weight, device=device, cumsum=cumsum,
-                            max_iter=max_iter, epsilon=epsilon, debug=debug)
+        result = data.lstsq(weight=weight, cumsum=cumsum,
+                            max_iter=max_iter, epsilon=epsilon,
+                            x_tol=x_tol, debug=debug)
 
         # Rebuild Batches preserving all original elements except first
         elements = [result] + list(self[1:])
@@ -2767,7 +2756,7 @@ class Batches(tuple):
     def regression1d_baseline(self, *args, **kwargs):
         raise NotImplementedError("Batches.regression1d_baseline() is removed. Use Batches.detrend1d() or Batch.trend1d() instead.")
 
-    def detrend1d_pairs(self, degree=1, device='auto', max_refine=3, threshold=0.5, debug=False):
+    def detrend1d_pairs(self, degree=1, max_refine=9, threshold=0.5, debug=False):
         """
         Detrend 1D polynomial trend along temporal pairs and return Batches.
 
@@ -2786,8 +2775,6 @@ class Batches(tuple):
         ----------
         degree : int
             Polynomial degree (0=mean, 1=linear). Default 1.
-        device : str
-            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
         max_refine : int
             Maximum refinement iterations (0 = single-pass). Default 3.
         debug : bool
@@ -2817,7 +2804,7 @@ class Batches(tuple):
         # Fuse fit+subtract into one blockwise call (detrend=True) so the input
         # phase is referenced only once in the dask graph.
         detrended = phase.trend1d_pairs(weight=weight, degree=degree,
-                                        device=device, detrend=True,
+                                        detrend=True,
                                         max_refine=max_refine,
                                         threshold=threshold, debug=debug)
 

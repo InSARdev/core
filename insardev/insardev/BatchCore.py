@@ -1975,15 +1975,13 @@ class BatchCore(dict):
         return output
 
     def trend1d(self, weight: 'BatchUnit | None' = None, baseline: str = 'BPR',
-                degree: int = 1, device: str = 'auto', detrend: bool = False,
+                detrend: bool = False,
                 intercept: bool = False, slope: bool = True,
                 debug: bool = False) -> 'Batch':
         """
-        Fit 1D polynomial trend along perpendicular baseline at each (y, x) pixel.
+        Fit linear trend along perpendicular baseline at each (y, x) pixel.
 
-        Two modes:
-        - Complex (BatchComplex): unit-circle fitting, returns BatchComplex
-        - Real (Batch): standard polynomial, returns Batch
+        Uses numba per-pixel IRLS with analytical 2x2 solve for complex phase.
 
         Parameters
         ----------
@@ -1991,10 +1989,6 @@ class BatchCore(dict):
             Optional weight for the fitting (typically correlation).
         baseline : str
             Variable name to regress against (default 'BPR' for perpendicular baseline).
-        degree : int
-            Polynomial degree (1=linear, 2=quadratic). Default 1.
-        device : str
-            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
         detrend : bool
             If True, return detrended data instead of the trend surface.
             Fuses fit+subtract into one blockwise call to avoid double-referencing
@@ -2004,14 +1998,13 @@ class BatchCore(dict):
 
         Returns
         -------
-        Batch or BatchComplex
-            Fitted trend values, same type and shape as input data.
+        BatchComplex
+            Fitted trend values, same shape as input data.
 
         Examples
         --------
         >>> trend = intf.trend1d(weight=corr)
-        >>> detrended = intf * trend.conj()  # complex
-        >>> detrended = phase - trend        # real
+        >>> detrended = intf * trend.conj()
         """
         import dask
         import dask.array as da
@@ -2025,13 +2018,6 @@ class BatchCore(dict):
 
         # Validate lazy data
         BatchCore._require_lazy(data, 'trend1d')
-
-        # Auto-detect device
-        resolved = BatchCore._get_torch_device(device, debug=debug)
-        device = resolved.type
-
-        if debug:
-            print(f"DEBUG: using device={device}")
 
         is_complex = isinstance(data, BatchComplex)
 
@@ -2099,21 +2085,16 @@ class BatchCore(dict):
                 n_stack = data_dask.shape[0]
 
                 def _trend1d_block(data_block, weight_block=None,
-                                   _bv=baseline_values, _dev=device,
-                                   _deg=degree, _detrend=detrend, _dtype=out_dtype,
+                                   _bv=baseline_values,
+                                   _detrend=detrend, _dtype=out_dtype,
                                    _intercept=intercept, _slope=slope):
-                    import torch
                     trend = utils_detrend.trend1d_array(
                         [data_block], _bv,
                         [weight_block] if weight_block is not None else None,
-                        torch.device(_dev), _deg,
                         intercept=_intercept, slope=_slope,
                     )
                     if _detrend:
-                        if np.iscomplexobj(data_block):
-                            return (data_block * np.conj(trend)).astype(_dtype)
-                        else:
-                            return (data_block - trend).astype(_dtype)
+                        return (data_block * np.conj(trend)).astype(_dtype)
                     return trend.astype(_dtype)
 
                 if weight_dask is not None:
@@ -2146,16 +2127,14 @@ class BatchCore(dict):
 
             result[key] = xr.Dataset(result_ds, attrs=ds.attrs)
 
-        if is_complex:
-            return BatchComplex(result)
-        return Batch(result)
+        return BatchComplex(result)
 
     # Backward compatibility alias
     regression1d_baseline = trend1d
 
     def trend1d_pairs(self, weight: 'BatchUnit | None' = None, degree: int = 1,
-                      device: str = 'auto', detrend: bool = False,
-                      max_refine: int = 3, threshold: float | None = None,
+                      detrend: bool = False,
+                      max_refine: int = 9, threshold: float | None = None,
                       debug: bool = False) -> 'Batch':
         """
         Fit 1D atmospheric phase trend along temporal pairs for each date.
@@ -2174,8 +2153,6 @@ class BatchCore(dict):
             Optional weight for the fitting (typically correlation).
         degree : int
             Polynomial degree (0=mean, 1=linear). Default 1.
-        device : str
-            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
         detrend : bool
             If True, return detrended data instead of the trend surface.
             Fuses fit+subtract into one blockwise call to avoid double-referencing
@@ -2213,13 +2190,6 @@ class BatchCore(dict):
                 "Place detrend1d_pairs() before unwrapping in the pipeline."
             )
 
-        # Auto-detect device
-        resolved = BatchCore._get_torch_device(device, debug=debug)
-        device = resolved.type
-
-        if debug:
-            print(f"DEBUG: trend1d_pairs using device={device}")
-
         out_dtype = np.complex64
 
         results = {}
@@ -2252,16 +2222,15 @@ class BatchCore(dict):
 
                 def _trend1d_pairs_block(data_block, weight_block=None,
                                          _ref=ref_values, _rep=rep_values,
-                                         _dev=str(device), _deg=degree,
+                                         _deg=degree,
                                          _detrend=detrend,
                                          _max_refine=max_refine,
                                          _threshold=threshold,
                                          _dtype=out_dtype):
-                    import torch
                     trend = utils_detrend.trend1d_pairs_array(
                         [data_block],
                         [weight_block] if weight_block is not None else None,
-                        _ref, _rep, torch.device(_dev), _deg,
+                        _ref, _rep, _deg,
                         max_refine=_max_refine, threshold=_threshold
                     )
                     if _detrend:

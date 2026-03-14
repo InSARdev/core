@@ -11,11 +11,9 @@
 """
 1D phase unwrapping along the temporal dimension using L1-norm IRLS.
 
-Optimized implementation with:
-- CPU batched linear solve (faster than GPU for small matrices)
-- Efficient einsum-based AtWA computation
-- Memory-efficient chunked processing
-- Direct time series output option
+Numba per-pixel kernels:
+- Triplet pre-filtering + IRLS unwrapping (unwrap1d)
+- Fisher-weighted IRLS network inversion with solution convergence (lstsq)
 """
 from .BatchCore import BatchCore
 from . import utils_unwrap1d
@@ -25,8 +23,8 @@ import numpy as np
 class Stack_unwrap1d(BatchCore):
     """1D phase unwrapping along the temporal dimension using L1-norm IRLS."""
 
-    def lstsq(self, data, weight=None, device='auto', cumsum=True,
-              max_iter=5, epsilon=0.1, debug=False):
+    def lstsq(self, data, weight=None, cumsum=True,
+              max_iter=5, epsilon=0.1, x_tol=0.001, debug=False):
         """
         L1-norm IRLS network inversion to date-based time series.
 
@@ -44,8 +42,6 @@ class Stack_unwrap1d(BatchCore):
             Unwrapped phase data with 'pair' dimension.
         weight : BatchUnit, optional
             Correlation weights for each pair.
-        device : str, optional
-            PyTorch device ('auto', 'cuda', 'mps', 'cpu'). Default 'auto'.
         cumsum : bool, optional
             If True (default), return cumulative displacement time series.
             If False, return incremental phase changes between dates.
@@ -53,6 +49,8 @@ class Stack_unwrap1d(BatchCore):
             Maximum IRLS iterations. Default 5.
         epsilon : float, optional
             IRLS regularization parameter. Default 0.1.
+        x_tol : float, optional
+            Solution convergence tolerance. Default 0.001.
         debug : bool, optional
             Print debug information.
 
@@ -108,8 +106,8 @@ class Stack_unwrap1d(BatchCore):
                 da = ds[pol]
                 w_da = w_ds[pol] if w_ds is not None else None
 
-                result = self._lstsq_dataarray(da, w_da, device, cumsum,
-                                               max_iter, epsilon, debug)
+                result = self._lstsq_dataarray(da, w_da, cumsum,
+                                               max_iter, epsilon, x_tol, debug)
                 result_vars[pol] = result
 
             result_ds = xr.Dataset(result_vars)
@@ -121,8 +119,8 @@ class Stack_unwrap1d(BatchCore):
 
         return Batch(results)
 
-    def _lstsq_dataarray(self, data, weight, device, cumsum,
-                         max_iter, epsilon, debug):
+    def _lstsq_dataarray(self, data, weight, cumsum,
+                         max_iter, epsilon, x_tol, debug):
         """Internal method for lstsq on DataArray - LAZY dask processing."""
         import xarray as xr
         import pandas as pd
@@ -147,11 +145,13 @@ class Stack_unwrap1d(BatchCore):
             weight_dask = None
 
         def _lstsq_block(data_block, weight_block=None,
-                         _max_iter=max_iter, _epsilon=epsilon):
+                         _max_iter=max_iter, _epsilon=epsilon,
+                         _x_tol=x_tol):
             ts_block, _ = utils_unwrap1d.lstsq_to_dates_numpy(
                 [data_block], [weight_block] if weight_block is not None else None,
-                pair_dates, device=device, cumsum=cumsum,
-                max_iter=_max_iter, epsilon=_epsilon, debug=False
+                pair_dates, cumsum=cumsum,
+                max_iter=_max_iter, epsilon=_epsilon,
+                x_tol=_x_tol, debug=False
             )
             return ts_block.astype(np.float32)
 
@@ -189,8 +189,8 @@ class Stack_unwrap1d(BatchCore):
             name='displacement'
         )
 
-    def unwrap1d(self, data, weight=None, device='auto', max_iter=5,
-                 epsilon=0.1, batch_size=50000, threshold=0.5,
+    def unwrap1d(self, data, weight=None, max_iter=5,
+                 epsilon=0.1, threshold=0.5,
                  debug=False):
         """
         Temporal phase unwrapping returning unwrapped pairs.
@@ -208,14 +208,10 @@ class Stack_unwrap1d(BatchCore):
             Phase data with 'pair' dimension (wrapped or 2D-unwrapped).
         weight : BatchUnit, optional
             Correlation weights for each pair.
-        device : str, optional
-            PyTorch device ('auto', 'cuda', 'mps', 'cpu'). Default 'auto'.
         max_iter : int, optional
             Maximum IRLS iterations. Default 5.
         epsilon : float, optional
             IRLS regularization parameter. Default 0.1.
-        batch_size : int, optional
-            Pixels per batch for memory efficiency. Default 50000.
         threshold : float, optional
             Pair consistency threshold. Lower = more conservative filtering.
             Default 0.5.
@@ -241,13 +237,8 @@ class Stack_unwrap1d(BatchCore):
         import xarray as xr
         from .Batch import Batch, BatchWrap, BatchUnit
 
-        # Auto-detect device based on Dask cluster resources and hardware
-        # Convert to string once to avoid serialization issues and repeated resolution
-        resolved = Stack_unwrap1d._get_torch_device(device, debug=debug)
-        device = resolved.type  # 'cpu', 'cuda', or 'mps' as string
-
         if debug:
-            print(f"DEBUG: unwrap1d using device={device}")
+            print(f"DEBUG: unwrap1d using numba kernel")
 
         # Validate input types
         if not isinstance(data, (Batch, BatchWrap)):
@@ -278,7 +269,7 @@ class Stack_unwrap1d(BatchCore):
                 w_da = w_ds[pol] if w_ds is not None else None
 
                 result = self._unwrap1d_pairs_dataarray(
-                    da, w_da, device, max_iter, epsilon, batch_size,
+                    da, w_da, max_iter, epsilon,
                     threshold, debug
                 )
                 result_vars[pol] = result
@@ -292,8 +283,8 @@ class Stack_unwrap1d(BatchCore):
 
         return Batch(results)
 
-    def _unwrap1d_pairs_dataarray(self, data, weight, device, max_iter,
-                                   epsilon, batch_size,
+    def _unwrap1d_pairs_dataarray(self, data, weight, max_iter,
+                                   epsilon,
                                    threshold, debug):
         """Internal method for unwrapping on DataArray returning pairs - LAZY."""
         import xarray as xr
@@ -331,8 +322,8 @@ class Stack_unwrap1d(BatchCore):
         def _unwrap_block(data_block, weight_block=None):
             unwrapped = utils_unwrap1d.unwrap1d_pairs_numpy(
                 [data_block], [weight_block] if weight_block is not None else None,
-                pair_dates, device=device, max_iter=max_iter,
-                epsilon=epsilon, batch_size=batch_size,
+                pair_dates, max_iter=max_iter,
+                epsilon=epsilon,
                 threshold=threshold,
                 debug=False
             )
@@ -366,4 +357,3 @@ class Stack_unwrap1d(BatchCore):
         result = result.assign_coords(original_coords)
 
         return result
-
