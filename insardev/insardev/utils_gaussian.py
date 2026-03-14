@@ -433,6 +433,12 @@ def gaussian_numpy(data_np, weight_np=None, sigma=None, truncate=4.0, threshold=
             result = nanconvolve2d_gaussian_pytorch(
                 data_np, weight_np, sigma=tuple(sigma), truncate=truncate, threshold=threshold, device=dev
             )
+            # Clear GPU cache
+            import torch
+            if dev.type == 'mps':
+                torch.mps.empty_cache()
+            elif dev.type == 'cuda':
+                torch.cuda.empty_cache()
 
     if squeeze:
         result = result[np.newaxis, ...]

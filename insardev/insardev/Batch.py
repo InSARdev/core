@@ -1683,7 +1683,12 @@ class BatchComplex(BatchCore):
         if dev.type == 'cpu':
             result = goldstein_numpy(phase_np, corr_np, psize_y, psize_x, threshold=threshold)
         else:
+            import torch
             result = goldstein_pytorch(phase_np, corr_np, psize_y, psize_x, dev, threshold=threshold)
+            if dev.type == 'mps':
+                torch.mps.empty_cache()
+            elif dev.type == 'cuda':
+                torch.cuda.empty_cache()
 
         if squeeze:
             result = result[np.newaxis, ...]
