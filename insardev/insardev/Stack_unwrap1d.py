@@ -190,16 +190,17 @@ class Stack_unwrap1d(BatchCore):
         )
 
     def unwrap1d(self, data, weight=None, device='auto', max_iter=5,
-                 epsilon=0.1, batch_size=50000, debug=False):
+                 epsilon=0.1, batch_size=50000, threshold=0.5,
+                 debug=False):
         """
-        L1-norm IRLS temporal phase unwrapping returning unwrapped pairs.
+        Temporal phase unwrapping returning unwrapped pairs.
 
         .. deprecated::
             Use ``phase.unwrap1d(weight=corr)`` on BatchWrap instead.
             This Stack method will be removed in a future version.
 
-        Performs temporal unwrapping across the interferogram network,
-        applying 2π corrections to make pairs consistent.
+        Uses triplet phase closure pre-filtering to identify consistent pairs,
+        then IRLS unwrapping on selected pairs. Rejected pairs are set to NaN.
 
         Parameters
         ----------
@@ -215,6 +216,9 @@ class Stack_unwrap1d(BatchCore):
             IRLS regularization parameter. Default 0.1.
         batch_size : int, optional
             Pixels per batch for memory efficiency. Default 50000.
+        threshold : float, optional
+            Pair consistency threshold. Lower = more conservative filtering.
+            Default 0.5.
         debug : bool, optional
             Print debug information.
 
@@ -274,7 +278,8 @@ class Stack_unwrap1d(BatchCore):
                 w_da = w_ds[pol] if w_ds is not None else None
 
                 result = self._unwrap1d_pairs_dataarray(
-                    da, w_da, device, max_iter, epsilon, batch_size, debug
+                    da, w_da, device, max_iter, epsilon, batch_size,
+                    threshold, debug
                 )
                 result_vars[pol] = result
 
@@ -288,8 +293,9 @@ class Stack_unwrap1d(BatchCore):
         return Batch(results)
 
     def _unwrap1d_pairs_dataarray(self, data, weight, device, max_iter,
-                                   epsilon, batch_size, debug):
-        """Internal method for IRLS unwrapping on DataArray returning pairs - LAZY."""
+                                   epsilon, batch_size,
+                                   threshold, debug):
+        """Internal method for unwrapping on DataArray returning pairs - LAZY."""
         import xarray as xr
         import pandas as pd
         import dask.array as da
@@ -326,7 +332,9 @@ class Stack_unwrap1d(BatchCore):
             unwrapped = utils_unwrap1d.unwrap1d_pairs_numpy(
                 [data_block], [weight_block] if weight_block is not None else None,
                 pair_dates, device=device, max_iter=max_iter,
-                epsilon=epsilon, batch_size=batch_size, debug=False
+                epsilon=epsilon, batch_size=batch_size,
+                threshold=threshold,
+                debug=False
             )
             return unwrapped.astype(np.float32)
 

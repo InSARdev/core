@@ -72,17 +72,12 @@ def build_incidence_matrix(pair_dates):
 
 
 def irls_solve_1d(phi, W_corr, A_t, dev, max_iter=5, epsilon=0.1,
-                  convergence_threshold=1e-3, return_increments=False,
-                  max_closure=3):
+                  convergence_threshold=1e-3, return_increments=False):
     """
-    Optimized IRLS solver with network closure correction.
+    IRLS solver for temporal phase unwrapping.
 
     Uses CPU for batched linear solve (much faster than MPS/CUDA for small matrices)
     while keeping other operations on the specified device.
-
-    After the initial IRLS unwrapping, iteratively corrects wrong 2pi decisions
-    using network redundancy: a single weighted least squares re-inversion
-    reconstructs pairs from dates and fixes any pair where |residual| > pi.
 
     Parameters
     ----------
@@ -102,9 +97,6 @@ def irls_solve_1d(phi, W_corr, A_t, dev, max_iter=5, epsilon=0.1,
         Stop when weight change is below this.
     return_increments : bool
         If True, return phase increments instead of corrected pairs.
-    max_closure : int
-        Maximum closure correction iterations. Each iteration uses a single
-        weighted least squares solve (cheap) to detect and fix wrong 2pi.
 
     Returns
     -------
@@ -181,34 +173,6 @@ def irls_solve_1d(phi, W_corr, A_t, dev, max_iter=5, epsilon=0.1,
     corrections = _round_half_away((phi_recon - phi_clean) / (2 * np.pi))
     unwrapped = phi_clean + corrections * 2 * np.pi
 
-    # Closure correction: use network redundancy to fix wrong 2pi decisions.
-    # Each iteration does a single cheap WLS solve (no IRLS needed since
-    # data is already unwrapped — residuals are not wrapped).
-    for closure_iter in range(max_closure):
-        # Single weighted least squares on unwrapped data
-        W_cpu2 = W_corr_clean.cpu()
-        uw_cpu = unwrapped.cpu()
-        W_T_cpu2 = W_cpu2.T
-
-        AtWA2 = torch.einsum('pk,ki,kj->pij', W_T_cpu2, A_cpu, A_cpu)
-        AtWA2 = AtWA2 + reg_cpu
-        Wphi2 = W_cpu2 * uw_cpu
-        AtWphi2 = (A_cpu.T @ Wphi2).T
-
-        x2 = torch.linalg.solve(AtWA2, AtWphi2.unsqueeze(2)).squeeze(2)
-        x2 = x2.T.to(dev)
-        phi_recon2 = A_t @ x2
-
-        # Find pairs where unwrapped differs from reconstruction by > pi
-        delta = _round_half_away((phi_recon2 - unwrapped) / (2 * np.pi))
-        n_fixes = (delta != 0).sum().item()
-        if n_fixes == 0:
-            x = x2
-            break
-
-        unwrapped = unwrapped + delta * 2 * np.pi
-        x = x2
-
     if return_increments:
         result = x
         all_nan = nan_mask.all(dim=0)
@@ -220,10 +184,190 @@ def irls_solve_1d(phi, W_corr, A_t, dev, max_iter=5, epsilon=0.1,
         return unwrapped
 
 
-def unwrap1d_pairs_numpy(phase_stack, weight_stack, pair_dates, device='auto',
-                         max_iter=5, epsilon=0.1, batch_size=None, debug=False):
+def build_triplets(A):
     """
-    L1-norm IRLS temporal phase unwrapping on numpy arrays.
+    Enumerate all valid triplets from incidence matrix.
+
+    For each pair [s..e], find all splits at point m where both [s..m]
+    and [m+1..e] exist as pairs. Precompute once, reuse across pixel batches.
+
+    Parameters
+    ----------
+    A : np.ndarray
+        Incidence matrix (n_pairs, n_intervals).
+
+    Returns
+    -------
+    triplets : tuple or None
+        (long_idx, left_idx, right_idx, n_trip) as numpy arrays,
+        or None if no triplets exist.
+        n_trip[p] = number of triplets where pair p is the long pair.
+    """
+    n_pairs = A.shape[0]
+    pair_start = np.zeros(n_pairs, dtype=np.int32)
+    pair_end = np.zeros(n_pairs, dtype=np.int32)
+    for p in range(n_pairs):
+        nz = np.nonzero(A[p])[0]
+        if len(nz) > 0:
+            pair_start[p] = nz[0]
+            pair_end[p] = nz[-1]
+
+    pair_lookup = {}
+    for p in range(n_pairs):
+        pair_lookup[(int(pair_start[p]), int(pair_end[p]))] = p
+
+    long_list, left_list, right_list = [], [], []
+    for p in range(n_pairs):
+        s, e = int(pair_start[p]), int(pair_end[p])
+        if s == e:
+            continue
+        for m in range(s, e):
+            if (s, m) in pair_lookup and (m + 1, e) in pair_lookup:
+                long_list.append(p)
+                left_list.append(pair_lookup[(s, m)])
+                right_list.append(pair_lookup[(m + 1, e)])
+
+    if len(long_list) == 0:
+        return None
+
+    long_idx = np.array(long_list, dtype=np.int64)
+    left_idx = np.array(left_list, dtype=np.int64)
+    right_idx = np.array(right_list, dtype=np.int64)
+    n_trip = np.bincount(long_idx, minlength=n_pairs).astype(np.int64)
+    return long_idx, left_idx, right_idx, n_trip
+
+
+def triplet_solve_1d(phi, W_corr, A_t, dev, triplets,
+                     threshold=0.5,
+                     max_iter=5, epsilon=0.1,
+                     return_increments=False):
+    """
+    Triplet-closure pre-filtering followed by IRLS unwrapping.
+
+    Two-stage approach:
+    1. Triplet analysis: identify consistent pairs via triplet phase closure.
+       Pairs whose circular std of long-role triplet closures falls below
+       threshold are accepted, along with their decomposition sub-pairs.
+    2. IRLS on selected pairs only: zero-weight rejected pairs,
+       then run irls_solve_1d for robust unwrapping.
+
+    Rejected pairs are set to NaN in the output.
+
+    Parameters
+    ----------
+    phi : torch.Tensor
+        Wrapped phases (n_pairs, n_pixels).
+    W_corr : torch.Tensor
+        Correlation weights (n_pairs, n_pixels).
+    A_t : torch.Tensor
+        Incidence matrix (n_pairs, n_intervals).
+    dev : torch.device
+        PyTorch device.
+    triplets : tuple or None
+        Precomputed (long_idx, left_idx, right_idx, n_trip) from
+        build_triplets(). If None, all pairs are used (no filtering).
+    threshold : float
+        Pair consistency threshold. Lower = more conservative filtering.
+        Default 0.5.
+    max_iter : int
+        Maximum IRLS iterations. Default 5.
+    epsilon : float
+        IRLS regularization. Default 0.1.
+    return_increments : bool
+        If True, return phase increments (n_intervals, n_pixels).
+
+    Returns
+    -------
+    result : torch.Tensor
+        Corrected phases (n_pairs, n_pixels) with NaN for rejected pairs,
+        or increments (n_intervals, n_pixels) if return_increments=True.
+    """
+    import torch
+
+    n_pairs, n_pixels = phi.shape
+
+    # Handle NaN
+    nan_mask = torch.isnan(phi) | torch.isnan(W_corr)
+    phi_clean = torch.where(nan_mask, torch.zeros_like(phi), phi)
+    W_clean = torch.where(nan_mask, torch.zeros_like(W_corr), W_corr)
+
+    if triplets is not None:
+        long_np, left_np, right_np, n_trip_np = triplets
+        n_triplets = len(long_np)
+
+        long_idx = torch.from_numpy(long_np).to(dev)
+        left_idx = torch.from_numpy(left_np).to(dev)
+        right_idx = torch.from_numpy(right_np).to(dev)
+        n_trip = torch.from_numpy(n_trip_np).to(dev)
+
+        # Closures + circular std via scatter (chunked for memory)
+        sum_cos = torch.zeros(n_pairs, n_pixels, dtype=phi.dtype, device=dev)
+        sum_sin = torch.zeros(n_pairs, n_pixels, dtype=phi.dtype, device=dev)
+        CHUNK = 2000
+        for tc in range(0, n_triplets, CHUNK):
+            te = min(tc + CHUNK, n_triplets)
+            cl = (phi_clean[long_idx[tc:te]]
+                  - phi_clean[left_idx[tc:te]]
+                  - phi_clean[right_idx[tc:te]])
+            cl = torch.atan2(torch.sin(cl), torch.cos(cl))
+            le = long_idx[tc:te].unsqueeze(1).expand(te - tc, n_pixels)
+            sum_cos.scatter_add_(0, le, torch.cos(cl))
+            sum_sin.scatter_add_(0, le, torch.sin(cl))
+            del cl
+
+        count = n_trip.unsqueeze(1).float().clamp(min=1)
+        R = torch.sqrt((sum_cos / count)**2 + (sum_sin / count)**2)
+        R = R.clamp(max=1 - 1e-10)
+        pair_cstd = torch.sqrt(-2 * torch.log(R))
+        del sum_cos, sum_sin, R
+
+        # Require >= 3 triplets for meaningful cstd
+        pair_cstd[n_trip < 3] = float('inf')
+
+        # Selection: good_long + sub-pairs
+        good_long = pair_cstd < threshold
+        del pair_cstd
+
+        # Propagate to sub-pairs via scatter
+        selected_f = good_long.float().clone()
+        for tc in range(0, n_triplets, CHUNK):
+            te = min(tc + CHUNK, n_triplets)
+            gt = good_long[long_idx[tc:te]].float()
+            le = left_idx[tc:te].unsqueeze(1).expand(te - tc, n_pixels)
+            re = right_idx[tc:te].unsqueeze(1).expand(te - tc, n_pixels)
+            selected_f.scatter_add_(0, le, gt)
+            selected_f.scatter_add_(0, re, gt)
+        selected = (selected_f > 0) & ~nan_mask
+        del selected_f, good_long
+    else:
+        # No triplets — select all non-NaN pairs
+        selected = ~nan_mask
+
+    # --- IRLS on selected pairs (zero-weight rejected) ---
+    W_filtered = selected.float() * W_clean
+    result = irls_solve_1d(
+        phi, W_filtered, A_t, dev,
+        max_iter=max_iter, epsilon=epsilon,
+        return_increments=return_increments
+    )
+
+    if not return_increments:
+        # NaN out rejected pairs
+        rejected = ~selected
+        result = torch.where(rejected, torch.full_like(result, float('nan')),
+                             result)
+
+    return result
+
+
+def unwrap1d_pairs_numpy(phase_stack, weight_stack, pair_dates, device='auto',
+                         max_iter=5, epsilon=0.1, batch_size=None,
+                         threshold=0.5, debug=False):
+    """
+    Temporal phase unwrapping on numpy arrays.
+
+    Uses triplet phase closure pre-filtering to identify consistent pairs,
+    then IRLS unwrapping on selected pairs. Rejected pairs are set to NaN.
 
     Parameters
     ----------
@@ -241,6 +385,9 @@ def unwrap1d_pairs_numpy(phase_stack, weight_stack, pair_dates, device='auto',
         IRLS regularization parameter.
     batch_size : int
         Pixels per batch for memory efficiency.
+    threshold : float
+        Pair consistency threshold. Lower = more conservative filtering.
+        Default 0.5.
     debug : bool
         Print debug information.
 
@@ -280,11 +427,14 @@ def unwrap1d_pairs_numpy(phase_stack, weight_stack, pair_dates, device='auto',
     dev = BatchCore._get_torch_device(device)
 
     if debug:
-        print(f'IRLS 1D unwrap: {n_pairs} pairs, {len(dates)} dates, {n_pixels} pixels')
+        print(f'1D unwrap: {n_pairs} pairs, {len(dates)} dates, {n_pixels} pixels')
         print(f'  Device: {dev}, batch_size: {batch_size}')
 
     # Move matrix to device
     A_t = torch.from_numpy(A).to(dev)
+
+    # Precompute triplets once (reused across all pixel batches)
+    triplets = build_triplets(A)
 
     # Compute batch size from dask config if not provided
     if batch_size is None:
@@ -322,8 +472,10 @@ def unwrap1d_pairs_numpy(phase_stack, weight_stack, pair_dates, device='auto',
             else:
                 W = torch.ones(n_pairs, b_end - b_start, device=dev)
 
-            result = irls_solve_1d(
-                phi, W, A_t, dev, max_iter=max_iter, epsilon=epsilon,
+            result = triplet_solve_1d(
+                phi, W, A_t, dev, triplets=triplets,
+                threshold=threshold,
+                max_iter=max_iter, epsilon=epsilon,
                 return_increments=False
             )
             unwrapped_flat[:, g_start + b_start:g_start + b_end] = result.cpu().numpy()

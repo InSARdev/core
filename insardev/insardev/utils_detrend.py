@@ -546,7 +546,7 @@ def trend2d_array(phase, weight, variables, device, degree=1):
     return trends.astype(np.float32)
 
 
-def polyfit1d_pairs_pytorch(data, time_values, weight, sign, device, degree=0):
+def polyfit1d_pairs_pytorch(data, time_values, weight, sign, device, degree=0, threshold=None):
     """
     Fit 1D polynomial along first dimension at each pixel using PyTorch.
 
@@ -573,8 +573,12 @@ def polyfit1d_pairs_pytorch(data, time_values, weight, sign, device, degree=0):
 
     Returns
     -------
-    np.ndarray
+    np.ndarray or tuple
         Model at date (ny, nx), complex64.
+        When threshold is not None, returns (model, kept_mask, cstd_map) where
+        kept_mask is (n_samples, ny, nx) bool — True for pairs kept by threshold,
+        cstd_map is (ny, nx) float32 — circular std of fit residuals for ALL
+        valid pairs (used for averaging across dates in trend1d_pairs_array).
     """
     import torch
     from .utils_dask import get_dask_chunk_size_mb
@@ -587,6 +591,19 @@ def polyfit1d_pairs_pytorch(data, time_values, weight, sign, device, degree=0):
 
     out_dtype = np.complex64
     nan_val = np.nan + 0j
+
+    # Minimum pairs for a meaningful fit: degree+3 (4 for degree=1)
+    min_pairs = degree + 3
+    if n_samples < min_pairs:
+        model = np.full((ny, nx), nan_val, dtype=out_dtype)
+        if threshold is not None:
+            return model, np.zeros((n_samples, ny, nx), dtype=bool), \
+                   np.full((ny, nx), np.inf, dtype=np.float32)
+        return model
+
+    # Initialize kept mask and cstd map when threshold filtering is active
+    kept_np = np.zeros((n_samples, n_pixels), dtype=bool) if threshold is not None else None
+    cstd_np = np.full(n_pixels, np.inf, dtype=np.float32) if threshold is not None else None
 
     # Use float64 on CPU, float32 on GPU
     if device.type == 'cpu':
@@ -613,8 +630,8 @@ def polyfit1d_pairs_pytorch(data, time_values, weight, sign, device, degree=0):
     else:
         weight_flat = None
 
-    # Valid mask: at least degree+2 finite samples per pixel
-    min_valid = degree + 2
+    # Valid mask: at least min_pairs finite samples per pixel
+    min_valid = min_pairs
     finite_count = np.sum(np.isfinite(angles_flat), axis=0)
     valid_mask = finite_count >= min_valid
     has_partial_nan = np.any(finite_count[valid_mask] < n_samples) if valid_mask.any() else False
@@ -622,7 +639,11 @@ def polyfit1d_pairs_pytorch(data, time_values, weight, sign, device, degree=0):
     n_valid = len(valid_indices)
 
     if n_valid == 0:
-        return np.full((ny, nx), nan_val, dtype=out_dtype)
+        model = np.full((ny, nx), nan_val, dtype=out_dtype)
+        if threshold is not None:
+            return model, np.zeros((n_samples, ny, nx), dtype=bool), \
+                   np.full((ny, nx), np.inf, dtype=np.float32)
+        return model
 
     # Normalize time: t / absmax so t=0 maps to 0, intercept = value at date
     t_absmax = np.max(np.abs(time_values))
@@ -695,10 +716,17 @@ def polyfit1d_pairs_pytorch(data, time_values, weight, sign, device, degree=0):
             new_jumps = _round_half_away((fit_raw - angles_safe) / (2 * np.pi))
             new_jumps[nan_mask] = 0
 
-            # Wrapped residuals → IRLS weights
+            # Wrapped residuals → weights
             residuals = data_b - fit_raw
             residuals = torch.atan2(torch.sin(residuals), torch.cos(residuals))
-            W_irls_new = 1.0 / (torch.abs(residuals) + epsilon)
+            if threshold is not None:
+                # Hard threshold: uniform weight for kept pairs, zero for rejected
+                W_irls_new = torch.where(torch.abs(residuals) <= threshold,
+                                         torch.ones_like(angles_safe),
+                                         torch.zeros_like(angles_safe))
+            else:
+                # IRLS L1-norm soft reweighting (no threshold)
+                W_irls_new = 1.0 / (torch.abs(residuals) + epsilon)
             W_irls_new[nan_mask] = 0
 
             # Convergence check
@@ -714,6 +742,24 @@ def polyfit1d_pairs_pytorch(data, time_values, weight, sign, device, degree=0):
         c0 = coeffs.squeeze(-1)[:, 0]  # (batch,)
         result_np[idx] = np.exp(1j * c0.cpu().numpy()).astype(out_dtype)
 
+        # Save kept mask and compute per-date cstd for this batch
+        if kept_np is not None:
+            kept_np[:, idx] = (W_irls > 0).cpu().numpy()
+            # Require minimum kept pairs for a meaningful fit
+            n_kept = (W_irls > 0).sum(dim=0)  # (batch,)
+            min_kept = degree + 3  # 4 for degree=1, 3 for degree=0
+            insufficient = (n_kept < min_kept).cpu().numpy()
+            if insufficient.any():
+                result_np[idx[insufficient]] = nan_val
+                kept_np[:, idx[insufficient]] = False
+            # Per-date cstd of ALL valid pairs against the fit
+            valid_float = (~nan_mask).to(dtype)
+            n_valid_b = valid_float.sum(dim=0).clamp(min=1)
+            cos_sum = (torch.cos(residuals) * valid_float).sum(dim=0)
+            sin_sum = (torch.sin(residuals) * valid_float).sum(dim=0)
+            R = torch.sqrt((cos_sum / n_valid_b)**2 + (sin_sum / n_valid_b)**2).clamp(max=1 - 1e-10)
+            cstd_np[idx] = torch.sqrt(-2 * torch.log(R)).cpu().numpy().astype(np.float32)
+
     result_np = result_np.reshape(ny, nx)
 
     # Cleanup GPU memory
@@ -722,11 +768,14 @@ def polyfit1d_pairs_pytorch(data, time_values, weight, sign, device, degree=0):
     elif device.type == 'cuda':
         torch.cuda.empty_cache()
 
+    if threshold is not None:
+        return result_np, kept_np.reshape(n_samples, ny, nx), \
+               cstd_np.reshape(ny, nx)
     return result_np
 
 
 def trend1d_pairs_array(data_chunk, weight_chunk, ref_values, rep_values,
-                         device, degree, max_refine=3):
+                         device, degree, max_refine=3, threshold=None):
     """
     Estimate per-date atmospheric phase from complex interferometric network.
 
@@ -864,6 +913,8 @@ def trend1d_pairs_array(data_chunk, weight_chunk, ref_values, rep_values,
 
     # --- Iterative fitting: pass 0 = initial, passes 1..max_refine = refinement ---
     models = {}
+    date_kept = {}   # per-date kept masks from last filter iteration
+    date_cstd = {}   # per-date cstd from FIRST filter iteration (original data)
     for iteration in range(1 + max_refine):
 
         # For iteration > 0: correct original data by removing current model
@@ -879,16 +930,30 @@ def trend1d_pairs_array(data_chunk, weight_chunk, ref_values, rep_values,
         else:
             _select_iter = _select
 
-        # Fit per-date models (signed time ensures consistent velocity slope
-        # across ref/rep pairs, so degree=1 refinement is stable)
+        # Fit per-date models: filter on filter iterations, refine-only otherwise.
+        # Pattern: F,R,R,F,R,R,... (filter every 3rd iteration)
+        is_filter_iter = (threshold is not None) and (iteration % 3 == 0)
+        iter_threshold = threshold if is_filter_iter else None
+
         new_models = {}
         for date_day, (pair_indices, time_values, signs) in date_info.items():
             selected_data = _select_iter(pair_indices)
             selected_weight = _select_w(pair_indices) if _select_w is not None else None
-            new_models[date_day] = polyfit1d_pairs_pytorch(
+            result = polyfit1d_pairs_pytorch(
                 selected_data, time_values, selected_weight, signs,
-                device, degree=degree
+                device, degree=degree, threshold=iter_threshold
             )
+            if is_filter_iter:
+                model, kept_mask, cstd_map = result
+                new_models[date_day] = model
+                # kept mask: overwritten each filter iteration (last one used)
+                date_kept[date_day] = (pair_indices, kept_mask)
+                # cstd: keep FIRST filter iteration only (original data, before
+                # iterative refinement can create artificial consistency)
+                if date_day not in date_cstd:
+                    date_cstd[date_day] = cstd_map
+            else:
+                new_models[date_day] = result
 
         # Accumulate models (complex multiplication)
         if iteration == 0:
@@ -900,6 +965,40 @@ def trend1d_pairs_array(data_chunk, weight_chunk, ref_values, rep_values,
                 else:
                     models[d] = delta
 
+    # Build per-pair kept mask: pair must be kept in BOTH ref and rep date fits
+    if threshold is not None:
+        pair_kept = np.zeros((n_pairs, ny, nx), dtype=bool)
+        kept_in_ref = np.zeros((n_pairs, ny, nx), dtype=bool)
+        kept_in_rep = np.zeros((n_pairs, ny, nx), dtype=bool)
+        for date_day, (pair_indices, kept_mask) in date_kept.items():
+            is_ref_d = np.isclose(ref_days, date_day)
+            is_rep_d = np.isclose(rep_days, date_day)
+            for local_idx, global_idx in enumerate(pair_indices):
+                if is_ref_d[global_idx]:
+                    kept_in_ref[global_idx] = kept_mask[local_idx]
+                elif is_rep_d[global_idx]:
+                    kept_in_rep[global_idx] = kept_mask[local_idx]
+        pair_kept = kept_in_ref & kept_in_rep
+
+        # Overfitting check: average per-date fit residual cstd of ALL valid
+        # pairs must be < threshold. Uses cstd from the FIRST filter iteration
+        # (original data) — before iterative refinement can create artificial
+        # consistency for noisy pixels. The polynomial fit removes both atmospheric
+        # intercept and velocity slope, so cstd measures pure noise/model mismatch.
+        avg_cstd = np.zeros((ny, nx), dtype=np.float64)
+        n_dates_valid = np.zeros((ny, nx), dtype=np.int32)
+        for date_day, cstd_map in date_cstd.items():
+            finite = np.isfinite(cstd_map)
+            avg_cstd[finite] += cstd_map[finite]
+            n_dates_valid[finite] += 1
+        has_dates = n_dates_valid > 0
+        avg_cstd[has_dates] /= n_dates_valid[has_dates]
+        avg_cstd[~has_dates] = np.inf
+
+        overfitting = avg_cstd > threshold
+        if overfitting.any():
+            pair_kept[:, overfitting] = False
+
     # Reconstruct pair-wise trends
     trend_data = np.full((n_pairs, ny, nx), np.nan + 0j, dtype=out_dtype)
 
@@ -909,6 +1008,10 @@ def trend1d_pairs_array(data_chunk, weight_chunk, ref_values, rep_values,
         if rm is None or rp is None:
             continue
         trend_data[i] = rm * np.conj(rp)
+
+    # NaN out pairs that were rejected by threshold or overfitting check
+    if threshold is not None:
+        trend_data[~pair_kept] = np.nan + 0j
 
     return trend_data
 

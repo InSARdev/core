@@ -1445,7 +1445,7 @@ class BatchWrap(BatchCore):
     def unwrap1d(self, weight: 'BatchUnit | None' = None, device: str = 'auto',
                  debug: bool = False, **kwargs) -> 'Batch':
         """
-        1D temporal phase unwrapping using IRLS optimization.
+        1D temporal phase unwrapping using triplet pre-filtering and IRLS.
 
         Parameters
         ----------
@@ -1456,7 +1456,7 @@ class BatchWrap(BatchCore):
         debug : bool
             Print diagnostic information.
         **kwargs
-            Additional arguments: max_iter, epsilon, batch_size.
+            Additional arguments: max_iter, epsilon, batch_size, threshold.
 
         Returns
         -------
@@ -2767,7 +2767,7 @@ class Batches(tuple):
     def regression1d_baseline(self, *args, **kwargs):
         raise NotImplementedError("Batches.regression1d_baseline() is removed. Use Batches.detrend1d() or Batch.trend1d() instead.")
 
-    def detrend1d_pairs(self, degree=1, device='auto', max_refine=3, debug=False):
+    def detrend1d_pairs(self, degree=1, device='auto', max_refine=3, threshold=0.5, debug=False):
         """
         Detrend 1D polynomial trend along temporal pairs and return Batches.
 
@@ -2818,7 +2818,8 @@ class Batches(tuple):
         # phase is referenced only once in the dask graph.
         detrended = phase.trend1d_pairs(weight=weight, degree=degree,
                                         device=device, detrend=True,
-                                        max_refine=max_refine, debug=debug)
+                                        max_refine=max_refine,
+                                        threshold=threshold, debug=debug)
 
         # Preserve non-spatial variables (e.g. BPR) that may be dropped by arithmetic
         detrended = Batches._preserve_nonspatial(phase, detrended)
