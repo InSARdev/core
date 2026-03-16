@@ -151,7 +151,7 @@ def _triplet_irls_unwrap_numba(
     for px in range(n_pixels):
         # --- Step 1: Triplet filtering ---
         n_triplets = len(trip_long)
-        if n_triplets > 0 and threshold < 900.0:
+        if n_triplets > 0 and threshold >= 0.0:
             for p in range(n_pairs):
                 pair_cstd[p] = np.inf
                 selected[p] = False
@@ -493,9 +493,9 @@ def unwrap1d_pairs_numpy(phase_stack, weight_stack, pair_dates,
         Maximum IRLS iterations. Default 5.
     epsilon : float
         IRLS regularization parameter. Default 0.1.
-    threshold : float
+    threshold : float or None
         Pair consistency threshold. Lower = more conservative filtering.
-        Default 0.5.
+        None disables triplet filtering (all pairs used). Default 0.5.
     debug : bool
         Print debug information.
 
@@ -519,10 +519,13 @@ def unwrap1d_pairs_numpy(phase_stack, weight_stack, pair_dates,
         print(f'1D unwrap: {n_pairs} pairs, {len(dates)} dates, '
               f'{phases_flat.shape[1]} pixels')
 
+    # threshold=None → -1.0 to disable triplet filtering in numba kernel
+    thr = -1.0 if threshold is None else float(threshold)
+
     result = _triplet_irls_unwrap_numba(
         phases_flat, weights_flat, pair_start, pair_end, n_intervals,
         trip_long, trip_left, trip_right, trip_offsets,
-        threshold, max_iter, epsilon)
+        thr, max_iter, epsilon)
 
     return result.reshape(n_pairs, height, width)
 

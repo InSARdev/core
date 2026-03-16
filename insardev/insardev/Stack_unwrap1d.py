@@ -212,9 +212,9 @@ class Stack_unwrap1d(BatchCore):
             Maximum IRLS iterations. Default 5.
         epsilon : float, optional
             IRLS regularization parameter. Default 0.1.
-        threshold : float, optional
+        threshold : float or None, optional
             Pair consistency threshold. Lower = more conservative filtering.
-            Default 0.5.
+            None disables triplet filtering (all pairs used). Default 0.5.
         debug : bool, optional
             Print debug information.
 
