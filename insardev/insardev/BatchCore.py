@@ -4983,10 +4983,9 @@ class BatchCore(dict):
             assert vmin is None and vmax is None, "ERROR: arguments 'quantile' and 'vmin', 'vmax' cannot be used together"
 
         sample = next(iter(self.values()))
-        # find all variables in the first dataset related to polarizations
-        # TODO
-        #polarizations = [pol for pol in ['VV','VH','HH','HV'] if pol in sample.data_vars]
-        polarizations = list(sample.data_vars)
+        # Only plot spatial variables (with y, x dims), skip 1D coords like ref/rep/BPR
+        polarizations = [v for v in sample.data_vars
+                         if sample[v].ndim >= 2 and sample[v].dims[-2:] == ('y', 'x')]
         #print ('polarizations', polarizations)
 
         # Handle composite mode
