@@ -2132,16 +2132,17 @@ class BatchCore(dict):
     # Backward compatibility alias
     regression1d_baseline = trend1d
 
-    def trend1d_pairs(self, weight: 'BatchUnit | None' = None, degree: int = 1,
+    def trend1d_pairs(self, weight: 'BatchUnit | None' = None,
                       detrend: bool = False,
                       max_refine: int = 9, threshold: float | None = None,
                       debug: bool = False) -> 'Batch':
         """
         Fit 1D atmospheric phase trend along temporal pairs for each date.
 
-        For each date, gathers all pairs sharing that date, fits a polynomial
-        to phase vs temporal baseline, and evaluates the model. Uses all pairs
-        (no temporal filtering) to maximize the fit constraint.
+        For each date, gathers all pairs sharing that date, fits a linear model
+        (intercept + slope) to phase vs temporal baseline, and evaluates the
+        model. Uses all pairs (no temporal filtering) to maximize the fit
+        constraint.
 
         Requires complex input (BatchComplex): unit-circle fitting per date,
         reconstruct pair trend as model[ref] * conj(model[rep]).
@@ -2151,8 +2152,6 @@ class BatchCore(dict):
         ----------
         weight : BatchUnit or None
             Optional weight for the fitting (typically correlation).
-        degree : int
-            Polynomial degree (0=mean, 1=linear). Default 1.
         detrend : bool
             If True, return detrended data instead of the trend surface.
             Fuses fit+subtract into one blockwise call to avoid double-referencing
@@ -2169,7 +2168,7 @@ class BatchCore(dict):
 
         Examples
         --------
-        >>> trend = intf.trend1d_pairs(degree=1)
+        >>> trend = intf.trend1d_pairs()
         >>> detrended = intf * trend.conj()
         """
         import dask.array as da
@@ -2222,7 +2221,6 @@ class BatchCore(dict):
 
                 def _trend1d_pairs_block(data_block, weight_block=None,
                                          _ref=ref_values, _rep=rep_values,
-                                         _deg=degree,
                                          _detrend=detrend,
                                          _max_refine=max_refine,
                                          _threshold=threshold,
@@ -2230,7 +2228,7 @@ class BatchCore(dict):
                     trend = utils_detrend.trend1d_pairs_array(
                         [data_block],
                         [weight_block] if weight_block is not None else None,
-                        _ref, _rep, _deg,
+                        _ref, _rep,
                         max_refine=_max_refine, threshold=_threshold
                     )
                     if _detrend:

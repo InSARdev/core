@@ -60,9 +60,9 @@ def _trend1d_pairs_numba_kernel(
 ):
     """Per-pixel IRLS fitting of all dates, with iterative refinement.
 
-    Degree-1 polynomial (intercept + slope) solved analytically via 2×2
-    normal equations. Uses sequential pixel loop (parallel=False) for
-    thread-safety when called from Dask workers.
+    Linear model (intercept + slope) solved analytically via 2×2 normal
+    equations. Uses sequential pixel loop (parallel=False) for thread-safety
+    when called from Dask workers.
 
     Returns
     -------
@@ -870,14 +870,14 @@ def polyfit1d_pairs_pytorch(data, time_values, weight, sign, device, degree=0, t
 
 
 def trend1d_pairs_array(data_chunk, weight_chunk, ref_values, rep_values,
-                         degree, max_refine=3, threshold=None):
+                         max_refine=3, threshold=None):
     """
     Estimate per-date atmospheric phase from complex interferometric network.
 
     For each unique date, gathers all pairs sharing that date, fits a
-    polynomial to phase vs temporal baseline using all pairs, and stores
-    the model at zero temporal baseline (intercept). Pair trends are
-    reconstructed as model[ref] * conj(model[rep]).
+    linear model (intercept + slope) to phase vs temporal baseline using
+    all pairs, and stores the model at zero temporal baseline (intercept).
+    Pair trends are reconstructed as model[ref] * conj(model[rep]).
 
     Iterative refinement (max_refine > 0): after the initial per-date fit,
     pair-wise corrections from accumulated models are subtracted from the
@@ -899,8 +899,6 @@ def trend1d_pairs_array(data_chunk, weight_chunk, ref_values, rep_values,
         1D array of ref dates as int64 (nanoseconds since epoch).
     rep_values : np.ndarray
         1D array of rep dates as int64 (nanoseconds since epoch).
-    degree : int
-        Polynomial degree (0=mean, 1=linear).
     max_refine : int
         Maximum refinement iterations (0 = single-pass). Default 3.
 

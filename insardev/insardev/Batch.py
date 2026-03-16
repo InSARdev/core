@@ -1615,14 +1615,9 @@ class BatchComplex(BatchCore):
 
     def plot(self, *args, **kwargs):
         """
-        Plotting is not supported on raw complex batches.
-        Convert to real values first (e.g. with .angle() or .abs()).
+        Plot complex phase as wrapped phase via .angle() conversion.
         """
-        raise NotImplementedError(
-            "BatchComplex objects do not support plot().\n"
-            "Convert to a real-valued batch first, e.g.:\n"
-            "  • use `.angle()` to get wrapped phase → BatchWrap\n"
-            "  • use `.abs()` or `.power()` to get magnitude → Batch"
+        return self.angle().plot(*args, **kwargs
         )
 
     @staticmethod
@@ -1844,6 +1839,33 @@ class Batches(tuple):
             if extra:
                 target[key] = tgt_ds.assign(extra)
         return target
+
+    def phase(self) -> 'BatchComplex | BatchWrap | Batch | None':
+        """Extract phase from Batches.
+
+        Returns the first BatchComplex, or first BatchWrap,
+        or first Batch found. Returns None if none found.
+        """
+        for b in self:
+            if isinstance(b, BatchComplex):
+                return b
+        for b in self:
+            if isinstance(b, BatchWrap):
+                return b
+        for b in self:
+            if isinstance(b, Batch) and not isinstance(b, BatchUnit):
+                return b
+        return None
+
+    def correlation(self) -> 'BatchUnit | None':
+        """Extract correlation weights from Batches.
+
+        Returns the first BatchUnit found, or None.
+        """
+        for b in self:
+            if isinstance(b, BatchUnit):
+                return b
+        return None
 
     def snapshot(self, store: str | None = None, storage_options: dict[str, str] | None = None,
                  caption: str | None = None,
@@ -2761,13 +2783,14 @@ class Batches(tuple):
     def regression1d_baseline(self, *args, **kwargs):
         raise NotImplementedError("Batches.regression1d_baseline() is removed. Use Batches.detrend1d() or Batch.trend1d() instead.")
 
-    def detrend1d_pairs(self, degree=1, max_refine=3, threshold=1.2, debug=False):
+    def detrend1d_pairs(self, max_refine=3, threshold=1.2, debug=False):
         """
-        Detrend 1D polynomial trend along temporal pairs and return Batches.
+        Detrend 1D linear trend along temporal pairs and return Batches.
 
-        For each date, fits a polynomial to phase vs temporal baseline across
-        all pairs sharing that date, then subtracts the fit. This removes
-        constant atmospheric delay (intercept at zero temporal baseline).
+        For each date, fits a linear model (intercept + slope) to phase vs
+        temporal baseline across all pairs sharing that date, then subtracts
+        the fit. This removes constant atmospheric delay (intercept at zero
+        temporal baseline).
 
         Iterative refinement (max_refine > 0): re-estimates atmospheric phase
         after removing current pair-wise model from the data. Each pass
@@ -2778,10 +2801,10 @@ class Batches(tuple):
 
         Parameters
         ----------
-        degree : int
-            Polynomial degree (0=mean, 1=linear). Default 1.
         max_refine : int
             Maximum refinement iterations (0 = single-pass). Default 3.
+        threshold : float
+            Pair consistency threshold for outlier rejection. Default 1.2.
         debug : bool
             Print diagnostic information.
 
@@ -2808,7 +2831,7 @@ class Batches(tuple):
 
         # Fuse fit+subtract into one blockwise call (detrend=True) so the input
         # phase is referenced only once in the dask graph.
-        detrended = phase.trend1d_pairs(weight=weight, degree=degree,
+        detrended = phase.trend1d_pairs(weight=weight,
                                         detrend=True,
                                         max_refine=max_refine,
                                         threshold=threshold, debug=debug)

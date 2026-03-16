@@ -276,29 +276,26 @@ class Stack(Stack_plot, BatchCore):
         batch_complex = self[complex_vars]
         return batch_complex.adi(device)
 
-    def similarity(
+    def similars(
         self,
         window: tuple = (5, 5),
-        neighbors: tuple = (5, 5),
+        threshold: float = 0.5,
         valid_threshold: float = 0.5,
         device: str = 'auto'
     ) -> Batch:
         """
-        Compute spatial phase similarity using neighbor phase difference variance.
+        Count temporally phase-similar neighbors per pixel.
 
         NOTE: Requires insardev_polsar extension.
 
-        Wrapper that calls BatchComplex.similarity() on complex variables.
-        Use with optimize2()-optimized stack for best results.
+        Wrapper that calls BatchComplex.similars() on complex variables.
 
         Parameters
         ----------
         window : tuple of int
             Window size (y, x). Asymmetric to account for different pixel spacing.
-        neighbors : tuple of int
-            Neighbor count range (min, max):
-            - min: Minimum valid neighbors required, else NaN
-            - max: Maximum neighbors to use (top N most similar)
+        threshold : float
+            Maximum phase std (radians) for a neighbor to count as similar.
         valid_threshold : float
             Minimum fraction of dates with valid (non-NaN) data.
         device : str
@@ -307,12 +304,12 @@ class Stack(Stack_plot, BatchCore):
         Returns
         -------
         Batch
-            Phase similarity values (lower = more spatially similar)
+            Count of phase-similar neighbors per pixel. Higher = more stable.
 
         Examples
         --------
-        >>> sim = stack.similarity(window=(5, 5), neighbors=(5, 5))
-        >>> stable_mask = sim < 0.5
+        >>> sim = stack.similars(window=(11, 41), threshold=1.0)
+        >>> ps_mask = sim >= 40
         """
         # Get complex variables
         sample_ds = next(iter(self.values()))
@@ -322,9 +319,9 @@ class Stack(Stack_plot, BatchCore):
         if not complex_vars:
             raise ValueError("No complex time-series data found")
 
-        # Get as BatchComplex and call similarity()
+        # Get as BatchComplex and call similars()
         batch_complex = self[complex_vars]
-        return batch_complex.similarity(window, neighbors, valid_threshold, device)
+        return batch_complex.similars(window, threshold, valid_threshold, device)
 
     def neighbors(
         self,
