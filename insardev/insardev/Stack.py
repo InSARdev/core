@@ -243,6 +243,49 @@ class Stack(Stack_plot, BatchCore):
 
         return type(self)(s_opt_dict)
 
+    def adi2(self,
+             angle_coarse: float = 15,
+             angle_fine: float = 5,
+             device: str = 'auto') -> Batch:
+        """
+        Dual-pol ADI: optimize2() + adi() in one call.
+
+        NOTE: Requires insardev_polsar extension.
+
+        Finds optimal VV/VH amplitude combination that minimizes ADI,
+        then computes ADI on the optimized amplitudes.
+
+        Parameters
+        ----------
+        angle_coarse : float
+            Coarse grid step in degrees. Default 15.
+        angle_fine : float
+            Fine grid step in degrees. Default 5.
+        device : str
+            PyTorch device: 'auto', 'cuda', 'mps', or 'cpu'.
+
+        Returns
+        -------
+        Batch
+            ADI values computed on polarimetrically optimized amplitudes.
+
+        Examples
+        --------
+        >>> import insardev_polsar
+        >>> adi = stack.adi2()
+        >>> ps_mask = adi[['VV']] < 0.4
+        """
+        sample_ds = next(iter(self.values()))
+        if 'VV' in sample_ds.data_vars and 'VH' in sample_ds.data_vars:
+            pols = ['VV', 'VH']
+        elif 'HH' in sample_ds.data_vars and 'HV' in sample_ds.data_vars:
+            pols = ['HH', 'HV']
+        else:
+            raise ValueError("Dual-pol data required (VV+VH or HH+HV)")
+
+        batch_complex = self[pols]
+        return batch_complex.adi2(angle_coarse, angle_fine, device)
+
     def adi(self, device: str = 'auto') -> Batch:
         """
         Compute Amplitude Dispersion Index (ADI) for calibrated σ₀ data.
@@ -275,53 +318,6 @@ class Stack(Stack_plot, BatchCore):
         # Get as BatchComplex and call adi()
         batch_complex = self[complex_vars]
         return batch_complex.adi(device)
-
-    def similars(
-        self,
-        window: tuple = (5, 5),
-        threshold: float = 0.5,
-        valid_threshold: float = 0.5,
-        device: str = 'auto'
-    ) -> Batch:
-        """
-        Count temporally phase-similar neighbors per pixel.
-
-        NOTE: Requires insardev_polsar extension.
-
-        Wrapper that calls BatchComplex.similars() on complex variables.
-
-        Parameters
-        ----------
-        window : tuple of int
-            Window size (y, x). Asymmetric to account for different pixel spacing.
-        threshold : float
-            Maximum phase std (radians) for a neighbor to count as similar.
-        valid_threshold : float
-            Minimum fraction of dates with valid (non-NaN) data.
-        device : str
-            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'
-
-        Returns
-        -------
-        Batch
-            Count of phase-similar neighbors per pixel. Higher = more stable.
-
-        Examples
-        --------
-        >>> sim = stack.similars(window=(11, 41), threshold=1.0)
-        >>> ps_mask = sim >= 40
-        """
-        # Get complex variables
-        sample_ds = next(iter(self.values()))
-        complex_vars = [v for v in sample_ds.data_vars
-                        if sample_ds[v].dtype.kind == 'c' and 'date' in sample_ds[v].dims]
-
-        if not complex_vars:
-            raise ValueError("No complex time-series data found")
-
-        # Get as BatchComplex and call similars()
-        batch_complex = self[complex_vars]
-        return batch_complex.similars(window, threshold, valid_threshold, device)
 
     def neighbors(
         self,
