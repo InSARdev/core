@@ -2920,12 +2920,12 @@ class BatchCore(dict):
     def expand_dims(self, *args, **kw):
         return type(self)({k: ds.expand_dims(*args, **kw) for k, ds in self.items()})
 
-    def drop_vars(self, names):
+    def drop_vars(self, names, errors='raise'):
         """Return a new Batch with those data-vars removed from each dataset."""
         if isinstance(names, str):
             names = [names]
         return type(self)({
-            k: ds.drop_vars(names)
+            k: ds.drop_vars(names, errors=errors)
             for k, ds in self.items()
         })
 
