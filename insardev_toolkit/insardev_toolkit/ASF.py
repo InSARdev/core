@@ -480,7 +480,10 @@ class ASF(progressbar_joblib):
         import os
 
         # Normalize inputs
-        if isinstance(bursts, str):
+        import geopandas as gpd
+        if isinstance(bursts, gpd.GeoDataFrame):
+            bursts = bursts['sceneName'].tolist()
+        elif isinstance(bursts, str):
             bursts = list(filter(None, map(str.strip, bursts.split('\n'))))
         pols = self._normalize_polarization(polarization)
 
@@ -3573,7 +3576,7 @@ class ASF(progressbar_joblib):
 
     @staticmethod
     def search(geometry, startTime=None, stopTime=None, flightDirection=None,
-               platform='SENTINEL-1', processingLevel='auto', polarization='VV', beamMode='IW'):
+               platform='SENTINEL-1', processingLevel='auto', polarization=None, beamMode='IW'):
         import geopandas as gpd
         import shapely
 
@@ -3613,7 +3616,10 @@ class ASF(progressbar_joblib):
             polarization=polarization,
             beamMode=beamMode,
         )
-        return gpd.GeoDataFrame.from_features([product.geojson() for product in results], crs="EPSG:4326")
+        gdf = gpd.GeoDataFrame.from_features([product.geojson() for product in results], crs="EPSG:4326")
+        if 'burst' in gdf.columns:
+            gdf['fullBurstID'] = gdf['burst'].apply(lambda b: b['fullBurstID'])
+        return gdf
 
     @staticmethod
     def plot(bursts, ax=None, figsize=None):
