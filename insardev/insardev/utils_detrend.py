@@ -55,7 +55,6 @@ def _trend1d_pairs_numba_kernel(
     date_offsets,      # (n_dates+1,) start offsets into flat arrays
     pair_ref_didx,     # (n_pairs,) ref date index
     pair_rep_didx,     # (n_pairs,) rep date index
-    threshold,
     max_refine,
 ):
     """Per-pixel IRLS fitting of all dates, with iterative refinement.
@@ -152,6 +151,8 @@ def _trend1d_pairs_numba_kernel(
                         w_irls[k] = 0.0  # NaN pairs must be rejected
 
                 # IRLS loop: degree-1 analytical 2×2 solve
+                # Always uses soft weights during IRLS. Hard rejection
+                # applied post-convergence with N-scaled threshold.
                 c0 = 0.0
                 b = 0.0
                 for irls_iter in range(10):
@@ -190,10 +191,7 @@ def _trend1d_pairs_numba_kernel(
                         res = y - fit_val
                         res = np.arctan2(np.sin(res), np.cos(res))
 
-                        if is_filter:
-                            w_irls[k] = 1.0 if abs(res) <= threshold else 0.0
-                        else:
-                            w_irls[k] = 1.0 / (abs(res) + 0.1)
+                        w_irls[k] = 1.0 / (abs(res) + 0.1)
 
                     if converged:
                         break
@@ -380,6 +378,9 @@ def trend1d_array(data, dim_values, weight, intercept=True, slope=True):
         data = np.concatenate([np.asarray(c) for c in data], axis=0)
     n_samples, ny, nx = data.shape
     n_pixels = ny * nx
+
+    # Convert 0+0j to NaN in-place (skipped dask blocks)
+    data[data == 0] = np.nan + 0j
 
     # Extract angles
     data_flat = data.reshape(n_samples, n_pixels)
@@ -870,7 +871,7 @@ def polyfit1d_pairs_pytorch(data, time_values, weight, sign, device, degree=0, t
 
 
 def trend1d_pairs_array(data_chunk, weight_chunk, ref_values, rep_values,
-                         max_refine=3, threshold=None):
+                         max_refine=3):
     """
     Estimate per-date atmospheric phase from complex interferometric network.
 
@@ -918,6 +919,9 @@ def trend1d_pairs_array(data_chunk, weight_chunk, ref_values, rep_values,
         raise TypeError("trend1d_pairs_array requires complex input (wrapped phase). "
                         "Place detrend1d_pairs() before unwrapping in the pipeline.")
 
+    # Convert 0+0j to NaN in-place (skipped dask blocks)
+    data_np[data_np == 0] = np.nan + 0j
+
     out_dtype = np.complex64
     n_pixels = ny * nx
 
@@ -963,7 +967,7 @@ def trend1d_pairs_array(data_chunk, weight_chunk, ref_values, rep_values,
     pair_rep_didx = np.array([day_to_idx[d] for d in
                               unique_days[np.searchsorted(unique_days, rep_days)]])
 
-    # Extract angles: NaN for zero-amplitude pixels
+    # Extract angles: NaN for zero-amplitude and NaN pixels
     data_abs = np.abs(data_np)
     with np.errstate(invalid='ignore', divide='ignore'):
         angles = np.where(data_abs > 0, np.angle(data_np), np.nan)
@@ -980,37 +984,34 @@ def trend1d_pairs_array(data_chunk, weight_chunk, ref_values, rep_values,
         np.array(all_signs, dtype=np.float64),
         offsets_np,
         pair_ref_didx, pair_rep_didx,
-        threshold if threshold is not None else 999.0,
         max_refine,
     )
 
-    # Reconstruct pair trends from per-date models
+    # Reconstruct pair trends from per-date models;
+    # trend_data starts NaN — only fill pixels with finite angles
     trend_data = np.full((n_pairs, ny, nx), np.nan + 0j, dtype=out_dtype)
     for p in range(n_pairs):
+        valid_p = np.isfinite(angles[p])
         ref_model = model_angles[pair_ref_didx[p]].reshape(ny, nx)
         rep_model = model_angles[pair_rep_didx[p]].reshape(ny, nx)
-        trend_data[p] = np.exp(1j * (ref_model - rep_model)).astype(out_dtype)
+        trend_p = np.exp(1j * (ref_model - rep_model)).astype(out_dtype)
+        trend_data[p, valid_p] = trend_p[valid_p]
 
-    # Apply kept mask and overfitting check
-    if threshold is not None:
-        kept_2d = kept.reshape(n_pairs, ny, nx)
-        trend_data[~kept_2d] = np.nan + 0j
-
-        # Overfitting check: average per-date fit residual cstd must be < threshold.
-        # Uses cstd from the FIRST filter iteration (original data) — before
-        # iterative refinement can create artificial consistency for noisy pixels.
-        avg_cstd = np.zeros(n_pixels, dtype=np.float64)
-        n_dates_valid = np.zeros(n_pixels, dtype=np.int32)
-        for d in range(n_dates):
-            fin = np.isfinite(date_cstd[d])
-            avg_cstd[fin] += date_cstd[d, fin]
-            n_dates_valid[fin] += 1
-        has = n_dates_valid > 0
-        avg_cstd[has] /= n_dates_valid[has]
-        avg_cstd[~has] = np.inf
-        overfitting = avg_cstd.reshape(ny, nx) > threshold
-        if overfitting.any():
-            trend_data[:, overfitting] = np.nan + 0j
+    # Overfitting check: average per-date cstd must be < π/2.
+    # Cstd of uniform distribution is ~1.81, so π/2 ≈ 1.57 separates
+    # coherent from incoherent pixels. Fixed cutoff, N-independent.
+    avg_cstd = np.zeros(n_pixels, dtype=np.float64)
+    n_dates_valid = np.zeros(n_pixels, dtype=np.int32)
+    for d in range(n_dates):
+        fin = np.isfinite(date_cstd[d])
+        avg_cstd[fin] += date_cstd[d, fin]
+        n_dates_valid[fin] += 1
+    has = n_dates_valid > 0
+    avg_cstd[has] /= n_dates_valid[has]
+    avg_cstd[~has] = np.inf
+    overfitting = avg_cstd.reshape(ny, nx) > (np.pi / 2)
+    if overfitting.any():
+        trend_data[:, overfitting] = np.nan + 0j
 
     return trend_data
 

@@ -2134,7 +2134,7 @@ class BatchCore(dict):
 
     def trend1d_pairs(self, weight: 'BatchUnit | None' = None,
                       detrend: bool = False,
-                      max_refine: int = 9, threshold: float | None = None,
+                      max_refine: int = 9,
                       debug: bool = False) -> 'Batch':
         """
         Fit 1D atmospheric phase trend along temporal pairs for each date.
@@ -2223,13 +2223,12 @@ class BatchCore(dict):
                                          _ref=ref_values, _rep=rep_values,
                                          _detrend=detrend,
                                          _max_refine=max_refine,
-                                         _threshold=threshold,
                                          _dtype=out_dtype):
                     trend = utils_detrend.trend1d_pairs_array(
                         [data_block],
                         [weight_block] if weight_block is not None else None,
                         _ref, _rep,
-                        max_refine=_max_refine, threshold=_threshold
+                        max_refine=_max_refine,
                     )
                     if _detrend:
                         return (data_block * np.conj(trend)).astype(_dtype)

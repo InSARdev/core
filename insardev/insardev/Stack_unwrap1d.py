@@ -255,6 +255,20 @@ class Stack_unwrap1d(BatchCore):
         from .BatchCore import BatchCore
         BatchCore._require_lazy(data, 'unwrap1d')
 
+        # Quick check: triplet filtering needs pairs spanning 3+ date intervals.
+        # Just inspect ref/rep coords — no matrix building.
+        if threshold is not None:
+            first_ds = next(iter(data.values()))
+            refs = first_ds.coords['ref'].values
+            reps = first_ds.coords['rep'].values
+            dates = np.unique(np.concatenate([refs, reps]))
+            longest = np.argmax(reps - refs)
+            n_between = int(np.sum((dates > refs[longest]) & (dates < reps[longest])))
+            if n_between < 2:
+                print(f"NOTE: triplet filtering disabled — longest pair spans {n_between + 1} intervals "
+                      f"(need 3+). Use days=36+ or threshold=None.")
+                threshold = None
+
         # Process each burst
         results = {}
         for key in data.keys():

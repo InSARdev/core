@@ -160,7 +160,7 @@ def _triplet_irls_unwrap_numba(
                 t_start = trip_offsets[p]
                 t_end = trip_offsets[p + 1]
                 n_t = t_end - t_start
-                if n_t < 3:
+                if n_t < 2:
                     pair_cstd[p] = np.inf
                     continue
 

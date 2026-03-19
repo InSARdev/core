@@ -2651,7 +2651,8 @@ class Batches(tuple):
         elements = [detrended] + list(self[1:])
         return Batches(elements)
 
-    def detrend1d(self, baseline='BPR', intercept=False, slope=True, debug=False):
+    def detrend1d(self, baseline='BPR', intercept=False, slope=True,
+                  debug=False):
         """
         Detrend linear trend along perpendicular baseline and return Batches.
 
@@ -2697,7 +2698,8 @@ class Batches(tuple):
         # phase is referenced only once in the dask graph.
         detrended = phase.trend1d(weight=weight, baseline=baseline,
                                   detrend=True,
-                                  intercept=intercept, slope=slope, debug=debug)
+                                  intercept=intercept, slope=slope,
+                                  debug=debug)
 
         # Preserve non-spatial variables (e.g. BPR) that may be dropped by arithmetic
         detrended = Batches._preserve_nonspatial(phase, detrended)
@@ -2783,7 +2785,7 @@ class Batches(tuple):
     def regression1d_baseline(self, *args, **kwargs):
         raise NotImplementedError("Batches.regression1d_baseline() is removed. Use Batches.detrend1d() or Batch.trend1d() instead.")
 
-    def detrend1d_pairs(self, max_refine=3, threshold=1.2, debug=False):
+    def detrend1d_pairs(self, max_refine=3, debug=False):
         """
         Detrend 1D linear trend along temporal pairs and return Batches.
 
@@ -2798,13 +2800,12 @@ class Batches(tuple):
 
         Requires complex input (BatchComplex): unit-circle fitting, detrend
         multiplicatively (phase * trend.conj()). Must be placed before unwrapping.
+        Incoherent pixels (circular std > π/2) are automatically NaN'd.
 
         Parameters
         ----------
         max_refine : int
             Maximum refinement iterations (0 = single-pass). Default 3.
-        threshold : float
-            Pair consistency threshold for outlier rejection. Default 1.2.
         debug : bool
             Print diagnostic information.
 
@@ -2834,7 +2835,7 @@ class Batches(tuple):
         detrended = phase.trend1d_pairs(weight=weight,
                                         detrend=True,
                                         max_refine=max_refine,
-                                        threshold=threshold, debug=debug)
+                                        debug=debug)
 
         # Preserve non-spatial variables (e.g. BPR) that may be dropped by arithmetic
         detrended = Batches._preserve_nonspatial(phase, detrended)
