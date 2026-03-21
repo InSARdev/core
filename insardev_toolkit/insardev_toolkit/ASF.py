@@ -1352,12 +1352,12 @@ class ASF(progressbar_joblib):
 
             if http_session:
                 # Follow redirects manually to capture final URL
-                resp = http_session.get(url, headers=headers, allow_redirects=False)
+                resp = http_session.get(url, headers=headers, allow_redirects=False, timeout=(10, 30))
                 while resp.status_code in (301, 302, 303, 307, 308):
                     location = resp.headers.get('Location')
                     if not location:
                         break
-                    resp = http_session.get(location, headers=headers, allow_redirects=False)
+                    resp = http_session.get(location, headers=headers, allow_redirects=False, timeout=(10, 30))
                 # Final URL after all redirects
                 if 'cloudfront.net' in resp.url:
                     return resp.url
@@ -1380,23 +1380,29 @@ class ASF(progressbar_joblib):
 
             if signed_url:
                 # Use signed URL directly (much faster - no OAuth redirects)
-                r = requests.get(signed_url, headers=headers, stream=True)
+                r = requests.get(signed_url, headers=headers, stream=True, timeout=(10, 300))
             elif http_session:
-                r = http_session.get(url, headers=headers, stream=True)
+                r = http_session.get(url, headers=headers, stream=True, timeout=(10, 300))
                 # Capture signed URL from redirect chain
                 if 'cloudfront.net' in r.url:
                     returned_signed_url = r.url
             else:
-                r = requests.get(url, headers=headers, auth=auth_tuple, stream=True)
+                r = requests.get(url, headers=headers, auth=auth_tuple, stream=True, timeout=(10, 300))
 
             with r:
                 r.raise_for_status()
+                content_length = int(r.headers.get('Content-Length', 0))
+                if content_length > 0 and content_length < size:
+                    raise Exception(f'Truncated range response: expected {size} bytes, server reports {content_length}')
                 for chunk in r.iter_content(chunk_size=1024*1024):
                     chunks_data.append(chunk)
                     if pbar:
                         pbar.update(len(chunk))
 
-            return b''.join(chunks_data), returned_signed_url
+            result = b''.join(chunks_data)
+            if len(result) < size:
+                raise Exception(f'Truncated download: got {len(result)} bytes of {size} expected')
+            return result, returned_signed_url
 
         def download_filtered_chunks(url, chunk_info, bbox_info, freq, auth_tuple, pbar=None,
                                       http_session=None, signed_url=None, gap_threshold=16*1024*1024):
@@ -1500,7 +1506,7 @@ class ASF(progressbar_joblib):
             http_session = self._get_asf_session()
 
             # Get file size (HEAD request)
-            head_resp = http_session.head(url, allow_redirects=True)
+            head_resp = http_session.head(url, allow_redirects=True, timeout=(10, 30))
             file_size = int(head_resp.headers['Content-Length'])
 
             # Download 128MB metadata block (same as cache path) with progress bar
@@ -2111,8 +2117,10 @@ class ASF(progressbar_joblib):
             """
             url = f"{_NISAR_CACHE_PROXY}/{granule_id}/{offset}/{length}.bin"
             sess = session or requests.Session()
-            resp = sess.get(url)
+            resp = sess.get(url, timeout=120)
             resp.raise_for_status()
+            if len(resp.content) != length:
+                raise ValueError(f'Cache response size mismatch: got {len(resp.content)}, expected {length}')
             # Check both X-Cache (proxy) and cf-cache-status (CDN) headers
             cache_hit = (resp.headers.get('X-Cache', '').upper() == 'HIT' or
                         resp.headers.get('cf-cache-status', '').upper() == 'HIT')
@@ -2537,6 +2545,8 @@ class ASF(progressbar_joblib):
             if debug:
                 print(f"Fetching metadata for {gid}...")
             meta_raw, _ = fetch_cache_range(gid, 0, MAX_BLOCK)
+            if meta_raw[:4] != b'\x89HDF':
+                raise Exception(f'Cache returned invalid metadata (not HDF5): {meta_raw[:100]!r}')
             meta_buf = patch_hdf5_superblock(meta_raw)
             if debug:
                 print(f"  Metadata: {len(meta_buf)/(1024**2):.1f}MB")
@@ -2681,22 +2691,22 @@ class ASF(progressbar_joblib):
                 def extract_chunks_from_data(ci, freq_label=''):
                     if not ci:
                         return None
-                    # Only extract chunks that were actually downloaded (subset when bbox applied)
+                    # Extract downloaded chunks — with bbox, only a subset is present
                     result = {}
-                    missing = 0
                     empty = 0
                     for c in ci['chunks']:
-                        if c['offset'] not in block_data:
-                            missing += 1
-                        else:
+                        if c['offset'] in block_data:
                             chunk_bytes = block_data[c['offset']]
                             if len(chunk_bytes) == 0:
                                 empty += 1
                             result[c['offset']] = chunk_bytes
-                    if missing > 0 or empty > 0:
+                    if empty > 0:
                         raise ValueError(
-                            f"freq{freq_label} {pol}: {missing} missing + {empty} empty chunks "
-                            f"out of {len(ci['chunks'])} total ({len(block_data)} in block_data)")
+                            f"freq{freq_label} {pol}: {empty} empty chunks")
+                    if len(result) == 0:
+                        raise ValueError(
+                            f"freq{freq_label} {pol}: no chunks downloaded "
+                            f"(0 of {len(ci['chunks'])} in block_data)")
                     return result
 
                 data_a = extract_chunks_from_data(ci_a, 'A')
@@ -2739,9 +2749,9 @@ class ASF(progressbar_joblib):
         # Download first 128MB (reuse session if provided)
         headers = {'Range': f'bytes=0-{METADATA_SIZE-1}'}
         if http_session:
-            response = http_session.get(url, headers=headers, stream=True)
+            response = http_session.get(url, headers=headers, stream=True, timeout=(10, 300))
         else:
-            response = requests.get(url, headers=headers, auth=auth_tuple, stream=True)
+            response = requests.get(url, headers=headers, auth=auth_tuple, stream=True, timeout=(10, 300))
         response.raise_for_status()
 
         # Stream download with progress
@@ -2751,6 +2761,16 @@ class ASF(progressbar_joblib):
             if pbar:
                 pbar.update(len(chunk))
         data = bytearray(b''.join(chunks))
+
+        # Validate HDF5 magic bytes
+        if data[:4] != b'\x89HDF':
+            try:
+                import json
+                error = json.loads(bytes(data).decode('utf-8', errors='replace'))
+                msg = error.get('message', error.get('error', str(error)))
+                raise Exception(f'Server returned error instead of HDF5: {msg}')
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                raise Exception(f'Server returned invalid response (not HDF5): {bytes(data[:100])!r}')
 
         # Patch HDF5 superblock EOF
         version = data[8]
@@ -3564,7 +3584,20 @@ class ASF(progressbar_joblib):
                 for key, value in metadata['_root_attrs'].items():
                     h5_mem.attrs[key] = value
 
-        # Single disk write to temp file, then atomic rename
+        # Validate in-memory HDF5 before writing to disk
+        import h5py
+        with h5py.File(BytesIO(mem_buffer.getvalue()), 'r') as h5_check:
+            swaths = h5_check['science/LSAR/RSLC/swaths']
+            for freq_key in ['frequencyA', 'frequencyB']:
+                if freq_key in swaths and pol in swaths[freq_key]:
+                    ds = swaths[freq_key][pol]
+                    if ds.shape[0] == 0 or ds.shape[1] == 0:
+                        raise ValueError(f'{freq_key}/{pol} has zero dimension: {ds.shape}')
+                    break
+            else:
+                raise ValueError(f'No SLC dataset found for {pol}')
+
+        # Write to temp file, then atomic rename
         tmp_path = out_path + '.tmp'
         with open(tmp_path, 'wb') as f:
             f.write(mem_buffer.getvalue())
