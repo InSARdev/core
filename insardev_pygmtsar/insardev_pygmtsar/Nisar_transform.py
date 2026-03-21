@@ -722,6 +722,7 @@ class Nisar_transform(Nisar_align):
                   dem_vertical_accuracy: float = 0.5,
                   alignment_spacing: float = 12.0 / 3600,
                   xcorr: tuple | None = (512, 512),
+                  bbox: list | tuple | None = None,
                   overwrite: bool = False,
                   append: bool = False,
                   n_jobs: int | None = None,
@@ -766,6 +767,9 @@ class Nisar_transform(Nisar_align):
         xcorr : tuple | None, optional
             Xcorr patch size as (height, width). Default (512, 512) for NISAR.
             Set to None to disable xcorr refinement. Grid is auto-computed.
+        bbox : list | tuple | None, optional
+            Bounding box [lon_min, lat_min, lon_max, lat_max] in WGS84 to crop
+            output grid. Useful when input data was downloaded for a subregion.
         overwrite : bool, optional
             Overwrite existing results.
         append : bool, optional
@@ -837,7 +841,10 @@ class Nisar_transform(Nisar_align):
             print('NOTE: EPSG code will be computed automatically for each scene.')
         elif isinstance(epsg, str) and epsg == 'auto':
             from .utils_satellite import get_utm_epsg
-            epsgs = self.to_dataframe().centroid.apply(lambda geom: get_utm_epsg(geom.y, geom.x)).unique()
+            import warnings
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', message='.*geographic CRS.*centroid.*')
+                epsgs = self.to_dataframe().centroid.apply(lambda geom: get_utm_epsg(geom.y, geom.x)).unique()
             if len(epsgs) > 1:
                 raise ValueError(f'ERROR: Multiple UTM zones found: {", ".join(map(str, epsgs))}.')
             epsg = epsgs[0]
@@ -896,7 +903,7 @@ class Nisar_transform(Nisar_align):
             compute_conversion_chunked(
                 prm_ref_main, self.DEM, record.geometry.iloc[0], outdir,
                 scale_factor=1 / dem_vertical_accuracy,
-                epsg=epsg, resolution=resolution,
+                epsg=epsg, resolution=resolution, bbox=bbox,
                 chunk=chunk, compute_topo=remove_topo_phase,
                 n_jobs=n_jobs, netcdf_engine=self.netcdf_engine_read, debug=debug
             )

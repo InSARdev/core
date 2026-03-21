@@ -677,7 +677,8 @@ def _process_topo_worker(args):
         batch_topo = ele_gmtsar.reshape(batch_shape)
         scaled = (scale_factor * batch_topo).round()
         finite = np.isfinite(scaled)
-        int_data = np.where(finite, scaled.astype(np.int32), fill_value)
+        int_data = np.full(scaled.shape, fill_value, dtype=np.int32)
+        int_data[finite] = scaled[finite].astype(np.int32)
         topo_arr[ia + ba:ia + ea, ir:jr] = int_data
         del ele_gmtsar, batch_topo, scaled, finite, int_data
 
@@ -3488,6 +3489,7 @@ def compute_conversion_chunked(prm, dem_path, geometry, outdir,
                                scale_factor=2.0,
                                epsg=None,
                                resolution=(16.0, 4.0),
+                               bbox=None,
                                chunk=(8192, 8192),
                                compute_topo=True,
                                n_jobs=-1,
@@ -3651,6 +3653,20 @@ def compute_conversion_chunked(prm, dem_path, geometry, outdir,
     x_max = float(dx * (np.ceil(np.nanmax(bnd_x[valid_bnd]) / dx) + margin))
     dy = float(dy)
     dx = float(dx)
+
+    # Apply bbox crop if specified (WGS84: [lon_min, lat_min, lon_max, lat_max])
+    if bbox is not None:
+        bbox_y, bbox_x = proj(
+            np.array([bbox[1], bbox[3]]),
+            np.array([bbox[0], bbox[2]]),
+            from_epsg=4326, to_epsg=epsg
+        )
+        y_min = max(y_min, dy * np.floor(min(bbox_y) / dy))
+        y_max = min(y_max, dy * np.ceil(max(bbox_y) / dy))
+        x_min = max(x_min, dx * np.floor(min(bbox_x) / dx))
+        x_max = min(x_max, dx * np.ceil(max(bbox_x) / dx))
+        if debug:
+            print(f'  bbox crop: y=[{y_min:.0f}, {y_max:.0f}], x=[{x_min:.0f}, {x_max:.0f}]')
 
     # Compute grid dimensions without creating full arrays (memory-efficient)
     n_y = int((y_max - y_min) / dy)
