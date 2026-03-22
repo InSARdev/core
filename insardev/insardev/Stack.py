@@ -57,6 +57,19 @@ class Stack(Stack_plot, BatchCore):
         return None
 
     @property
+    def wavelength(self):
+        """Radar wavelength in meters (scalar, constant across all bursts)."""
+        if not self:
+            return None
+        ds = next(iter(self.values()))
+        if 'radar_wavelength' in ds:
+            val = ds['radar_wavelength']
+            return float(val.values.flat[0]) if val.ndim >= 1 else float(val.item())
+        if 'radar_wavelength' in ds.attrs:
+            return float(ds.attrs['radar_wavelength'])
+        return None
+
+    @property
     def coords(self):
         """Return coordinates from the first dataset in the stack.
         
