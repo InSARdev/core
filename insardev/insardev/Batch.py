@@ -1613,6 +1613,14 @@ class BatchComplex(BatchCore):
         # package up as a BatchWrap (real, wrapped-phase)
         return BatchWrap(out)
 
+    def unwrap2d(self, *args, **kwargs):
+        """Unwrap complex interferogram via .angle() conversion."""
+        return self.angle().unwrap2d(*args, **kwargs)
+
+    def unwrap2d_irls(self, *args, **kwargs):
+        """Unwrap complex interferogram via .angle() conversion."""
+        return self.angle().unwrap2d_irls(*args, **kwargs)
+
     def plot(self, *args, **kwargs):
         """
         Plot complex phase as wrapped phase via .angle() conversion.
@@ -2690,9 +2698,8 @@ class Batches(tuple):
         phase = self[0]
         weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
 
-        if not isinstance(phase, BatchComplex):
-            raise TypeError(f"detrend1d() requires complex phase (BatchComplex), got {type(phase).__name__}. "
-                            f"Call detrend1d() before unwrap1d().")
+        if not isinstance(phase, (Batch, BatchComplex)):
+            raise TypeError(f"detrend1d() requires Batch or BatchComplex, got {type(phase).__name__}.")
 
         # Fuse fit+subtract into one blockwise call (detrend=True) so the input
         # phase is referenced only once in the dask graph.
@@ -2824,10 +2831,10 @@ class Batches(tuple):
         phase = self[0]
         weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
 
-        if not isinstance(phase, BatchComplex):
+        if not isinstance(phase, (Batch, BatchComplex)):
             raise TypeError(
-                f"detrend1d_pairs() requires BatchComplex (complex wrapped phase), "
-                f"got {type(phase).__name__}. Place detrend1d_pairs() before unwrapping."
+                f"detrend1d_pairs() requires Batch or BatchComplex, "
+                f"got {type(phase).__name__}."
             )
 
         # Fuse fit+subtract into one blockwise call (detrend=True) so the input

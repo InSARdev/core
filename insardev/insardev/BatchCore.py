@@ -2065,6 +2065,13 @@ class BatchCore(dict):
             else:
                 baseline_values = np.asarray(baseline, dtype=np.float64)
 
+            n_stack_data = ref_da.sizes[stack_dim]
+            if len(baseline_values) != n_stack_data:
+                raise ValueError(
+                    f"Baseline length {len(baseline_values)} does not match data "
+                    f"{stack_dim} dimension {n_stack_data}. "
+                    f"Use per-pair BPR (e.g. intfA[['BPR']]) not per-date stackA.BPR.")
+
             if debug:
                 print(f"DEBUG {key}: stack_dim={stack_dim}, n_samples={len(baseline_values)}, baseline range=[{baseline_values.min():.2f}, {baseline_values.max():.2f}]")
 
@@ -2087,14 +2094,19 @@ class BatchCore(dict):
                 def _trend1d_block(data_block, weight_block=None,
                                    _bv=baseline_values,
                                    _detrend=detrend, _dtype=out_dtype,
-                                   _intercept=intercept, _slope=slope):
+                                   _intercept=intercept, _slope=slope,
+                                   _is_complex=is_complex):
                     trend = utils_detrend.trend1d_array(
                         [data_block], _bv,
                         [weight_block] if weight_block is not None else None,
                         intercept=_intercept, slope=_slope,
+                        is_complex=_is_complex,
                     )
                     if _detrend:
-                        return (data_block * np.conj(trend)).astype(_dtype)
+                        if _is_complex:
+                            return (data_block * np.conj(trend)).astype(_dtype)
+                        else:
+                            return (data_block - trend).astype(_dtype)
                     return trend.astype(_dtype)
 
                 if weight_dask is not None:
@@ -2127,7 +2139,9 @@ class BatchCore(dict):
 
             result[key] = xr.Dataset(result_ds, attrs=ds.attrs)
 
-        return BatchComplex(result)
+        if is_complex:
+            return BatchComplex(result)
+        return Batch(result)
 
     # Backward compatibility alias
     regression1d_baseline = trend1d
@@ -2176,20 +2190,15 @@ class BatchCore(dict):
         import xarray as xr
         import pandas as pd
         from . import utils_detrend
-        from .Batch import BatchComplex
+        from .Batch import Batch, BatchComplex
 
         data = self
 
         # Validate lazy data
         BatchCore._require_lazy(data, 'trend1d_pairs')
 
-        if not isinstance(data, BatchComplex):
-            raise TypeError(
-                "trend1d_pairs() requires BatchComplex (complex wrapped phase). "
-                "Place detrend1d_pairs() before unwrapping in the pipeline."
-            )
-
-        out_dtype = np.complex64
+        is_complex = isinstance(data, BatchComplex)
+        out_dtype = np.complex64 if is_complex else np.float32
 
         results = {}
         for burst_id in data.keys():
@@ -2223,15 +2232,20 @@ class BatchCore(dict):
                                          _ref=ref_values, _rep=rep_values,
                                          _detrend=detrend,
                                          _max_refine=max_refine,
-                                         _dtype=out_dtype):
+                                         _dtype=out_dtype,
+                                         _is_complex=is_complex):
                     trend = utils_detrend.trend1d_pairs_array(
                         [data_block],
                         [weight_block] if weight_block is not None else None,
                         _ref, _rep,
                         max_refine=_max_refine,
+                        is_complex=_is_complex,
                     )
                     if _detrend:
-                        return (data_block * np.conj(trend)).astype(_dtype)
+                        if _is_complex:
+                            return (data_block * np.conj(trend)).astype(_dtype)
+                        else:
+                            return (data_block - trend).astype(_dtype)
                     return trend.astype(_dtype)
 
                 if weight_dask is not None:
@@ -2263,7 +2277,9 @@ class BatchCore(dict):
 
             results[burst_id] = xr.Dataset(result_ds, attrs=burst_ds.attrs)
 
-        return BatchComplex(results)
+        if is_complex:
+            return BatchComplex(results)
+        return Batch(results)
 
     def regression1d_pairs(self, *args, **kwargs):
         raise NotImplementedError("regression1d_pairs() is removed. Use trend1d_pairs() instead.")
