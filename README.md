@@ -41,6 +41,10 @@ All examples are tested to work even on FREE Google Colab instances (2 slow vCPU
 
 For a $10/month Google Colab subscription, you get approximately 60 hours of L4 GPU instances—enough to run the NISAR processing example at full resolution 100–300 times (depending on NASA ASF portal download speed) with the full pipeline including SLC data downloading and preprocessing, or more than 500 times using preprocessed Zarr datasets stored on Zenodo, GitHub, etc. Often, complete PolSAR and InSAR analysis can be done in a few minutes. For NISAR, use frequency B to reduce download size and processing time; if better resolution is needed, just rerun the same pipeline with frequency A.
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1JbBnHnyM1hnIfq2YmPLbQrUbspTiyMZu?usp=sharing) NISAR L-band FrequencyA/B Split-Spectrum HH Time Series Analysis for Mexico City Subsidence.
+
+<img src="assets/NisarL_Mexico_City_Subsidence.jpg" />
+
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/156sHUllAORmb3LmZoHz3YPecG7HWdie-?usp=sharing) NISAR L-Band HH/HV RGB composite, HH interferogram, and unwrapped phase.
 
 <img src="assets/NisarLB.jpg" />
