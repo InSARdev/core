@@ -4842,7 +4842,7 @@ class BatchCore(dict):
             )
             fg.set_axis_labels('easting [km]', 'northing [km]')
             fg.set_ticks(max_xticks=nbins, max_yticks=nbins)
-            fg.fig.suptitle(f'{polarization} {caption or ''}'.strip(), y=y)
+            fg.fig.suptitle(f'{polarization} {caption or ""}'.strip(), y=y)
 
             # fg is the FacetGrid returned by xarray.plot.imshow
             # Get original limits from first axis before any modifications
