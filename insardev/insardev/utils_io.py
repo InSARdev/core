@@ -269,30 +269,24 @@ def save(*args, store, storage_options: dict[str, str] | None = None, compat: bo
 
                 if all_per_pair:
                     # --- Per-pair path: batch by pairs ---
+                    # Compute on workers, gather to client, write from client.
+                    # Writing from workers via da.store() loses ~0.7% chunks
+                    # due to zarr v3 async event loop issues under concurrent
+                    # write pressure (even to different chunk files).
                     batch_tgt = [targets[i] for i in idx_3d]
-                    if _client is not None:
-                        for k in range(0, n_pairs, batch_size):
-                            k_end = min(k + batch_size, n_pairs)
-                            batch_src = list(dask.optimize(
-                                *[sources[i][k:k_end] for i in idx_3d]))
-                            batch_reg = [(slice(k, k_end),)] * len(idx_3d)
-                            d = da.store(batch_src, batch_tgt,
-                                         regions=batch_reg,
-                                         lock=False, compute=False)
-                            futures = _client.compute(d,
-                                                      optimize_graph=False)
-                            wait(futures)
-                            _client.gather(futures)
-                            pbar.update((k_end - k) * len(batch_burst_ids))
-                    else:
-                        for k in range(0, n_pairs, batch_size):
-                            k_end = min(k + batch_size, n_pairs)
-                            batch_src = list(dask.optimize(
-                                *[sources[i][k:k_end] for i in idx_3d]))
-                            batch_reg = [(slice(k, k_end),)] * len(idx_3d)
-                            da.store(batch_src, batch_tgt,
-                                     regions=batch_reg, lock=False)
-                            pbar.update((k_end - k) * len(batch_burst_ids))
+                    for k in range(0, n_pairs, batch_size):
+                        k_end = min(k + batch_size, n_pairs)
+                        batch_src = list(dask.optimize(
+                            *[sources[i][k:k_end] for i in idx_3d]))
+                        if _client is not None:
+                            futures = _client.compute(batch_src)
+                            results = _client.gather(futures)
+                        else:
+                            results = dask.compute(*batch_src)
+                        for vi, arr in enumerate(results):
+                            batch_tgt[vi][k:k_end] = arr
+                        del results
+                        pbar.update((k_end - k) * len(batch_burst_ids))
                 else:
                     # Merged pairs (from blockwise ops like trend1d).
                     # Batch by spatial tiles (y-chunk × x-chunk).
