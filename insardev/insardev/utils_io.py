@@ -132,7 +132,11 @@ def save(*args, store, storage_options: dict[str, str] | None = None, compat: bo
     # Check if store is a string path or a store object
     is_store_object = not isinstance(store, str)
 
-    # open to drop existing store (for string paths) or initialize (for store objects)
+    # Remove existing store manually before zarr.group to avoid OS errors
+    # (macOS .DS_Store files from Spotlight can prevent zarr's shutil.rmtree)
+    import os, shutil
+    if not is_store_object and os.path.exists(store):
+        shutil.rmtree(store, ignore_errors=True)
     root = zarr.group(store=store, zarr_format=3, overwrite=True)
     root.attrs['__class__'] = [
         f'{cls.__module__}.{cls.__qualname__}'
@@ -216,7 +220,8 @@ def save(*args, store, storage_options: dict[str, str] | None = None, compat: bo
                         chunks=chunks,
                         dtype=da_xr.dtype,
                         dimension_names=dim_names,
-                        overwrite=True
+                        overwrite=True,
+                        fill_value=np.nan if (np.issubdtype(da_xr.dtype, np.floating) or np.issubdtype(da_xr.dtype, np.complexfloating)) else 0,
                     )
                     sources.append(da_xr.data)
                     targets.append(z)
@@ -277,7 +282,6 @@ def save(*args, store, storage_options: dict[str, str] | None = None, compat: bo
                             futures = _client.compute(d,
                                                       optimize_graph=False)
                             wait(futures)
-                            # Raise if any task failed (otherwise zarr chunk stays at fill_value=0)
                             _client.gather(futures)
                             pbar.update((k_end - k) * len(batch_burst_ids))
                     else:
@@ -481,38 +485,8 @@ def open(store: str, storage_options: dict[str, str] | None = None, compat: bool
     dss = dict(results)
     del results
 
-    # Rechunk spatial dims to match dask config chunk-size budget,
-    # similar to Stack.load(). Split or merge zarr disk chunks so
-    # each dask chunk is close to the configured memory budget.
-    from .utils_dask import rechunk2d, get_dask_chunk_size_mb
-    _target_mb = get_dask_chunk_size_mb()
-
-    for grp_key, ds in dss.items():
-        # Find the heaviest 3D variable to compute element_bytes
-        max_elem = 0
-        spatial_shape = None
-        spatial_chunks = None
-        dim0_name = None
-        for vname in ds.data_vars:
-            da_var = ds[vname]
-            if da_var.ndim >= 3 and 'y' in da_var.dims and 'x' in da_var.dims:
-                d0 = da_var.dims[0]
-                d0_chunk = da_var.data.chunks[0][0] if hasattr(da_var.data, 'chunks') else da_var.sizes[d0]
-                eb = d0_chunk * da_var.dtype.itemsize
-                if eb > max_elem:
-                    max_elem = eb
-                    spatial_shape = (da_var.sizes['y'], da_var.sizes['x'])
-                    yi = da_var.dims.index('y')
-                    xi = da_var.dims.index('x')
-                    spatial_chunks = (da_var.data.chunks[yi], da_var.data.chunks[xi])
-                    dim0_name = d0
-        if max_elem > 0 and spatial_shape is not None:
-            _opt = rechunk2d(spatial_shape, element_bytes=max_elem,
-                             input_chunks=spatial_chunks, target_mb=_target_mb,
-                             merge=True)
-            if _opt['y'] != spatial_chunks[0] or _opt['x'] != spatial_chunks[1]:
-                rechunk_dict = {'y': _opt['y'], 'x': _opt['x']}
-                dss[grp_key] = ds.chunk(rechunk_dict)
+    # Read chunks exactly as stored in zarr — no rechunking.
+    # The zarr chunks match what was computed and stored by save().
 
     if interleave:
         # unpack interleaved datasets and return as Batches for chaining
