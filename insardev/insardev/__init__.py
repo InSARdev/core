@@ -8,7 +8,7 @@
 # See the LICENSE file in the insardev directory for license terms.
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
-__version__ = '2026.3.21.post2'
+__version__ = '2026.3.21.post3'
 
 # processing functions
 from .Stack import Stack
@@ -24,5 +24,10 @@ except ImportError:
 
 try:
     import insardev_backscatter
+except ImportError:
+    pass
+
+try:
+    import insardev_io
 except ImportError:
     pass
