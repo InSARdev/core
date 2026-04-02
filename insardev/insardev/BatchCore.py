@@ -3109,14 +3109,10 @@ class BatchCore(dict):
 
         target_mb = _parse_budget(budget) if budget is not None else None
 
-        if p2p:
-            ctx = dask.config.set({
-                "array.rechunk.method": "p2p",
-                "optimization.fuse.active": False,
-            })
-        else:
-            from contextlib import nullcontext
-            ctx = nullcontext()
+        ctx = dask.config.set({
+            "array.rechunk.method": "p2p" if p2p else "tasks",
+            **({"optimization.fuse.active": False} if p2p else {}),
+        })
 
         with ctx:
             result = {}
@@ -3145,7 +3141,10 @@ class BatchCore(dict):
                         var_chunks = {arr.dims[0]: 1, 'y': optimal['y'], 'x': optimal['x']}
                     else:
                         var_chunks = {'y': optimal['y'], 'x': optimal['x']}
-                    rechunked_vars[var] = arr.chunk(var_chunks)
+                    rechunked = arr.chunk(var_chunks)
+                    if hasattr(rechunked.data, 'dask'):
+                        (rechunked.data,) = dask.optimize(rechunked.data)
+                    rechunked_vars[var] = rechunked
                 if rechunked_vars:
                     ds = ds.assign(rechunked_vars)
                 result[k] = ds
@@ -3180,14 +3179,10 @@ class BatchCore(dict):
 
         target_mb = _parse_budget(budget) if budget is not None else None
 
-        if p2p:
-            ctx = dask.config.set({
-                "array.rechunk.method": "p2p",
-                "optimization.fuse.active": False,
-            })
-        else:
-            from contextlib import nullcontext
-            ctx = nullcontext()
+        ctx = dask.config.set({
+            "array.rechunk.method": "p2p" if p2p else "tasks",
+            **({"optimization.fuse.active": False} if p2p else {}),
+        })
 
         with ctx:
             result = {}
@@ -3217,10 +3212,14 @@ class BatchCore(dict):
                     if not (arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x')):
                         continue
                     if arr.ndim == 3:
-                        var_chunks = {'y': optimal['y'], 'x': optimal['x']}
+                        var_chunks = {arr.dims[0]: -1, 'y': optimal['y'], 'x': optimal['x']}
                     else:
                         var_chunks = {'y': optimal['y'], 'x': optimal['x']}
-                    rechunked_vars[var] = arr.chunk(var_chunks)
+                    rechunked = arr.chunk(var_chunks)
+                    # Optimize to flatten the rechunk graph (215K→4K keys)
+                    if hasattr(rechunked.data, 'dask'):
+                        (rechunked.data,) = dask.optimize(rechunked.data)
+                    rechunked_vars[var] = rechunked
                 if rechunked_vars:
                     ds = ds.assign(rechunked_vars)
                 result[k] = ds

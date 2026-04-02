@@ -81,7 +81,7 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
     import numpy as np
     import zarr
     import gc
-    from dask.distributed import get_client, wait
+    from dask.distributed import get_client
     from tqdm.auto import tqdm
 
     # Suppress zarr v3 consolidated metadata and .DS_Store warnings
@@ -135,20 +135,21 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
     except ValueError:
         _client = None
 
-    # Pre-scan to get total pairs for progress bar
+    # Pre-scan to get total pairs/chunks for progress bar
     n_pairs = 0
+    _ref_dask = None
     for grp, ds in burst_groups[burst_ids[0]]:
         for var_name in ds.data_vars:
             da_xr = ds[var_name]
             if hasattr(da_xr.data, 'dask') and da_xr.ndim >= 3:
                 n_pairs = da_xr.shape[0]
+                _ref_dask = da_xr.data
                 break
         if n_pairs > 0:
             break
-    total = n_bursts_total * max(n_pairs, 1)
 
     # Process all bursts together
-    pbar = tqdm(desc=caption.ljust(25), total=total)
+    pbar = tqdm(desc=caption.ljust(25), total=0)  # set total after path selection
 
     # Prepare zarr targets for dask arrays
     sources = []
@@ -196,51 +197,72 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
                         overwrite=True
                     )
 
-    # Write dask arrays to zarr. n_chunks = pairs/dates per worker per batch.
+    # Write dask arrays to zarr in memory-controlled batches.
+    # Each batch slice is optimized (dask.optimize culls unused keys).
     if sources:
+        import numpy as np
+
         if _client is not None:
             n_workers = max(len(_client.nthreads()), 1)
         else:
             n_workers = 1
-        n_pairs = max((s.shape[0] for s in sources if s.ndim >= 3), default=1)
-        # n_chunks pairs/dates per worker → total per batch
-        batch_pairs = n_chunks * n_workers
 
-        # Check if dim-0 is already merged (one chunk) — don't slice inside chunks
-        dim0_merged = all(s.chunksize[0] == s.shape[0] for s in sources if s.ndim >= 3)
+        ref_3d = next((s for s in sources if s.ndim >= 3), None)
+        n_pairs = ref_3d.shape[0] if ref_3d is not None else 1
+        dim0_merged = ref_3d is not None and ref_3d.chunksize[0] == ref_3d.shape[0]
 
-        if n_pairs <= batch_pairs or dim0_merged:
-            da.store(sources, targets, lock=False)
-            pbar.update(n_pairs * n_bursts_total)
-        else:
-            # Batch by dim-0: n_chunks pairs per worker per batch
+        if dim0_merged and ref_3d is not None:
+            # Batch by spatial x-columns, optimize per batch to cull graph
+            n_y = len(ref_3d.chunks[-2])
+            n_x = len(ref_3d.chunks[-1])
+            x_chunks = ref_3d.chunks[-1]
+            x_boundaries = [0] + list(np.cumsum(x_chunks))
+            batch_x = max(1, (n_chunks * n_workers + n_y - 1) // n_y)
+            n_batches = (n_x + batch_x - 1) // batch_x
+            pbar.total = n_batches
+            idx_3d = [i for i, s in enumerate(sources) if s.ndim >= 3]
+            idx_2d = [i for i, s in enumerate(sources) if s.ndim < 3]
+
+            # Write 2D sources once (non-batched)
+            if idx_2d:
+                da.store([sources[i] for i in idx_2d],
+                         [targets[i] for i in idx_2d], lock=False)
+
+            for kx in range(0, n_x, batch_x):
+                kx_end = min(kx + batch_x, n_x)
+                x0, x1 = x_boundaries[kx], x_boundaries[kx_end]
+                ndim = ref_3d.ndim
+                reg = (slice(None),) * (ndim - 1) + (slice(x0, x1),)
+                # Slice + optimize: culls graph to only keys needed for this batch
+                src_b = [dask.optimize(sources[i][..., x0:x1])[0] for i in idx_3d]
+                tgt_b = [targets[i] for i in idx_3d]
+                da.store(src_b, tgt_b, lock=False, regions=[reg] * len(src_b))
+                pbar.update(1)
+        elif n_pairs > n_chunks * n_workers:
+            # Batch by dim-0 (pairs)
+            batch_pairs = n_chunks * n_workers
+            n_batches = (n_pairs + batch_pairs - 1) // batch_pairs
+            pbar.total = n_batches
+
+            idx_3d = [i for i, s in enumerate(sources) if s.ndim >= 3]
+            idx_2d = [i for i, s in enumerate(sources) if s.ndim < 3]
+
+            if idx_2d:
+                da.store([sources[i] for i in idx_2d],
+                         [targets[i] for i in idx_2d], lock=False)
+
             for k in range(0, n_pairs, batch_pairs):
                 k_end = min(k + batch_pairs, n_pairs)
-                src_b = [s[k:k_end] for s in sources if s.ndim >= 3]
+                src_b = [dask.optimize(sources[i][k:k_end])[0] for i in idx_3d]
+                tgt_b = [targets[i] for i in idx_3d]
                 reg_b = [(slice(k, k_end),)] * len(src_b)
-                tgt_b = [targets[i] for i, s in enumerate(sources) if s.ndim >= 3]
-                # Write 2D sources in first batch only
-                if k == 0:
-                    for i, s in enumerate(sources):
-                        if s.ndim < 3:
-                            src_b.append(s)
-                            tgt_b.append(targets[i])
-                            reg_b.append(None)
-                # Separate None regions from sliced regions
-                idx_full = [i for i, r in enumerate(reg_b) if r is None]
-                idx_reg = [i for i, r in enumerate(reg_b) if r is not None]
-                if idx_full and idx_reg:
-                    da.store([src_b[i] for i in idx_full],
-                             [tgt_b[i] for i in idx_full], lock=False)
-                    da.store([src_b[i] for i in idx_reg],
-                             [tgt_b[i] for i in idx_reg], lock=False,
-                             regions=[reg_b[i] for i in idx_reg])
-                elif idx_full:
-                    da.store([src_b[i] for i in idx_full],
-                             [tgt_b[i] for i in idx_full], lock=False)
-                else:
-                    da.store(src_b, tgt_b, lock=False, regions=reg_b)
-                pbar.update((k_end - k) * n_bursts_total)
+                da.store(src_b, tgt_b, lock=False, regions=reg_b)
+                pbar.update(1)
+        else:
+            # Small enough for single store
+            pbar.total = 1
+            da.store(sources, targets, lock=False)
+            pbar.update(1)
 
     # Write xarray metadata (coords, attrs) AFTER data is written
     for grp, ds, grp_store in grp_info:
