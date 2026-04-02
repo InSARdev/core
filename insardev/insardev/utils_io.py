@@ -233,8 +233,8 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
                 x0, x1 = x_boundaries[kx], x_boundaries[kx_end]
                 ndim = ref_3d.ndim
                 reg = (slice(None),) * (ndim - 1) + (slice(x0, x1),)
-                # Slice + optimize: culls graph to only keys needed for this batch
-                src_b = [dask.optimize(sources[i][..., x0:x1])[0] for i in idx_3d]
+                # Slice + optimize together: culls graph, preserves shared upstream tasks
+                src_b = list(dask.optimize(*[sources[i][..., x0:x1] for i in idx_3d]))
                 tgt_b = [targets[i] for i in idx_3d]
                 da.store(src_b, tgt_b, lock=False, regions=[reg] * len(src_b))
                 pbar.update(1)
@@ -253,7 +253,7 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
 
             for k in range(0, n_pairs, batch_pairs):
                 k_end = min(k + batch_pairs, n_pairs)
-                src_b = [dask.optimize(sources[i][k:k_end])[0] for i in idx_3d]
+                src_b = list(dask.optimize(*[sources[i][k:k_end] for i in idx_3d]))
                 tgt_b = [targets[i] for i in idx_3d]
                 reg_b = [(slice(k, k_end),)] * len(src_b)
                 da.store(src_b, tgt_b, lock=False, regions=reg_b)
