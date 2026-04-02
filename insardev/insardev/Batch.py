@@ -2549,21 +2549,24 @@ class Batches(tuple):
         elements = [unwrapped] + list(self[1:])
         return Batches(elements)
 
-    def detrend2d(self, transform, degree=1, device='auto', debug=False):
+    def detrend2d(self, transform, degree=1, window=None, device='auto', debug=False):
         """
         Detrend 2D polynomial trend and return Batches with detrended data.
 
-        Expects Batches from interferogram(): [BatchComplex (intf), BatchUnit (corr)].
-
-        For complex input (BatchComplex): detrended = intf * trend.conj()
-        For real input (Batch): detrended = phase - trend
+        Two modes:
+        - window=None (default): global polynomial fit across full spatial extent.
+        - window=N or window=(Ny, Nx): local windowed fit with 4 half-overlapping
+          grids averaged per pixel. Extent-independent. Window size in pixels.
 
         Parameters
         ----------
         transform : Batch
-            Coordinate transform from stack.transform() containing 'azi' and 'rng'.
+            Coordinate transform from stack.transform() containing 'azi', 'rng', 'ele'.
         degree : int
             Polynomial degree (1=plane, 2=quadratic). Default 1.
+        window : int, tuple, or None
+            Window size in pixels. None = global fit. int = square window.
+            tuple (win_y, win_x) = rectangular window.
         device : str
             PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
         debug : bool
@@ -2576,8 +2579,10 @@ class Batches(tuple):
 
         Examples
         --------
-        >>> # Complex interferogram detrending (chained)
-        >>> intf, corr = stack.pairs(baseline).interferogram(wavelength=30).detrend2d(transform)
+        >>> # Global detrend (default)
+        >>> intf = stack.pairs(bl).interferogram(wl=30).detrend2d(transform)
+        >>> # Local windowed detrend (extent-independent)
+        >>> intf = stack.pairs(bl).interferogram(wl=30).detrend2d(transform, window=250)
         """
         if len(self) < 1:
             raise ValueError("detrend2d() requires Batches with at least 1 element: [phase]")
@@ -2588,70 +2593,20 @@ class Batches(tuple):
         if not isinstance(phase, (Batch, BatchComplex)):
             raise TypeError(f"First element must be Batch or BatchComplex, got {type(phase).__name__}")
 
-        # Fuse fit+subtract into one blockwise call (detrend=True) so the input
-        # phase is referenced only once in the dask graph. Without fusion, phase
-        # is referenced both by the full-spatial rechunk inside trend2d AND by the
-        # phase * trend.conj() multiplication — pinning all Gaussian chunks in
-        # memory until both consumers finish, causing 50GB+ per worker.
-        detrended = phase.trend2d(transform, weight=weight, degree=degree,
-                                  device=device, detrend=True, debug=debug)
+        if window is None:
+            # Global polynomial fit (Pattern D: three-phase)
+            detrended = phase.trend2d(transform, weight=weight, degree=degree,
+                                      device=device, detrend=True, debug=debug)
+        else:
+            # Local windowed fit with 4-grid overlap averaging
+            detrended = phase.trend2d_window(transform, weight=weight, degree=degree,
+                                              window=window, device=device,
+                                              detrend=True, debug=debug)
 
         # Preserve non-spatial variables (e.g. BPR) that may be dropped by arithmetic
         detrended = Batches._preserve_nonspatial(phase, detrended)
 
         # Rebuild Batches preserving all original elements except first
-        elements = [detrended] + list(self[1:])
-        return Batches(elements)
-
-    def detrend2d_chunk(self, transform, degree=1, overlap=None,
-                         device='auto', debug=False):
-        """
-        Windowed detrend2d using overlapping-tile local polynomial fitting.
-
-        Fits independent local polynomials per overlapping tile. Each tile sees
-        neighbors via overlap for well-conditioned fits at tile edges. Suitable
-        for large rasters where local fitting better captures spatially-varying
-        trends (e.g. tropospheric delay with local variations).
-
-        Parameters
-        ----------
-        transform : BatchCore
-            Coordinate transform from stack.transform().
-        degree : int
-            Polynomial degree (1=plane, 2=quadratic). Default 1.
-        overlap : float, int, or tuple
-            Overlap size. Float values are fractions of chunk size (e.g. 0.25 = 25%).
-            Int values are pixels. Tuple (overlap_y, overlap_x) allows different
-            overlap per axis. Default 0.25.
-        device : str
-            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
-        debug : bool
-            Print diagnostic information.
-
-        Returns
-        -------
-        Batches
-            Batches with [detrended_phase, weight] preserving original types.
-
-        Examples
-        --------
-        >>> intf, corr = stack.pairs(baseline).interferogram(wavelength=30).detrend2d_chunk(transform)
-        """
-        if len(self) < 1:
-            raise ValueError("detrend2d_chunk() requires Batches with at least 1 element: [phase]")
-
-        phase = self[0]
-        weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
-
-        if not isinstance(phase, (Batch, BatchComplex)):
-            raise TypeError(f"First element must be Batch or BatchComplex, got {type(phase).__name__}")
-
-        detrended = phase.trend2d_chunk(
-            transform, weight=weight, degree=degree, overlap=overlap,
-            device=device, detrend=True, debug=debug)
-
-        detrended = Batches._preserve_nonspatial(phase, detrended)
-
         elements = [detrended] + list(self[1:])
         return Batches(elements)
 

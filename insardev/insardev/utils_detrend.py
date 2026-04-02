@@ -526,6 +526,163 @@ def trend1d_array(data, dim_values, weight, intercept=True, slope=True, is_compl
 regression1d_array = trend1d_array
 
 
+
+def trend2d_window_array(phase_2d, variables, weight_2d, device, degree, win_y, win_x):
+    """Fit local polynomials on 4 half-overlapping grids, average predictions.
+
+    Uses fast numpy least-squares (no PyTorch overhead per window).
+
+    Parameters
+    ----------
+    phase_2d : (ny, nx) complex64 or float32
+    variables : list of (ny, nx) float32 — regressors (azi, rng, ele)
+    weight_2d : (ny, nx) float32 or None
+    device : ignored (numpy only)
+    degree : int — polynomial degree
+    win_y, win_x : int — window size in pixels
+
+    Returns
+    -------
+    trend : (ny, nx) same dtype — averaged trend from 4 grids
+    """
+    ny, nx = phase_2d.shape
+    is_complex = np.iscomplexobj(phase_2d)
+
+    if is_complex:
+        trend_sum = np.zeros((ny, nx), dtype=np.complex64)
+    else:
+        trend_sum = np.zeros((ny, nx), dtype=np.float32)
+    count = np.zeros((ny, nx), dtype=np.int32)
+
+    wy = min(win_y, ny)
+    wx = min(win_x, nx)
+    hy = wy // 2
+    hx = wx // 2
+
+    def _window_extents(size, win, half):
+        """Return list of (start, end) covering all pixels, extending last window to edge."""
+        extents = []
+        for s in range(0, size - win + 1, win):
+            extents.append((s, s + win))
+        if extents and extents[-1][1] < size:
+            extents[-1] = (extents[-1][0], size)
+        if not extents and size > 0:
+            extents.append((0, size))
+        # Assert no window smaller than half_window
+        for s, e in extents:
+            assert e - s >= half, f"Window [{s}:{e}] size {e-s} < half_window {half}"
+        return extents
+
+    # Use shifted grid if remaining space after offset ≥ half_window
+    y_offsets = [0] + ([hy] if ny - hy >= hy else [])
+    x_offsets = [0] + ([hx] if nx - hx >= hx else [])
+
+    full_half = (wy * wx) // 2
+    windows = []
+    for off_y in y_offsets:
+        for off_x in x_offsets:
+            y_extents = _window_extents(ny - off_y, wy, hy)
+            x_extents = _window_extents(nx - off_x, wx, hx)
+            for (y0, y1) in y_extents:
+                ys, ye = y0 + off_y, y1 + off_y
+                for (x0, x1) in x_extents:
+                    xs, xe = x0 + off_x, x1 + off_x
+                    if (ye - ys) * (xe - xs) >= full_half:
+                        windows.append((ys, ye, xs, xe))
+
+    for ys, ye, xs, xe in windows:
+        p_win = phase_2d[ys:ye, xs:xe]
+        v_wins = [v[ys:ye, xs:xe] for v in variables]
+        w_win = weight_2d[ys:ye, xs:xe] if weight_2d is not None else None
+
+        if is_complex:
+            valid = np.isfinite(p_win) & (p_win != 0)
+        else:
+            valid = np.isfinite(p_win)
+
+        n_valid = valid.sum()
+        min_pixels = (degree + 1) * (len(variables) + 1)
+        if n_valid < min_pixels:
+            continue
+
+        # Build design matrix on valid pixels
+        idx = np.where(valid.ravel())[0]
+        n = len(idx)
+        cols = [np.ones(n, dtype=np.float64)]
+        standardize = []
+        for v in v_wins:
+            vf = v.ravel()[idx].astype(np.float64)
+            mu, std = vf.mean(), max(vf.std(), 1e-10)
+            cols.append((vf - mu) / std)
+            standardize.append((mu, std))
+        if degree >= 2:
+            base = list(cols[1:])
+            for d in range(2, degree + 1):
+                for c in base:
+                    cols.append(c ** d)
+
+        A = np.column_stack(cols)
+        nf = A.shape[1]
+        if n < nf:
+            continue
+
+        w_sqrt = None
+        if w_win is not None:
+            w_sqrt = np.sqrt(np.clip(w_win.ravel()[idx].astype(np.float64), 1e-6, None))
+            Aw = A * w_sqrt[:, np.newaxis]
+        else:
+            Aw = A
+
+        AtA = Aw.T @ Aw + np.eye(nf) * 1e-8
+        win_h, win_w = ye - ys, xe - xs
+
+        # Evaluate on ALL pixels in window
+        all_cols = [np.ones(win_h * win_w, dtype=np.float64)]
+        for v, (mu, std) in zip(v_wins, standardize):
+            all_cols.append((v.ravel().astype(np.float64) - mu) / std)
+        if degree >= 2:
+            base = list(all_cols[1:])
+            for d in range(2, degree + 1):
+                for c in base:
+                    all_cols.append(c ** d)
+        A_all = np.column_stack(all_cols)
+
+        if is_complex:
+            p_flat = p_win.ravel()[idx].astype(np.complex128)
+            p_unit = p_flat / np.abs(p_flat)
+            b_real = p_unit.real
+            b_imag = p_unit.imag
+            if w_sqrt is not None:
+                b_real = b_real * w_sqrt
+                b_imag = b_imag * w_sqrt
+            c_real = np.linalg.solve(AtA, Aw.T @ b_real)
+            c_imag = np.linalg.solve(AtA, Aw.T @ b_imag)
+            pred = (A_all @ c_real + 1j * A_all @ c_imag).reshape(win_h, win_w)
+            pred_abs = np.abs(pred)
+            pred_abs[~(pred_abs > 0)] = 1
+            trend_win = (pred / pred_abs).astype(np.complex64)
+        else:
+            p_flat = p_win.ravel()[idx].astype(np.float64)
+            if w_sqrt is not None:
+                p_flat = p_flat * w_sqrt
+            coeffs = np.linalg.solve(AtA, Aw.T @ p_flat)
+            trend_win = (A_all @ coeffs).reshape(win_h, win_w).astype(np.float32)
+
+        trend_sum[ys:ye, xs:xe] += trend_win
+        count[ys:ye, xs:xe] += 1
+
+    assert count.min() >= 1, f"Uncovered pixels: min count={count.min()}"
+    assert count.max() <= 4, f"Over-covered pixels: max count={count.max()}"
+
+    mask = count > 0
+    if is_complex:
+        result = np.full((ny, nx), np.nan + 0j, dtype=np.complex64)
+    else:
+        result = np.full((ny, nx), np.nan, dtype=np.float32)
+    result[mask] = trend_sum[mask] / count[mask]
+    return result
+
+
 def trend2d_array(phase, weight, variables, device, degree=1):
     """
     Fit 2D polynomial trend using PyTorch least squares (pure GPU implementation).

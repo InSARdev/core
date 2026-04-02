@@ -258,186 +258,6 @@ def _apply_gaussian_2d_for_dask(block, weight_block=None, sigmas=None, threshold
                           device=device, pixel_sizes=pixel_sizes).astype(out_dtype)
 
 
-def _trend2d_chunk_kernel(phase_block, *args, var_count=0,
-                            degree=1, detrend=False, has_weight=False):
-    """
-    Per-tile trend2d kernel for da.map_overlap / da.blockwise.
-
-    Accepts 2D (y, x) or 3D (1, y, x) phase blocks.
-    Uses pure-numpy polynomial fitting (same as trend2d)
-    to avoid torch overhead per tile.
-
-    For map_overlap: all inputs are 2D (y, x).
-    For blockwise: phase is 3D (1, y, x), vars are 2D (y, x).
-    """
-    from .utils_detrend import _build_poly_features
-
-    is_3d = phase_block.ndim == 3
-    if is_3d:
-        # 3D (1, y, x) → extract 2D
-        phase_2d = phase_block[0]
-    else:
-        phase_2d = phase_block
-
-    # All-NaN tile: nothing to fit, return input as-is
-    if not np.any(np.isfinite(phase_2d)):
-        return phase_block
-
-    # Unpack positional args: var_count transform arrays, then optional weight.
-    # Vars may be 2D (blockwise 'yx') or 3D (map_overlap broadcast).
-    var_blocks = []
-    for i in range(var_count):
-        v = args[i]
-        var_blocks.append(v[0] if v.ndim == 3 else v)
-    if has_weight:
-        w = args[var_count]
-        weight_2d = w[0] if w.ndim == 3 else w
-    else:
-        weight_2d = None
-
-    ny, nx = phase_2d.shape
-    n_pixels = ny * nx
-    is_complex = np.iscomplexobj(phase_2d)
-
-    # Build fit mask and flatten variables
-    fit_mask = np.ones(n_pixels, dtype=bool)
-    var_flat_list = []
-    for v in var_blocks:
-        v_flat = v.ravel().astype(np.float64)
-        fit_mask &= np.isfinite(v_flat)
-        var_flat_list.append(np.nan_to_num(v_flat, nan=0.0))
-
-    n_valid_fit = fit_mask.sum()
-    if n_valid_fit < 10:
-        return phase_block
-
-    # Build polynomial features for standardization stats (only on fit-valid pixels)
-    X_poly_valid = _build_poly_features([v[fit_mask] for v in var_flat_list],
-                                         int(n_valid_fit), degree)
-    n_poly = X_poly_valid.shape[1]
-    n_feat = n_poly + 1  # +1 for bias
-    feature_mean = X_poly_valid.mean(axis=0)
-    feature_std = X_poly_valid.std(axis=0) + 1e-10
-    del X_poly_valid
-
-    # Phase + weight flattened
-    phase_flat = phase_2d.ravel()
-    if is_complex:
-        valid = np.isfinite(phase_flat) & (phase_flat != 0) & fit_mask
-    else:
-        valid = np.isfinite(phase_flat) & fit_mask
-    if weight_2d is not None:
-        w_flat = weight_2d.ravel()
-        valid &= np.isfinite(w_flat)
-    else:
-        w_flat = None
-
-    n_valid = valid.sum()
-    if n_valid < n_feat:
-        return phase_block
-
-    # Pixel batching: keep A_std_batch + WA under half dask chunk budget
-    from .utils_dask import get_dask_chunk_size_mb
-    _budget = get_dask_chunk_size_mb() * 1024 * 1024 // 2
-    batch_size = max(1024, _budget // max(1, 2 * n_feat * 8))
-    n_batches = (n_pixels + batch_size - 1) // batch_size
-
-    # Phase 1: Accumulate normal equations in batches
-    AtWA = np.zeros((n_feat, n_feat), dtype=np.float64)
-    cdtype = np.complex128 if is_complex else np.float64
-    AtWb = np.zeros(n_feat, dtype=cdtype)
-
-    for bi in range(n_batches):
-        s = bi * batch_size
-        e = min((bi + 1) * batch_size, n_pixels)
-
-        valid_b = valid[s:e]
-        n_v = int(valid_b.sum())
-        if n_v == 0:
-            continue
-
-        # Build A_std for batch
-        var_b = [v[s:e] for v in var_flat_list]
-        X_poly_b = _build_poly_features(var_b, e - s, degree)
-        A_std_b = np.concatenate([
-            (X_poly_b - feature_mean) / feature_std,
-            np.ones((e - s, 1), dtype=np.float64)
-        ], axis=1)
-
-        A_v = A_std_b[valid_b]
-        if w_flat is not None:
-            sqrt_w = np.sqrt(np.clip(w_flat[s:e][valid_b], 0, None))
-            WA_v = A_v * sqrt_w[:, None]
-        else:
-            WA_v = A_v
-
-        AtWA += WA_v.T @ WA_v
-
-        p_v = phase_flat[s:e][valid_b]
-        if is_complex:
-            p_abs = np.abs(p_v)
-            with np.errstate(invalid='ignore', divide='ignore'):
-                b_v = np.where(p_abs > 0, p_v / p_abs, 0 + 0j)
-            b_v = np.nan_to_num(b_v, nan=0.0)
-        else:
-            b_v = np.nan_to_num(p_v, nan=0.0).astype(np.float64)
-
-        if w_flat is not None:
-            Wb_v = sqrt_w * b_v
-        else:
-            Wb_v = b_v
-        AtWb += WA_v.T.astype(cdtype) @ Wb_v
-
-    # Solve
-    reg = 1e-10 * np.eye(n_feat, dtype=np.float64)
-    try:
-        coeffs = np.linalg.solve(AtWA.astype(cdtype) + reg, AtWb)
-    except np.linalg.LinAlgError:
-        return phase_block
-
-    # Phase 2: Apply trend in batches
-    if detrend:
-        out_2d = phase_2d.copy()
-    else:
-        out_2d = np.empty((ny, nx), dtype=np.complex64 if is_complex else np.float32)
-
-    for bi in range(n_batches):
-        s = bi * batch_size
-        e = min((bi + 1) * batch_size, n_pixels)
-        sy, sx = divmod(s, nx)
-        ey, ex = divmod(e, nx)
-
-        var_b = [v[s:e] for v in var_flat_list]
-        X_poly_b = _build_poly_features(var_b, e - s, degree)
-        A_std_b = np.concatenate([
-            (X_poly_b - feature_mean) / feature_std,
-            np.ones((e - s, 1), dtype=np.float64)
-        ], axis=1)
-
-        trend_b = A_std_b.astype(cdtype) @ coeffs
-        if is_complex:
-            trend_abs = np.abs(trend_b)
-            with np.errstate(invalid='ignore', divide='ignore'):
-                trend_b = np.where(trend_abs > 0, trend_b / trend_abs, 0)
-            trend_b = np.asarray(trend_b, dtype=np.complex64)
-            trend_b[~np.isfinite(trend_b)] = 0
-        else:
-            trend_b = np.asarray(trend_b, dtype=np.float32)
-
-        out_flat = out_2d.ravel()
-        if detrend:
-            if is_complex:
-                out_flat[s:e] = phase_flat[s:e] * np.conj(trend_b)
-            else:
-                out_flat[s:e] = phase_flat[s:e] - trend_b
-        else:
-            out_flat[s:e] = trend_b
-
-    if is_3d:
-        return out_2d[np.newaxis, ...]
-    return out_2d
-
-
 def _neighbors_kernel_2d_for_dask(data_chunk, window_y, window_x, half_y, half_x, device):
     """Count valid neighbors for 2D data.
 
@@ -1655,236 +1475,144 @@ class BatchCore(dict):
             return BatchComplex(result)
         return Batch(result)
 
-    def trend2d_chunk(self, transform: 'BatchCore', weight: 'BatchUnit | None' = None,
-                       degree: int = 1, overlap: 'float | int | tuple | None' = None,
-                       device: str = 'auto', detrend: bool = False,
-                       debug: bool = False) -> 'BatchCore':
+    def trend2d_window(self, transform: 'BatchCore', weight: 'BatchUnit | None' = None,
+                        degree: int = 1, window: 'int | tuple' = 250,
+                        device: str = 'auto', detrend: bool = False,
+                        debug: bool = False) -> 'BatchCore':
         """
-        Compute 2D polynomial trend using overlapping-tile local fitting.
+        Local 2D polynomial trend using 4 half-overlapping window grids.
 
-        Fits independent local polynomials per overlapping tile using
-        da.map_overlap. Each tile sees neighbors via overlap for well-conditioned
-        fits at tile edges. No blending needed — dask trims overlap margins.
+        Each pixel's trend is the average of predictions from 4 shifted
+        grids of non-overlapping windows (half-step offset). This is
+        extent-independent — results depend only on the window size.
+
+        Uses da.map_overlap: dask provides half-window border, kernel
+        fits 4 grids internally, returns extended result, dask trims.
 
         Parameters
         ----------
         transform : BatchCore
-            Coordinate transform from stack.transform() containing 'azi' and 'rng'.
+            Coordinate transform containing 'azi', 'rng', 'ele'.
         weight : BatchUnit or None
-            Optional weight for the fitting (typically correlation).
+            Optional weight for fitting (typically correlation).
         degree : int
             Polynomial degree (1=plane, 2=quadratic). Default 1.
-        overlap : float, int, or tuple
-            Overlap size. Float values are fractions of chunk size (e.g. 0.25 = 25%).
-            Int values are pixels. Tuple (overlap_y, overlap_x) allows different
-            overlap per axis. Default 0.25.
+        window : int or tuple
+            Window size in pixels. int = square. tuple = (win_y, win_x).
         device : str
-            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
+            PyTorch device.
         detrend : bool
-            If True, return detrended data instead of the trend surface.
+            If True, return detrended data instead of trend surface.
         debug : bool
             Print diagnostic information.
 
         Returns
         -------
         Batch or BatchComplex
-            Trend surface or detrended data (same type as input).
-
-        Examples
-        --------
-        >>> # Local polynomial trend removal
-        >>> trend = phase.trend2d_chunk(stack.transform(), weight=corr)
-        >>> # Detrend in one step (fused, memory-efficient)
-        >>> detrended = intf.trend2d_chunk(transform, weight=corr, detrend=True)
+            Trend surface or detrended data.
         """
-        import dask
         import dask.array as da
         import numpy as np
         import xarray as xr
         from .Batch import Batch, BatchComplex
+        from . import utils_detrend
 
         phase = self
+        BatchCore._require_lazy(phase, 'trend2d_window')
 
-        # Validate lazy data
-        BatchCore._require_lazy(phase, 'trend2d_chunk')
-
-        # Auto-detect device
         resolved = BatchCore._get_torch_device(device, debug=debug)
-        device = resolved.type
-
-        if debug:
-            print(f"DEBUG: trend2d_chunk using device={device}")
 
         is_complex = isinstance(phase, BatchComplex)
 
-        if transform is None:
-            raise ValueError("transform is required for trend2d_chunk.")
-
-        # Unify transform keys to phase
-        transform = transform.sel(phase)
-
-        # Parse overlap into (ov_y, ov_x) — each is float or int
-        if overlap is None:
-            ov_y, ov_x = 0, 0
-        elif isinstance(overlap, tuple):
-            ov_y, ov_x = overlap
+        if isinstance(window, int):
+            win_y, win_x = window, window
         else:
-            ov_y, ov_x = overlap, overlap
+            win_y, win_x = window
+
+        half_y = win_y // 2
+        half_x = win_x // 2
+
+        if transform is None:
+            raise ValueError("transform is required for trend2d_window.")
+        transform = transform.sel(phase)
 
         result = {}
         for key in phase.keys():
             ds = phase[key]
-
             pols = [v for v in ds.data_vars
                    if 'y' in ds[v].dims and 'x' in ds[v].dims]
-
             trans_ds = transform[key]
             var_names = [v for v in trans_ds.data_vars
                         if 'y' in trans_ds[v].dims and 'x' in trans_ds[v].dims]
-
-            # Check that transform shape matches phase
-            phase_da_ref = ds[pols[0]]
-            phase_shape = phase_da_ref.shape[-2:]
-
-            trans_da_ref = trans_ds[var_names[0]]
-            trans_shape = trans_da_ref.shape
-            if phase_shape != trans_shape:
-                phase_dy = float(phase_da_ref.y.diff('y')[0])
-                phase_dx = float(phase_da_ref.x.diff('x')[0])
-                trans_dy = float(trans_da_ref.y.diff('y')[0])
-                trans_dx = float(trans_da_ref.x.diff('x')[0])
-                raise ValueError(
-                    f"Transform shape {trans_shape} does not match phase shape {phase_shape}. "
-                    f"Phase spacing: dy={phase_dy:.1f}, dx={phase_dx:.1f}. "
-                    f"Transform spacing: dy={trans_dy:.1f}, dx={trans_dx:.1f}. "
-                    f"Use stack.transform()[['azi','rng','ele']].downsample(N) to match."
-                )
-
-            if weight is not None:
-                weight_ds = weight[key]
-                weight_pols = [v for v in weight_ds.data_vars
-                              if 'y' in weight_ds[v].dims and 'x' in weight_ds[v].dims]
-                if weight_pols:
-                    weight_da_ref = weight_ds[weight_pols[0]]
-                    weight_shape = weight_da_ref.shape[-2:]
-                    if phase_shape != weight_shape:
-                        raise ValueError(
-                            f"Weight shape {weight_shape} does not match phase shape {phase_shape}."
-                        )
-
-            if debug:
-                print(f"DEBUG {key}: variables={var_names}")
 
             result_ds = {}
             for pol in pols:
                 phase_da = ds[pol]
                 weight_da = weight[key][pol] if weight is not None else None
-
                 phase_dask = phase_da.data
-                has_weight = weight_da is not None
                 out_dtype = phase_da.dtype if is_complex else np.float32
 
-                # Prepare transform vars (2D) — rechunk to match phase spatial chunks
+                # Rechunk transform to match phase spatial chunks
                 phase_spatial_chunks = phase_dask.chunks[-2:]
                 var_dask_list = []
                 for v in var_names:
-                    var_dask = trans_ds[v].data
-                    if var_dask.chunks != phase_spatial_chunks:
-                        var_dask = var_dask.rechunk(phase_spatial_chunks)
-                    var_dask_list.append(var_dask)
-                n_vars = len(var_dask_list)
+                    vd = trans_ds[v].data
+                    if vd.chunks != phase_spatial_chunks:
+                        vd = vd.rechunk(phase_spatial_chunks)
+                    var_dask_list.append(vd)
 
-                # Prepare weight — rechunk to match phase if needed
+                has_weight = weight_da is not None
                 if has_weight:
                     weight_dask = weight_da.data
                     if weight_dask.chunks != phase_dask.chunks:
                         weight_dask = weight_dask.rechunk(phase_dask.chunks)
 
-                # Compute overlap depth from chunk sizes
-                cy0 = phase_dask.chunks[-2][0]
-                cx0 = phase_dask.chunks[-1][0]
-                depth_y = int(ov_y * cy0) if isinstance(ov_y, float) else int(ov_y)
-                depth_x = int(ov_x * cx0) if isinstance(ov_x, float) else int(ov_x)
-                if overlap is not None and overlap != 0 and overlap != (0, 0):
-                    depth_y = max(1, depth_y)
-                    depth_x = max(1, depth_x)
-
-                if debug:
-                    print(f"DEBUG {key}/{pol}: depth=({depth_y},{depth_x}), "
-                          f"chunks={phase_dask.chunksize}")
-
-                # Build kernel function for blockwise/map_overlap
-                def _make_kernel(nv, deg, det, hw):
+                # Kernel: per-pair, receives (1, cy+win, cx+win) extended tile
+                def _make_kernel(_win_y, _win_x, _degree, _dev, _nv, _hw, _det, _is_complex):
                     def kernel(phase_block, *args):
-                        var_arrays = args[:nv]
-                        weight_block = args[nv] if hw else None
-                        # Loop over pairs in dim 0
+                        var_arrays = [np.asarray(a) for a in args[:_nv]]
+                        w_block = np.asarray(args[_nv]) if _hw else None
+                        n_pairs = phase_block.shape[0]
                         results = []
-                        for pidx in range(phase_block.shape[0]):
-                            p = phase_block[pidx:pidx+1]
-                            kargs = list(var_arrays)
-                            if hw:
-                                kargs.append(weight_block[pidx:pidx+1])
-                            r = _trend2d_chunk_kernel(
-                                p, *kargs,
-                                var_count=nv, degree=deg,
-                                detrend=det, has_weight=hw)
-                            results.append(r)
-                        return np.concatenate(results, axis=0)
+                        for p in range(n_pairs):
+                            trend_p = utils_detrend.trend2d_window_array(
+                                phase_block[p], var_arrays,
+                                w_block[p] if w_block is not None else None,
+                                _dev, _degree, _win_y, _win_x)
+                            if _det:
+                                if _is_complex:
+                                    np.conj(trend_p, out=trend_p)
+                                    results.append((phase_block[p] * trend_p)[np.newaxis])
+                                else:
+                                    results.append((phase_block[p] - trend_p)[np.newaxis])
+                            else:
+                                results.append(trend_p[np.newaxis])
+                        return np.concatenate(results, axis=0).astype(out_dtype)
                     return kernel
-                kernel = _make_kernel(n_vars, degree, detrend, has_weight)
 
-                if depth_y > 0 or depth_x > 0:
-                    # map_overlap path — needs all inputs to have same spatial chunks
-                    depth_3d = {0: 0, 1: depth_y, 2: depth_x}
-                    depth_2d = {0: depth_y, 1: depth_x}
+                kernel = _make_kernel(win_y, win_x, degree, resolved,
+                                       len(var_dask_list), has_weight,
+                                       detrend, is_complex)
 
-                    # Wrap kernel for map_overlap: unpack positional args
-                    def _make_overlap_fn(kern, nv, hw):
-                        def fn(phase_block, *args):
-                            # map_overlap passes blocks with overlap margins
-                            return kern(phase_block, *args)
-                        return fn
-                    overlap_fn = _make_overlap_fn(kernel, n_vars, has_weight)
+                # Build args for map_overlap
+                depth_3d = {0: 0, 1: half_y, 2: half_x}
+                depth_2d = {0: half_y, 1: half_x}
 
-                    # Build args list for map_overlap
-                    overlap_args = []
-                    for v_dask in var_dask_list:
-                        overlap_args.append(v_dask)
-                    if has_weight:
-                        overlap_args.append(weight_dask)
+                overlap_args = list(var_dask_list)
+                if has_weight:
+                    overlap_args.append(weight_dask)
 
-                    result_dask = da.map_overlap(
-                        overlap_fn,
-                        phase_dask, *overlap_args,
-                        depth=[depth_3d] + [depth_2d] * n_vars +
-                              ([depth_3d] if has_weight else []),
-                        boundary='none',
-                        dtype=out_dtype,
-                    )
-                else:
-                    # blockwise path — no overlap, same output chunks as input
-                    blockwise_args = [phase_dask, 'pyx']
-                    for v_dask in var_dask_list:
-                        blockwise_args.extend([v_dask, 'yx'])
-                    if has_weight:
-                        blockwise_args.extend([weight_dask, 'pyx'])
-
-                    result_dask = da.blockwise(
-                        kernel, 'pyx',
-                        *blockwise_args,
-                        concatenate=True,
-                        dtype=out_dtype,
-                        meta=np.empty((0, 0, 0), dtype=out_dtype),
-                    )
-
-                trend_da = xr.DataArray(
-                    result_dask,
-                    dims=phase_da.dims,
-                    coords=phase_da.coords
+                result_dask = da.map_overlap(
+                    kernel,
+                    phase_dask, *overlap_args,
+                    depth=[depth_3d] + [depth_2d] * len(var_dask_list) +
+                          ([depth_3d] if has_weight else []),
+                    boundary='none',
+                    dtype=out_dtype,
                 )
 
-                result_ds[pol] = trend_da
+                result_ds[pol] = xr.DataArray(
+                    result_dask, dims=phase_da.dims, coords=phase_da.coords)
 
             result[key] = xr.Dataset(result_ds, attrs=ds.attrs)
 
@@ -1892,13 +1620,21 @@ class BatchCore(dict):
             return BatchComplex(result)
         return Batch(result)
 
-    @classmethod
-    def trend2d_dataset(cls, phase, weight=None, transform=None, degree=1, device='auto', debug=False):
-        """
-        Compute 2D trend from phase Dataset using PyTorch (GPU-accelerated).
+    def trend2d_chunk(self, *args, **kwargs):
+        """Removed. Use trend2d_window() for local windowed detrending."""
+        raise NotImplementedError(
+            "trend2d_chunk has been removed. Use trend2d_window() instead, "
+            "which uses 4 half-overlapping window grids with averaging."
+        )
 
-        Convenience wrapper around trend2d() for working with merged datasets
-        instead of per-burst batches.
+    @classmethod
+    def trend2d_dataset(cls, phase, weight=None, transform=None, degree=1,
+                         window=None, device='auto', debug=False):
+        """
+        Compute 2D trend from phase Dataset.
+
+        Convenience wrapper around trend2d()/trend2d_window() for working
+        with merged datasets instead of per-burst batches.
 
         Parameters
         ----------
@@ -1910,6 +1646,9 @@ class BatchCore(dict):
             Transform dataset with variables to use as regressors.
         degree : int, optional
             Polynomial degree (default 1).
+        window : int, tuple, or None
+            Window size in pixels. None = global fit. int = square window.
+            tuple (win_y, win_x) = rectangular window.
         device : str, optional
             PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
         debug : bool, optional
@@ -1923,6 +1662,7 @@ class BatchCore(dict):
         Examples
         --------
         >>> trend = BatchCore.trend2d_dataset(phase_ds, corr_ds, transform_ds, degree=1)
+        >>> trend = BatchCore.trend2d_dataset(phase_ds, corr_ds, transform_ds, window=250)
         """
         import xarray as xr
         from .Batch import Batch, BatchUnit
@@ -1934,41 +1674,23 @@ class BatchCore(dict):
         if transform is not None and not isinstance(transform, xr.Dataset):
             raise TypeError(f"transform must be xr.Dataset, got {type(transform).__name__}")
 
-        # Rechunk to single spatial chunk if needed
-        needs_rechunk = False
-        for var_name in phase.data_vars:
-            var_data = phase[var_name]
-            if hasattr(var_data.data, 'chunks'):
-                chunks = var_data.data.chunks
-                y_chunks = chunks[-2] if len(chunks) >= 2 else chunks[0]
-                x_chunks = chunks[-1]
-                if len(y_chunks) > 1 or len(x_chunks) > 1:
-                    print(f"NOTE: trend2d_dataset() rechunking to single spatial chunk "
-                          f"(from y: {len(y_chunks)} chunks, x: {len(x_chunks)} chunks)")
-                    needs_rechunk = True
-                break
-
-        if needs_rechunk:
-            phase = phase.chunk({'y': -1, 'x': -1})
-            if weight is not None:
-                weight = weight.chunk({'y': -1, 'x': -1})
-            if transform is not None:
-                transform = transform.chunk({'y': -1, 'x': -1})
-
-        # Wrap datasets in single-key Batches for trend2d()
+        # Wrap datasets in single-key Batches for trend2d()/trend2d_window()
+        # No rechunk needed: trend2d() uses three-phase Pattern D (handles arbitrary chunks),
+        # trend2d_window() uses da.map_overlap (also handles arbitrary chunks).
         dummy_key = '__dataset__'
         phase_batch = Batch({dummy_key: phase})
         weight_batch = BatchUnit({dummy_key: weight}) if weight is not None else None
         transform_batch = Batch({dummy_key: transform}) if transform is not None else None
 
-        # Call trend2d on the batch
-        trend_batch = phase_batch.trend2d(
-            transform=transform_batch,
-            weight=weight_batch,
-            degree=degree,
-            device=device,
-            debug=debug
-        )
+        # Route to global or windowed fit
+        if window is None:
+            trend_batch = phase_batch.trend2d(
+                transform=transform_batch, weight=weight_batch,
+                degree=degree, device=device, debug=debug)
+        else:
+            trend_batch = phase_batch.trend2d_window(
+                transform=transform_batch, weight=weight_batch,
+                degree=degree, window=window, device=device, debug=debug)
 
         output = trend_batch[dummy_key]
         output.attrs = phase.attrs
@@ -3450,7 +3172,7 @@ class BatchCore(dict):
 
         Examples
         --------
-        >>> data = Stack().snapshot('detrend2d_chunk').chunk1d('128MiB')
+        >>> data = Stack().snapshot('detrend').chunk1d('128MiB')
         >>> displacement = data.detrend1d()
         """
         import dask
