@@ -1927,3 +1927,17 @@ def detect_discontinuity_hough_focal(phase, grad_threshold=2.0, mask_width=3, de
     }
 
     return mask, info
+
+
+def _warmup_numba_cache():
+    """Compile numba kernels once in the main process so dask workers load from cache."""
+    _l = np.array([0, 1, 1], dtype=np.int32)
+    _p = np.array([0.0, 0.5, 1.0], dtype=np.float32)
+    _u = np.array([0.0, 0.5, 1.0], dtype=np.float32)
+    _adj = np.array([0.0, 0.0], dtype=np.float64)
+    _accum_sincos_count(_l, _p, _u, 2)
+    _apply_adjustment(_u, _l, _adj)
+
+_warmup_numba_cache()
+
+

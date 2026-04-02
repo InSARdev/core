@@ -8,7 +8,7 @@
 # See the LICENSE file in the insardev directory for license terms.
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
-__version__ = '2026.3.21.post3'
+__version__ = '2026.4.2'
 
 # processing functions
 from .Stack import Stack
@@ -29,5 +29,8 @@ except ImportError:
 
 try:
     import insardev_io
+    import multiprocessing
+    if multiprocessing.current_process().name == 'MainProcess':
+        print('NOTE: insardev_io extension loaded for zarr I/O.')
 except ImportError:
     pass

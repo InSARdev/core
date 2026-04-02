@@ -43,9 +43,27 @@ def _round_half_away_numba(x):
     return np.sign(x) * np.floor(np.abs(x) + 0.5)
 
 
+def _warmup_numba_cache():
+    """Compile numba kernels once in the main process so dask workers load from cache."""
+    _c = np.zeros((3, 1), dtype=np.complex64)
+    _w = np.ones((1, 1), dtype=np.float32)
+    _d = np.array([-1.0, 0.0, 1.0])
+    _trend1d_numba_kernel(_c, _w, _d, True, True, True, False)
+    _trend1d_pairs_numba_kernel(
+        _c, 1, 2, 3,
+        np.array([0, 1, 2], dtype=np.int64),
+        np.array([1.0, -1.0, 0.5]),
+        np.array([1.0, -1.0, 1.0]),
+        np.array([0, 2, 3], dtype=np.int64),
+        np.array([0, 0, 1], dtype=np.int64),
+        np.array([1, 1, 0], dtype=np.int64),
+        0, True,
+    )
+
+
 @nb.njit(cache=True)
 def _trend1d_pairs_numba_kernel(
-    angles_flat,       # (n_pairs, n_pixels) float64
+    data_flat,         # (n_pairs, n_pixels) complex128 or float64
     n_pixels,
     n_dates,
     n_pairs,
@@ -60,44 +78,52 @@ def _trend1d_pairs_numba_kernel(
 ):
     """Per-pixel IRLS fitting of all dates, with iterative refinement.
 
-    Linear model (intercept + slope) solved analytically via 2×2 normal
-    equations. Uses sequential pixel loop (parallel=False) for thread-safety
-    when called from Dask workers.
+    Accepts complex or real input directly — extracts angles per-pixel
+    inside the loop to avoid full-size intermediate arrays.
 
     Returns
     -------
-    model_angles : (n_dates, n_pixels) float64
-        Accumulated intercept angles per date.
-    kept : (n_pairs, n_pixels) bool
-        True for pairs kept by threshold filtering.
-    date_cstd : (n_dates, n_pixels) float64
-        Per-date circular std of fit residuals (first filter iteration).
+    trend : (n_pairs, n_pixels) complex64
+        Per-pair trend: exp(1j * (model[ref] - model[rep])) for complex,
+        model[ref] - model[rep] for real. NaN where input is invalid or overfitting.
     """
     model_angles = np.zeros((n_dates, n_pixels), dtype=np.float64)
-    date_cstd = np.full((n_dates, n_pixels), np.inf, dtype=np.float64)
-    kept = np.ones((n_pairs, n_pixels), dtype=nb.boolean)
+    trend = np.full((n_pairs, n_pixels), np.nan + 0j, dtype=np.complex64)
+
+    # Per-pixel working array for angles (reused across pixels)
+    pixel_angles = np.empty(n_pairs, dtype=np.float64)
 
     for px in range(n_pixels):
+        # Extract angles in float64 precision (complex64 float32 causes cstd blow-up)
+        if use_jumps:
+            for p in range(n_pairs):
+                c = data_flat[p, px]
+                re = np.float64(c.real)
+                im = np.float64(c.imag)
+                if re == 0.0 and im == 0.0:
+                    pixel_angles[p] = np.nan
+                else:
+                    pixel_angles[p] = np.arctan2(im, re)
+        else:
+            for p in range(n_pairs):
+                pixel_angles[p] = data_flat[p, px].real
+
         corrected = np.empty(n_pairs, dtype=np.float64)
         local_models = np.zeros(n_dates, dtype=np.float64)
+
+        cstd_sum = 0.0
+        cstd_count = 0
 
         for iteration in range(1 + max_refine):
             is_filter = (iteration % 3 == 0)
 
-            # Reset kept mask at each filter iteration so only the
-            # last filter iteration's rejections are used (matching
-            # the old PyTorch behavior where date_kept is overwritten).
-            if is_filter:
-                for p in range(n_pairs):
-                    kept[p, px] = True
-
             # Correct data using accumulated models
             if iteration == 0:
                 for p in range(n_pairs):
-                    corrected[p] = angles_flat[p, px]
+                    corrected[p] = pixel_angles[p]
             else:
                 for p in range(n_pairs):
-                    corrected[p] = angles_flat[p, px] \
+                    corrected[p] = pixel_angles[p] \
                                    - local_models[pair_ref_didx[p]] \
                                    + local_models[pair_rep_didx[p]]
 
@@ -192,6 +218,7 @@ def _trend1d_pairs_numba_kernel(
                     # Update jumps and weights
                     if use_jumps:
                         converged = True
+                        max_dw = 0.0
                         for k in range(n_d):
                             if not valid[k]:
                                 continue
@@ -204,11 +231,15 @@ def _trend1d_pairs_numba_kernel(
 
                             y = phases[k] + jumps[k] * (2 * np.pi)
                             res = y - fit_val
-                            res = np.arctan2(np.sin(res), np.cos(res))
+                            res = res - (2.0 * np.pi) * _round_half_away_numba(res / (2.0 * np.pi))
 
-                            w_irls[k] = 1.0 / (abs(res) + 0.1)
+                            new_w = 1.0 / (abs(res) + 0.1)
+                            dw = abs(new_w - w_irls[k])
+                            if dw > max_dw:
+                                max_dw = dw
+                            w_irls[k] = new_w
 
-                        if converged:
+                        if converged or max_dw < 1e-3:
                             break
                     else:
                         for k in range(n_d):
@@ -218,7 +249,7 @@ def _trend1d_pairs_numba_kernel(
                             res = phases[k] - fit_val
                             w_irls[k] = 1.0 / (abs(res) + 0.1)
 
-                # Compute cstd for overfitting check (first filter iteration only)
+                # Compute cstd and accumulate for overfitting check (iteration 0)
                 if iteration == 0:
                     cos_s = 0.0
                     sin_s = 0.0
@@ -227,24 +258,16 @@ def _trend1d_pairs_numba_kernel(
                         if not valid[k]:
                             continue
                         y = phases[k] + jumps[k] * (2 * np.pi)
-                        fit_val = c0 + b * t_vals[k]
-                        res = np.arctan2(np.sin(y - fit_val),
-                                         np.cos(y - fit_val))
-                        cos_s += np.cos(res)
-                        sin_s += np.sin(res)
+                        raw_res = y - (c0 + b * t_vals[k])
+                        cos_s += np.cos(raw_res)
+                        sin_s += np.sin(raw_res)
                         nv += 1
                     if nv >= 2:
                         R = np.sqrt((cos_s / nv)**2 + (sin_s / nv)**2)
                         if R > 1 - 1e-10:
                             R = 1 - 1e-10
-                        date_cstd[d, px] = np.sqrt(-2 * np.log(R))
-
-                # Update kept mask on filter iterations
-                if is_filter:
-                    for k in range(n_d):
-                        pidx = date_pair_flat[d_start + k]
-                        if w_irls[k] == 0:
-                            kept[pidx, px] = False
+                        cstd_sum += np.sqrt(-2 * np.log(R))
+                        cstd_count += 1
 
                 # Accumulate model
                 if iteration == 0:
@@ -255,79 +278,109 @@ def _trend1d_pairs_numba_kernel(
         for d in range(n_dates):
             model_angles[d, px] = local_models[d]
 
-    return model_angles, kept, date_cstd
+        # Overfitting check: avg cstd across dates must be < π/2
+        if cstd_count > 0 and (cstd_sum / cstd_count) > (np.pi / 2):
+            continue  # leave trend as NaN for this pixel
+
+        # Reconstruct per-pair trend for this pixel
+        for p in range(n_pairs):
+            if np.isfinite(pixel_angles[p]):
+                diff = local_models[pair_ref_didx[p]] - local_models[pair_rep_didx[p]]
+                if use_jumps:
+                    trend[p, px] = np.complex64(np.exp(1j * diff))
+                else:
+                    trend[p, px] = np.complex64(diff)
+
+    return trend
 
 
 @nb.njit(cache=True)
 def _trend1d_numba_kernel(
-    angles_flat,    # (n_samples, n_pixels) float64  — phase angles or unwrapped values
-    w_flat,         # (n_samples, n_pixels) float64  — correlation weights (or ones)
+    data_flat,      # (n_samples, n_pixels) complex128 or float64
+    w_flat,         # (n_samples, n_pixels) float32 or None-like
     dim_norm,       # (n_samples,) float64  — normalized dim values
     intercept,      # bool — include intercept in output
     slope,          # bool — include slope in output
     use_jumps,      # bool — True for wrapped (complex) phase, False for unwrapped (real)
+    has_weight,     # bool — True if w_flat contains real weights, False if unit weights
 ):
     """Per-pixel IRLS linear fitting for detrend1d.
+
+    Accepts complex or real input directly — extracts angles per-pixel
+    inside the loop to avoid full-size intermediate arrays.
 
     Analytical 2x2 weighted least squares solve per pixel:
     y = a + b*t, 5 accumulators (sw, swt, swt2, swy, swty), Cramer's rule.
 
-    When use_jumps=True: applies circular mean initialization and 2π jump
-    correction for wrapped phase data. When False: standard linear fit.
-
-    Returns fitted values (n_samples, n_pixels).
+    Returns
+    -------
+    result : (n_samples, n_pixels) complex64 if use_jumps, else float32.
+        Complex: unit-magnitude trend exp(1j*fit). Real: fitted values.
     """
-    n_samples, n_pixels = angles_flat.shape
-    fit_flat = np.full((n_samples, n_pixels), np.nan, dtype=np.float64)
+    n_samples, n_pixels = data_flat.shape
+    result = np.full((n_samples, n_pixels), np.nan + 0j, dtype=np.complex64)
+
+    # Per-pixel working arrays (reused across pixels)
+    angles = np.empty(n_samples, dtype=np.float64)
+    jumps = np.empty(n_samples, dtype=np.float64)
+    w_irls = np.empty(n_samples, dtype=np.float64)
+    valid = np.empty(n_samples, dtype=nb.boolean)
 
     for px in range(n_pixels):
-        # Count valid samples
+        # Extract angles per-pixel from complex input, or use values directly
         n_valid = 0
-        for s in range(n_samples):
-            val = angles_flat[s, px]
-            if use_jumps:
-                if np.isfinite(val) and val != 0.0:
-                    n_valid += 1
-            else:
+        if use_jumps:
+            for s in range(n_samples):
+                c = data_flat[s, px]
+                re = np.float64(c.real)
+                im = np.float64(c.imag)
+                if re == 0.0 and im == 0.0:
+                    angles[s] = np.nan
+                    valid[s] = False
+                else:
+                    a = np.arctan2(im, re)
+                    if np.isfinite(a):
+                        angles[s] = a
+                        valid[s] = True
+                        n_valid += 1
+                    else:
+                        angles[s] = np.nan
+                        valid[s] = False
+        else:
+            for s in range(n_samples):
+                val = data_flat[s, px].real  # real input stored as complex with imag=0
                 if np.isfinite(val):
+                    angles[s] = val
+                    valid[s] = True
                     n_valid += 1
+                else:
+                    angles[s] = np.nan
+                    valid[s] = False
+
         if n_valid < 3:
             continue
 
         # Initialize jumps and IRLS weights
-        jumps = np.empty(n_samples, dtype=np.float64)
-        w_irls = np.empty(n_samples, dtype=np.float64)
-        valid = np.empty(n_samples, dtype=nb.boolean)
-
         if use_jumps:
-            # Circular mean for jump initialization (wrapped phase only)
             sin_sum = 0.0
             cos_sum = 0.0
             for s in range(n_samples):
-                val = angles_flat[s, px]
-                if np.isfinite(val) and val != 0.0:
-                    sin_sum += np.sin(val)
-                    cos_sum += np.cos(val)
+                if valid[s]:
+                    sin_sum += np.sin(angles[s])
+                    cos_sum += np.cos(angles[s])
             circ_mean = np.arctan2(sin_sum, cos_sum)
 
             for s in range(n_samples):
-                val = angles_flat[s, px]
-                v = np.isfinite(val) and val != 0.0
-                valid[s] = v
-                if v:
-                    jumps[s] = _round_half_away_numba((circ_mean - val) / (2 * np.pi))
-                    w_irls[s] = w_flat[s, px]
+                if valid[s]:
+                    jumps[s] = _round_half_away_numba((circ_mean - angles[s]) / (2 * np.pi))
+                    w_irls[s] = np.sqrt(w_flat[s, px]) if has_weight else 1.0
                 else:
                     jumps[s] = 0.0
                     w_irls[s] = 0.0
         else:
-            # No jump correction for unwrapped phase (0.0 is valid)
             for s in range(n_samples):
-                val = angles_flat[s, px]
-                v = np.isfinite(val)
-                valid[s] = v
                 jumps[s] = 0.0
-                w_irls[s] = w_flat[s, px] if v else 0.0
+                w_irls[s] = (np.sqrt(w_flat[s, px]) if has_weight else 1.0) if valid[s] else 0.0
 
         # IRLS loop with analytical 2x2 solve
         epsilon = 0.1
@@ -335,13 +388,12 @@ def _trend1d_numba_kernel(
         c1 = 0.0
 
         for irls_iter in range(10):
-            # Accumulate weighted normal equations
             sw = 0.0; swt = 0.0; swt2 = 0.0
             swy = 0.0; swty = 0.0
             for s in range(n_samples):
                 if not valid[s]:
                     continue
-                y = angles_flat[s, px] + jumps[s] * (2 * np.pi)
+                y = angles[s] + jumps[s] * (2 * np.pi)
                 w = w_irls[s]
                 t = dim_norm[s]
                 sw += w
@@ -354,8 +406,8 @@ def _trend1d_numba_kernel(
             c1 = (sw * swty - swt * swy) / det
 
             if use_jumps:
-                # Evaluate fit, update jumps and weights (wrapped phase)
                 converged = True
+                max_dw = 0.0
                 for s in range(n_samples):
                     if not valid[s]:
                         continue
@@ -363,49 +415,57 @@ def _trend1d_numba_kernel(
                     fit_val = c0 + c1 * t
 
                     new_jump = _round_half_away_numba(
-                        (fit_val - angles_flat[s, px]) / (2 * np.pi))
+                        (fit_val - angles[s]) / (2 * np.pi))
                     if new_jump != jumps[s]:
                         converged = False
                         jumps[s] = new_jump
 
-                    y = angles_flat[s, px] + jumps[s] * (2 * np.pi)
+                    y = angles[s] + jumps[s] * (2 * np.pi)
                     res = y - fit_val
-                    res = np.arctan2(np.sin(res), np.cos(res))
-                    w_irls[s] = w_flat[s, px] / (abs(res) + epsilon)
+                    res = res - (2.0 * np.pi) * _round_half_away_numba(res / (2.0 * np.pi))
+                    base_w = np.sqrt(w_flat[s, px]) if has_weight else 1.0
+                    new_w = base_w / (abs(res) + epsilon)
+                    dw = abs(new_w - w_irls[s])
+                    if dw > max_dw:
+                        max_dw = dw
+                    w_irls[s] = new_w
 
-                if converged:
+                if converged or max_dw < 1e-3:
                     break
             else:
-                # IRLS weight update for unwrapped phase (no jumps, no wrapping)
                 for s in range(n_samples):
                     if not valid[s]:
                         continue
                     t = dim_norm[s]
-                    res = angles_flat[s, px] - (c0 + c1 * t)
-                    w_irls[s] = w_flat[s, px] / (abs(res) + epsilon)
+                    res = angles[s] - (c0 + c1 * t)
+                    base_w = np.sqrt(w_flat[s, px]) if has_weight else 1.0
+                    w_irls[s] = base_w / (abs(res) + epsilon)
 
-        # Compute final fit values with intercept/slope selection
+        # Write final values directly as output type
         for s in range(n_samples):
             t = dim_norm[s]
             if not intercept and not slope:
-                fit_flat[s, px] = 0.0
+                fit_val = 0.0
             elif not intercept:
-                fit_flat[s, px] = c1 * t
+                fit_val = c1 * t
             elif not slope:
-                fit_flat[s, px] = c0
+                fit_val = c0
             else:
-                fit_flat[s, px] = c0 + c1 * t
+                fit_val = c0 + c1 * t
+            if use_jumps:
+                result[s, px] = np.complex64(np.exp(1j * fit_val))
+            else:
+                result[s, px] = np.complex64(fit_val)
 
-    return fit_flat
+    return result
 
 
 def trend1d_array(data, dim_values, weight, intercept=True, slope=True, is_complex=True):
     """
     Fit linear trend along first dimension at each (y, x) pixel.
 
-    Uses numba per-pixel IRLS with analytical 2x2 solve and 2π jump correction
-    for complex phase data. For real (unwrapped) data, skips angle extraction
-    and returns fitted values directly.
+    Passes data directly to numba kernel — no intermediate float64 arrays.
+    Complex: kernel extracts angles per-pixel. Real: passes values through.
 
     Parameters
     ----------
@@ -429,28 +489,23 @@ def trend1d_array(data, dim_values, weight, intercept=True, slope=True, is_compl
         Complex: complex64 unit-magnitude trend. Real: float32 trend.
     """
     if isinstance(data, list):
-        data = np.concatenate([np.asarray(c) for c in data], axis=0)
+        data = np.asarray(data[0]) if len(data) == 1 else np.concatenate([np.asarray(c) for c in data], axis=0)
     n_samples, ny, nx = data.shape
     n_pixels = ny * nx
 
-    # Extract angles (complex) or values directly (real)
+    # Pass data directly to kernel — no intermediate float64 arrays
     if is_complex:
         data[data == 0] = np.nan + 0j
-        data_flat = data.reshape(n_samples, n_pixels)
-        data_abs = np.abs(data_flat)
-        with np.errstate(invalid='ignore', divide='ignore'):
-            angles_flat = np.where(data_abs > 0, np.angle(data_flat), np.nan).astype(np.float64)
-        del data_abs, data_flat
-    else:
-        angles_flat = data.reshape(n_samples, n_pixels).astype(np.float64)
+    data_flat = np.ascontiguousarray(data.reshape(n_samples, n_pixels))
 
-    # Weights
+    # Weights: pass raw float32 to kernel, sqrt done per-pixel inside
     if isinstance(weight, list):
-        weight = np.concatenate([np.asarray(c) for c in weight], axis=0)
-    if weight is not None:
-        w_flat = np.sqrt(weight.reshape(n_samples, n_pixels)).astype(np.float64)
+        weight = np.asarray(weight[0]) if len(weight) == 1 else np.concatenate([np.asarray(c) for c in weight], axis=0)
+    has_weight = weight is not None
+    if has_weight:
+        w_flat = weight.reshape(n_samples, n_pixels).astype(np.float32)
     else:
-        w_flat = np.ones((n_samples, n_pixels), dtype=np.float64)
+        w_flat = np.empty((1, 1), dtype=np.float32)  # dummy, not accessed
 
     # Normalize dim values
     dim_absmax = np.max(np.abs(dim_values))
@@ -459,17 +514,12 @@ def trend1d_array(data, dim_values, weight, intercept=True, slope=True, is_compl
     else:
         dim_norm = np.zeros(n_samples, dtype=np.float64)
 
-    # Run numba kernel — skip 2π jump correction for real (unwrapped) data
-    fit_flat = _trend1d_numba_kernel(angles_flat, w_flat, dim_norm, intercept, slope, is_complex)
-
+    result = _trend1d_numba_kernel(data_flat, w_flat, dim_norm,
+                                    intercept, slope, is_complex, has_weight)
     if is_complex:
-        result_flat = np.full((n_samples, n_pixels), complex('nan'), dtype=np.complex64)
-        valid = np.isfinite(fit_flat)
-        result_flat[valid] = np.exp(1j * fit_flat[valid]).astype(np.complex64)
-        return result_flat.reshape(n_samples, ny, nx)
+        return result.reshape(n_samples, ny, nx)
     else:
-        result_flat = np.where(np.isfinite(fit_flat), fit_flat, np.nan).astype(np.float32)
-        return result_flat.reshape(n_samples, ny, nx)
+        return result.real.astype(np.float32).reshape(n_samples, ny, nx)
 
 
 # Backward compatibility alias
@@ -964,9 +1014,9 @@ def trend1d_pairs_array(data_chunk, weight_chunk, ref_values, rep_values,
     np.ndarray
         Trend array (n_pairs, chunk_y, chunk_x), complex64 or float32.
     """
-    # Materialize data from chunk list
+    # Materialize data from chunk list (avoid copy for single chunk)
     if isinstance(data_chunk, list):
-        data_np = np.concatenate([np.asarray(c) for c in data_chunk], axis=0)
+        data_np = np.asarray(data_chunk[0]) if len(data_chunk) == 1 else np.concatenate([np.asarray(c) for c in data_chunk], axis=0)
     else:
         data_np = np.asarray(data_chunk)
 
@@ -1021,21 +1071,15 @@ def trend1d_pairs_array(data_chunk, weight_chunk, ref_values, rep_values,
     pair_rep_didx = np.array([day_to_idx[d] for d in
                               unique_days[np.searchsorted(unique_days, rep_days)]])
 
-    # Extract angles (complex) or values directly (real)
+    # Pass data directly to kernel — no intermediate float64 arrays
     if is_complex:
-        data_abs = np.abs(data_np)
-        with np.errstate(invalid='ignore', divide='ignore'):
-            angles = np.where(data_abs > 0, np.angle(data_np), np.nan)
-        del data_abs
-    else:
-        angles = data_np.astype(np.float64)
-    angles_flat = angles.reshape(n_pairs, n_pixels)
+        data_np[data_np == 0] = np.nan + 0j
+    data_flat = np.ascontiguousarray(data_np.reshape(n_pairs, n_pixels))
+    del data_np
 
-    # Run numba kernel (sequential — workqueue threading layer is not
-    # thread-safe for concurrent Dask workers; Dask parallelizes across
-    # spatial chunks instead)
-    model_angles, kept, date_cstd = _trend1d_pairs_numba_kernel(
-        angles_flat, n_pixels, n_dates, n_pairs,
+    # Run numba kernel — extracts angles, fits, reconstructs trend, checks overfitting
+    trend_data = _trend1d_pairs_numba_kernel(
+        data_flat, n_pixels, n_dates, n_pairs,
         np.array(all_pairs, dtype=np.int64),
         all_times_np,
         np.array(all_signs, dtype=np.float64),
@@ -1044,43 +1088,9 @@ def trend1d_pairs_array(data_chunk, weight_chunk, ref_values, rep_values,
         max_refine,
         is_complex,
     )
+    del data_flat
 
-    # Reconstruct pair trends from per-date models;
-    # trend_data starts NaN — only fill pixels with finite angles
-    if is_complex:
-        trend_data = np.full((n_pairs, ny, nx), np.nan + 0j, dtype=out_dtype)
-        for p in range(n_pairs):
-            valid_p = np.isfinite(angles[p])
-            ref_model = model_angles[pair_ref_didx[p]].reshape(ny, nx)
-            rep_model = model_angles[pair_rep_didx[p]].reshape(ny, nx)
-            trend_p = np.exp(1j * (ref_model - rep_model)).astype(out_dtype)
-            trend_data[p, valid_p] = trend_p[valid_p]
-    else:
-        trend_data = np.full((n_pairs, ny, nx), np.nan, dtype=out_dtype)
-        for p in range(n_pairs):
-            valid_p = np.isfinite(angles[p])
-            ref_model = model_angles[pair_ref_didx[p]].reshape(ny, nx)
-            rep_model = model_angles[pair_rep_didx[p]].reshape(ny, nx)
-            trend_p = (ref_model - rep_model).astype(out_dtype)
-            trend_data[p, valid_p] = trend_p[valid_p]
-
-    # Overfitting check: average per-date cstd must be < π/2.
-    # Cstd of uniform distribution is ~1.81, so π/2 ≈ 1.57 separates
-    # coherent from incoherent pixels. Fixed cutoff, N-independent.
-    avg_cstd = np.zeros(n_pixels, dtype=np.float64)
-    n_dates_valid = np.zeros(n_pixels, dtype=np.int32)
-    for d in range(n_dates):
-        fin = np.isfinite(date_cstd[d])
-        avg_cstd[fin] += date_cstd[d, fin]
-        n_dates_valid[fin] += 1
-    has = n_dates_valid > 0
-    avg_cstd[has] /= n_dates_valid[has]
-    avg_cstd[~has] = np.inf
-    overfitting = avg_cstd.reshape(ny, nx) > (np.pi / 2)
-    if overfitting.any():
-        trend_data[:, overfitting] = np.nan + 0j if is_complex else np.nan
-
-    return trend_data
+    return trend_data.reshape(n_pairs, ny, nx)
 
 
 # ============================================================================
@@ -1462,3 +1472,7 @@ def _apply_chunk(phase_chunk, coeffs_packed, var_chunks,
             result[p] = trend
 
     return result
+
+
+# Populate numba file cache on first import so dask workers skip compilation
+_warmup_numba_cache()

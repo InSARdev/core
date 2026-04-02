@@ -1877,7 +1877,7 @@ class Batches(tuple):
 
     def snapshot(self, store: str | None = None, storage_options: dict[str, str] | None = None,
                  caption: str | None = None,
-                 n_bursts: int = 2, debug: bool = False, **kwargs):
+                 n_chunks: int = 4, debug: bool = False, **kwargs):
         """Save or open a Batches snapshot.
 
         When called on a Batches with data, saves all batches to Zarr store.
@@ -1891,8 +1891,8 @@ class Batches(tuple):
             Storage options for cloud stores.
         caption : str, optional
             Progress bar caption.
-        n_bursts : int
-            Number of bursts to process in parallel. Default 2.
+        n_chunks : int
+            Spatial chunks per worker per batch. Default 4.
         debug : bool
             Print debug information.
 
@@ -1911,22 +1911,20 @@ class Batches(tuple):
         from . import utils_io
 
         if len(self) == 0:
-            # Open mode - no data args
             result = utils_io.snapshot(store=store, storage_options=storage_options,
-                                       compat=True, caption=caption or 'Opening...',
-                                       n_bursts=n_bursts, debug=debug)
+                                       caption=caption or 'Opening...',
+                                       n_chunks=n_chunks, debug=debug)
         else:
-            # Save mode - pass batches directly to preserve types
             result = utils_io.snapshot(*self, store=store, storage_options=storage_options,
-                                       compat=True, caption=caption or 'Snapshotting...',
-                                       n_bursts=n_bursts, debug=debug)
+                                       caption=caption or 'Snapshotting...',
+                                       n_chunks=n_chunks, debug=debug)
 
         if isinstance(result, tuple):
             return result
         return Batches((result,))
 
     def archive(self, store: str, caption: str | None = None, compression: int = 6,
-                n_bursts: int = 2, debug: bool = False):
+                debug: bool = False):
         """Save or open a Batches archive as a single ZIP file.
 
         Wrapper around snapshot() that uses ZipStore for single-file storage.
@@ -1941,8 +1939,6 @@ class Batches(tuple):
         compression : int
             ZIP compression level 0-9 (0=no compression, 9=max). Default 6.
             Higher values produce smaller files but take longer.
-        n_bursts : int
-            Number of bursts to process in parallel. Default 2.
         debug : bool
             Print debug information.
 
@@ -1984,7 +1980,7 @@ class Batches(tuple):
                 raise FileNotFoundError(f"Archive not found: {store}")
             # Use ZipStore directly for reading
             zip_store = zarr.storage.ZipStore(store, mode='r')
-            result = self.snapshot(store=zip_store, caption=caption or 'Opening archive...', n_bursts=n_bursts, debug=debug)
+            result = self.snapshot(store=zip_store, caption=caption or 'Opening archive...', debug=debug)
             zip_store.close()
             return result
         else:
@@ -1992,7 +1988,7 @@ class Batches(tuple):
             # This avoids ZipStore's duplicate entry problem
             temp_dir = tempfile.mkdtemp()
             try:
-                result = self.snapshot(store=temp_dir, caption=caption or 'Archiving...', n_bursts=n_bursts, debug=debug)
+                result = self.snapshot(store=temp_dir, caption=caption or 'Archiving...', debug=debug)
                 # Create zip with specified compression level
                 # Use fsspec for cloud storage support
                 with fsspec.open(store, 'wb') as f:

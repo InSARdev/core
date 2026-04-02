@@ -285,14 +285,16 @@ def _lstsq_numba(
     max_iter,           # int
     epsilon,            # float
     x_tol,              # float — solution convergence tolerance
+    cumsum,             # bool — if True, return cumulative sum (time series)
 ):
-    """Per-pixel IRLS network inversion from pairs to date increments.
+    """Per-pixel IRLS network inversion from pairs to date time series.
 
     Uses Fisher-transformed correlation weights and solution-based convergence.
-    Returns increments (n_intervals, n_pixels).
+    Returns time series (n_dates, n_pixels) with first date = 0 (or NaN if all-NaN).
     """
     n_pairs, n_pixels = phi_flat.shape
-    increments = np.full((n_intervals, n_pixels), np.nan, dtype=np.float32)
+    n_dates = n_intervals + 1
+    result = np.full((n_dates, n_pixels), np.nan, dtype=np.float32)
 
     # Pre-allocate all working arrays once
     AtWA = np.zeros((n_intervals, n_intervals), dtype=np.float64)
@@ -399,10 +401,18 @@ def _lstsq_numba(
                 res = phi_flat[p, px] - phi_recon
                 w_irls[p] = 1.0 / (abs(res) + epsilon)
 
-        for i in range(n_intervals):
-            increments[i, px] = x[i]
+        # Build time series for this pixel
+        result[0, px] = 0.0
+        if cumsum:
+            cs = 0.0
+            for i in range(n_intervals):
+                cs += x[i]
+                result[i + 1, px] = np.float32(cs)
+        else:
+            for i in range(n_intervals):
+                result[i + 1, px] = np.float32(x[i])
 
-    return increments
+    return result
 
 
 def _build_pair_spans(A):
@@ -446,24 +456,21 @@ def _flatten_input(phase_stack, weight_stack):
     Returns (phases_flat, weights_flat, n_pairs, height, width).
     """
     if isinstance(phase_stack, list):
-        flat_chunks = [np.asarray(c) for c in phase_stack]
-        height, width = flat_chunks[0].shape[1], flat_chunks[0].shape[2]
-        n_pairs = sum(c.shape[0] for c in flat_chunks)
-        n_pixels = height * width
-        phases_flat = np.concatenate(
-            [c.reshape(c.shape[0], n_pixels) for c in flat_chunks], axis=0)
-    else:
-        n_pairs, height, width = phase_stack.shape
-        n_pixels = height * width
-        phases_flat = phase_stack.reshape(n_pairs, n_pixels)
+        if len(phase_stack) == 1:
+            phase_stack = np.asarray(phase_stack[0])
+        else:
+            phase_stack = np.concatenate([np.asarray(c) for c in phase_stack], axis=0)
+    n_pairs, height, width = phase_stack.shape
+    n_pixels = height * width
+    phases_flat = phase_stack.reshape(n_pairs, n_pixels)
 
     if weight_stack is not None:
         if isinstance(weight_stack, list):
-            flat_w = [np.asarray(c) for c in weight_stack]
-            weights_flat = np.concatenate(
-                [c.reshape(c.shape[0], n_pixels) for c in flat_w], axis=0)
-        else:
-            weights_flat = weight_stack.reshape(weight_stack.shape[0], n_pixels)
+            if len(weight_stack) == 1:
+                weight_stack = np.asarray(weight_stack[0])
+            else:
+                weight_stack = np.concatenate([np.asarray(c) for c in weight_stack], axis=0)
+        weights_flat = weight_stack.reshape(weight_stack.shape[0], n_pixels)
     else:
         weights_flat = np.ones_like(phases_flat)
 
@@ -580,20 +587,24 @@ def lstsq_to_dates_numpy(phase_stack, weight_stack, pair_dates,
     if debug:
         print(f'lstsq: {n_pairs} pairs -> {n_dates} dates, {n_pixels} pixels')
 
-    increments = _lstsq_numba(
+    time_series = _lstsq_numba(
         phases_flat, weights_flat, pair_start, pair_end,
-        n_intervals, max_iter, epsilon, x_tol)
+        n_intervals, max_iter, epsilon, x_tol, cumsum)
 
-    # Build time series — np.cumsum propagates NaN (all-NaN pixels stay NaN)
-    ts = np.zeros((n_dates, n_pixels), dtype=np.float32)
-    if cumsum:
-        ts[1:, :] = np.cumsum(increments, axis=0)
-    else:
-        ts[1:, :] = increments
-    # Set first date to NaN when all increments are NaN
-    all_nan_pixels = np.all(np.isnan(increments), axis=0)
-    ts[:, all_nan_pixels] = np.nan
+    return time_series.reshape(n_dates, height, width), dates
 
-    time_series = ts.reshape(n_dates, height, width)
 
-    return time_series, dates
+def _warmup_numba_cache():
+    """Compile numba kernels once in the main process so dask workers load from cache."""
+    _phi = np.zeros((3, 1), dtype=np.float32)
+    _w = np.ones((3, 1), dtype=np.float32)
+    _ps = np.array([0, 0, 0], dtype=np.int32)
+    _pe = np.array([1, 1, 1], dtype=np.int32)
+    _tl = np.array([2], dtype=np.int64)
+    _tL = np.array([0], dtype=np.int64)
+    _tR = np.array([1], dtype=np.int64)
+    _to = np.array([0, 0, 0, 1], dtype=np.int64)
+    _triplet_irls_unwrap_numba(_phi, _w, _ps, _pe, 2, _tl, _tL, _tR, _to, 1.0, 1, 0.1)
+    _lstsq_numba(_phi, _w, _ps, _pe, 2, 1, 0.1, 1e-4, True)
+
+_warmup_numba_cache()

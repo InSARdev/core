@@ -2091,6 +2091,7 @@ class BatchCore(dict):
                 weight_dask = weight_da.data if weight_da is not None else None
                 n_stack = data_dask.shape[0]
 
+
                 def _trend1d_block(data_block, weight_block=None,
                                    _bv=baseline_values,
                                    _detrend=detrend, _dtype=out_dtype,
@@ -2104,10 +2105,13 @@ class BatchCore(dict):
                     )
                     if _detrend:
                         if _is_complex:
-                            return (data_block * np.conj(trend)).astype(_dtype)
+                            np.conj(trend, out=trend)
+                            np.multiply(data_block, trend, out=trend)
+                            return trend
                         else:
-                            return (data_block - trend).astype(_dtype)
-                    return trend.astype(_dtype)
+                            np.subtract(data_block, trend, out=trend)
+                            return trend
+                    return trend
 
                 if weight_dask is not None:
                     result_dask = da.blockwise(
@@ -2228,6 +2232,7 @@ class BatchCore(dict):
                 weight_dask = weight_da.data if weight_da is not None else None
                 n_pairs_val = len(ref_values)
 
+
                 def _trend1d_pairs_block(data_block, weight_block=None,
                                          _ref=ref_values, _rep=rep_values,
                                          _detrend=detrend,
@@ -2243,10 +2248,13 @@ class BatchCore(dict):
                     )
                     if _detrend:
                         if _is_complex:
-                            return (data_block * np.conj(trend)).astype(_dtype)
+                            np.conj(trend, out=trend)
+                            np.multiply(data_block, trend, out=trend)
+                            return trend
                         else:
-                            return (data_block - trend).astype(_dtype)
-                    return trend.astype(_dtype)
+                            np.subtract(data_block, trend, out=trend)
+                            return trend
+                    return trend
 
                 if weight_dask is not None:
                     result_dask = da.blockwise(
@@ -3799,22 +3807,23 @@ class BatchCore(dict):
         return result
 
     def save(self, store: str, storage_options: dict[str, str] | None = None,
-                caption: str | None = 'Saving...', n_bursts: int = 2, debug=False):
-        return utils_io.save(self, store=store, storage_options=storage_options, compat=False, caption=caption, n_bursts=n_bursts, debug=debug)
+                caption: str | None = 'Saving...', n_chunks: int = 4, debug=False):
+        return utils_io.save(self, store=store, storage_options=storage_options, caption=caption, n_chunks=n_chunks, debug=debug)
 
     def open(self, store: str, storage_options: dict[str, str] | None = None, n_jobs: int = -1, debug=False):
-        data = utils_io.open(store=store, storage_options=storage_options, compat=False, n_jobs=n_jobs, debug=debug)
+        data = utils_io.open(store=store, storage_options=storage_options, n_jobs=n_jobs, debug=debug)
         if not isinstance(data, dict):
             raise ValueError(f'ERROR: open() returns multiple datasets, you need to use Stack class to open them.')
         return data
     
     def snapshot(self, store: str | None = None, storage_options: dict[str, str] | None = None,
-                caption: str | None = 'Snapshotting...',
-                n_bursts: int = 2, debug=False, **kwargs):
+                caption: str | None = 'Snapshotting...', n_chunks: int = 4,
+                debug=False, **kwargs):
         # Only save if this batch has data; otherwise just open existing store
         if len(self) > 0:
-            utils_io.save(self, store=store, storage_options=storage_options, caption=caption, n_bursts=n_bursts, debug=debug)
-        return utils_io.open(store=store, storage_options=storage_options, compat=False,
+            utils_io.save(self, store=store, storage_options=storage_options, caption=caption, n_chunks=n_chunks,
+                         debug=debug)
+        return utils_io.open(store=store, storage_options=storage_options,
                             n_jobs=-1, debug=debug)
 
     def to_dataset(self, polarization=None, chunks='auto', compute: bool = False, debug: bool = False):

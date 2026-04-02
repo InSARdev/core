@@ -763,7 +763,7 @@ class Stack(Stack_plot, BatchCore):
 
                 pbar.update(1)
 
-    def compute(self, *batches: BatchCore, n_bursts: int = 2) -> tuple:
+    def compute(self, *batches: BatchCore) -> tuple:
         """Compute multiple Batch objects together efficiently.
 
         This method materializes multiple dependent Batch objects in a single
@@ -781,8 +781,6 @@ class Stack(Stack_plot, BatchCore):
         *batches : BatchCore
             One or more Batch objects to compute together.
             If empty, computes the Stack itself.
-        n_bursts : int
-            Number of bursts to process in parallel. Default 2.
 
         Returns
         -------
@@ -799,16 +797,14 @@ class Stack(Stack_plot, BatchCore):
         if not batches:
             return BatchCore.compute(self)
         from .Batch import Batches
-        return Batches(batches).compute(n_bursts=n_bursts)
+        return Batches(batches).compute()
 
     def snapshot(self, *args, store: str | None = None, storage_options: dict[str, str] | None = None,
-                caption: str | None = None, n_bursts: int = 2, debug=False):
-        """Save or open a snapshot of the Stack or Batch objects.
+                caption: str | None = None, n_chunks: int = 4, debug=False):
+        """Open or save a Batch/Batches snapshot.
 
-        Stack serves as a unified interface - use empty Stack() for utility operations:
-        - stack.snapshot('path') on non-empty Stack saves the Stack
-        - Stack().snapshot('path') on empty Stack opens existing snapshot
-        - stack.snapshot(batch1, batch2, store='path') saves batches
+        This is a convenience passthrough to Batches.snapshot(). Stack itself
+        is never saved via snapshot() — use Stack.load()/save() for that.
 
         Parameters
         ----------
@@ -820,22 +816,19 @@ class Stack(Stack_plot, BatchCore):
             Storage options for cloud stores.
         caption : str, optional
             Progress bar caption.
-        n_bursts : int
-            Number of bursts to process in parallel. Default 2.
         debug : bool
             Print debug information.
 
         Returns
         -------
-        Stack or tuple
-            The saved Stack, or tuple of opened/saved Batch objects.
+        Batches or tuple
+            Opened or saved Batch objects.
 
         Examples
         --------
-        >>> # Save stack itself
-        >>> stack.snapshot('mystack')
         >>> # Open existing snapshot
-        >>> mintf, mcorr = Stack().snapshot('mintf_corr')
+        >>> intfcorr = stack.snapshot('intfcorr')
+        >>> mintf, mcorr = stack.snapshot('mintf_corr')
         >>> # Save batches
         >>> mintf, mcorr = stack.snapshot(mintf, mcorr, store='mintf_corr')
         """
@@ -847,27 +840,18 @@ class Stack(Stack_plot, BatchCore):
             store = args[0]
             args = ()
 
-        # If no batch args provided
+        # If no batch args provided — open mode
         if len(args) == 0:
             if store is None:
-                raise ValueError("store path is required to save/open snapshot")
-            # Empty Stack -> open mode, non-empty Stack -> save mode
-            if len(self) == 0:
-                result = Batches().snapshot(store=store, storage_options=storage_options,
-                                             caption=caption, n_bursts=n_bursts, debug=debug)
-                # Unwrap single Stack from tuple
-                if len(result) == 1 and isinstance(result[0], Stack):
-                    return result[0]
-                return result
-            utils_io.save(self, store=store, storage_options=storage_options, compat=True,
-                         caption=caption or 'Snapshotting...', n_bursts=n_bursts, debug=debug)
-            return self
+                raise ValueError("store path is required to open snapshot")
+            return Batches().snapshot(store=store, storage_options=storage_options,
+                                      caption=caption, n_chunks=n_chunks, debug=debug)
 
         # Save mode - args are batches
-        return Batches(args).snapshot(store=store, storage_options=storage_options, caption=caption, n_bursts=n_bursts, debug=debug)
+        return Batches(args).snapshot(store=store, storage_options=storage_options, caption=caption, n_chunks=n_chunks, debug=debug)
 
     def archive(self, *args, store: str | None = None, caption: str | None = None,
-                compression: int = 6, n_bursts: int = 2, debug=False):
+                compression: int = 6, debug=False):
         """Save or open an archive of the Stack or Batch objects as a single ZIP file.
 
         Wrapper around snapshot() that uses ZipStore for single-file storage.
@@ -889,8 +873,6 @@ class Stack(Stack_plot, BatchCore):
         compression : int
             ZIP compression level 0-9 (0=no compression, 9=max). Default 6.
             Higher values produce smaller files but take longer.
-        n_bursts : int
-            Number of bursts to process in parallel. Default 2.
         debug : bool
             Print debug information.
 
@@ -947,7 +929,7 @@ class Stack(Stack_plot, BatchCore):
                     raise FileNotFoundError(f"Archive not found: {store}")
                 # Use ZipStore directly for reading
                 zip_store = zarr.storage.ZipStore(store, mode='r')
-                result = Batches().snapshot(store=zip_store, caption=caption or 'Opening archive...', n_bursts=n_bursts, debug=debug)
+                result = Batches().snapshot(store=zip_store, caption=caption or 'Opening archive...', debug=debug)
                 zip_store.close()
                 # Unwrap single Stack from tuple
                 if len(result) == 1 and isinstance(result[0], Stack):
@@ -956,8 +938,8 @@ class Stack(Stack_plot, BatchCore):
             # Save self - write to temp directory, then zip
             temp_dir = tempfile.mkdtemp()
             try:
-                utils_io.save(self, store=temp_dir, storage_options=None, compat=True,
-                             caption=caption or 'Archiving...', n_bursts=n_bursts, debug=debug)
+                utils_io.save(self, store=temp_dir, storage_options=None,
+                             caption=caption or 'Archiving...', debug=debug)
                 # Create zip with specified compression level
                 # Use fsspec for cloud storage support
                 with fsspec.open(store, 'wb') as f:
@@ -973,7 +955,7 @@ class Stack(Stack_plot, BatchCore):
             return self
 
         # Save mode - args are batches
-        return Batches(args).archive(store, caption=caption, compression=compression, n_bursts=n_bursts, debug=debug)
+        return Batches(args).archive(store, caption=caption, compression=compression, debug=debug)
 
     # def downsample(self, *args, coarsen=None, resolution=60, func='mean', debug:bool=False):
     #     datas = []
