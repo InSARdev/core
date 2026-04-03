@@ -2549,7 +2549,7 @@ class Batches(tuple):
         elements = [unwrapped] + list(self[1:])
         return Batches(elements)
 
-    def detrend2d(self, transform, degree=1, window=None, device='auto', debug=False):
+    def detrend2d(self, transform, degree=1, window=None, stride=1, device='auto', debug=False):
         """
         Detrend 2D polynomial trend and return Batches with detrended data.
 
@@ -2598,9 +2598,18 @@ class Batches(tuple):
             detrended = phase.trend2d(transform, weight=weight, degree=degree,
                                       device=device, detrend=True, debug=debug)
         else:
-            # Local windowed fit with 4-grid overlap averaging
-            detrended = phase.trend2d_window(transform, weight=weight, degree=degree,
-                                              window=window, device=device,
+            if degree != 1:
+                raise ValueError("Windowed detrend2d only supports degree=1. "
+                                 "Use window=None for higher-degree global fit.")
+            n_vars = len([v for v in transform[list(transform.keys())[0]].data_vars
+                          if 'y' in transform[list(transform.keys())[0]][v].dims])
+            if not (1 <= n_vars <= 3):
+                raise ValueError(f"Windowed detrend2d requires 1-3 transform variables "
+                                 f"(e.g. ele, azi+rng, azi+rng+ele), got {n_vars}. "
+                                 f"Use window=None for global fit with more variables.")
+            # Local sliding window fit
+            detrended = phase.trend2d_window(transform, weight=weight,
+                                              window=window, stride=stride,
                                               detrend=True, debug=debug)
 
         # Preserve non-spatial variables (e.g. BPR) that may be dropped by arithmetic

@@ -1476,8 +1476,8 @@ class BatchCore(dict):
         return Batch(result)
 
     def trend2d_window(self, transform: 'BatchCore', weight: 'BatchUnit | None' = None,
-                        degree: int = 1, window: 'int | tuple' = 250,
-                        device: str = 'auto', detrend: bool = False,
+                        window: 'int | tuple' = 250, stride: 'int | tuple' = 1,
+                        detrend: bool = False,
                         debug: bool = False) -> 'BatchCore':
         """
         Local 2D polynomial trend using 4 half-overlapping window grids.
@@ -1519,8 +1519,6 @@ class BatchCore(dict):
 
         phase = self
         BatchCore._require_lazy(phase, 'trend2d_window')
-
-        resolved = BatchCore._get_torch_device(device, debug=debug)
 
         is_complex = isinstance(phase, BatchComplex)
 
@@ -1567,8 +1565,14 @@ class BatchCore(dict):
                     if weight_dask.chunks != phase_dask.chunks:
                         weight_dask = weight_dask.rechunk(phase_dask.chunks)
 
-                # Kernel: per-pair, receives (1, cy+win, cx+win) extended tile
-                def _make_kernel(_win_y, _win_x, _degree, _dev, _nv, _hw, _det, _is_complex):
+                # Parse stride
+                if isinstance(stride, (tuple, list)):
+                    _stride = (int(stride[0]), int(stride[1]))
+                else:
+                    _stride = (int(stride), int(stride))
+
+                # Kernel: per-pair sliding window
+                def _make_kernel(_win_y, _win_x, _nv, _hw, _det, _is_complex, _stride):
                     def kernel(phase_block, *args):
                         var_arrays = [np.asarray(a) for a in args[:_nv]]
                         w_block = np.asarray(args[_nv]) if _hw else None
@@ -1578,7 +1582,7 @@ class BatchCore(dict):
                             trend_p = utils_detrend.trend2d_window_array(
                                 phase_block[p], var_arrays,
                                 w_block[p] if w_block is not None else None,
-                                _dev, _degree, _win_y, _win_x)
+                                _win_y, _win_x, stride=_stride)
                             if _det:
                                 if _is_complex:
                                     np.conj(trend_p, out=trend_p)
@@ -1590,9 +1594,9 @@ class BatchCore(dict):
                         return np.concatenate(results, axis=0).astype(out_dtype)
                     return kernel
 
-                kernel = _make_kernel(win_y, win_x, degree, resolved,
+                kernel = _make_kernel(win_y, win_x,
                                        len(var_dask_list), has_weight,
-                                       detrend, is_complex)
+                                       detrend, is_complex, _stride)
 
                 # Build args for map_overlap
                 depth_3d = {0: 0, 1: half_y, 2: half_x}

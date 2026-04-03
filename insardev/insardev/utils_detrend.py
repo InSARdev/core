@@ -60,11 +60,13 @@ def _warmup_numba_cache():
         0, True,
     )
     _v = np.zeros((2, 3), dtype=np.float32)
-    _wn = np.array([[0, 2, 0, 3]], dtype=np.int64)
-    _trend2d_window_numba_kernel(
-        _c[:, :3].reshape(1, 3).view(np.complex64),
-        _v, _v, _v, np.ones((1, 1), dtype=np.float32),
-        2, 3, False, True, _wn,
+    _g = np.zeros((2, 2), dtype=np.float64)
+    _gy = np.array([0.0, 1.0]); _gx = np.array([0.0, 2.0])
+    _bilinear_interp_trend(_g, _g, _gy, _gx, 2, 3, True)
+    _p = _c[:, :3].reshape(1, 3).view(np.complex64)
+    _trend2d_sliding_numba_kernel(
+        _p, _v, _v, _v, np.ones((1, 1), dtype=np.float32),
+        1, 1, 1, 1, False, True, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0,
     )
 
 
@@ -568,332 +570,366 @@ def _solve4x4(A, b):
 
 
 @nb.njit(cache=True)
-def _trend2d_window_numba_kernel(phase_2d, var0, var1, var2, weight_2d,
-                                  win_y, win_x, has_weight, is_complex,
-                                  windows):
-    """Numba kernel: windowed polynomial fit degree=1 with 3 variables.
+def _trend2d_sliding_numba_kernel(phase_2d, var0, var1, var2, weight_2d,
+                                   half_y, half_x, stride_y, stride_x,
+                                   has_weight, is_complex,
+                                   g_mu0, g_std0, g_mu1, g_std1, g_mu2, g_std2):
+    """Sliding window polynomial fit with column-cached incremental updates.
 
-    Three passes per window:
-    1. Compute mean/std of variables on valid pixels
-    2. Accumulate 4x4 normal equations and solve
-    3. Predict on all pixels and accumulate into trend_sum/count
+    Column cache: per-column AtA/Atb/n_valid for the current vertical range.
+    Horizontal step: add/remove cached column stats (O(19) per column, not O(wy)).
+    Vertical step: update each column cache by adding/removing stride_y rows.
     """
     ny, nx = phase_2d.shape
+    NC = 19  # 10 AtA upper-tri + 4 Atb_re + 4 Atb_im + 1 n_valid
 
-    trend_sum_re = np.zeros((ny, nx), dtype=np.float64)
-    trend_sum_im = np.zeros((ny, nx), dtype=np.float64)
-    count = np.zeros((ny, nx), dtype=np.int32)
+    gy_list = list(range(0, ny, stride_y))
+    if gy_list[-1] != ny - 1:
+        gy_list.append(ny - 1)
+    gx_list = list(range(0, nx, stride_x))
+    if gx_list[-1] != nx - 1:
+        gx_list.append(nx - 1)
+    n_gy = len(gy_list)
+    n_gx = len(gx_list)
 
-    for w in range(windows.shape[0]):
-        ys = windows[w, 0]
-        ye = windows[w, 1]
-        xs = windows[w, 2]
-        xe = windows[w, 3]
+    grid_re = np.full((n_gy, n_gx), np.nan, dtype=np.float64)
+    grid_im = np.full((n_gy, n_gx), np.nan, dtype=np.float64)
 
-        # Pass 1: mean/std of variables on valid pixels
-        sum_v0 = 0.0; sum_v1 = 0.0; sum_v2 = 0.0
-        sum2_v0 = 0.0; sum2_v1 = 0.0; sum2_v2 = 0.0
-        n_valid = 0
-        for i in range(ys, ye):
-            for j in range(xs, xe):
-                if is_complex:
-                    pr = np.float64(phase_2d[i, j].real)
-                    pi = np.float64(phase_2d[i, j].imag)
-                    if not (np.isfinite(pr) and np.isfinite(pi)):
-                        continue
-                    if pr == 0.0 and pi == 0.0:
-                        continue
-                else:
-                    pf = np.float64(phase_2d[i, j].real)
-                    if not np.isfinite(pf):
-                        continue
-                v0 = np.float64(var0[i, j])
-                v1 = np.float64(var1[i, j])
-                v2 = np.float64(var2[i, j])
-                if not (np.isfinite(v0) and np.isfinite(v1) and np.isfinite(v2)):
-                    continue
-                sum_v0 += v0; sum_v1 += v1; sum_v2 += v2
-                sum2_v0 += v0*v0; sum2_v1 += v1*v1; sum2_v2 += v2*v2
-                n_valid += 1
+    # Precompute
+    sv0 = np.empty((ny, nx), dtype=np.float64)
+    sv1 = np.empty((ny, nx), dtype=np.float64)
+    sv2 = np.empty((ny, nx), dtype=np.float64)
+    valid = np.zeros((ny, nx), dtype=nb.boolean)
+    p_re = np.zeros((ny, nx), dtype=np.float64)
+    p_im = np.zeros((ny, nx), dtype=np.float64)
+    for i in range(ny):
+        for j in range(nx):
+            sv0[i,j] = (np.float64(var0[i,j]) - g_mu0) / g_std0
+            sv1[i,j] = (np.float64(var1[i,j]) - g_mu1) / g_std1
+            sv2[i,j] = (np.float64(var2[i,j]) - g_mu2) / g_std2
+            if not (np.isfinite(sv0[i,j]) and np.isfinite(sv1[i,j]) and np.isfinite(sv2[i,j])):
+                continue
+            if is_complex:
+                pr = np.float64(phase_2d[i,j].real); pi = np.float64(phase_2d[i,j].imag)
+                if not (np.isfinite(pr) and np.isfinite(pi)): continue
+                mag = np.sqrt(pr*pr + pi*pi)
+                if mag == 0: continue
+                p_re[i,j] = pr/mag; p_im[i,j] = pi/mag
+            else:
+                pf = np.float64(phase_2d[i,j].real)
+                if not np.isfinite(pf): continue
+                p_re[i,j] = pf
+            valid[i,j] = True
 
-        if n_valid < 4:
-            continue
+    min_valid = 8
+    # Column cache: cc[j, 0:10]=AtA, cc[j, 10:14]=Atb_re, cc[j, 14:18]=Atb_im, cc[j, 18]=n_valid
+    cc = np.zeros((nx, NC), dtype=np.float64)
 
-        mu0 = sum_v0 / n_valid
-        mu1 = sum_v1 / n_valid
-        mu2 = sum_v2 / n_valid
-        std0 = max(np.sqrt(max(sum2_v0/n_valid - mu0*mu0, 0.0)), 1e-10)
-        std1 = max(np.sqrt(max(sum2_v1/n_valid - mu1*mu1, 0.0)), 1e-10)
-        std2 = max(np.sqrt(max(sum2_v2/n_valid - mu2*mu2, 0.0)), 1e-10)
+    # --- Helper: add one pixel (i,j) to column cache cc[j] with sign +1 or -1 ---
+    # Inlined below for speed, but the mapping is:
+    # cc[j,0]=AtA00 cc[j,1]=AtA01 cc[j,2]=AtA02 cc[j,3]=AtA03
+    # cc[j,4]=AtA11 cc[j,5]=AtA12 cc[j,6]=AtA13
+    # cc[j,7]=AtA22 cc[j,8]=AtA23 cc[j,9]=AtA33
+    # cc[j,10:14]=Atb_re cc[j,14:18]=Atb_im cc[j,18]=n_valid
 
-        # Pass 2: accumulate normal equations
+    # Build initial column caches for first grid row
+    wy0 = max(0, gy_list[0] - half_y)
+    wy1 = min(ny, gy_list[0] + half_y + 1)
+    for j in range(nx):
+        for i in range(wy0, wy1):
+            if not valid[i,j]: continue
+            a1=sv0[i,j]; a2=sv1[i,j]; a3=sv2[i,j]
+            if has_weight:
+                ww = np.float64(weight_2d[i,j])
+                if not (np.isfinite(ww) and ww > 0): continue
+                w = np.sqrt(max(ww, 1e-6))
+            else:
+                w = 1.0
+            wa0=w; wa1=a1*w; wa2=a2*w; wa3=a3*w
+            cc[j,0]+=wa0*wa0; cc[j,1]+=wa0*wa1; cc[j,2]+=wa0*wa2; cc[j,3]+=wa0*wa3
+            cc[j,4]+=wa1*wa1; cc[j,5]+=wa1*wa2; cc[j,6]+=wa1*wa3
+            cc[j,7]+=wa2*wa2; cc[j,8]+=wa2*wa3; cc[j,9]+=wa3*wa3
+            bw=p_re[i,j]*w
+            cc[j,10]+=wa0*bw; cc[j,11]+=wa1*bw; cc[j,12]+=wa2*bw; cc[j,13]+=wa3*bw
+            if is_complex:
+                bw2=p_im[i,j]*w
+                cc[j,14]+=wa0*bw2; cc[j,15]+=wa1*bw2; cc[j,16]+=wa2*bw2; cc[j,17]+=wa3*bw2
+            cc[j,18] += 1.0
+
+    prev_wy0 = wy0; prev_wy1 = wy1
+
+    for gi in range(n_gy):
+        cy = gy_list[gi]
+        wy0 = max(0, cy - half_y)
+        wy1 = min(ny, cy + half_y + 1)
+
+        if gi > 0:
+            # Update column caches vertically: remove top rows, add bottom rows
+            for j in range(nx):
+                for i in range(prev_wy0, wy0):
+                    if not valid[i,j]: continue
+                    a1=sv0[i,j]; a2=sv1[i,j]; a3=sv2[i,j]
+                    if has_weight:
+                        ww = np.float64(weight_2d[i,j])
+                        if not (np.isfinite(ww) and ww > 0): continue
+                        w = np.sqrt(max(ww, 1e-6))
+                    else:
+                        w = 1.0
+                    wa0=w; wa1=a1*w; wa2=a2*w; wa3=a3*w
+                    cc[j,0]-=wa0*wa0; cc[j,1]-=wa0*wa1; cc[j,2]-=wa0*wa2; cc[j,3]-=wa0*wa3
+                    cc[j,4]-=wa1*wa1; cc[j,5]-=wa1*wa2; cc[j,6]-=wa1*wa3
+                    cc[j,7]-=wa2*wa2; cc[j,8]-=wa2*wa3; cc[j,9]-=wa3*wa3
+                    bw=p_re[i,j]*w
+                    cc[j,10]-=wa0*bw; cc[j,11]-=wa1*bw; cc[j,12]-=wa2*bw; cc[j,13]-=wa3*bw
+                    if is_complex:
+                        bw2=p_im[i,j]*w
+                        cc[j,14]-=wa0*bw2; cc[j,15]-=wa1*bw2; cc[j,16]-=wa2*bw2; cc[j,17]-=wa3*bw2
+                    cc[j,18] -= 1.0
+                for i in range(prev_wy1, wy1):
+                    if not valid[i,j]: continue
+                    a1=sv0[i,j]; a2=sv1[i,j]; a3=sv2[i,j]
+                    if has_weight:
+                        ww = np.float64(weight_2d[i,j])
+                        if not (np.isfinite(ww) and ww > 0): continue
+                        w = np.sqrt(max(ww, 1e-6))
+                    else:
+                        w = 1.0
+                    wa0=w; wa1=a1*w; wa2=a2*w; wa3=a3*w
+                    cc[j,0]+=wa0*wa0; cc[j,1]+=wa0*wa1; cc[j,2]+=wa0*wa2; cc[j,3]+=wa0*wa3
+                    cc[j,4]+=wa1*wa1; cc[j,5]+=wa1*wa2; cc[j,6]+=wa1*wa3
+                    cc[j,7]+=wa2*wa2; cc[j,8]+=wa2*wa3; cc[j,9]+=wa3*wa3
+                    bw=p_re[i,j]*w
+                    cc[j,10]+=wa0*bw; cc[j,11]+=wa1*bw; cc[j,12]+=wa2*bw; cc[j,13]+=wa3*bw
+                    if is_complex:
+                        bw2=p_im[i,j]*w
+                        cc[j,14]+=wa0*bw2; cc[j,15]+=wa1*bw2; cc[j,16]+=wa2*bw2; cc[j,17]+=wa3*bw2
+                    cc[j,18] += 1.0
+            prev_wy0 = wy0; prev_wy1 = wy1
+
+        # Build window AtA from column caches for first grid column
         AtA = np.zeros((4, 4), dtype=np.float64)
         Atb_re = np.zeros(4, dtype=np.float64)
         Atb_im = np.zeros(4, dtype=np.float64)
+        n_valid = 0
+        wx0_init = max(0, gx_list[0] - half_x)
+        wx1_init = min(nx, gx_list[0] + half_x + 1)
+        for j in range(wx0_init, wx1_init):
+            AtA[0,0]+=cc[j,0]; AtA[0,1]+=cc[j,1]; AtA[0,2]+=cc[j,2]; AtA[0,3]+=cc[j,3]
+            AtA[1,1]+=cc[j,4]; AtA[1,2]+=cc[j,5]; AtA[1,3]+=cc[j,6]
+            AtA[2,2]+=cc[j,7]; AtA[2,3]+=cc[j,8]; AtA[3,3]+=cc[j,9]
+            Atb_re[0]+=cc[j,10]; Atb_re[1]+=cc[j,11]; Atb_re[2]+=cc[j,12]; Atb_re[3]+=cc[j,13]
+            if is_complex:
+                Atb_im[0]+=cc[j,14]; Atb_im[1]+=cc[j,15]; Atb_im[2]+=cc[j,16]; Atb_im[3]+=cc[j,17]
+            n_valid += int(cc[j,18])
 
-        for i in range(ys, ye):
-            for j in range(xs, xe):
+        # Solve at first grid column
+        if n_valid >= min_valid:
+            A = AtA.copy()
+            A[1,0]=A[0,1]; A[2,0]=A[0,2]; A[3,0]=A[0,3]
+            A[2,1]=A[1,2]; A[3,1]=A[1,3]; A[3,2]=A[2,3]
+            for k in range(4): A[k,k]+=1e-8
+            c = _solve4x4(A, Atb_re)
+            cx0 = gx_list[0]
+            pr = c[0]+sv0[cy,cx0]*c[1]+sv1[cy,cx0]*c[2]+sv2[cy,cx0]*c[3]
+            if is_complex:
+                ci = _solve4x4(A, Atb_im)
+                ppi = ci[0]+sv0[cy,cx0]*ci[1]+sv1[cy,cx0]*ci[2]+sv2[cy,cx0]*ci[3]
+                mag = np.sqrt(pr*pr+ppi*ppi)
+                if mag > 0: grid_re[gi,0]=pr/mag; grid_im[gi,0]=ppi/mag
+            else:
+                grid_re[gi,0] = pr
+
+        # Horizontal sweep using column caches
+        prev_wx0 = wx0_init; prev_wx1 = wx1_init
+
+        for gj in range(1, n_gx):
+            cx = gx_list[gj]
+            new_wx0 = max(0, cx - half_x)
+            new_wx1 = min(nx, cx + half_x + 1)
+
+            # Remove left columns from window
+            for j in range(prev_wx0, new_wx0):
+                AtA[0,0]-=cc[j,0]; AtA[0,1]-=cc[j,1]; AtA[0,2]-=cc[j,2]; AtA[0,3]-=cc[j,3]
+                AtA[1,1]-=cc[j,4]; AtA[1,2]-=cc[j,5]; AtA[1,3]-=cc[j,6]
+                AtA[2,2]-=cc[j,7]; AtA[2,3]-=cc[j,8]; AtA[3,3]-=cc[j,9]
+                Atb_re[0]-=cc[j,10]; Atb_re[1]-=cc[j,11]; Atb_re[2]-=cc[j,12]; Atb_re[3]-=cc[j,13]
                 if is_complex:
-                    pr = np.float64(phase_2d[i, j].real)
-                    pi = np.float64(phase_2d[i, j].imag)
-                    if not (np.isfinite(pr) and np.isfinite(pi)):
-                        continue
-                    if pr == 0.0 and pi == 0.0:
-                        continue
-                else:
-                    pf = np.float64(phase_2d[i, j].real)
-                    if not np.isfinite(pf):
-                        continue
+                    Atb_im[0]-=cc[j,14]; Atb_im[1]-=cc[j,15]; Atb_im[2]-=cc[j,16]; Atb_im[3]-=cc[j,17]
+                n_valid -= int(cc[j,18])
 
-                v0 = np.float64(var0[i, j])
-                v1 = np.float64(var1[i, j])
-                v2 = np.float64(var2[i, j])
-                if not (np.isfinite(v0) and np.isfinite(v1) and np.isfinite(v2)):
-                    continue
-
-                a1 = (v0 - mu0) / std0
-                a2 = (v1 - mu1) / std1
-                a3 = (v2 - mu2) / std2
-
-                w_val = 1.0
-                if has_weight:
-                    ww = np.float64(weight_2d[i, j])
-                    if not np.isfinite(ww) or ww <= 0:
-                        continue
-                    w_val = np.sqrt(max(ww, 1e-6))
-
-                wa0 = w_val
-                wa1 = a1 * w_val
-                wa2 = a2 * w_val
-                wa3 = a3 * w_val
-
-                AtA[0,0] += wa0*wa0; AtA[0,1] += wa0*wa1; AtA[0,2] += wa0*wa2; AtA[0,3] += wa0*wa3
-                AtA[1,1] += wa1*wa1; AtA[1,2] += wa1*wa2; AtA[1,3] += wa1*wa3
-                AtA[2,2] += wa2*wa2; AtA[2,3] += wa2*wa3
-                AtA[3,3] += wa3*wa3
-
+            # Add right columns to window
+            for j in range(prev_wx1, new_wx1):
+                AtA[0,0]+=cc[j,0]; AtA[0,1]+=cc[j,1]; AtA[0,2]+=cc[j,2]; AtA[0,3]+=cc[j,3]
+                AtA[1,1]+=cc[j,4]; AtA[1,2]+=cc[j,5]; AtA[1,3]+=cc[j,6]
+                AtA[2,2]+=cc[j,7]; AtA[2,3]+=cc[j,8]; AtA[3,3]+=cc[j,9]
+                Atb_re[0]+=cc[j,10]; Atb_re[1]+=cc[j,11]; Atb_re[2]+=cc[j,12]; Atb_re[3]+=cc[j,13]
                 if is_complex:
-                    mag = np.sqrt(pr*pr + pi*pi)
-                    if mag > 0:
-                        ur = pr / mag
-                        ui = pi / mag
-                    else:
-                        continue
-                    Atb_re[0] += wa0 * ur * w_val; Atb_re[1] += wa1 * ur * w_val
-                    Atb_re[2] += wa2 * ur * w_val; Atb_re[3] += wa3 * ur * w_val
-                    Atb_im[0] += wa0 * ui * w_val; Atb_im[1] += wa1 * ui * w_val
-                    Atb_im[2] += wa2 * ui * w_val; Atb_im[3] += wa3 * ui * w_val
-                else:
-                    Atb_re[0] += wa0 * pf * w_val; Atb_re[1] += wa1 * pf * w_val
-                    Atb_re[2] += wa2 * pf * w_val; Atb_re[3] += wa3 * pf * w_val
+                    Atb_im[0]+=cc[j,14]; Atb_im[1]+=cc[j,15]; Atb_im[2]+=cc[j,16]; Atb_im[3]+=cc[j,17]
+                n_valid += int(cc[j,18])
 
-        # Fill symmetric lower triangle + regularize
-        AtA[1,0] = AtA[0,1]; AtA[2,0] = AtA[0,2]; AtA[3,0] = AtA[0,3]
-        AtA[2,1] = AtA[1,2]; AtA[3,1] = AtA[1,3]; AtA[3,2] = AtA[2,3]
-        for k in range(4):
-            AtA[k,k] += 1e-8
+            prev_wx0 = new_wx0; prev_wx1 = new_wx1
 
-        c_re = _solve4x4(AtA, Atb_re)
-        c_im = _solve4x4(AtA, Atb_im)
-
-        # Pass 3: predict on ALL pixels and accumulate
-        for i in range(ys, ye):
-            for j in range(xs, xe):
-                v0 = np.float64(var0[i, j])
-                v1 = np.float64(var1[i, j])
-                v2 = np.float64(var2[i, j])
-
-                a1 = (v0 - mu0) / std0
-                a2 = (v1 - mu1) / std1
-                a3 = (v2 - mu2) / std2
-
+            if n_valid >= min_valid:
+                A = AtA.copy()
+                A[1,0]=A[0,1]; A[2,0]=A[0,2]; A[3,0]=A[0,3]
+                A[2,1]=A[1,2]; A[3,1]=A[1,3]; A[3,2]=A[2,3]
+                for k in range(4): A[k,k]+=1e-8
+                c = _solve4x4(A, Atb_re)
+                pr = c[0]+sv0[cy,cx]*c[1]+sv1[cy,cx]*c[2]+sv2[cy,cx]*c[3]
                 if is_complex:
-                    pred_re = c_re[0] + a1*c_re[1] + a2*c_re[2] + a3*c_re[3]
-                    pred_im = c_im[0] + a1*c_im[1] + a2*c_im[2] + a3*c_im[3]
-                    mag = np.sqrt(pred_re*pred_re + pred_im*pred_im)
-                    if mag > 0:
-                        trend_sum_re[i,j] += pred_re / mag
-                        trend_sum_im[i,j] += pred_im / mag
+                    ci = _solve4x4(A, Atb_im)
+                    ppi = ci[0]+sv0[cy,cx]*ci[1]+sv1[cy,cx]*ci[2]+sv2[cy,cx]*ci[3]
+                    mag = np.sqrt(pr*pr+ppi*ppi)
+                    if mag > 0: grid_re[gi,gj]=pr/mag; grid_im[gi,gj]=ppi/mag
                 else:
-                    trend_sum_re[i,j] += c_re[0] + a1*c_re[1] + a2*c_re[2] + a3*c_re[3]
-                count[i,j] += 1
+                    grid_re[gi,gj] = pr
 
-    return trend_sum_re, trend_sum_im, count
+    return grid_re, grid_im, gy_list, gx_list
 
 
-def trend2d_window_array(phase_2d, variables, weight_2d, device, degree, win_y, win_x):
-    """Fit local polynomials on 4 half-overlapping grids, average predictions.
+@nb.njit(cache=True)
+def _bilinear_interp_trend(grid_re, grid_im, gy, gx, ny, nx, is_complex):
+    """Bilinear interpolation of sparse trend grid to full (ny, nx) resolution."""
+    n_gy = len(gy)
+    n_gx = len(gx)
+    out_re = np.full((ny, nx), np.nan, dtype=np.float64)
+    out_im = np.full((ny, nx), np.nan, dtype=np.float64)
 
-    For degree=1 with 3 variables, uses a fast numba kernel (no array allocation
-    per window). Falls back to numpy for degree>=2 or != 3 variables.
+    # Precompute per-pixel grid indices and fractional weights
+    # O(ny + nx) instead of O(ny * nx) searches
+    row_gi = np.empty(ny, dtype=np.int64)
+    row_fy = np.empty(ny, dtype=np.float64)
+    gi = 0
+    for i in range(ny):
+        while gi < n_gy - 2 and gy[gi + 1] < i:
+            gi += 1
+        row_gi[i] = gi
+        span = gy[gi + 1] - gy[gi]
+        row_fy[i] = (i - gy[gi]) / span if span > 0 else 0.0
+
+    col_gj = np.empty(nx, dtype=np.int64)
+    col_fx = np.empty(nx, dtype=np.float64)
+    gj = 0
+    for j in range(nx):
+        while gj < n_gx - 2 and gx[gj + 1] < j:
+            gj += 1
+        col_gj[j] = gj
+        span = gx[gj + 1] - gx[gj]
+        col_fx[j] = (j - gx[gj]) / span if span > 0 else 0.0
+
+    for i in range(ny):
+        gi1 = row_gi[i]
+        gi2 = gi1 + 1
+        fy = row_fy[i]
+        for j in range(nx):
+            gj1 = col_gj[j]
+            gj2 = gj1 + 1
+            fx = col_fx[j]
+
+            # Bilinear weights for 4 corners
+            w00 = (1-fy)*(1-fx); w01 = (1-fy)*fx
+            w10 = fy*(1-fx);     w11 = fy*fx
+
+            # Accumulate from valid corners only
+            wsum = 0.0; vr = 0.0; vi = 0.0
+            r = grid_re[gi1, gj1]
+            if np.isfinite(r):
+                wsum += w00; vr += w00 * r
+                if is_complex: vi += w00 * grid_im[gi1, gj1]
+            r = grid_re[gi1, gj2]
+            if np.isfinite(r):
+                wsum += w01; vr += w01 * r
+                if is_complex: vi += w01 * grid_im[gi1, gj2]
+            r = grid_re[gi2, gj1]
+            if np.isfinite(r):
+                wsum += w10; vr += w10 * r
+                if is_complex: vi += w10 * grid_im[gi2, gj1]
+            r = grid_re[gi2, gj2]
+            if np.isfinite(r):
+                wsum += w11; vr += w11 * r
+                if is_complex: vi += w11 * grid_im[gi2, gj2]
+            if wsum > 0:
+                out_re[i, j] = vr / wsum
+                if is_complex:
+                    out_im[i, j] = vi / wsum
+    return out_re, out_im
+
+
+def trend2d_window_array(phase_2d, variables, weight_2d, win_y, win_x, stride=1):
+    """Sliding window local polynomial fit with column-cached incremental updates.
+
+    Per-pixel degree=1 polynomial fit using a sliding window with 3 regressors.
+    Uses a fast numba kernel with column-cached incremental normal equations.
+    With stride>1, computes at grid points and bilinearly interpolates the trend.
 
     Parameters
     ----------
     phase_2d : (ny, nx) complex64 or float32
-    variables : list of (ny, nx) float32 — regressors (azi, rng, ele)
+    variables : list of 3 (ny, nx) float32 — regressors (azi, rng, ele)
     weight_2d : (ny, nx) float32 or None
-    device : ignored (numpy only)
-    degree : int — polynomial degree
     win_y, win_x : int — window size in pixels
+    stride : int or tuple(int, int) — step between grid points (default 1).
+        E.g. stride=(10, 40) evaluates every 10th row, 40th column, then
+        bilinearly interpolates the trend to full resolution.
 
     Returns
     -------
-    trend : (ny, nx) same dtype — averaged trend from 4 grids
+    trend : (ny, nx) same dtype
     """
     ny, nx = phase_2d.shape
     is_complex = np.iscomplexobj(phase_2d)
 
-    wy = min(win_y, ny)
-    wx = min(win_x, nx)
-    hy = wy // 2
-    hx = wx // 2
+    if not (1 <= len(variables) <= 3):
+        raise ValueError("trend2d_window_array requires 1 to 3 variables (e.g. ele, azi+rng, azi+rng+ele)")
+    # Pad to 3 variables with zeros if fewer provided
+    while len(variables) < 3:
+        variables = list(variables) + [np.zeros_like(variables[0])]
 
-    def _window_extents(size, win, half):
-        """Return list of (start, end) covering all pixels, extending last window to edge."""
-        extents = []
-        for s in range(0, size - win + 1, win):
-            extents.append((s, s + win))
-        if extents and extents[-1][1] < size:
-            extents[-1] = (extents[-1][0], size)
-        if not extents and size > 0:
-            extents.append((0, size))
-        for s, e in extents:
-            assert e - s >= half, f"Window [{s}:{e}] size {e-s} < half_window {half}"
-        return extents
+    has_weight = weight_2d is not None
+    w2d = weight_2d if has_weight else np.empty((1, 1), dtype=np.float32)
+    half_y = min(win_y, ny) // 2
+    half_x = min(win_x, nx) // 2
 
-    y_offsets = [0] + ([hy] if ny - hy >= hy else [])
-    x_offsets = [0] + ([hx] if nx - hx >= hx else [])
+    if isinstance(stride, (tuple, list)):
+        stride_y, stride_x = int(stride[0]), int(stride[1])
+    else:
+        stride_y = stride_x = int(stride)
 
-    full_half = (wy * wx) // 2
-    windows = []
-    for off_y in y_offsets:
-        for off_x in x_offsets:
-            y_extents = _window_extents(ny - off_y, wy, hy)
-            x_extents = _window_extents(nx - off_x, wx, hx)
-            for (y0, y1) in y_extents:
-                ys, ye = y0 + off_y, y1 + off_y
-                for (x0, x1) in x_extents:
-                    xs, xe = x0 + off_x, x1 + off_x
-                    if (ye - ys) * (xe - xs) >= full_half:
-                        windows.append((ys, ye, xs, xe))
+    # Global standardization
+    v0, v1, v2 = variables[0], variables[1], variables[2]
+    mask = np.isfinite(v0) & np.isfinite(v1) & np.isfinite(v2)
+    g_mu0 = np.float64(v0[mask].mean()); g_std0 = max(np.float64(v0[mask].std()), 1e-10)
+    g_mu1 = np.float64(v1[mask].mean()); g_std1 = max(np.float64(v1[mask].std()), 1e-10)
+    g_mu2 = np.float64(v2[mask].mean()); g_std2 = max(np.float64(v2[mask].std()), 1e-10)
 
-    windows_arr = np.array(windows, dtype=np.int64)
+    grid_re, grid_im, gy_list, gx_list = _trend2d_sliding_numba_kernel(
+        phase_2d, v0, v1, v2, w2d,
+        half_y, half_x, stride_y, stride_x, has_weight, is_complex,
+        g_mu0, g_std0, g_mu1, g_std1, g_mu2, g_std2)
 
-    # Fast numba path for degree=1, 3 variables
-    if degree == 1 and len(variables) == 3:
-        has_weight = weight_2d is not None
-        w2d = weight_2d if has_weight else np.empty((1, 1), dtype=np.float32)
-        trend_re, trend_im, count = _trend2d_window_numba_kernel(
-            phase_2d, variables[0], variables[1], variables[2],
-            w2d, win_y, win_x, has_weight, is_complex, windows_arr)
+    if stride_y == 1 and stride_x == 1:
+        trend_re = grid_re
+        trend_im = grid_im
+    else:
+        gy = np.array(gy_list, dtype=np.float64)
+        gx = np.array(gx_list, dtype=np.float64)
+        trend_re, trend_im = _bilinear_interp_trend(grid_re, grid_im, gy, gx,
+                                                      ny, nx, is_complex)
 
-        assert count.max() <= 4, f"Over-covered pixels: max count={count.max()}"
-        mask = count > 0
-        if is_complex:
-            result = np.full((ny, nx), np.nan + 0j, dtype=np.complex64)
-            c = count[mask].astype(np.float64)
-            result.real[mask] = (trend_re[mask] / c).astype(np.float32)
-            result.imag[mask] = (trend_im[mask] / c).astype(np.float32)
-        else:
-            result = np.full((ny, nx), np.nan, dtype=np.float32)
-            result[mask] = (trend_re[mask] / count[mask]).astype(np.float32)
+    if is_complex:
+        result = np.empty((ny, nx), dtype=np.complex64)
+        result.real = trend_re.astype(np.float32)
+        result.imag = trend_im.astype(np.float32)
+        # Normalize to unit circle
+        mag = np.abs(result)
+        mag[~(mag > 0)] = 1
+        result /= mag
+        result[np.isnan(trend_re)] = np.nan + 0j
         return result
-
-    # Fallback: numpy path for degree>=2 or != 3 variables
-    if is_complex:
-        trend_sum = np.zeros((ny, nx), dtype=np.complex64)
     else:
-        trend_sum = np.zeros((ny, nx), dtype=np.float32)
-    count = np.zeros((ny, nx), dtype=np.int32)
-
-    for ys, ye, xs, xe in windows:
-        p_win = phase_2d[ys:ye, xs:xe]
-        v_wins = [v[ys:ye, xs:xe] for v in variables]
-        w_win = weight_2d[ys:ye, xs:xe] if weight_2d is not None else None
-
-        if is_complex:
-            valid = np.isfinite(p_win) & (p_win != 0)
-        else:
-            valid = np.isfinite(p_win)
-
-        n_valid = valid.sum()
-        min_pixels = (degree + 1) * (len(variables) + 1)
-        if n_valid < min_pixels:
-            continue
-
-        idx = np.where(valid.ravel())[0]
-        n = len(idx)
-        cols = [np.ones(n, dtype=np.float64)]
-        standardize = []
-        for v in v_wins:
-            vf = v.ravel()[idx].astype(np.float64)
-            mu, std = vf.mean(), max(vf.std(), 1e-10)
-            cols.append((vf - mu) / std)
-            standardize.append((mu, std))
-        if degree >= 2:
-            base = list(cols[1:])
-            for d in range(2, degree + 1):
-                for c in base:
-                    cols.append(c ** d)
-
-        A = np.column_stack(cols)
-        nf = A.shape[1]
-        if n < nf:
-            continue
-
-        w_sqrt = None
-        if w_win is not None:
-            w_sqrt = np.sqrt(np.clip(w_win.ravel()[idx].astype(np.float64), 1e-6, None))
-            Aw = A * w_sqrt[:, np.newaxis]
-        else:
-            Aw = A
-
-        AtA = Aw.T @ Aw + np.eye(nf) * 1e-8
-        win_h, win_w = ye - ys, xe - xs
-
-        all_cols = [np.ones(win_h * win_w, dtype=np.float64)]
-        for v, (mu, std) in zip(v_wins, standardize):
-            all_cols.append((v.ravel().astype(np.float64) - mu) / std)
-        if degree >= 2:
-            base = list(all_cols[1:])
-            for d in range(2, degree + 1):
-                for c in base:
-                    all_cols.append(c ** d)
-        A_all = np.column_stack(all_cols)
-
-        if is_complex:
-            p_flat = p_win.ravel()[idx].astype(np.complex128)
-            p_unit = p_flat / np.abs(p_flat)
-            b_real = p_unit.real
-            b_imag = p_unit.imag
-            if w_sqrt is not None:
-                b_real = b_real * w_sqrt
-                b_imag = b_imag * w_sqrt
-            c_real = np.linalg.solve(AtA, Aw.T @ b_real)
-            c_imag = np.linalg.solve(AtA, Aw.T @ b_imag)
-            pred = (A_all @ c_real + 1j * A_all @ c_imag).reshape(win_h, win_w)
-            pred_abs = np.abs(pred)
-            pred_abs[~(pred_abs > 0)] = 1
-            trend_win = (pred / pred_abs).astype(np.complex64)
-        else:
-            p_flat = p_win.ravel()[idx].astype(np.float64)
-            if w_sqrt is not None:
-                p_flat = p_flat * w_sqrt
-            coeffs = np.linalg.solve(AtA, Aw.T @ p_flat)
-            trend_win = (A_all @ coeffs).reshape(win_h, win_w).astype(np.float32)
-
-        trend_sum[ys:ye, xs:xe] += trend_win
-        count[ys:ye, xs:xe] += 1
-
-    assert count.max() <= 4, f"Over-covered pixels: max count={count.max()}"
-
-    mask = count > 0
-    if is_complex:
-        result = np.full((ny, nx), np.nan + 0j, dtype=np.complex64)
-    else:
-        result = np.full((ny, nx), np.nan, dtype=np.float32)
-    result[mask] = trend_sum[mask] / count[mask]
-    return result
+        result = trend_re.astype(np.float32)
+        result[np.isnan(trend_re)] = np.nan
+        return result
 
 
 def trend2d_array(phase, weight, variables, device, degree=1):
