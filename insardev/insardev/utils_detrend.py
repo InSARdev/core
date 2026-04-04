@@ -85,7 +85,7 @@ def _trend1d_pairs_numba_kernel(
     pair_ref_didx,     # (n_pairs,) ref date index
     pair_rep_didx,     # (n_pairs,) rep date index
     max_refine,
-    use_jumps=True,    # True for wrapped (complex), False for unwrapped (real)
+    is_complex=True,   # True for wrapped (complex), False for unwrapped (real)
 ):
     """Per-pixel IRLS fitting of all dates, with iterative refinement.
 
@@ -108,7 +108,7 @@ def _trend1d_pairs_numba_kernel(
 
     for px in range(n_pixels):
         # Extract angles and correlation weights in float64
-        if use_jumps:
+        if is_complex:
             for p in range(n_pairs):
                 c = data_flat[p, px]
                 re = np.float64(c.real)
@@ -184,7 +184,7 @@ def _trend1d_pairs_numba_kernel(
 
                 # IRLS loop using wrapped residuals.
                 # Initialize with weighted circular mean, then refine with slope.
-                if use_jumps:
+                if is_complex:
                     wsin = 0.0; wcos = 0.0
                     for k in range(n_d):
                         if valid[k]:
@@ -205,7 +205,7 @@ def _trend1d_pairs_numba_kernel(
                             continue
                         t = t_vals[k]
                         fit_val = a + b * t
-                        if use_jumps:
+                        if is_complex:
                             res = phases[k] - fit_val
                             res = res - 2.0 * np.pi * np.floor((res + np.pi) / (2.0 * np.pi))
                             y = fit_val + res
@@ -266,11 +266,60 @@ def _trend1d_pairs_numba_kernel(
         if cstd_count > 0 and (cstd_sum / cstd_count) > (np.pi / 2):
             continue  # leave trend as NaN for this pixel
 
+        # Date-to-date smoothness check on detrended output.
+        # Weighted mean of detrended signed phases per date;
+        # delta between adjacent dates must be < π/2.
+        DATE_DELTA_THR = np.pi * 0.5
+        date_cmean = np.empty(n_dates, dtype=np.float64)
+        date_has_cmean = np.zeros(n_dates, dtype=nb.boolean)
+        for d in range(n_dates):
+            d_start = date_offsets[d]
+            d_end = date_offsets[d + 1]
+            wsin_d = 0.0; wcos_d = 0.0; wsum_d = 0.0; wmean_d = 0.0
+            for k in range(d_end - d_start):
+                pidx = date_pair_flat[d_start + k]
+                if not np.isfinite(pixel_angles[pidx]):
+                    continue
+                pw = pixel_weights[pidx]
+                if pw <= 0.0:
+                    continue
+                # Detrended signed phase
+                diff = local_models[pair_ref_didx[pidx]] - local_models[pair_rep_didx[pidx]]
+                detr = pixel_angles[pidx] - diff
+                signed = detr * date_sign_flat[d_start + k]
+                if is_complex:
+                    wsin_d += pw * np.sin(signed)
+                    wcos_d += pw * np.cos(signed)
+                else:
+                    wmean_d += pw * signed
+                wsum_d += pw
+            if wsum_d > 1e-10:
+                if is_complex:
+                    date_cmean[d] = np.arctan2(wsin_d, wcos_d)
+                else:
+                    date_cmean[d] = wmean_d / wsum_d
+                date_has_cmean[d] = True
+            else:
+                date_cmean[d] = 0.0
+
+        # Check deltas between adjacent dates (d, d+1) only
+        bad_pixel = False
+        for d in range(n_dates - 1):
+            if date_has_cmean[d] and date_has_cmean[d + 1]:
+                delta = date_cmean[d + 1] - date_cmean[d]
+                if is_complex:
+                    delta = delta - 2.0 * np.pi * np.floor((delta + np.pi) / (2.0 * np.pi))
+                if abs(delta) >= DATE_DELTA_THR:
+                    bad_pixel = True
+                    break
+        if bad_pixel:
+            continue  # leave trend as NaN for this pixel
+
         # Reconstruct per-pair trend
         for p in range(n_pairs):
             if np.isfinite(pixel_angles[p]):
                 diff = local_models[pair_ref_didx[p]] - local_models[pair_rep_didx[p]]
-                if use_jumps:
+                if is_complex:
                     trend[p, px] = np.complex64(np.exp(1j * diff))
                 else:
                     trend[p, px] = np.complex64(diff)
@@ -285,7 +334,7 @@ def _trend1d_numba_kernel(
     dim_norm,       # (n_samples,) float64  — normalized dim values
     intercept,      # bool — include intercept in output
     slope,          # bool — include slope in output
-    use_jumps,      # bool — True for wrapped (complex) phase, False for unwrapped (real)
+    is_complex,      # bool — True for wrapped (complex) phase, False for unwrapped (real)
     has_weight,     # bool — True if w_flat contains real weights, False if unit weights
 ):
     """Per-pixel IRLS linear fitting for detrend1d.
@@ -298,7 +347,7 @@ def _trend1d_numba_kernel(
 
     Returns
     -------
-    result : (n_samples, n_pixels) complex64 if use_jumps, else float32.
+    result : (n_samples, n_pixels) complex64 if is_complex, else float32.
         Complex: unit-magnitude trend exp(1j*fit). Real: fitted values.
     """
     n_samples, n_pixels = data_flat.shape
@@ -313,7 +362,7 @@ def _trend1d_numba_kernel(
     for px in range(n_pixels):
         # Extract angles per-pixel from complex input, or use values directly
         n_valid = 0
-        if use_jumps:
+        if is_complex:
             for s in range(n_samples):
                 c = data_flat[s, px]
                 re = np.float64(c.real)
@@ -353,7 +402,7 @@ def _trend1d_numba_kernel(
 
         # IRLS loop using wrapped residuals (no jumps for wrapped phase)
         epsilon = 0.1
-        if use_jumps:
+        if is_complex:
             # Initialize with circular mean from complex input (no trig)
             re_sum = 0.0; im_sum = 0.0
             for s in range(n_samples):
@@ -374,7 +423,7 @@ def _trend1d_numba_kernel(
                     continue
                 t = dim_norm[s]
                 fit_val = c0 + c1 * t
-                if use_jumps:
+                if is_complex:
                     # Wrap residual, then "unwrap" around current model
                     res = angles[s] - fit_val
                     res = res - 2.0 * np.pi * np.floor((res + np.pi) / (2.0 * np.pi))
@@ -413,7 +462,7 @@ def _trend1d_numba_kernel(
                 fit_val = c0
             else:
                 fit_val = c0 + c1 * t
-            if use_jumps:
+            if is_complex:
                 result[s, px] = np.complex64(np.exp(1j * fit_val))
             else:
                 result[s, px] = np.complex64(fit_val)
