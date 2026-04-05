@@ -840,10 +840,16 @@ class Stack(Stack_plot, BatchCore):
             store = args[0]
             args = ()
 
-        # If no batch args provided — open mode
+        # If no batch args provided — save Stack (if non-empty) or open existing
         if len(args) == 0:
             if store is None:
                 raise ValueError("store path is required to open snapshot")
+            if len(self) > 0:
+                # Non-empty Stack: save itself, then reopen
+                utils_io.save(self, store=store, storage_options=storage_options,
+                             caption=caption or 'Snapshotting...', n_chunks=n_chunks, debug=debug)
+                return utils_io.open(store=store, storage_options=storage_options,
+                                     n_jobs=-1, debug=debug)
             return Batches().snapshot(store=store, storage_options=storage_options,
                                       caption=caption, n_chunks=n_chunks, debug=debug)
 
