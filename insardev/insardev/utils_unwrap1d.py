@@ -145,19 +145,14 @@ def _triplet_irls_unwrap_numba(
     trip_left,          # (n_triplets,) int64
     trip_right,         # (n_triplets,) int64
     trip_offsets,        # (n_pairs+1,) int64 — offsets into trip arrays by long pair
-    pair_trip_flat,     # (sum,) int64 — ALL triplets per pair (long+left+right)
-    pair_trip_offsets,  # (n_pairs+1,) int64 — offsets into pair_trip_flat
-    threshold,          # float — triplet cstd threshold
     max_iter,           # int — IRLS iterations
     epsilon,            # float — IRLS regularization
-    min_probability,    # float — minimum fraction of pairs passing closure (0-1)
 ):
-    """Per-pixel triplet filtering + integer-aware IRLS unwrapping.
+    """Per-pixel integer-aware IRLS unwrapping.
 
-    Three robustness mechanisms:
+    Robustness mechanisms:
     1. Integer corrections applied inside IRLS loop (not single-shot at end)
     2. Interval wrapping: x[i] → [-π,π], ambiguous intervals (|x[i]|≥π/2) zeroed
-    3. Post-unwrap triplet closure check on all pairs
 
     Returns unwrapped phases (n_pairs, n_pixels).
     """
@@ -172,54 +167,13 @@ def _triplet_irls_unwrap_numba(
     x = np.zeros(n_intervals, dtype=np.float64)
     w_irls = np.ones(n_pairs, dtype=np.float64)
     selected = np.ones(n_pairs, dtype=nb.boolean)
-    pair_cstd = np.zeros(n_pairs, dtype=np.float64)
     k_corr = np.zeros(n_pairs, dtype=np.int64)
     k_prev = np.zeros(n_pairs, dtype=np.int64)
 
     for px in range(n_pixels):
-        # --- Step 1: Triplet filtering ---
-        n_triplets = len(trip_long)
-        if n_triplets > 0 and threshold >= 0.0:
-            for p in range(n_pairs):
-                pair_cstd[p] = np.inf
-                selected[p] = False
-
-            for p in range(n_pairs):
-                t_start = trip_offsets[p]
-                t_end = trip_offsets[p + 1]
-                n_t = t_end - t_start
-                if n_t < 2:
-                    pair_cstd[p] = np.inf
-                    continue
-
-                sum_cos = 0.0
-                sum_sin = 0.0
-                for t in range(t_start, t_end):
-                    cl = phi_flat[trip_long[t], px] - phi_flat[trip_left[t], px] - phi_flat[trip_right[t], px]
-                    cl = np.arctan2(np.sin(cl), np.cos(cl))
-                    sum_cos += np.cos(cl)
-                    sum_sin += np.sin(cl)
-                R = np.sqrt((sum_cos / n_t)**2 + (sum_sin / n_t)**2)
-                if R >= 1.0 - 1e-10:
-                    R = 1.0 - 1e-10
-                pair_cstd[p] = np.sqrt(-2.0 * np.log(R))
-
-            for p in range(n_pairs):
-                if pair_cstd[p] < threshold:
-                    selected[p] = True
-
-            for t in range(n_triplets):
-                lp = trip_long[t]
-                if selected[lp]:
-                    selected[trip_left[t]] = True
-                    selected[trip_right[t]] = True
-
-            for p in range(n_pairs):
-                if not np.isfinite(phi_flat[p, px]) or not np.isfinite(w_flat[p, px]):
-                    selected[p] = False
-        else:
-            for p in range(n_pairs):
-                selected[p] = np.isfinite(phi_flat[p, px]) and np.isfinite(w_flat[p, px])
+        # Select valid pairs (finite phase and weight)
+        for p in range(n_pairs):
+            selected[p] = np.isfinite(phi_flat[p, px]) and np.isfinite(w_flat[p, px])
 
         n_valid = 0
         for p in range(n_pairs):
@@ -335,74 +289,8 @@ def _triplet_irls_unwrap_numba(
             k_corr[p] = int(_round_half_away_numba(
                 (phi_recon - np.float64(phi_flat[p, px])) / (2.0 * np.pi)))
 
-        # --- Step 4: Triplet closure check (ALL triplets per pair) ---
-        PERTURB_EPS = 0.1
-        CLOSURE_THRESHOLD = np.pi * 0.5
-
-        n_passed = 0
-        n_selected = 0
-        for p in range(n_pairs):
-            if not selected[p]:
-                continue
-            n_selected += 1
-            phi_corr = np.float64(phi_flat[p, px]) + k_corr[p] * 2.0 * np.pi
-
-            # Check ALL triplets containing this pair (as long, left, or right)
-            pt_start = pair_trip_offsets[p]
-            pt_end = pair_trip_offsets[p + 1]
-            n_bad = 0
-            n_checked = 0
-            for ti in range(pt_start, pt_end):
-                t = pair_trip_flat[ti]
-                tl = trip_long[t]; tleft = trip_left[t]; tright = trip_right[t]
-                if not (selected[tl] and selected[tleft] and selected[tright]):
-                    continue
-                ul = np.float64(phi_flat[tl, px]) + k_corr[tl] * 2.0 * np.pi
-                uleft = np.float64(phi_flat[tleft, px]) + k_corr[tleft] * 2.0 * np.pi
-                uright = np.float64(phi_flat[tright, px]) + k_corr[tright] * 2.0 * np.pi
-                closure = ul - uleft - uright
-                n_checked += 1
-                if abs(closure) > CLOSURE_THRESHOLD:
-                    n_bad += 1
-            if n_bad > 0:
-                selected[p] = False
-                continue
-
-            # Perturbation check for pairs with no triplets
-            if n_checked == 0:
-                phi_recon = 0.0
-                for i in range(pair_start[p], pair_end[p] + 1):
-                    phi_recon += x[i]
-                raw_diff = phi_recon - np.float64(phi_flat[p, px])
-                k_base = _round_half_away_numba(raw_diff / (2.0 * np.pi))
-                k_plus = _round_half_away_numba((raw_diff - PERTURB_EPS) / (2.0 * np.pi))
-                k_minus = _round_half_away_numba((raw_diff + PERTURB_EPS) / (2.0 * np.pi))
-                if k_plus != k_base or k_minus != k_base:
-                    selected[p] = False
-                    continue
-
-            n_passed += 1
-
-        # If too few pairs passed closure → pixel is unsolvable
-        if n_selected > 0 and n_passed < int(n_selected * min_probability):
-            continue  # NaN entire pixel
-
-        # RMS residual check: random/incoherent input has σ_res ≈ π/√3 ≈ 1.8
-        # Good data has σ_res ≈ noise level (0.1-0.3). Reject if σ_res > π/4.
-        rms_sum = 0.0
-        rms_n = 0
-        for p in range(n_pairs):
-            if not selected[p]:
-                continue
-            phi_recon = 0.0
-            for i in range(pair_start[p], pair_end[p] + 1):
-                phi_recon += x[i]
-            res = np.float64(phi_flat[p, px]) + k_corr[p] * 2.0 * np.pi - phi_recon
-            res = np.arctan2(np.sin(res), np.cos(res))
-            rms_sum += res * res
-            rms_n += 1
-        if rms_n > 0 and np.sqrt(rms_sum / rms_n) > np.pi * 0.25:
-            continue  # high residual → random/incoherent input
+        # No RMS quality gate — weighted RMS doesn't reliably separate
+        # noise from high-atmospheric stable pixels. Use threshold() instead.
 
         for p in range(n_pairs):
             if selected[p]:
@@ -537,20 +425,7 @@ def _lstsq_numba(
                 res = phi_flat[p, px] - phi_recon
                 w_irls[p] = 1.0 / (abs(res) + epsilon)
 
-        # RMS residual check: reject if fit residual is too high
-        rms_sum = 0.0
-        rms_n = 0
-        for p in range(n_pairs):
-            if not np.isfinite(phi_flat[p, px]) or not np.isfinite(w_flat[p, px]):
-                continue
-            phi_recon = 0.0
-            for i in range(pair_start[p], pair_end[p] + 1):
-                phi_recon += x[i]
-            res = phi_flat[p, px] - phi_recon
-            rms_sum += res * res
-            rms_n += 1
-        if rms_n > 0 and np.sqrt(rms_sum / rms_n) > np.pi * 0.25:
-            continue  # noisy/inconsistent input → NaN
+        # No RMS quality gate — use threshold() for explicit filtering.
 
         # Build time series for this pixel
         result[0, px] = 0.0
@@ -638,8 +513,7 @@ def _flatten_input(phase_stack, weight_stack):
 
 
 def unwrap1d_pairs_numpy(phase_stack, weight_stack, pair_dates,
-                         max_iter=20, epsilon=0.1,
-                         threshold=0.5, min_probability=0.5, debug=False):
+                         max_iter=20, epsilon=0.1, debug=False):
     """
     Temporal phase unwrapping on numpy arrays.
 
@@ -658,9 +532,6 @@ def unwrap1d_pairs_numpy(phase_stack, weight_stack, pair_dates,
         Maximum IRLS iterations. Default 5.
     epsilon : float
         IRLS regularization parameter. Default 0.1.
-    threshold : float or None
-        Pair consistency threshold. Lower = more conservative filtering.
-        None disables triplet filtering (all pairs used). Default 0.5.
     debug : bool
         Print debug information.
 
@@ -684,14 +555,10 @@ def unwrap1d_pairs_numpy(phase_stack, weight_stack, pair_dates,
         print(f'1D unwrap: {n_pairs} pairs, {len(dates)} dates, '
               f'{phases_flat.shape[1]} pixels')
 
-    # threshold=None → -1.0 to disable triplet filtering in numba kernel
-    thr = -1.0 if threshold is None else float(threshold)
-
     result = _triplet_irls_unwrap_numba(
         phases_flat, weights_flat, pair_start, pair_end, n_intervals,
         trip_long, trip_left, trip_right, trip_offsets,
-        pair_trip_flat, pair_trip_offsets,
-        thr, max_iter, epsilon, float(min_probability))
+        max_iter, epsilon)
 
     return result.reshape(n_pairs, height, width)
 
@@ -763,11 +630,8 @@ def _warmup_numba_cache():
     _tL = np.array([0], dtype=np.int64)
     _tR = np.array([1], dtype=np.int64)
     _to = np.array([0, 0, 0, 1], dtype=np.int64)
-    # pair_trip: all 3 pairs participate in triplet 0
-    _ptf = np.array([0, 0, 0], dtype=np.int64)
-    _pto = np.array([0, 1, 2, 3], dtype=np.int64)
     _triplet_irls_unwrap_numba(_phi, _w, _ps, _pe, 2, _tl, _tL, _tR, _to,
-                                _ptf, _pto, 1.0, 1, 0.1, 0.5)
+                                1, 0.1)
     _lstsq_numba(_phi, _w, _ps, _pe, 2, 1, 0.1, 1e-4, True)
 
 _warmup_numba_cache()

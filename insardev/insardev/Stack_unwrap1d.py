@@ -190,8 +190,7 @@ class Stack_unwrap1d(BatchCore):
         )
 
     def unwrap1d(self, data, weight=None, max_iter=5,
-                 epsilon=0.1, threshold=0.5,
-                 debug=False):
+                 epsilon=0.1, debug=False):
         """
         Temporal phase unwrapping returning unwrapped pairs.
 
@@ -212,9 +211,6 @@ class Stack_unwrap1d(BatchCore):
             Maximum IRLS iterations. Default 5.
         epsilon : float, optional
             IRLS regularization parameter. Default 0.1.
-        threshold : float or None, optional
-            Pair consistency threshold. Lower = more conservative filtering.
-            None disables triplet filtering (all pairs used). Default 0.5.
         debug : bool, optional
             Print debug information.
 
@@ -255,20 +251,6 @@ class Stack_unwrap1d(BatchCore):
         from .BatchCore import BatchCore
         BatchCore._require_lazy(data, 'unwrap1d')
 
-        # Quick check: triplet filtering needs pairs spanning 3+ date intervals.
-        # Just inspect ref/rep coords — no matrix building.
-        if threshold is not None:
-            first_ds = next(iter(data.values()))
-            refs = first_ds.coords['ref'].values
-            reps = first_ds.coords['rep'].values
-            dates = np.unique(np.concatenate([refs, reps]))
-            longest = np.argmax(reps - refs)
-            n_between = int(np.sum((dates > refs[longest]) & (dates < reps[longest])))
-            if n_between < 2:
-                print(f"NOTE: triplet filtering disabled — longest pair spans {n_between + 1} intervals "
-                      f"(need 3+). Use days=36+ or threshold=None.")
-                threshold = None
-
         # Process each burst
         results = {}
         for key in data.keys():
@@ -283,8 +265,7 @@ class Stack_unwrap1d(BatchCore):
                 w_da = w_ds[pol] if w_ds is not None else None
 
                 result = self._unwrap1d_pairs_dataarray(
-                    da, w_da, max_iter, epsilon,
-                    threshold, debug
+                    da, w_da, max_iter, epsilon, debug
                 )
                 result_vars[pol] = result
 
@@ -298,8 +279,7 @@ class Stack_unwrap1d(BatchCore):
         return Batch(results)
 
     def _unwrap1d_pairs_dataarray(self, data, weight, max_iter,
-                                   epsilon,
-                                   threshold, debug):
+                                   epsilon, debug):
         """Internal method for unwrapping on DataArray returning pairs - LAZY."""
         import xarray as xr
         import pandas as pd
@@ -337,9 +317,7 @@ class Stack_unwrap1d(BatchCore):
             unwrapped = utils_unwrap1d.unwrap1d_pairs_numpy(
                 [data_block], [weight_block] if weight_block is not None else None,
                 pair_dates, max_iter=max_iter,
-                epsilon=epsilon,
-                threshold=threshold,
-                debug=False
+                epsilon=epsilon, debug=False
             )
             return unwrapped.astype(np.float32)
 

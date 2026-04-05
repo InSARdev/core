@@ -48,8 +48,10 @@ def _warmup_numba_cache():
     _c = np.zeros((3, 1), dtype=np.complex64)
     _w = np.ones((1, 1), dtype=np.float32)
     _d = np.array([-1.0, 0.0, 1.0])
-    _trend1d_numba_kernel(_c, _w, _d, True, True, True, False)
+    _trend1d_numba_kernel(_c, _w, _d, True, True, True, False, 128)
     _wf = np.ones((3, 1), dtype=np.float32)
+    _threshold_pairs_numba_kernel(_c, _wf, 1, 3, np.pi * 0.5)
+    _v, _r = _velocity_pairs_numba_kernel(_c, _wf, 1, 3, np.array([1.0, 1.0, 2.0]), 3, np.pi)
     _trend1d_pairs_numba_kernel(
         _c, _wf, 1, 2, 3,
         np.array([0, 1, 2], dtype=np.int64),
@@ -58,6 +60,7 @@ def _warmup_numba_cache():
         np.array([0, 2, 3], dtype=np.int64),
         np.array([0, 0, 1], dtype=np.int64),
         np.array([1, 1, 0], dtype=np.int64),
+        np.array([1.0, 1.0, 2.0]),  # pair_dt
         0, True,
     )
     _v = np.zeros((2, 3), dtype=np.float32)
@@ -69,6 +72,306 @@ def _warmup_numba_cache():
         _p, _v, _v, _v, np.ones((1, 1), dtype=np.float32),
         1, 1, 1, 1, False, True, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0,
     )
+
+
+@nb.njit(cache=True)
+def _threshold_pairs_numba_kernel(
+    data_flat,         # (n_pairs, n_pixels) complex64/128
+    weight_flat,       # (n_pairs, n_pixels) float32
+    n_pixels,
+    n_pairs,
+    threshold,         # cstd threshold in radians
+):
+    """Per-pixel weighted cstd check. Returns mask: True = keep, False = reject."""
+    mask = np.zeros(n_pixels, dtype=nb.boolean)
+    for px in range(n_pixels):
+        wcos = 0.0; wsin = 0.0; wsum = 0.0
+        for p in range(n_pairs):
+            c = data_flat[p, px]
+            re = np.float64(c.real)
+            im = np.float64(c.imag)
+            ang = np.arctan2(im, re)
+            if (re == 0.0 and im == 0.0) or not np.isfinite(ang):
+                continue
+            pw = np.float64(weight_flat[p, px])
+            if pw <= 0.0:
+                continue
+            wcos += pw * np.cos(ang)
+            wsin += pw * np.sin(ang)
+            wsum += pw
+        if wsum < 1e-10:
+            continue
+        R = np.sqrt((wcos / wsum)**2 + (wsin / wsum)**2)
+        if R < 1e-10:
+            continue
+        R = min(R, 1 - 1e-10)
+        if np.sqrt(-2.0 * np.log(R)) < threshold:
+            mask[px] = True
+    return mask
+
+
+def threshold_pairs_array(data_chunk, weight_chunk, threshold=np.pi/2):
+    """Apply cstd threshold to complex pair data. Returns filtered copy.
+
+    Pixels with weighted cstd >= threshold have all pairs set to 0+0j.
+    """
+    import numpy as np
+
+    if isinstance(data_chunk, list):
+        data_np = np.asarray(data_chunk[0]) if len(data_chunk) == 1 else np.concatenate([np.asarray(c) for c in data_chunk], axis=0)
+    else:
+        data_np = np.asarray(data_chunk)
+
+    if data_np.ndim == 2:
+        n_pairs, nx = data_np.shape
+        ny = 1
+        data_np = data_np.reshape(n_pairs, ny, nx)
+    else:
+        n_pairs, ny, nx = data_np.shape
+    n_pixels = ny * nx
+
+    data_flat = np.ascontiguousarray(data_np.reshape(n_pairs, n_pixels))
+
+    if isinstance(weight_chunk, list):
+        weight_np = np.asarray(weight_chunk[0]) if len(weight_chunk) == 1 else np.concatenate([np.asarray(c) for c in weight_chunk], axis=0)
+    elif weight_chunk is not None:
+        weight_np = np.asarray(weight_chunk)
+    else:
+        weight_np = None
+
+    if weight_np is not None:
+        weight_flat = np.ascontiguousarray(weight_np.reshape(n_pairs, n_pixels).astype(np.float32))
+        weight_flat[~np.isfinite(weight_flat)] = 0.0
+        weight_flat[weight_flat < 0] = 0.0
+    else:
+        weight_flat = np.ones((n_pairs, n_pixels), dtype=np.float32)
+    del weight_np
+
+    mask = _threshold_pairs_numba_kernel(data_flat, weight_flat, n_pixels, n_pairs, threshold)
+
+    # NaN rejected pixels
+    result = data_np.copy()
+    mask_2d = mask.reshape(ny, nx)
+    nan_val = np.complex64(np.nan + 0j)
+    for iy in range(ny):
+        for ix in range(nx):
+            if not mask_2d[iy, ix]:
+                result[:, iy, ix] = nan_val
+    return result
+
+
+@nb.njit(cache=True)
+def _velocity_pairs_numba_kernel(
+    data_flat,         # (n_pairs, n_pixels) complex128
+    weight_flat,       # (n_pairs, n_pixels) float32
+    n_pixels,
+    n_pairs,
+    pair_dt,           # (n_pairs,) temporal baseline (years)
+    max_refine,        # refinement levels (0=coarse only, 3=0.5mm/yr accuracy)
+    vmax,              # max velocity in rad/year (0 = use Nyquist)
+):
+    """Global velocity estimation per pixel via multi-level periodogram.
+
+    16-bin coarse search + up to max_refine levels of 16-bin refinement.
+    Each level refines within ±1 bin of the previous level.
+    Resolution: level 0 = ±32mm/yr, level 1 = ±4mm/yr,
+    level 2 = ±0.5mm/yr, level 3 = ±0.06mm/yr.
+
+    Returns
+    -------
+    velocity : (n_pixels,) float32
+        Velocity in rad/year. NaN where insufficient valid pairs.
+    rmse : (n_pixels,) float32
+        RMSE of residuals in rad after velocity removal. NaN where invalid.
+        Clean pixel ~0.3, noise ~1.8. Use as quality metric.
+    """
+    TWO_PI = 2.0 * np.pi
+    N_BIN = 16
+    velocity = np.full(n_pixels, np.nan, dtype=np.float32)
+    rmse = np.full(n_pixels, np.nan, dtype=np.float32)
+
+    # Search range: user-specified vmax or Nyquist
+    if vmax > 0:
+        gv_range = vmax
+    else:
+        gv_dt_min = 1e30
+        for p in range(n_pairs):
+            adt = abs(pair_dt[p])
+            if adt > 1e-10 and adt < gv_dt_min:
+                gv_dt_min = adt
+        if gv_dt_min > 1e20:
+            gv_dt_min = 1.0
+        gv_range = np.pi / gv_dt_min
+
+    # Precompute angles and weights per pixel (reused across scan bins)
+    pixel_ang = np.empty(n_pairs, dtype=np.float64)
+    pixel_w = np.empty(n_pairs, dtype=np.float64)
+    pixel_valid = np.empty(n_pairs, dtype=nb.boolean)
+
+    for px in range(n_pixels):
+        n_valid = 0
+        for p in range(n_pairs):
+            c = data_flat[p, px]
+            re = np.float64(c.real)
+            im = np.float64(c.imag)
+            pw = np.float64(weight_flat[p, px])
+            ang = np.arctan2(im, re)
+            if (re == 0.0 and im == 0.0) or not np.isfinite(ang) or pw <= 0.0:
+                pixel_ang[p] = 0.0
+                pixel_w[p] = 0.0
+                pixel_valid[p] = False
+            else:
+                pixel_ang[p] = ang
+                pixel_w[p] = pw
+                pixel_valid[p] = True
+                n_valid += 1
+        if n_valid < 4:
+            continue
+
+        # Multi-level periodogram with trig recurrence.
+        # Precompute cos/sin of phases (same for all scan bins).
+        # cos(phase - v*dt) = cos_ph*cos(v*dt) + sin_ph*sin(v*dt)
+        # sin(phase - v*dt) = sin_ph*cos(v*dt) - cos_ph*sin(v*dt)
+        cos_ph = np.empty(n_pairs, dtype=np.float64)
+        sin_ph = np.empty(n_pairs, dtype=np.float64)
+        for p in range(n_pairs):
+            if pixel_valid[p]:
+                cos_ph[p] = np.cos(pixel_ang[p])
+                sin_ph[p] = np.sin(pixel_ang[p])
+            else:
+                cos_ph[p] = 0.0; sin_ph[p] = 0.0
+
+        step = 2.0 * gv_range / N_BIN
+        best_S = -1.0
+        best_v = 0.0
+        scan_lo = -gv_range
+
+        cos_step = np.empty(n_pairs, dtype=np.float64)
+        sin_step = np.empty(n_pairs, dtype=np.float64)
+        cos_cur = np.empty(n_pairs, dtype=np.float64)
+        sin_cur = np.empty(n_pairs, dtype=np.float64)
+
+        for level in range(1 + max_refine):
+            # Init trig recurrence for this level
+            for p in range(n_pairs):
+                if pixel_valid[p]:
+                    st = step * pair_dt[p]
+                    cos_step[p] = np.cos(st); sin_step[p] = np.sin(st)
+                    bt = scan_lo * pair_dt[p]
+                    cos_cur[p] = np.cos(bt); sin_cur[p] = np.sin(bt)
+
+            for bi in range(N_BIN):
+                sr = 0.0; si = 0.0
+                for p in range(n_pairs):
+                    if not pixel_valid[p]:
+                        continue
+                    sr += pixel_w[p] * (cos_ph[p] * cos_cur[p] + sin_ph[p] * sin_cur[p])
+                    si += pixel_w[p] * (sin_ph[p] * cos_cur[p] - cos_ph[p] * sin_cur[p])
+                S = sr * sr + si * si
+                if S > best_S:
+                    best_S = S
+                    best_v = scan_lo + step * bi
+                # Step recurrence
+                for p in range(n_pairs):
+                    if pixel_valid[p]:
+                        c = cos_cur[p] * cos_step[p] - sin_cur[p] * sin_step[p]
+                        s = sin_cur[p] * cos_step[p] + cos_cur[p] * sin_step[p]
+                        cos_cur[p] = c; sin_cur[p] = s
+
+            # Next level: refine within ±1 bin of current best
+            scan_lo = best_v - step
+            step = 2.0 * step / N_BIN
+
+        velocity[px] = np.float32(best_v)
+
+        # RMSE: weighted RMS of wrapped residuals after velocity removal (rad).
+        # Clean pixel: ~0.3 rad. Noise: ~1.8 rad. Clear separation.
+        rms_sum = 0.0; w_sum = 0.0
+        for p in range(n_pairs):
+            if not pixel_valid[p]:
+                continue
+            bt = best_v * pair_dt[p]
+            cv = np.cos(bt); sv = np.sin(bt)
+            res_cos = cos_ph[p] * cv + sin_ph[p] * sv
+            res_sin = sin_ph[p] * cv - cos_ph[p] * sv
+            res = np.arctan2(res_sin, res_cos)
+            rms_sum += pixel_w[p] * res * res
+            w_sum += pixel_w[p]
+        if w_sum > 1e-10:
+            rmse[px] = np.float32(np.sqrt(rms_sum / w_sum))
+
+    return velocity, rmse
+
+
+def velocity_pairs_array(data_chunk, weight_chunk, ref_values, rep_values, max_refine=3):
+    """Estimate global velocity from interferometric pair network.
+
+    Parameters
+    ----------
+    data_chunk : np.ndarray or list
+        3D complex array (n_pairs, chunk_y, chunk_x).
+    weight_chunk : np.ndarray or None
+        Weight array (real), same shape as data_chunk.
+    ref_values : np.ndarray
+        1D array of ref dates as int64 (nanoseconds since epoch).
+    rep_values : np.ndarray
+        1D array of rep dates as int64 (nanoseconds since epoch).
+    max_refine : int
+        Refinement levels (0=coarse ~32mm/yr, 3=fine ~0.5mm/yr). Default 3.
+
+    Returns
+    -------
+    np.ndarray
+        Velocity array (chunk_y, chunk_x), float32, in rad/year.
+    """
+    import numpy as np
+
+    if isinstance(data_chunk, list):
+        data_np = np.asarray(data_chunk[0]) if len(data_chunk) == 1 else np.concatenate([np.asarray(c) for c in data_chunk], axis=0)
+    else:
+        data_np = np.asarray(data_chunk)
+
+    if data_np.ndim == 2:
+        n_pairs, nx = data_np.shape
+        ny = 1
+        data_np = data_np.reshape(n_pairs, ny, nx)
+    else:
+        n_pairs, ny, nx = data_np.shape
+    n_pixels = ny * nx
+
+    # Convert 0+0j to NaN
+    data_np[data_np == 0] = np.nan + 0j
+    data_flat = np.ascontiguousarray(data_np.reshape(n_pairs, n_pixels))
+    del data_np
+
+    # Prepare weights
+    if isinstance(weight_chunk, list):
+        weight_np = np.asarray(weight_chunk[0]) if len(weight_chunk) == 1 else np.concatenate([np.asarray(c) for c in weight_chunk], axis=0)
+    elif weight_chunk is not None:
+        weight_np = np.asarray(weight_chunk)
+    else:
+        weight_np = None
+
+    if weight_np is not None:
+        weight_flat = np.ascontiguousarray(weight_np.reshape(n_pairs, n_pixels).astype(np.float32))
+        weight_flat[~np.isfinite(weight_flat)] = 0.0
+        weight_flat[weight_flat < 0] = 0.0
+    else:
+        weight_flat = np.ones((n_pairs, n_pixels), dtype=np.float32)
+    del weight_np
+
+    # Temporal baseline in years
+    ns_per_year = 365.25 * 86400 * 1e9
+    pair_dt = ((rep_values - ref_values) / ns_per_year).astype(np.float64)
+
+    # Max velocity: π/2 per shortest interval (unambiguous for noisy phase)
+    dt_min_yr = np.min(np.abs(pair_dt[pair_dt != 0]))
+    vmax = (np.pi / 2) / dt_min_yr  # rad/year
+
+    vel, rmse = _velocity_pairs_numba_kernel(data_flat, weight_flat, n_pixels, n_pairs, pair_dt, max_refine, vmax)
+    del data_flat, weight_flat
+
+    return vel.reshape(ny, nx), rmse.reshape(ny, nx)
 
 
 @nb.njit(cache=True)
@@ -84,21 +387,22 @@ def _trend1d_pairs_numba_kernel(
     date_offsets,      # (n_dates+1,) start offsets into flat arrays
     pair_ref_didx,     # (n_pairs,) ref date index
     pair_rep_didx,     # (n_pairs,) rep date index
+    pair_dt,           # (n_pairs,) temporal baseline in intervals (unnormalized)
     max_refine,
     is_complex=True,   # True for wrapped (complex), False for unwrapped (real)
 ):
-    """Per-pixel IRLS fitting of all dates, with iterative refinement.
+    """Per-pixel atmospheric phase estimation using global velocity derotation
+    + weighted circular mean.
 
-    Accepts complex or real input directly — extracts angles per-pixel
-    inside the loop to avoid full-size intermediate arrays.
-
-    Correlation weights seed the IRLS and weight the circular mean init.
+    1. Global velocity: 16-bin periodogram on all pairs vs temporal baseline.
+    2. Derotate pair phases by global velocity.
+    3. Per-date weighted circular mean of derotated signed phases (iterative).
+    4. Output trend = atmospheric model only (velocity preserved in detrended data).
 
     Returns
     -------
     trend : (n_pairs, n_pixels) complex64
-        Per-pair trend: exp(1j * (model[ref] - model[rep])) for complex,
-        model[ref] - model[rep] for real. NaN where input is invalid or overfitting.
+        Per-pair atmospheric trend. NaN where input is invalid.
     """
     model_angles = np.zeros((n_dates, n_pixels), dtype=np.float64)
     trend = np.full((n_pairs, n_pixels), np.nan + 0j, dtype=np.complex64)
@@ -113,11 +417,12 @@ def _trend1d_pairs_numba_kernel(
                 c = data_flat[p, px]
                 re = np.float64(c.real)
                 im = np.float64(c.imag)
-                if re == 0.0 and im == 0.0:
+                ang = np.arctan2(im, re)
+                if (re == 0.0 and im == 0.0) or not np.isfinite(ang):
                     pixel_angles[p] = np.nan
                     pixel_weights[p] = 0.0
                 else:
-                    pixel_angles[p] = np.arctan2(im, re)
+                    pixel_angles[p] = ang
                     pw = np.float64(weight_flat[p, px])
                     pixel_weights[p] = pw if pw > 0.0 else 0.0
         else:
@@ -129,24 +434,55 @@ def _trend1d_pairs_numba_kernel(
         corrected = np.empty(n_pairs, dtype=np.float64)
         local_models = np.zeros(n_dates, dtype=np.float64)
 
-        cstd_sum = 0.0
-        cstd_count = 0
-
-        for iteration in range(1 + max_refine):
-            is_filter = (iteration % 3 == 0)
-
-            # Correct data using accumulated models
-            if iteration == 0:
+        # Global velocity estimation: periodogram on all pairs vs temporal
+        # baseline. Removes the dominant velocity trend so per-date periodogram
+        # only needs to find residual (seasonal/nonlinear) slope + atmospheric.
+        global_v = 0.0
+        if is_complex:
+            n_valid_gv = 0
+            for p in range(n_pairs):
+                if np.isfinite(pixel_angles[p]) and pixel_weights[p] > 0.0:
+                    n_valid_gv += 1
+            if n_valid_gv >= 4:
+                # Multi-level periodogram (16 coarse + 16 fine = level 1).
+                # Range: π/2 per shortest baseline (unambiguous for noisy phase).
+                gv_dt_min = 1e30
                 for p in range(n_pairs):
-                    corrected[p] = pixel_angles[p]
-            else:
-                for p in range(n_pairs):
-                    corrected[p] = pixel_angles[p] \
-                                   - local_models[pair_ref_didx[p]] \
-                                   + local_models[pair_rep_didx[p]]
+                    if np.isfinite(pixel_angles[p]) and pixel_weights[p] > 0.0:
+                        adt = abs(pair_dt[p])
+                        if adt > 1e-10 and adt < gv_dt_min:
+                            gv_dt_min = adt
+                if gv_dt_min > 1e20:
+                    gv_dt_min = 1.0
+                gv_range = (np.pi * 0.5) / gv_dt_min
+                gv_step = 2.0 * gv_range / 16
+                best_gS = -1.0
+                best_gv = 0.0
+                scan_lo = -gv_range
+                for level in range(1 + max_refine):
+                    for bi in range(16):
+                        v_try = scan_lo + gv_step * bi
+                        sr = 0.0; si = 0.0
+                        for p in range(n_pairs):
+                            if not (np.isfinite(pixel_angles[p]) and pixel_weights[p] > 0.0):
+                                continue
+                            ang = pixel_angles[p] - v_try * pair_dt[p]
+                            ang = ang - 2.0 * np.pi * np.floor((ang + np.pi) / (2.0 * np.pi))
+                            sr += pixel_weights[p] * np.cos(ang)
+                            si += pixel_weights[p] * np.sin(ang)
+                        S = sr * sr + si * si
+                        if S > best_gS:
+                            best_gS = S; best_gv = v_try
+                    scan_lo = best_gv - gv_step
+                    gv_step = 2.0 * gv_step / 16
+                global_v = best_gv
 
-            # Fit each date
-            for d in range(n_dates):
+        # Single-pass atmospheric fit: derotate by velocity, then per-date circular mean.
+        for p in range(n_pairs):
+            corrected[p] = pixel_angles[p] - global_v * pair_dt[p]
+
+        # Fit each date
+        for d in range(n_dates):
                 d_start = date_offsets[d]
                 d_end = date_offsets[d + 1]
                 n_d = d_end - d_start
@@ -182,140 +518,137 @@ def _trend1d_pairs_numba_kernel(
                         phases[k] = 0.0
                         w_irls[k] = 0.0
 
-                # IRLS loop using wrapped residuals.
-                # Initialize with weighted circular mean, then refine with slope.
+                # Per-date periodogram search (with global velocity already removed).
+                # Finds residual slope (seasonal/nonlinear) + atmospheric intercept.
                 if is_complex:
-                    wsin = 0.0; wcos = 0.0
+                    # Search range π/4: after global velocity removal, residual
+                    # slope is from seasonal variations only. π/4 = π/2 (noisy
+                    # limit) / 2 (two dates per pair) — the maximum stable slope.
+                    b_range = np.pi * 0.25
+                    n_scan = 32
+                    scan_step = 2.0 * b_range / n_scan
+                    # Precompute cos/sin of phases
+                    cos_ph = np.empty(n_d, dtype=np.float64)
+                    sin_ph = np.empty(n_d, dtype=np.float64)
                     for k in range(n_d):
                         if valid[k]:
-                            wsin += w_irls[k] * np.sin(phases[k])
-                            wcos += w_irls[k] * np.cos(phases[k])
-                    c0 = np.arctan2(wsin, wcos)
-                else:
-                    c0 = 0.0
-                b = 0.0
-
-                a = c0
-                for irls_iter in range(10):
-                    sw = 0.0; swt = 0.0; swt2 = 0.0
-                    swy = 0.0; swty = 0.0
-                    max_dw = 0.0
-                    for k in range(n_d):
-                        if not valid[k]:
-                            continue
-                        t = t_vals[k]
-                        fit_val = a + b * t
-                        if is_complex:
-                            res = phases[k] - fit_val
-                            res = res - 2.0 * np.pi * np.floor((res + np.pi) / (2.0 * np.pi))
-                            y = fit_val + res
+                            cos_ph[k] = np.cos(phases[k])
+                            sin_ph[k] = np.sin(phases[k])
                         else:
-                            y = phases[k]
-                            res = y - fit_val
-                        w = w_irls[k]
-                        sw += w; swt += w * t; swt2 += w * t * t
-                        swy += w * y; swty += w * t * y
-
-                        # IRLS reweight: correlation * residual-based
-                        pidx = date_pair_flat[d_start + k]
-                        new_w = pixel_weights[pidx] / (abs(res) + 0.1)
-                        if new_w > 10.0:
-                            new_w = 10.0
-                        dw = abs(new_w - w_irls[k])
-                        if dw > max_dw:
-                            max_dw = dw
-                        w_irls[k] = new_w
-
-                    det = sw * swt2 - swt * swt + 1e-30
-                    a = (swt2 * swy - swt * swty) / det
-                    b = (sw * swty - swt * swy) / det
-                    c0 = a
-
-                    if max_dw < 1e-3:
-                        break
-
-                # Compute cstd and accumulate for overfitting check (iteration 0)
-                if iteration == 0:
-                    cos_s = 0.0
-                    sin_s = 0.0
-                    nv = 0
+                            cos_ph[k] = 0.0; sin_ph[k] = 0.0
+                    # Coarse scan with trig recurrence
+                    cos_step = np.empty(n_d, dtype=np.float64)
+                    sin_step = np.empty(n_d, dtype=np.float64)
+                    cos_cur = np.empty(n_d, dtype=np.float64)
+                    sin_cur = np.empty(n_d, dtype=np.float64)
+                    b0 = -b_range
                     for k in range(n_d):
-                        if not valid[k]:
-                            continue
-                        raw_res = phases[k] - (c0 + b * t_vals[k])
-                        cos_s += np.cos(raw_res)
-                        sin_s += np.sin(raw_res)
-                        nv += 1
-                    if nv >= 2:
-                        R = np.sqrt((cos_s / nv)**2 + (sin_s / nv)**2)
-                        if R > 1 - 1e-10:
-                            R = 1 - 1e-10
-                        cstd_sum += np.sqrt(-2 * np.log(R))
-                        cstd_count += 1
-
-                # Accumulate model
-                if iteration == 0:
-                    local_models[d] = c0
+                        if valid[k]:
+                            st = scan_step * t_vals[k]
+                            cos_step[k] = np.cos(st); sin_step[k] = np.sin(st)
+                            bt = b0 * t_vals[k]
+                            cos_cur[k] = np.cos(bt); sin_cur[k] = np.sin(bt)
+                        else:
+                            cos_step[k] = 1.0; sin_step[k] = 0.0
+                            cos_cur[k] = 1.0; sin_cur[k] = 0.0
+                    best_S = -1.0; best_b = 0.0; best_a = 0.0
+                    for bi in range(n_scan):
+                        sr = 0.0; si = 0.0
+                        for k in range(n_d):
+                            if not valid[k]: continue
+                            sr += w_irls[k] * (cos_ph[k]*cos_cur[k] + sin_ph[k]*sin_cur[k])
+                            si += w_irls[k] * (sin_ph[k]*cos_cur[k] - cos_ph[k]*sin_cur[k])
+                        S = sr*sr + si*si
+                        if S > best_S:
+                            best_S = S; best_b = b0 + scan_step*bi
+                            best_a = np.arctan2(si, sr)
+                        for k in range(n_d):
+                            if valid[k]:
+                                c = cos_cur[k]*cos_step[k] - sin_cur[k]*sin_step[k]
+                                s = sin_cur[k]*cos_step[k] + cos_cur[k]*sin_step[k]
+                                cos_cur[k] = c; sin_cur[k] = s
+                    # Fine refinement
+                    fine_step = 2.0 * scan_step / n_scan
+                    fine_lo = best_b - scan_step
+                    for k in range(n_d):
+                        if valid[k]:
+                            st = fine_step * t_vals[k]
+                            cos_step[k] = np.cos(st); sin_step[k] = np.sin(st)
+                            bt = fine_lo * t_vals[k]
+                            cos_cur[k] = np.cos(bt); sin_cur[k] = np.sin(bt)
+                    for bi in range(n_scan):
+                        sr = 0.0; si = 0.0
+                        for k in range(n_d):
+                            if not valid[k]: continue
+                            sr += w_irls[k] * (cos_ph[k]*cos_cur[k] + sin_ph[k]*sin_cur[k])
+                            si += w_irls[k] * (sin_ph[k]*cos_cur[k] - cos_ph[k]*sin_cur[k])
+                        S = sr*sr + si*si
+                        if S > best_S:
+                            best_S = S; best_b = fine_lo + fine_step*bi
+                            best_a = np.arctan2(si, sr)
+                        for k in range(n_d):
+                            if valid[k]:
+                                c = cos_cur[k]*cos_step[k] - sin_cur[k]*sin_step[k]
+                                s = sin_cur[k]*cos_step[k] + cos_cur[k]*sin_step[k]
+                                cos_cur[k] = c; sin_cur[k] = s
+                    c0 = best_a - 2.0 * np.pi * np.floor((best_a + np.pi) / (2.0 * np.pi))
                 else:
-                    local_models[d] += c0
+                    wsum = 0.0; wval = 0.0
+                    for k in range(n_d):
+                        if valid[k]:
+                            wsum += w_irls[k]; wval += w_irls[k] * phases[k]
+                    c0 = wval / (wsum + 1e-30)
+
+                local_models[d] = c0
+
+        # Remove linear trend from per-date models — prevents atmospheric
+        # model from absorbing net deformation after global velocity removal.
+        # Uses periodogram on models vs date index to find the trend slope,
+        # then subtracts it. Handles wrapping correctly (models can be near ±π).
+        if is_complex and n_dates > 2:
+            d_arr = np.empty(n_dates, dtype=np.float64)
+            for d in range(n_dates):
+                d_arr[d] = np.float64(d) / np.float64(n_dates - 1)  # normalize to [0, 1]
+            # Periodogram: find slope of models vs date index
+            # Search b ∈ [-π/4, π/4] (same limit as per-date slopes)
+            mt_range = np.pi * 0.25
+            mt_scan = 16
+            mt_step = 2.0 * mt_range / mt_scan
+            mt_best_S = -1.0; mt_best_b = 0.0; mt_best_a = 0.0
+            for bi in range(mt_scan):
+                b_try = -mt_range + mt_step * bi
+                sr = 0.0; si = 0.0
+                for d in range(n_dates):
+                    ang = local_models[d] - b_try * d_arr[d]
+                    ang = ang - 2.0 * np.pi * np.floor((ang + np.pi) / (2.0 * np.pi))
+                    sr += np.cos(ang); si += np.sin(ang)
+                S = sr * sr + si * si
+                if S > mt_best_S:
+                    mt_best_S = S; mt_best_b = b_try; mt_best_a = np.arctan2(si, sr)
+            # Fine
+            mt_fine_lo = mt_best_b - mt_step
+            mt_fine_step = 2.0 * mt_step / mt_scan
+            for bi in range(mt_scan):
+                b_try = mt_fine_lo + mt_fine_step * bi
+                sr = 0.0; si = 0.0
+                for d in range(n_dates):
+                    ang = local_models[d] - b_try * d_arr[d]
+                    ang = ang - 2.0 * np.pi * np.floor((ang + np.pi) / (2.0 * np.pi))
+                    sr += np.cos(ang); si += np.sin(ang)
+                S = sr * sr + si * si
+                if S > mt_best_S:
+                    mt_best_S = S; mt_best_b = b_try; mt_best_a = np.arctan2(si, sr)
+            # Subtract trend: model[d] -= (a + b*d), wrapped
+            for d in range(n_dates):
+                correction = mt_best_a + mt_best_b * d_arr[d]
+                local_models[d] = local_models[d] - correction
+                local_models[d] = local_models[d] - 2.0 * np.pi * np.floor(
+                    (local_models[d] + np.pi) / (2.0 * np.pi))
 
         for d in range(n_dates):
             model_angles[d, px] = local_models[d]
 
-        # Overfitting check: avg cstd across dates must be < π/2
-        if cstd_count > 0 and (cstd_sum / cstd_count) > (np.pi / 2):
-            continue  # leave trend as NaN for this pixel
-
-        # Date-to-date smoothness check on detrended output.
-        # Weighted mean of detrended signed phases per date;
-        # delta between adjacent dates must be < π/2.
-        DATE_DELTA_THR = np.pi * 0.5
-        date_cmean = np.empty(n_dates, dtype=np.float64)
-        date_has_cmean = np.zeros(n_dates, dtype=nb.boolean)
-        for d in range(n_dates):
-            d_start = date_offsets[d]
-            d_end = date_offsets[d + 1]
-            wsin_d = 0.0; wcos_d = 0.0; wsum_d = 0.0; wmean_d = 0.0
-            for k in range(d_end - d_start):
-                pidx = date_pair_flat[d_start + k]
-                if not np.isfinite(pixel_angles[pidx]):
-                    continue
-                pw = pixel_weights[pidx]
-                if pw <= 0.0:
-                    continue
-                # Detrended signed phase
-                diff = local_models[pair_ref_didx[pidx]] - local_models[pair_rep_didx[pidx]]
-                detr = pixel_angles[pidx] - diff
-                signed = detr * date_sign_flat[d_start + k]
-                if is_complex:
-                    wsin_d += pw * np.sin(signed)
-                    wcos_d += pw * np.cos(signed)
-                else:
-                    wmean_d += pw * signed
-                wsum_d += pw
-            if wsum_d > 1e-10:
-                if is_complex:
-                    date_cmean[d] = np.arctan2(wsin_d, wcos_d)
-                else:
-                    date_cmean[d] = wmean_d / wsum_d
-                date_has_cmean[d] = True
-            else:
-                date_cmean[d] = 0.0
-
-        # Check deltas between adjacent dates (d, d+1) only
-        bad_pixel = False
-        for d in range(n_dates - 1):
-            if date_has_cmean[d] and date_has_cmean[d + 1]:
-                delta = date_cmean[d + 1] - date_cmean[d]
-                if is_complex:
-                    delta = delta - 2.0 * np.pi * np.floor((delta + np.pi) / (2.0 * np.pi))
-                if abs(delta) >= DATE_DELTA_THR:
-                    bad_pixel = True
-                    break
-        if bad_pixel:
-            continue  # leave trend as NaN for this pixel
-
-        # Reconstruct per-pair trend
+        # Reconstruct per-pair trend (atmospheric only)
         for p in range(n_pairs):
             if np.isfinite(pixel_angles[p]):
                 diff = local_models[pair_ref_didx[p]] - local_models[pair_rep_didx[p]]
@@ -336,11 +669,14 @@ def _trend1d_numba_kernel(
     slope,          # bool — include slope in output
     is_complex,      # bool — True for wrapped (complex) phase, False for unwrapped (real)
     has_weight,     # bool — True if w_flat contains real weights, False if unit weights
+    bins,           # int — periodogram bins (0=skip periodogram, use circular mean init)
 ):
     """Per-pixel IRLS linear fitting for detrend1d.
 
-    Accepts complex or real input directly — extracts angles per-pixel
-    inside the loop to avoid full-size intermediate arrays.
+    For wrapped (complex) phase: periodogram init finds the slope globally
+    (handles multi-cycle wrapping), then IRLS refines from that init.
+    bins controls the periodogram search: range = bins/2, step = 1 rad.
+    bins=256 covers DEM errors up to ~500m for C-band Sentinel-1.
 
     Analytical 2x2 weighted least squares solve per pixel:
     y = a + b*t, 5 accumulators (sw, swt, swt2, swy, swty), Cramer's rule.
@@ -349,13 +685,15 @@ def _trend1d_numba_kernel(
     -------
     result : (n_samples, n_pixels) complex64 if is_complex, else float32.
         Complex: unit-magnitude trend exp(1j*fit). Real: fitted values.
+    slopes : (n_pixels,) float64
+        Fitted slope c1 per pixel in normalized dim units. NaN where invalid.
     """
     n_samples, n_pixels = data_flat.shape
     result = np.full((n_samples, n_pixels), np.nan + 0j, dtype=np.complex64)
+    slopes = np.full(n_pixels, np.nan, dtype=np.float64)
 
     # Per-pixel working arrays (reused across pixels)
     angles = np.empty(n_samples, dtype=np.float64)
-    jumps = np.empty(n_samples, dtype=np.float64)
     w_irls = np.empty(n_samples, dtype=np.float64)
     valid = np.empty(n_samples, dtype=nb.boolean)
 
@@ -400,20 +738,72 @@ def _trend1d_numba_kernel(
             else:
                 w_irls[s] = 0.0
 
-        # IRLS loop using wrapped residuals (no jumps for wrapped phase)
-        epsilon = 0.1
-        if is_complex:
-            # Initialize with circular mean from complex input (no trig)
+        # Init: periodogram (bins>0) or circular mean (bins=0)
+        if is_complex and bins > 0:
+            # Periodogram init — single-level scan with trig recurrence.
+            # range = bins/2, step = 1 rad. Finds slope globally, IRLS refines.
+            cos_ph = np.empty(n_samples, dtype=np.float64)
+            sin_ph = np.empty(n_samples, dtype=np.float64)
+            for s in range(n_samples):
+                if valid[s]:
+                    cos_ph[s] = np.cos(angles[s])
+                    sin_ph[s] = np.sin(angles[s])
+                else:
+                    cos_ph[s] = 0.0; sin_ph[s] = 0.0
+
+            p_range = 0.5 * bins
+            p_step = 2.0 * p_range / bins  # = 1.0
+            scan_lo = -p_range
+            best_S = -1.0; best_b = 0.0; best_a = 0.0
+
+            # Precompute step and initial rotations per sample
+            p_cos_step = np.empty(n_samples, dtype=np.float64)
+            p_sin_step = np.empty(n_samples, dtype=np.float64)
+            p_cos_cur = np.empty(n_samples, dtype=np.float64)
+            p_sin_cur = np.empty(n_samples, dtype=np.float64)
+            for s in range(n_samples):
+                if valid[s]:
+                    st = p_step * dim_norm[s]
+                    p_cos_step[s] = np.cos(st); p_sin_step[s] = np.sin(st)
+                    bt = scan_lo * dim_norm[s]
+                    p_cos_cur[s] = np.cos(bt); p_sin_cur[s] = np.sin(bt)
+                else:
+                    p_cos_step[s] = 1.0; p_sin_step[s] = 0.0
+                    p_cos_cur[s] = 1.0; p_sin_cur[s] = 0.0
+
+            for bi in range(bins):
+                sr = 0.0; si = 0.0
+                for s in range(n_samples):
+                    if not valid[s]: continue
+                    sr += w_irls[s] * (cos_ph[s]*p_cos_cur[s] + sin_ph[s]*p_sin_cur[s])
+                    si += w_irls[s] * (sin_ph[s]*p_cos_cur[s] - cos_ph[s]*p_sin_cur[s])
+                S = sr*sr + si*si
+                if S > best_S:
+                    best_S = S; best_b = scan_lo + p_step*bi
+                    best_a = np.arctan2(si, sr)
+                # Trig recurrence: rotate by step
+                for s in range(n_samples):
+                    if valid[s]:
+                        c = p_cos_cur[s]*p_cos_step[s] - p_sin_cur[s]*p_sin_step[s]
+                        sn = p_sin_cur[s]*p_cos_step[s] + p_cos_cur[s]*p_sin_step[s]
+                        p_cos_cur[s] = c; p_sin_cur[s] = sn
+
+            c0 = best_a - 2.0 * np.pi * np.floor((best_a + np.pi) / (2.0 * np.pi))
+            c1 = best_b
+        elif is_complex:
+            # Circular mean init (bins=0)
             re_sum = 0.0; im_sum = 0.0
             for s in range(n_samples):
                 if valid[s]:
                     re_sum += np.float64(data_flat[s, px].real)
                     im_sum += np.float64(data_flat[s, px].imag)
             c0 = np.arctan2(im_sum, re_sum)
+            c1 = 0.0
         else:
             c0 = 0.0
-        c1 = 0.0
+            c1 = 0.0
 
+        epsilon = 0.1
         for irls_iter in range(10):
             sw = 0.0; swt = 0.0; swt2 = 0.0
             swy = 0.0; swty = 0.0
@@ -451,6 +841,9 @@ def _trend1d_numba_kernel(
             if max_dw < 1e-3:
                 break
 
+        # Store slope (normalized units — caller denormalizes)
+        slopes[px] = c1
+
         # Write final values directly as output type
         for s in range(n_samples):
             t = dim_norm[s]
@@ -467,10 +860,10 @@ def _trend1d_numba_kernel(
             else:
                 result[s, px] = np.complex64(fit_val)
 
-    return result
+    return result, slopes
 
 
-def trend1d_array(data, dim_values, weight, intercept=True, slope=True, is_complex=True):
+def trend1d_array(data, dim_values, weight, intercept=True, slope=True, is_complex=True, bins=128):
     """
     Fit linear trend along first dimension at each (y, x) pixel.
 
@@ -524,12 +917,16 @@ def trend1d_array(data, dim_values, weight, intercept=True, slope=True, is_compl
     else:
         dim_norm = np.zeros(n_samples, dtype=np.float64)
 
-    result = _trend1d_numba_kernel(data_flat, w_flat, dim_norm,
-                                    intercept, slope, is_complex, has_weight)
+    result, slopes_norm = _trend1d_numba_kernel(data_flat, w_flat, dim_norm,
+                                    intercept, slope, is_complex, has_weight, bins)
+    # Denormalize slope: kernel fits in normalized dim, convert to original units
+    slopes_2d = (slopes_norm / dim_absmax).astype(np.float32).reshape(ny, nx) if dim_absmax > 0 \
+        else np.full((ny, nx), np.nan, dtype=np.float32)
+
     if is_complex:
-        return result.reshape(n_samples, ny, nx)
+        return result.reshape(n_samples, ny, nx), slopes_2d
     else:
-        return result.real.astype(np.float32).reshape(n_samples, ny, nx)
+        return result.real.astype(np.float32).reshape(n_samples, ny, nx), slopes_2d
 
 
 # Backward compatibility alias
@@ -1280,6 +1677,7 @@ def trend1d_pairs_array(data_chunk, weight_chunk, ref_values, rep_values,
         np.array(all_signs, dtype=np.float64),
         offsets_np,
         pair_ref_didx, pair_rep_didx,
+        (rep_days - ref_days).astype(np.float64),  # pair_dt in days
         max_refine,
         is_complex,
     )

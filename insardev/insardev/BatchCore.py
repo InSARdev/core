@@ -1703,6 +1703,7 @@ class BatchCore(dict):
     def trend1d(self, weight: 'BatchUnit | None' = None, baseline: str = 'BPR',
                 detrend: bool = False,
                 intercept: bool = False, slope: bool = True,
+                bins: int = 128,
                 debug: bool = False) -> 'Batch':
         """
         Fit linear trend along perpendicular baseline at each (y, x) pixel.
@@ -1748,6 +1749,7 @@ class BatchCore(dict):
         is_complex = isinstance(data, BatchComplex)
 
         result = {}
+        slope_result = {}
         for key in data.keys():
             ds = data[key]
 
@@ -1804,6 +1806,7 @@ class BatchCore(dict):
             out_dtype = np.complex64 if is_complex else np.float32
 
             result_ds = {}
+            slope_ds = {}
             for pol in pols:
                 data_da = ds[pol]
                 weight_da = weight[key][pol] if weight is not None else None
@@ -1818,16 +1821,20 @@ class BatchCore(dict):
                 n_stack = data_dask.shape[0]
 
 
+                # When detrend=True: return (n_stack, y, x) detrended data.
+                # When detrend=False: return (n_stack+1, y, x) with slope in last row.
+                n_out = n_stack if detrend else n_stack + 1
+
                 def _trend1d_block(data_block, weight_block=None,
                                    _bv=baseline_values,
                                    _detrend=detrend, _dtype=out_dtype,
                                    _intercept=intercept, _slope=slope,
-                                   _is_complex=is_complex):
-                    trend = utils_detrend.trend1d_array(
+                                   _is_complex=is_complex, _bins=bins):
+                    trend, slope_2d = utils_detrend.trend1d_array(
                         [data_block], _bv,
                         [weight_block] if weight_block is not None else None,
                         intercept=_intercept, slope=_slope,
-                        is_complex=_is_complex,
+                        is_complex=_is_complex, bins=_bins,
                     )
                     if _detrend:
                         if _is_complex:
@@ -1837,14 +1844,16 @@ class BatchCore(dict):
                         else:
                             np.subtract(data_block, trend, out=trend)
                             return trend
-                    return trend
+                    # Append slope as extra row (stored as complex with imag=0)
+                    slope_row = slope_2d[np.newaxis].astype(_dtype)
+                    return np.concatenate([trend, slope_row], axis=0)
 
                 if weight_dask is not None:
                     result_dask = da.blockwise(
                         _trend1d_block, 'dyx',
                         data_dask, 'pyx',
                         weight_dask, 'pyx',
-                        new_axes={'d': n_stack},
+                        new_axes={'d': n_out},
                         concatenate=True,
                         dtype=out_dtype,
                         meta=np.empty((0, 0, 0), dtype=out_dtype),
@@ -1853,25 +1862,50 @@ class BatchCore(dict):
                     result_dask = da.blockwise(
                         _trend1d_block, 'dyx',
                         data_dask, 'pyx',
-                        new_axes={'d': n_stack},
+                        new_axes={'d': n_out},
                         concatenate=True,
                         dtype=out_dtype,
                         meta=np.empty((0, 0, 0), dtype=out_dtype),
                     )
 
-                fit_da = xr.DataArray(
-                    result_dask,
-                    dims=data_da.dims,
-                    coords=data_da.coords
-                )
+                if detrend:
+                    fit_da = xr.DataArray(
+                        result_dask,
+                        dims=data_da.dims,
+                        coords=data_da.coords
+                    )
+                    result_ds[pol] = fit_da
+                else:
+                    # Split: trend (n_stack, y, x) and slope (y, x)
+                    trend_dask = result_dask[:n_stack]
+                    fit_da = xr.DataArray(
+                        trend_dask,
+                        dims=data_da.dims,
+                        coords=data_da.coords
+                    )
+                    result_ds[pol] = fit_da
 
-                result_ds[pol] = fit_da
+                    slope_dask = result_dask[n_stack].real
+                    spatial_coords = {k: v for k, v in data_da.coords.items()
+                                      if k in ('y', 'x', 'spatial_ref')}
+                    slope_ds[pol] = xr.DataArray(
+                        slope_dask,
+                        dims=('y', 'x'),
+                        coords=spatial_coords
+                    )
 
             result[key] = xr.Dataset(result_ds, attrs=ds.attrs)
+            if not detrend:
+                slope_result[key] = xr.Dataset(slope_ds, attrs=ds.attrs)
 
-        if is_complex:
-            return BatchComplex(result)
-        return Batch(result)
+        if detrend:
+            if is_complex:
+                return BatchComplex(result)
+            return Batch(result)
+        else:
+            if is_complex:
+                return BatchComplex(result), Batch(slope_result)
+            return Batch(result), Batch(slope_result)
 
     # Backward compatibility alias
     regression1d_baseline = trend1d
@@ -2777,30 +2811,128 @@ class BatchCore(dict):
         return self._agg("var", dim=dim, **kwargs)
 
     def rmse(self, solution, weight=None):
-        """RMSE: self (pairs) vs solution (pairs or dates).
+        """RMSE: self (pairs/dates) vs solution (pairs, dates, or velocity).
 
         Parameters
         ----------
         solution : Batch or BatchWrap
             If pair-based: direct comparison.
             If date-based: pairs reconstructed as sol[rep] - sol[ref].
+            If spatial-only (y, x): interpreted as yearly rate and
+                reconstructed per pair (velocity * dt_years) or per date.
         weight : BatchUnit, optional
-            Per-pair weights (e.g., correlation).
+            Per-pair/date weights (e.g., correlation).
 
         Returns
         -------
         Batch
             Per-pixel RMSE on (y, x) grid.
         """
+        import dask.array as da
         import numpy as np
         import xarray as xr
-        from .Batch import Batch
+        from .Batch import Batch, BatchComplex
 
-        # Detect pair-based vs date-based solution
+        nanoseconds_per_year = np.float64(365.25 * 24 * 60 * 60 * 1e9)
+
+        # Detect solution type: pair-based, date-based, or velocity (spatial-only)
         sol_sample_ds = next(iter(solution.values()))
         spatial_vars = [v for v in sol_sample_ds.data_vars if 'y' in sol_sample_ds[v].dims]
-        is_date_based = 'date' in sol_sample_ds[spatial_vars[0]].dims
+        sample_sol_dims = sol_sample_ds[spatial_vars[0]].dims
+        is_date_based = 'date' in sample_sol_dims
+        is_pair_based = 'pair' in sample_sol_dims
+        is_velocity = not is_date_based and not is_pair_based
+        is_complex = isinstance(self, BatchComplex)
 
+        if is_velocity:
+            # Fused kernel: accumulate per-pair residuals, O(y_chunk * x_chunk) memory
+            out = {}
+            for key in self:
+                if key not in solution:
+                    continue
+                obs_ds = self[key]
+                sol_ds = solution[key]
+                rmse_vars = {}
+                for var in [v for v in obs_ds.data_vars if 'y' in obs_ds[v].dims]:
+                    sol_var = var if var in sol_ds.data_vars else spatial_vars[0]
+                    if sol_var not in sol_ds.data_vars:
+                        continue
+                    obs_da = obs_ds[var]
+                    vel_da = sol_ds[sol_var]
+
+                    if 'pair' in obs_da.dims:
+                        tdim = 'pair'
+                        refs = obs_ds['ref'].values.astype('datetime64[ns]').astype(np.int64)
+                        reps = obs_ds['rep'].values.astype('datetime64[ns]').astype(np.int64)
+                        dt_np = ((reps.astype(np.float64) - refs.astype(np.float64))
+                                 / nanoseconds_per_year).astype(np.float32)
+                    elif 'date' in obs_da.dims:
+                        tdim = 'date'
+                        dates = obs_da.coords['date'].values.astype('datetime64[ns]').astype(np.int64)
+                        dt_np = ((dates.astype(np.float64) - np.float64(dates[0]))
+                                 / nanoseconds_per_year).astype(np.float32)
+                    else:
+                        continue
+
+                    if obs_da.dims[0] != tdim:
+                        obs_da = obs_da.transpose(tdim, ...)
+
+                    obs_dask = obs_da.data
+                    vel_data = vel_da.data
+                    if not isinstance(vel_data, da.Array):
+                        vel_data = da.from_array(vel_da.values, chunks=obs_dask.chunks[1:])
+
+                    w_dask = None
+                    if weight is not None and key in weight:
+                        w_ds = weight[key]
+                        w_da = w_ds[var] if var in w_ds.data_vars else w_ds[next(
+                            v for v in w_ds.data_vars if 'y' in w_ds[v].dims)]
+                        if w_da.dims[0] != tdim:
+                            w_da = w_da.transpose(tdim, ...)
+                        w_dask = w_da.data
+
+                    def _kernel(obs_blk, vel_blk, *args,
+                                _dt=dt_np, _cplx=is_complex):
+                        weight_blk = args[0] if args else None
+                        P = obs_blk.shape[0]
+                        sh = obs_blk.shape[1:]
+                        accum = np.zeros(sh, dtype=np.float64)
+                        if weight_blk is not None:
+                            w_sum = np.zeros(sh, dtype=np.float64)
+                        for p in range(P):
+                            pred = vel_blk * _dt[p]
+                            if _cplx:
+                                resid = np.angle(
+                                    obs_blk[p] * np.conj(np.exp(1j * pred)))
+                            else:
+                                resid = obs_blk[p].astype(np.float32) - pred
+                            if weight_blk is not None:
+                                w = weight_blk[p].astype(np.float64)
+                                accum += w * resid.astype(np.float64) ** 2
+                                w_sum += w
+                            else:
+                                accum += resid.astype(np.float64) ** 2
+                        denom = w_sum if weight_blk is not None else np.float64(P)
+                        return np.sqrt(accum / denom).astype(np.float32)
+
+                    bw_args = [obs_dask, 'pyx', vel_data, 'yx']
+                    if w_dask is not None:
+                        bw_args += [w_dask, 'pyx']
+                    rmse_dask = da.blockwise(
+                        _kernel, 'yx', *bw_args,
+                        concatenate=True,
+                        dtype=np.float32,
+                        meta=np.empty((0, 0), dtype=np.float32))
+
+                    coords = {k: v for k, v in obs_da.coords.items()
+                              if k in ('y', 'x', 'spatial_ref')}
+                    rmse_vars[var] = xr.DataArray(
+                        rmse_dask, dims=('y', 'x'), coords=coords)
+
+                out[key] = xr.Dataset(rmse_vars, attrs=self[key].attrs)
+            return Batch(out)
+
+        # --- Non-velocity: date-based or pair-based solution ---
         if is_date_based:
             # Reconstruct pairs from date-based solution
             recon = {}
@@ -2826,25 +2958,50 @@ class BatchCore(dict):
         else:
             solution_pairs = solution
 
-        # Compute error using batch subtraction (handles wrapping for BatchWrap)
-        error = self - solution_pairs
+        # Compute error — angle-based for complex phase, direct for real
+        if is_complex:
+            error_dict = {}
+            for key in self:
+                if key not in solution_pairs:
+                    continue
+                obs_ds = self[key]
+                sol_ds = solution_pairs[key]
+                err_vars = {}
+                for var in [v for v in obs_ds.data_vars if 'y' in obs_ds[v].dims]:
+                    sol_var = var if var in sol_ds.data_vars else next(
+                        (v for v in sol_ds.data_vars if 'y' in sol_ds[v].dims), None)
+                    if sol_var is None:
+                        continue
+                    err_vars[var] = xr.apply_ufunc(
+                        lambda obs, pred: np.angle(
+                            obs * np.conj(np.exp(1j * pred))
+                        ).astype(np.float32),
+                        obs_ds[var], sol_ds[sol_var],
+                        dask='parallelized', output_dtypes=[np.float32])
+                error_dict[key] = xr.Dataset(err_vars)
+            error = Batch(error_dict)
+        else:
+            error = self - solution_pairs
 
-        # Compute per-pixel RMSE across pairs
+        # Compute per-pixel RMSE across temporal dimension (pair or date)
         out = {}
         for key in error:
             err_ds = error[key]
             rmse_vars = {}
             for var in err_ds.data_vars:
-                if 'y' not in err_ds[var].dims or 'pair' not in err_ds[var].dims:
+                if 'y' not in err_ds[var].dims:
+                    continue
+                tdim = next((d for d in ('pair', 'date') if d in err_ds[var].dims), None)
+                if tdim is None:
                     continue
                 err_sq = err_ds[var] ** 2
                 if weight is not None and key in weight:
                     w_ds = weight[key]
                     w_da = w_ds[var] if var in w_ds.data_vars else w_ds[next(
                         v for v in w_ds.data_vars if 'y' in w_ds[v].dims)]
-                    rmse_val = np.sqrt((w_da * err_sq).sum('pair') / w_da.sum('pair'))
+                    rmse_val = np.sqrt((w_da * err_sq).sum(tdim) / w_da.sum(tdim))
                 else:
-                    rmse_val = np.sqrt(err_sq.mean('pair'))
+                    rmse_val = np.sqrt(err_sq.mean(tdim))
                 rmse_vars[var] = rmse_val.astype('float32')
             out[key] = xr.Dataset(rmse_vars, attrs=self[key].attrs)
 

@@ -1454,7 +1454,7 @@ class BatchWrap(BatchCore):
         debug : bool
             Print diagnostic information.
         **kwargs
-            Additional arguments: max_iter, epsilon, threshold.
+            Additional arguments: max_iter, epsilon.
 
         Returns
         -------
@@ -1557,6 +1557,178 @@ class BatchComplex(BatchCore):
         """ element-wise |x|², i.e. signal intensity """
         # Optimized: avoid sqrt in abs() by computing real² + imag² directly
         return Batch(self.map_da(lambda da: da.real**2 + da.imag**2, **kwargs))
+
+    def threshold(self, weight=None, threshold=np.pi/2) -> "BatchComplex":
+        """
+        Filter pixels by circular standard deviation (cstd) of pair phases.
+
+        Computes weighted cstd across all pairs per pixel. Pixels with
+        cstd >= threshold are set to 0+0j (all pairs). Useful for rejecting
+        incoherent pixels before velocity estimation or detrending.
+
+        Parameters
+        ----------
+        weight : BatchUnit or None
+            Optional correlation weight for weighted cstd.
+        threshold : float
+            Maximum cstd in radians. Default π/2. Use π/4 for stricter filtering.
+
+        Returns
+        -------
+        BatchComplex
+            Filtered copy with incoherent pixels zeroed.
+        """
+        import dask.array as da
+        import xarray as xr
+        from . import utils_detrend
+
+        BatchCore._require_lazy(self, 'threshold')
+
+        results = {}
+        for burst_id, burst_ds in self.items():
+            burst_weight = weight[burst_id] if weight is not None else None
+            filtered_vars = {}
+            for pol in [v for v in burst_ds.data_vars if v not in ['ref', 'rep', 'BPR', 'BPT']]:
+                data_da = burst_ds[pol]
+                weight_da = burst_weight[pol] if burst_weight is not None else None
+
+                if data_da.dims[0] != 'pair':
+                    data_da = data_da.transpose('pair', ...)
+
+                data_dask = data_da.data
+                weight_dask = weight_da.data if weight_da is not None else None
+                n_pairs_val = data_da.shape[0]
+
+                def _threshold_block(data_block, weight_block=None,
+                                     _threshold=threshold):
+                    return utils_detrend.threshold_pairs_array(
+                        [data_block],
+                        [weight_block] if weight_block is not None else None,
+                        threshold=_threshold,
+                    )
+
+                if weight_dask is not None:
+                    filtered_dask = da.blockwise(
+                        _threshold_block, 'dyx',
+                        data_dask, 'pyx',
+                        weight_dask, 'pyx',
+                        new_axes={'d': n_pairs_val},
+                        concatenate=True,
+                        dtype=data_dask.dtype,
+                        meta=np.empty((0, 0, 0), dtype=data_dask.dtype),
+                    )
+                else:
+                    filtered_dask = da.blockwise(
+                        _threshold_block, 'dyx',
+                        data_dask, 'pyx',
+                        new_axes={'d': n_pairs_val},
+                        concatenate=True,
+                        dtype=data_dask.dtype,
+                        meta=np.empty((0, 0, 0), dtype=data_dask.dtype),
+                    )
+
+                filtered_vars[pol] = xr.DataArray(filtered_dask, dims=data_da.dims,
+                                                   coords=data_da.coords, name=pol)
+
+            filtered_ds = burst_ds.assign(filtered_vars)
+            results[burst_id] = filtered_ds
+
+        return BatchComplex(results)
+
+    def velocity(self, weight=None, max_refine=3) -> "Batch":
+        """
+        Estimate global velocity from interferometric pair network using
+        periodogram on the unit circle. Fast shortcut that skips the full
+        detrend1d_pairs → unwrap1d → lstsq pipeline.
+
+        Returns velocity in rad/year. Use displacement_los(transform) to
+        convert to m/year, then multiply by 1000 for mm/year.
+
+        Parameters
+        ----------
+        weight : BatchUnit or None
+            Optional correlation weight.
+        max_refine : int
+            Refinement levels (0=coarse ~32mm/yr, 3=fine ~0.5mm/yr). Default 3.
+
+        Returns
+        -------
+        Batch
+            Velocity (y, x) in rad/year per burst, as a lazy Batch.
+        """
+        import dask.array as da
+        import numpy as np
+        import xarray as xr
+        from . import utils_detrend
+
+        BatchCore._require_lazy(self, 'velocity')
+
+        vel_results = {}
+        rmse_results = {}
+        for burst_id, burst_ds in self.items():
+            burst_weight = weight[burst_id] if weight is not None else None
+            vel_vars = {}
+            rmse_vars = {}
+            for pol in [v for v in burst_ds.data_vars if v not in ['ref', 'rep', 'BPR', 'BPT']]:
+                data_da = burst_ds[pol]
+                weight_da = burst_weight[pol] if burst_weight is not None else None
+
+                ref_values = burst_ds['ref'].values.astype('datetime64[ns]').astype(np.int64)
+                rep_values = burst_ds['rep'].values.astype('datetime64[ns]').astype(np.int64)
+
+                if data_da.dims[0] != 'pair':
+                    data_da = data_da.transpose('pair', ...)
+
+                data_dask = data_da.data
+                weight_dask = weight_da.data if weight_da is not None else None
+
+                def _velocity_block(data_block, weight_block=None,
+                                    _ref=ref_values, _rep=rep_values,
+                                    _max_refine=max_refine):
+                    vel, rmse = utils_detrend.velocity_pairs_array(
+                        [data_block],
+                        [weight_block] if weight_block is not None else None,
+                        _ref, _rep,
+                        max_refine=_max_refine,
+                    )
+                    # Stack (2, y, x) so blockwise can return both
+                    return np.stack([vel, rmse], axis=0)
+
+                if weight_dask is not None:
+                    stacked_dask = da.blockwise(
+                        _velocity_block, 'nyx',
+                        data_dask, 'pyx',
+                        weight_dask, 'pyx',
+                        new_axes={'n': 2},
+                        concatenate=True,
+                        dtype=np.float32,
+                        meta=np.empty((0, 0, 0), dtype=np.float32),
+                    )
+                else:
+                    stacked_dask = da.blockwise(
+                        _velocity_block, 'nyx',
+                        data_dask, 'pyx',
+                        new_axes={'n': 2},
+                        concatenate=True,
+                        dtype=np.float32,
+                        meta=np.empty((0, 0, 0), dtype=np.float32),
+                    )
+
+                coords = {k: v for k, v in data_da.coords.items() if k in ('y', 'x', 'spatial_ref')}
+                vel_da = xr.DataArray(stacked_dask[0], dims=('y', 'x'), coords=coords, name=pol)
+                rmse_da = xr.DataArray(stacked_dask[1], dims=('y', 'x'), coords=coords, name=pol)
+                vel_vars[pol] = vel_da
+                rmse_vars[pol] = rmse_da
+
+            vel_ds = xr.Dataset(vel_vars)
+            rmse_ds = xr.Dataset(rmse_vars)
+            if 'spatial_ref' in burst_ds.coords:
+                vel_ds = vel_ds.assign_coords(spatial_ref=burst_ds.spatial_ref)
+                rmse_ds = rmse_ds.assign_coords(spatial_ref=burst_ds.spatial_ref)
+            vel_results[burst_id] = vel_ds
+            rmse_results[burst_id] = rmse_ds
+
+        return Batch(vel_results), Batch(rmse_results)
 
     def backscatter(self, *args, **kwargs):
         """
@@ -2511,7 +2683,7 @@ class Batches(tuple):
         debug : bool
             Print diagnostic information.
         **kwargs
-            Additional arguments: max_iter, epsilon, threshold.
+            Additional arguments: max_iter, epsilon.
 
         Returns
         -------
@@ -2620,7 +2792,7 @@ class Batches(tuple):
         return Batches(elements)
 
     def detrend1d(self, baseline='BPR', intercept=False, slope=True,
-                  debug=False):
+                  bins=128, debug=False):
         """
         Detrend linear trend along perpendicular baseline and return Batches.
 
@@ -2666,7 +2838,7 @@ class Batches(tuple):
         detrended = phase.trend1d(weight=weight, baseline=baseline,
                                   detrend=True,
                                   intercept=intercept, slope=slope,
-                                  debug=debug)
+                                  bins=bins, debug=debug)
 
         # Preserve non-spatial variables (e.g. BPR) that may be dropped by arithmetic
         detrended = Batches._preserve_nonspatial(phase, detrended)
@@ -2809,6 +2981,101 @@ class Batches(tuple):
 
         # Rebuild Batches preserving all original elements except first
         elements = [detrended] + list(self[1:])
+        return Batches(elements)
+
+    def threshold(self, threshold=np.pi/2):
+        """
+        Filter pixels by circular standard deviation (cstd) of pair phases.
+
+        Pixels with cstd >= threshold are set to NaN. Uses correlation
+        weights from the second element if available.
+
+        Parameters
+        ----------
+        threshold : float
+            Maximum cstd in radians. Default π/2.
+
+        Returns
+        -------
+        Batches
+            Batches with filtered phase, preserving other elements.
+        """
+        phase = self[0]
+        weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
+
+        if not isinstance(phase, BatchComplex):
+            raise TypeError(f"threshold() requires BatchComplex, got {type(phase).__name__}")
+
+        filtered = phase.threshold(weight=weight, threshold=threshold)
+        elements = [filtered] + list(self[1:])
+        return Batches(elements)
+
+    def velocity(self, max_refine=3, **kwargs):
+        """
+        Estimate velocity from pair network (BatchComplex) or time series (Batch).
+
+        For BatchComplex: uses periodogram on pairs — fast shortcut for global
+        velocity in rad/year. Use displacement_los(transform) to convert to m/year.
+        For Batch: uses linear regression on time series (existing method).
+
+        Parameters
+        ----------
+        max_refine : int
+            For BatchComplex: refinement levels (0=coarse ~32mm/yr, 3=fine ~0.5mm/yr).
+
+        Returns
+        -------
+        Batches
+            For BatchComplex: Batches[velocity, rmse] — both in rad/year.
+            For Batch: Batches[velocity, intercept].
+        """
+        phase = self[0]
+        weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
+
+        if isinstance(phase, BatchComplex):
+            vel, rmse = phase.velocity(weight=weight, max_refine=max_refine, **kwargs)
+            return Batches((vel, rmse))
+        else:
+            vel, intercept = phase.velocity(**kwargs)
+            return Batches((vel, intercept))
+
+    def rmse(self, solution):
+        """RMSE of phase vs solution, using correlation weight if present.
+
+        Extracts phase from self[0] and optional weight from self[1] (BatchUnit).
+        Weight is automatically passed to the RMSE calculation and reduced
+        to (y, x) via mean over the temporal dimension.
+
+        Parameters
+        ----------
+        solution : Batch
+            Velocity (y, x), pair-based, or date-based solution.
+
+        Returns
+        -------
+        Batches
+            [RMSE Batch (y, x), mean weight BatchUnit (y, x)] when weight present,
+            [RMSE Batch (y, x)] otherwise.
+        """
+        if len(self) < 1:
+            raise ValueError("rmse() requires Batches with at least 1 element: [phase]")
+
+        phase = self[0]
+        weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
+
+        rmse_result = phase.rmse(solution, weight=weight)
+
+        if weight is not None:
+            # Reduce weight to (y, x) — detect temporal dimension
+            w_sample_ds = next(iter(weight.values()))
+            w_spatial = [v for v in w_sample_ds.data_vars if 'y' in w_sample_ds[v].dims]
+            tdim = next((d for d in ('pair', 'date')
+                         if w_spatial and d in w_sample_ds[w_spatial[0]].dims), None)
+            reduced_weight = weight.mean(tdim) if tdim else weight
+            elements = [rmse_result, reduced_weight]
+        else:
+            elements = [rmse_result]
+
         return Batches(elements)
 
     def regression1d_pairs(self, *args, **kwargs):
