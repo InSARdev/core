@@ -81,7 +81,7 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
     import numpy as np
     import zarr
     import gc
-    from dask.distributed import get_client
+    from dask.distributed import get_client, wait as dask_wait, futures_of
     from tqdm.auto import tqdm
 
     # Suppress zarr v3 consolidated metadata and .DS_Store warnings
@@ -211,8 +211,20 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
         n_pairs = ref_3d.shape[0] if ref_3d is not None else 1
         dim0_merged = ref_3d is not None and ref_3d.chunksize[0] == ref_3d.shape[0]
 
+        def _persist_wait(arrays, pbar):
+            """Persist dask arrays on workers and wait with progress tracking."""
+            persisted = list(dask.persist(*arrays))
+            futures = futures_of(persisted)
+            n_total = len(futures)
+            n_done = 0
+            for batch in dask.distributed.as_completed(futures, with_results=False).batches():
+                n_done += len(batch)
+                pbar.set_postfix_str(f'computing {n_done}/{n_total}')
+            pbar.set_postfix_str('writing')
+            return persisted
+
         if dim0_merged and ref_3d is not None:
-            # Batch by spatial x-columns, optimize per batch to cull graph
+            # Batch by spatial x-columns: persist on workers, then write.
             n_y = len(ref_3d.chunks[-2])
             n_x = len(ref_3d.chunks[-1])
             x_chunks = ref_3d.chunks[-1]
@@ -225,21 +237,23 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
 
             # Write 2D sources once (non-batched)
             if idx_2d:
-                da.store([sources[i] for i in idx_2d],
-                         [targets[i] for i in idx_2d], lock=False)
+                materialized = _persist_wait([sources[i] for i in idx_2d], pbar)
+                da.store(materialized, [targets[i] for i in idx_2d], lock=False)
+                del materialized
 
             for kx in range(0, n_x, batch_x):
                 kx_end = min(kx + batch_x, n_x)
                 x0, x1 = x_boundaries[kx], x_boundaries[kx_end]
                 ndim = ref_3d.ndim
                 reg = (slice(None),) * (ndim - 1) + (slice(x0, x1),)
-                # Slice + optimize together: culls graph, preserves shared upstream tasks
-                src_b = list(dask.optimize(*[sources[i][..., x0:x1] for i in idx_3d]))
+                src_b = _persist_wait([sources[i][..., x0:x1] for i in idx_3d], pbar)
                 tgt_b = [targets[i] for i in idx_3d]
                 da.store(src_b, tgt_b, lock=False, regions=[reg] * len(src_b))
+                del src_b
+                pbar.set_postfix_str('')
                 pbar.update(1)
         elif n_pairs > n_chunks * n_workers:
-            # Batch by dim-0 (pairs)
+            # Batch by dim-0 (pairs): persist on workers, then write.
             batch_pairs = n_chunks * n_workers
             n_batches = (n_pairs + batch_pairs - 1) // batch_pairs
             pbar.total = n_batches
@@ -248,20 +262,26 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
             idx_2d = [i for i, s in enumerate(sources) if s.ndim < 3]
 
             if idx_2d:
-                da.store([sources[i] for i in idx_2d],
-                         [targets[i] for i in idx_2d], lock=False)
+                materialized = _persist_wait([sources[i] for i in idx_2d], pbar)
+                da.store(materialized, [targets[i] for i in idx_2d], lock=False)
+                del materialized
 
             for k in range(0, n_pairs, batch_pairs):
                 k_end = min(k + batch_pairs, n_pairs)
-                src_b = list(dask.optimize(*[sources[i][k:k_end] for i in idx_3d]))
+                src_b = _persist_wait([sources[i][k:k_end] for i in idx_3d], pbar)
                 tgt_b = [targets[i] for i in idx_3d]
                 reg_b = [(slice(k, k_end),)] * len(src_b)
                 da.store(src_b, tgt_b, lock=False, regions=reg_b)
+                del src_b
+                pbar.set_postfix_str('')
                 pbar.update(1)
         else:
             # Small enough for single store
             pbar.total = 1
-            da.store(sources, targets, lock=False)
+            materialized = _persist_wait(sources, pbar)
+            da.store(materialized, targets, lock=False)
+            del materialized
+            pbar.set_postfix_str('')
             pbar.update(1)
 
     # Write xarray metadata (coords, attrs) AFTER data is written
@@ -333,12 +353,28 @@ def open(store: str, storage_options: dict[str, str] | None = None,
     joblib_backend = 'sequential' if debug else 'threading'
 
     def _load_grp(grp):
+        import uuid
+        import dask.array as da
         import rioxarray
         # Use consolidated=False for subgroups - they share root's consolidated metadata
         if is_store_object:
             ds = xr.open_zarr(store, group=grp, storage_options=storage_options, consolidated=False, zarr_format=3)
         else:
             ds = xr.open_zarr(f'{store}/{grp}', storage_options=storage_options, consolidated=False, zarr_format=3)
+        # Assign unique dask graph keys to prevent collisions when the same zarr
+        # is opened multiple times (e.g. snapshot('intfcorr') then pipeline reusing it).
+        # xr.open_zarr produces identical keys for the same path, so the dask
+        # scheduler confuses data between different opens — causing silent NaN.
+        uid = uuid.uuid4().hex[:8]
+        for var in list(ds.data_vars):
+            arr = ds[var].data
+            if hasattr(arr, 'dask'):
+                # map_blocks with identity + unique name: zero-cost layer that
+                # gives the array a fresh set of graph keys.
+                new_name = f'{grp}-{var}-{uid}'
+                ds[var].data = da.map_blocks(
+                    lambda x: x, arr, dtype=arr.dtype,
+                    name=new_name, meta=arr._meta)
         # restore rioxarray CRS from spatial_ref coordinate/variable if present
         if ds.rio.crs is None:
             # check both coords and data_vars for spatial_ref
