@@ -89,6 +89,7 @@ class S1_slc(Satellite):
                 date = start_time.date()
                 orbit= (orbits_dict.get((date-oneday, date+oneday)) or
                                      orbits_dict.get((date-oneday, date)) or
+                                     orbits_dict.get((date, date+oneday)) or
                                      orbits_dict.get((date, date)))
                 # Build record from parsed annotation
                 record = {
