@@ -800,7 +800,7 @@ class Stack(Stack_plot, BatchCore):
         return Batches(batches).compute()
 
     def snapshot(self, *args, store: str | None = None, storage_options: dict[str, str] | None = None,
-                caption: str | None = None, n_chunks: int = 4, debug=False):
+                caption: str | None = None, n_chunks: int = 1, debug=False):
         """Open or save a Batch/Batches snapshot.
 
         This is a convenience passthrough to Batches.snapshot(). Stack itself
@@ -850,8 +850,8 @@ class Stack(Stack_plot, BatchCore):
                              caption=caption or 'Snapshotting...', n_chunks=n_chunks, debug=debug)
                 return utils_io.open(store=store, storage_options=storage_options,
                                      n_jobs=-1, debug=debug)
-            return Batches().snapshot(store=store, storage_options=storage_options,
-                                      caption=caption, n_chunks=n_chunks, debug=debug)
+            return utils_io.open(store=store, storage_options=storage_options,
+                                n_jobs=-1, debug=debug)
 
         # Save mode - args are batches
         return Batches(args).snapshot(store=store, storage_options=storage_options, caption=caption, n_chunks=n_chunks, debug=debug)
@@ -1192,7 +1192,8 @@ class Stack(Stack_plot, BatchCore):
 
     @staticmethod
     def _load_zarr_complex_chunk(zarr_path, group_path, chunk_idx, chunk_shape,
-                                  disk_chunk_shape, scale, fill_value, storage_options=None):
+                                  disk_chunk_shape, scale, fill_value, storage_options=None,
+                                  re_dtype='int16'):
         """
         Load ONE zarr chunk of complex64 data. Returns NaN array if chunk files don't exist.
 
@@ -1209,35 +1210,70 @@ class Stack(Stack_plot, BatchCore):
         iy, ix = chunk_idx
 
         re_path = f"{base_path}/re/c/{iy}/{ix}"
-        im_path = f"{base_path}/im/c/{iy}/{ix}"
 
         # Check if chunk exists - return NaN array if not (like native zarr)
-        if not fs.exists(re_path) or not fs.exists(im_path):
+        if not fs.exists(re_path):
             return np.full(chunk_shape, np.nan + 0j, dtype=np.complex64)
 
         # Read real part (disk has full chunk size, slice to logical size)
         with fs.open(re_path, 'rb') as f:
-            re_full = np.frombuffer(codec.decode(f.read()), dtype=np.int16).reshape(disk_chunk_shape)
-        re_int16 = re_full[:chunk_shape[0], :chunk_shape[1]]
-        del re_full
+            raw = codec.decode(f.read())
 
-        # Read imaginary part
-        with fs.open(im_path, 'rb') as f:
-            im_full = np.frombuffer(codec.decode(f.read()), dtype=np.int16).reshape(disk_chunk_shape)
-        im_int16 = im_full[:chunk_shape[0], :chunk_shape[1]]
-        del im_full
-
-        # Build complex output
         data = np.empty(chunk_shape, dtype=np.complex64)
-        if fill_value is not None:
-            mask = (re_int16 == fill_value) | (im_int16 == fill_value)
 
-        np.multiply(re_int16, scale, out=data.real, casting='unsafe')
-        del re_int16
-        np.multiply(im_int16, scale, out=data.imag, casting='unsafe')
-        del im_int16
+        if re_dtype == 'float32':
+            # Float32: NaN is fill value, no scale
+            re_full = np.frombuffer(raw, dtype=np.float32).reshape(disk_chunk_shape)
+            re_f32 = re_full[:chunk_shape[0], :chunk_shape[1]]
+            del re_full
+            mask = ~np.isfinite(re_f32)
+            data.real[:] = re_f32
+            del re_f32
 
-        if fill_value is not None:
+            # Check for im (float32 complex) or amplitude-only
+            im_path = f"{base_path}/im/c/{iy}/{ix}"
+            if fs.exists(im_path):
+                with fs.open(im_path, 'rb') as f:
+                    im_full = np.frombuffer(codec.decode(f.read()), dtype=np.float32).reshape(disk_chunk_shape)
+                im_f32 = im_full[:chunk_shape[0], :chunk_shape[1]]
+                del im_full
+                mask |= ~np.isfinite(im_f32)
+                data.imag[:] = im_f32
+                del im_f32
+            else:
+                data.imag[:] = 0
+        else:
+            # Int16 with scale_factor
+            re_full = np.frombuffer(raw, dtype=np.int16).reshape(disk_chunk_shape)
+            re_int16 = re_full[:chunk_shape[0], :chunk_shape[1]]
+            del re_full
+
+            im_path = f"{base_path}/im/c/{iy}/{ix}"
+            # Amplitude-only mode: im doesn't exist → load re as amplitude, im=0
+            if not fs.exists(im_path):
+                if fill_value is not None:
+                    mask = (re_int16 == fill_value)
+                else:
+                    mask = None
+                np.multiply(re_int16, scale, out=data.real, casting='unsafe')
+                data.imag[:] = 0
+                del re_int16
+            else:
+                # Complex mode: load both re and im
+                with fs.open(im_path, 'rb') as f:
+                    im_full = np.frombuffer(codec.decode(f.read()), dtype=np.int16).reshape(disk_chunk_shape)
+                im_int16 = im_full[:chunk_shape[0], :chunk_shape[1]]
+                del im_full
+                if fill_value is not None:
+                    mask = (re_int16 == fill_value) | (im_int16 == fill_value)
+                else:
+                    mask = None
+                np.multiply(re_int16, scale, out=data.real, casting='unsafe')
+                del re_int16
+                np.multiply(im_int16, scale, out=data.imag, casting='unsafe')
+                del im_int16
+
+        if mask is not None and np.any(mask):
             np.putmask(data, mask, np.nan + 0j)
 
         return data
@@ -1260,27 +1296,56 @@ class Stack(Stack_plot, BatchCore):
         with fs.open(meta_path, 'r') as f:
             meta = json.load(f)
         shape = tuple(meta['shape'])
-        scale = np.float32(meta['attributes']['scale_factor'])
+        re_dtype = meta.get('data_type', 'int16')
+        scale = np.float32(meta['attributes'].get('scale_factor', 1.0))
         fill_value = meta['attributes'].get('_FillValue')
 
         codec = Zstd()
         data = np.empty(shape, dtype=np.complex64)
 
         with fs.open(f"{base_path}/re/c/0/0", 'rb') as f:
-            re_int16 = np.frombuffer(codec.decode(f.read()), dtype=np.int16).reshape(shape)
-        if fill_value is not None:
-            mask = (re_int16 == fill_value)
-        np.multiply(re_int16, scale, out=data.real, casting='unsafe')
-        del re_int16
+            raw = codec.decode(f.read())
 
-        with fs.open(f"{base_path}/im/c/0/0", 'rb') as f:
-            im_int16 = np.frombuffer(codec.decode(f.read()), dtype=np.int16).reshape(shape)
-        if fill_value is not None:
-            mask |= (im_int16 == fill_value)
-        np.multiply(im_int16, scale, out=data.imag, casting='unsafe')
-        del im_int16
+        if re_dtype == 'float32':
+            # Float32: NaN is the fill value, no scale needed
+            re_f32 = np.frombuffer(raw, dtype=np.float32).reshape(shape)
+            mask = ~np.isfinite(re_f32)
+            data.real[:] = re_f32
+            del re_f32
 
-        if fill_value is not None:
+            # Check for im (float32 complex) or amplitude-only
+            im_path = f"{base_path}/im/c/0/0"
+            if fs.exists(im_path):
+                with fs.open(im_path, 'rb') as f:
+                    im_f32 = np.frombuffer(codec.decode(f.read()), dtype=np.float32).reshape(shape)
+                mask |= ~np.isfinite(im_f32)
+                data.imag[:] = im_f32
+                del im_f32
+            else:
+                data.imag[:] = 0
+        else:
+            # Int16 with scale_factor
+            re_int16 = np.frombuffer(raw, dtype=np.int16).reshape(shape)
+            if fill_value is not None:
+                mask = (re_int16 == fill_value)
+            else:
+                mask = None
+            np.multiply(re_int16, scale, out=data.real, casting='unsafe')
+            del re_int16
+
+            # Amplitude-only mode: no 'im' directory → im=0
+            im_path = f"{base_path}/im/c/0/0"
+            if fs.exists(im_path):
+                with fs.open(im_path, 'rb') as f:
+                    im_int16 = np.frombuffer(codec.decode(f.read()), dtype=np.int16).reshape(shape)
+                if fill_value is not None:
+                    mask |= (im_int16 == fill_value)
+                np.multiply(im_int16, scale, out=data.imag, casting='unsafe')
+                del im_int16
+            else:
+                data.imag[:] = 0
+
+        if mask is not None and np.any(mask):
             np.putmask(data, mask, np.nan + 0j)
 
         return data
@@ -1300,10 +1365,11 @@ class Stack(Stack_plot, BatchCore):
 
         shape = tuple(meta['shape'])
         chunks = tuple(meta.get('chunk_grid', {}).get('configuration', {}).get('chunk_shape', shape))
-        scale = np.float32(meta['attributes']['scale_factor'])
+        dtype = meta.get('data_type', 'int16')
+        scale = np.float32(meta['attributes'].get('scale_factor', 1.0))
         fill_value = meta['attributes'].get('_FillValue')
 
-        return shape, chunks, scale, fill_value
+        return shape, chunks, scale, fill_value, dtype
 
     def load(self, urls:str | list | dict[str, str], storage_options:dict[str, str]|None=None,
              debug:bool=False):
@@ -1444,7 +1510,7 @@ class Stack(Stack_plot, BatchCore):
                 for info in pol_infos:
                     shape = info['shape']
                     # Get chunk metadata
-                    _, zarr_chunks, scale, fill_value = Stack._get_zarr_slc_meta(
+                    _, zarr_chunks, scale, fill_value, re_dtype = Stack._get_zarr_slc_meta(
                         zarr_path, info['burst_path'], storage_options
                     )
                     n_chunks_y = (shape[0] + zarr_chunks[0] - 1) // zarr_chunks[0]
@@ -1469,7 +1535,8 @@ class Stack(Stack_plot, BatchCore):
 
                                 delayed_chunk = dask.delayed(Stack._load_zarr_complex_chunk)(
                                     zarr_path, info['burst_path'], (iy, ix),
-                                    chunk_shape, zarr_chunks, scale, fill_value, storage_options
+                                    chunk_shape, zarr_chunks, scale, fill_value, storage_options,
+                                    re_dtype=re_dtype
                                 )
                                 chunk_arr = da.from_delayed(delayed_chunk, shape=chunk_shape, dtype=np.complex64)
                                 chunk_cols.append(chunk_arr)
@@ -2474,7 +2541,8 @@ class Stack(Stack_plot, BatchCore):
 
     def baseline(self, days: int | None = None, meters: float | None = None,
                  invert: bool = False,
-                 min_connections: int = 2, cleanup: bool = True) -> "Baseline":
+                 min_connections: int = 2, max_connections: int | None = None,
+                 cleanup: bool = True) -> "Baseline":
         """Generate baseline pairs table from the Stack.
 
         Creates a Baseline DataFrame containing all valid interferometric pairs
@@ -2500,6 +2568,12 @@ class Stack(Stack_plot, BatchCore):
             If True, invert reference and repeat dates. Default is False.
         min_connections : int, optional
             Minimum pairs per date for cleanup. Default is 2.
+        max_connections : int, optional
+            Maximum incoming and outgoing pairs per date. When set,
+            iterates over dates chronologically and for each date limits
+            both outgoing (date as ref) and incoming (date as rep) pairs
+            to max_connections, dropping the longest-duration ones first.
+            Applied before cleanup. Default None (no limit).
         cleanup : bool, optional
             If True (default), iteratively remove hanging dates and dates
             connected only to predecessors or only to successors.
@@ -2578,6 +2652,23 @@ class Stack(Stack_plot, BatchCore):
                              "Try increasing 'days' or 'meters'.")
 
         df = pd.DataFrame(data).sort_values(['ref', 'rep']).reset_index(drop=True)
+
+        if max_connections is not None:
+            _dur = (df['rep'] - df['ref']).dt.days
+            keep = pd.Series(True, index=df.index)
+            all_dates = sorted(set(df['ref']) | set(df['rep']))
+            for date in all_dates:
+                # Outgoing pairs (date as ref)
+                ref_mask = (df['ref'] == date) & keep
+                if ref_mask.sum() > max_connections:
+                    ref_dur = _dur[ref_mask].sort_values()
+                    keep[ref_dur.index[max_connections:]] = False
+                # Incoming pairs (date as rep)
+                rep_mask = (df['rep'] == date) & keep
+                if rep_mask.sum() > max_connections:
+                    rep_dur = _dur[rep_mask].sort_values()
+                    keep[rep_dur.index[max_connections:]] = False
+            df = df[keep].reset_index(drop=True)
 
         if cleanup:
             from .Baseline import _cleanup_network

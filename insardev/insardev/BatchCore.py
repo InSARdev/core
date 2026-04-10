@@ -1203,7 +1203,7 @@ class BatchCore(dict):
             out[key] = ds.where(mask_burst, other)
         return type(self)(out)
 
-    def trend2d(self, transform: 'BatchCore', weight: 'BatchUnit | None' = None,
+    def trend2d(self, transform: 'BatchCore | None' = None, weight: 'BatchUnit | None' = None,
                 degree: int = 1, device: str = 'auto', detrend: bool = False,
                 debug: bool = False) -> 'BatchCore':
         """
@@ -1215,8 +1215,9 @@ class BatchCore(dict):
 
         Parameters
         ----------
-        transform : BatchCore
+        transform : BatchCore or None
             Coordinate transform from stack.transform() containing 'azi' and 'rng'.
+            If None, uses y,x grid coordinates as regressors.
         weight : BatchUnit or None
             Optional weight for the fitting (typically correlation).
         degree : int
@@ -1237,8 +1238,10 @@ class BatchCore(dict):
 
         Examples
         --------
-        >>> # Real phase
+        >>> # With radar coordinates
         >>> trend = phase.trend2d(stack.transform(), weight=corr)
+        >>> # With y,x grid coordinates (no transform needed)
+        >>> trend = phase.trend2d(weight=corr)
         >>> # Complex interferogram
         >>> trend = intf_complex.trend2d(stack.transform(), weight=corr)
         >>> detrended = intf_complex * trend.conj()
@@ -1266,11 +1269,9 @@ class BatchCore(dict):
 
         is_complex = isinstance(phase, BatchComplex)
 
-        if transform is None:
-            raise ValueError("transform is required for trend2d. Use stack.transform()[['azi','rng','ele']] or stack.transform()[['azi','rng']].")
-
         # Unify transform keys to phase
-        transform = transform.sel(phase)
+        if transform is not None:
+            transform = transform.sel(phase)
 
         result = {}
         for key in phase.keys():
@@ -1279,27 +1280,31 @@ class BatchCore(dict):
             pols = [v for v in ds.data_vars
                    if 'y' in ds[v].dims and 'x' in ds[v].dims]
 
-            trans_ds = transform[key]
-            var_names = [v for v in trans_ds.data_vars
-                        if 'y' in trans_ds[v].dims and 'x' in trans_ds[v].dims]
-
-            # Check that transform and weight resolutions match phase resolution
             phase_da_ref = ds[pols[0]]
             phase_shape = phase_da_ref.shape[-2:]
             phase_dy = float(phase_da_ref.y.diff('y')[0])
             phase_dx = float(phase_da_ref.x.diff('x')[0])
 
-            trans_da_ref = trans_ds[var_names[0]]
-            trans_shape = trans_da_ref.shape
-            if phase_shape != trans_shape:
-                trans_dy = float(trans_da_ref.y.diff('y')[0])
-                trans_dx = float(trans_da_ref.x.diff('x')[0])
-                raise ValueError(
-                    f"Transform shape {trans_shape} does not match phase shape {phase_shape}. "
-                    f"Phase spacing: dy={phase_dy:.1f}, dx={phase_dx:.1f}. "
-                    f"Transform spacing: dy={trans_dy:.1f}, dx={trans_dx:.1f}. "
-                    f"Use stack.transform()[['azi','rng','ele']].downsample(N) to match."
-                )
+            if transform is not None:
+                trans_ds = transform[key]
+                var_names = [v for v in trans_ds.data_vars
+                            if 'y' in trans_ds[v].dims and 'x' in trans_ds[v].dims]
+
+                # Check that transform resolution matches phase resolution
+                trans_da_ref = trans_ds[var_names[0]]
+                trans_shape = trans_da_ref.shape
+                if phase_shape != trans_shape:
+                    trans_dy = float(trans_da_ref.y.diff('y')[0])
+                    trans_dx = float(trans_da_ref.x.diff('x')[0])
+                    raise ValueError(
+                        f"Transform shape {trans_shape} does not match phase shape {phase_shape}. "
+                        f"Phase spacing: dy={phase_dy:.1f}, dx={phase_dx:.1f}. "
+                        f"Transform spacing: dy={trans_dy:.1f}, dx={trans_dx:.1f}. "
+                        f"Use stack.transform()[['azi','rng','ele']].downsample(N) to match."
+                    )
+            else:
+                trans_ds = None
+                var_names = ['y', 'x']
 
             if weight is not None:
                 weight_ds = weight[key]
@@ -1346,14 +1351,25 @@ class BatchCore(dict):
 
                 n_pairs = phase_dask.shape[0]
 
-                # Rechunk transform to match phase spatial chunks
+                # Build variable arrays for the fit
                 phase_spatial_chunks = phase_dask.chunks[-2:]
-                var_dask_list = []
-                for v in var_names:
-                    var_dask = trans_ds[v].data
-                    if var_dask.chunks != phase_spatial_chunks:
-                        var_dask = var_dask.rechunk(phase_spatial_chunks)
-                    var_dask_list.append(var_dask)
+                if trans_ds is not None:
+                    var_dask_list = []
+                    for v in var_names:
+                        var_dask = trans_ds[v].data
+                        if var_dask.chunks != phase_spatial_chunks:
+                            var_dask = var_dask.rechunk(phase_spatial_chunks)
+                        var_dask_list.append(var_dask)
+                else:
+                    # Use y,x grid coordinates as regressors
+                    y_np, x_np = np.meshgrid(
+                        phase_da.y.values.astype(np.float32),
+                        phase_da.x.values.astype(np.float32),
+                        indexing='ij')
+                    var_dask_list = [
+                        da.from_array(y_np, chunks=phase_spatial_chunks),
+                        da.from_array(x_np, chunks=phase_spatial_chunks),
+                    ]
 
                 # Phase 0: Compute global feature standardization (pair-independent)
                 feature_mean, feature_std = utils_detrend._compute_feature_stats(
@@ -1475,7 +1491,7 @@ class BatchCore(dict):
             return BatchComplex(result)
         return Batch(result)
 
-    def trend2d_window(self, transform: 'BatchCore', weight: 'BatchUnit | None' = None,
+    def trend2d_window(self, transform: 'BatchCore | None' = None, weight: 'BatchUnit | None' = None,
                         window: 'int | tuple' = 250, stride: 'int | tuple' = 1,
                         detrend: bool = False,
                         debug: bool = False) -> 'BatchCore':
@@ -1491,8 +1507,9 @@ class BatchCore(dict):
 
         Parameters
         ----------
-        transform : BatchCore
+        transform : BatchCore or None
             Coordinate transform containing 'azi', 'rng', 'ele'.
+            If None, uses y,x grid coordinates as regressors.
         weight : BatchUnit or None
             Optional weight for fitting (typically correlation).
         degree : int
@@ -1530,18 +1547,20 @@ class BatchCore(dict):
         half_y = win_y // 2
         half_x = win_x // 2
 
-        if transform is None:
-            raise ValueError("transform is required for trend2d_window.")
-        transform = transform.sel(phase)
+        if transform is not None:
+            transform = transform.sel(phase)
 
         result = {}
         for key in phase.keys():
             ds = phase[key]
             pols = [v for v in ds.data_vars
                    if 'y' in ds[v].dims and 'x' in ds[v].dims]
-            trans_ds = transform[key]
-            var_names = [v for v in trans_ds.data_vars
-                        if 'y' in trans_ds[v].dims and 'x' in trans_ds[v].dims]
+            if transform is not None:
+                trans_ds = transform[key]
+                var_names = [v for v in trans_ds.data_vars
+                            if 'y' in trans_ds[v].dims and 'x' in trans_ds[v].dims]
+            else:
+                trans_ds = None
 
             result_ds = {}
             for pol in pols:
@@ -1550,14 +1569,25 @@ class BatchCore(dict):
                 phase_dask = phase_da.data
                 out_dtype = phase_da.dtype if is_complex else np.float32
 
-                # Rechunk transform to match phase spatial chunks
+                # Build variable arrays for the fit
                 phase_spatial_chunks = phase_dask.chunks[-2:]
-                var_dask_list = []
-                for v in var_names:
-                    vd = trans_ds[v].data
-                    if vd.chunks != phase_spatial_chunks:
-                        vd = vd.rechunk(phase_spatial_chunks)
-                    var_dask_list.append(vd)
+                if trans_ds is not None:
+                    var_dask_list = []
+                    for v in var_names:
+                        vd = trans_ds[v].data
+                        if vd.chunks != phase_spatial_chunks:
+                            vd = vd.rechunk(phase_spatial_chunks)
+                        var_dask_list.append(vd)
+                else:
+                    # Use y,x grid coordinates as regressors
+                    y_np, x_np = np.meshgrid(
+                        phase_da.y.values.astype(np.float32),
+                        phase_da.x.values.astype(np.float32),
+                        indexing='ij')
+                    var_dask_list = [
+                        da.from_array(y_np, chunks=phase_spatial_chunks),
+                        da.from_array(x_np, chunks=phase_spatial_chunks),
+                    ]
 
                 has_weight = weight_da is not None
                 if has_weight:
@@ -1700,15 +1730,15 @@ class BatchCore(dict):
         output.attrs = phase.attrs
         return output
 
-    def trend1d(self, weight: 'BatchUnit | None' = None, baseline: str = 'BPR',
+    def trend1d_baseline(self, weight: 'BatchUnit | None' = None, baseline: str = 'BPR',
                 detrend: bool = False,
                 intercept: bool = False, slope: bool = True,
                 bins: int = 128,
                 debug: bool = False) -> 'Batch':
         """
-        Fit linear trend along perpendicular baseline at each (y, x) pixel.
+        Fit linear trend along baseline variable (default BPR) at each (y, x) pixel.
 
-        Uses numba per-pixel IRLS with analytical 2x2 solve for complex phase.
+        Uses numba per-pixel periodogram init + IRLS with analytical 2x2 solve.
 
         Parameters
         ----------
@@ -1908,7 +1938,13 @@ class BatchCore(dict):
             return Batch(result), Batch(slope_result)
 
     # Backward compatibility alias
-    regression1d_baseline = trend1d
+    def trend1d(self, *args, **kwargs):
+        """Alias for trend1d_baseline(). Use trend1d_baseline() directly for clarity."""
+        print("NOTE: trend1d() is an alias. Use trend1d_baseline() directly.")
+        return self.trend1d_baseline(*args, **kwargs)
+
+    # Backward compatibility
+    regression1d_baseline = trend1d_baseline
 
     def trend1d_pairs(self, weight: 'BatchUnit | None' = None,
                       detrend: bool = False,
@@ -3240,9 +3276,9 @@ class BatchCore(dict):
                 result[k] = ds
         return type(self)(result)
 
-    def chunk2d(self, budget=None, p2p=False):
+    def chunk2d(self, budget=None, chunks=1, p2p=False):
         """
-        Rechunk for pair-based (2D) processing: dim-0=1, spatial dims sized to budget.
+        Rechunk for pair-based (2D) processing: dim-0=chunks, spatial dims sized to budget.
 
         Computes optimal spatial chunk sizes so that each 2D slice (one pair/date)
         fits within the specified memory budget.
@@ -3252,6 +3288,9 @@ class BatchCore(dict):
         budget : str or None
             Memory budget per chunk, e.g. '128MiB', '256MB', '1GiB'.
             If None (default), uses dask.config['array.chunk-size'].
+        chunks : int
+            Chunk size for the first (pair/date) dimension. Default 1.
+            Use -1 to merge all into one chunk.
         p2p : bool
             Use P2P rechunk for constant-memory rechunking. Default False.
 
@@ -3264,6 +3303,8 @@ class BatchCore(dict):
         --------
         >>> stack = Stack().load(zarr_path).chunk2d('128MiB')
         >>> phase, corr = stack.phasediff_multilook(pairs, wavelength=200)
+        >>> # Partial merge for faster snapshot + read:
+        >>> intfcorr2d.chunk2d('5MB', 20).snapshot('intfcorr2d')
         """
         import dask
         from .utils_dask import rechunk2d
@@ -3281,47 +3322,62 @@ class BatchCore(dict):
                 # Compute spatial chunks once per burst using 8 bytes (complex64)
                 # so all variables get identical spatial chunks.
                 sample = None
+                n_stack = 0
                 for var in ds.data_vars:
                     arr = ds[var]
                     if arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x'):
                         sample = arr
+                        if arr.ndim == 3 and arr.shape[0] > n_stack:
+                            n_stack = arr.shape[0]
                         break
                 if sample is None:
                     result[k] = ds
                     continue
+                # Scale budget by chunks so total chunk memory stays within budget
+                dim0 = chunks if chunks != -1 else (n_stack if n_stack > 0 else 1)
+                per_slice_mb = (target_mb / dim0) if target_mb is not None else None
                 y_size, x_size = sample.shape[-2], sample.shape[-1]
                 in_chunks = (sample.data.chunks[-2], sample.data.chunks[-1]) if hasattr(sample.data, 'chunks') else None
                 optimal = rechunk2d((y_size, x_size), element_bytes=8,
-                                   input_chunks=in_chunks, target_mb=target_mb, merge=True)
+                                   input_chunks=in_chunks, target_mb=per_slice_mb, merge=True)
                 rechunked_vars = {}
                 for var in ds.data_vars:
                     arr = ds[var]
                     if not (arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x')):
                         continue
                     if arr.ndim == 3:
-                        var_chunks = {arr.dims[0]: 1, 'y': optimal['y'], 'x': optimal['x']}
+                        var_chunks = {arr.dims[0]: chunks, 'y': optimal['y'], 'x': optimal['x']}
                     else:
                         var_chunks = {'y': optimal['y'], 'x': optimal['x']}
                     rechunked = arr.chunk(var_chunks)
                     if hasattr(rechunked.data, 'dask'):
-                        (rechunked.data,) = dask.optimize(rechunked.data)
+                        # Full fusion only when graph has enough layers for linear chains.
+                        # Rechunk-only graphs (≤3 layers) have no fusible chains —
+                        # skip expensive ensure_dict + fuse_linear (22s on 1M keys, 0% reduction).
+                        n_layers = len(rechunked.data.__dask_graph__().layers)
+                        with dask.config.set({'optimization.fuse.active': n_layers > 3}):
+                            (rechunked.data,) = dask.optimize(rechunked.data)
                     rechunked_vars[var] = rechunked
                 if rechunked_vars:
                     ds = ds.assign(rechunked_vars)
                 result[k] = ds
         return type(self)(result)
 
-    def chunk1d(self, budget=None, p2p=False):
+    def chunk1d(self, budget=None, chunks=-1, p2p=False):
         """
-        Rechunk for date-based (1D) processing: dim-0=-1, spatial dims sized to budget.
+        Rechunk for date-based (1D) processing: dim-0=chunks, spatial dims sized to budget.
 
-        Computes optimal spatial chunk sizes so that the full date/pair stack
+        Computes optimal spatial chunk sizes so that the date/pair stack
         fits within the specified memory budget per spatial tile.
 
         Parameters
         ----------
         budget : str
             Memory budget per chunk, e.g. '128MiB', '256MB', '1GiB'.
+        chunks : int
+            Chunk size for the first (pair/date) dimension. Default -1 (all).
+            Use e.g. 20 for partial merge — much faster rechunk/snapshot
+            while still grouping pairs for efficient sequential reads.
         p2p : bool
             Use P2P rechunk for constant-memory rechunking. Default False.
 
@@ -3334,6 +3390,8 @@ class BatchCore(dict):
         --------
         >>> data = Stack().snapshot('detrend').chunk1d('128MiB')
         >>> displacement = data.detrend1d()
+        >>> # Partial merge for faster snapshot:
+        >>> intfcorr2d.chunk1d('1GB', 20).snapshot('intfcorr')
         """
         import dask
         from .utils_dask import rechunk2d
@@ -3360,9 +3418,11 @@ class BatchCore(dict):
                 if sample is None:
                     result[k] = ds
                     continue
-                # Divide budget by n_stack to get per-slice budget,
+                # Resolve chunks: -1 means all pairs/dates in one chunk
+                dim0 = n_stack if chunks == -1 else chunks
+                # Divide budget by dim0 to get per-slice budget,
                 # then use rechunk2d (a 2D function) with per-slice element_bytes=8.
-                per_slice_mb = (target_mb / n_stack) if target_mb is not None else None
+                per_slice_mb = (target_mb / dim0) if target_mb is not None else None
                 y_size, x_size = sample.shape[1], sample.shape[2]
                 in_chunks = (sample.data.chunks[1], sample.data.chunks[2]) if hasattr(sample.data, 'chunks') else None
                 optimal = rechunk2d((y_size, x_size), element_bytes=8,
@@ -3373,13 +3433,17 @@ class BatchCore(dict):
                     if not (arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x')):
                         continue
                     if arr.ndim == 3:
-                        var_chunks = {arr.dims[0]: -1, 'y': optimal['y'], 'x': optimal['x']}
+                        var_chunks = {arr.dims[0]: chunks, 'y': optimal['y'], 'x': optimal['x']}
                     else:
                         var_chunks = {'y': optimal['y'], 'x': optimal['x']}
                     rechunked = arr.chunk(var_chunks)
-                    # Optimize to flatten the rechunk graph (215K→4K keys)
                     if hasattr(rechunked.data, 'dask'):
-                        (rechunked.data,) = dask.optimize(rechunked.data)
+                        # Full fusion only when graph has enough layers for linear chains.
+                        # Rechunk-only graphs (≤3 layers) have no fusible chains —
+                        # skip expensive ensure_dict + fuse_linear (22s on 1M keys, 0% reduction).
+                        n_layers = len(rechunked.data.__dask_graph__().layers)
+                        with dask.config.set({'optimization.fuse.active': n_layers > 3}):
+                            (rechunked.data,) = dask.optimize(rechunked.data)
                     rechunked_vars[var] = rechunked
                 if rechunked_vars:
                     ds = ds.assign(rechunked_vars)
@@ -3689,7 +3753,7 @@ class BatchCore(dict):
         return result
 
     def save(self, store: str, storage_options: dict[str, str] | None = None,
-                caption: str | None = 'Saving...', n_chunks: int = 4, debug=False):
+                caption: str | None = 'Saving...', n_chunks: int = 1, debug=False):
         return utils_io.save(self, store=store, storage_options=storage_options, caption=caption, n_chunks=n_chunks, debug=debug)
 
     def open(self, store: str, storage_options: dict[str, str] | None = None, n_jobs: int = -1, debug=False):
@@ -3699,7 +3763,7 @@ class BatchCore(dict):
         return data
     
     def snapshot(self, store: str | None = None, storage_options: dict[str, str] | None = None,
-                caption: str | None = 'Snapshotting...', n_chunks: int = 4,
+                caption: str | None = 'Snapshotting...', n_chunks: int = 1,
                 debug=False, **kwargs):
         # Only save if this batch has data; otherwise just open existing store
         if len(self) > 0:

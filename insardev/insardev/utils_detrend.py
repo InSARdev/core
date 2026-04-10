@@ -51,7 +51,8 @@ def _warmup_numba_cache():
     _trend1d_numba_kernel(_c, _w, _d, True, True, True, False, 128)
     _wf = np.ones((3, 1), dtype=np.float32)
     _threshold_pairs_numba_kernel(_c, _wf, 1, 3, np.pi * 0.5)
-    _v, _r = _velocity_pairs_numba_kernel(_c, _wf, 1, 3, np.array([1.0, 1.0, 2.0]), 3, np.pi)
+    _sd = np.array([0.0, 0.1, -0.1]); _cd = np.array([0.1, 0.0, -0.1])
+    _v, _r = _velocity_pairs_numba_kernel(_c, _wf, 1, 3, np.array([1.0, 1.0, 2.0]), _sd, _cd, 3, np.pi, False)
     _trend1d_pairs_numba_kernel(
         _c, _wf, 1, 2, 3,
         np.array([0, 1, 2], dtype=np.int64),
@@ -167,23 +168,25 @@ def _velocity_pairs_numba_kernel(
     n_pixels,
     n_pairs,
     pair_dt,           # (n_pairs,) temporal baseline (years)
+    sin_diff,          # (n_pairs,) sin(2π*t_ref) - sin(2π*t_rep)
+    cos_diff,          # (n_pairs,) cos(2π*t_ref) - cos(2π*t_rep)
     max_refine,        # refinement levels (0=coarse only, 3=0.5mm/yr accuracy)
     vmax,              # max velocity in rad/year (0 = use Nyquist)
+    seasonal,          # bool — enable annual seasonal projection
 ):
-    """Global velocity estimation per pixel via multi-level periodogram.
+    """Global velocity estimation per pixel via multi-level periodogram
+    with annual seasonal projection (IRLS).
 
-    16-bin coarse search + up to max_refine levels of 16-bin refinement.
-    Each level refines within ±1 bin of the previous level.
-    Resolution: level 0 = ±32mm/yr, level 1 = ±4mm/yr,
-    level 2 = ±0.5mm/yr, level 3 = ±0.06mm/yr.
+    For each velocity candidate, fits and removes annual seasonal component
+    A*sin_diff + B*cos_diff before scoring. Prevents seasonal signal from
+    biasing the velocity estimate.
 
     Returns
     -------
     velocity : (n_pixels,) float32
         Velocity in rad/year. NaN where insufficient valid pairs.
     rmse : (n_pixels,) float32
-        RMSE of residuals in rad after velocity removal. NaN where invalid.
-        Clean pixel ~0.3, noise ~1.8. Use as quality metric.
+        RMSE of residuals in rad after velocity+seasonal removal. NaN where invalid.
     """
     TWO_PI = 2.0 * np.pi
     N_BIN = 16
@@ -203,10 +206,19 @@ def _velocity_pairs_numba_kernel(
             gv_dt_min = 1.0
         gv_range = np.pi / gv_dt_min
 
-    # Precompute angles and weights per pixel (reused across scan bins)
+    # Precompute seasonal normal equation components (same for all pixels)
+    ss = 0.0; sc = 0.0; cc = 0.0
+    for p in range(n_pairs):
+        ss += sin_diff[p] * sin_diff[p]
+        sc += sin_diff[p] * cos_diff[p]
+        cc += cos_diff[p] * cos_diff[p]
+    seas_det = ss * cc - sc * sc + 1e-30
+
+    # Per-pixel working arrays
     pixel_ang = np.empty(n_pairs, dtype=np.float64)
     pixel_w = np.empty(n_pairs, dtype=np.float64)
     pixel_valid = np.empty(n_pairs, dtype=nb.boolean)
+    res = np.empty(n_pairs, dtype=np.float64)
 
     for px in range(n_pixels):
         n_valid = 0
@@ -228,10 +240,7 @@ def _velocity_pairs_numba_kernel(
         if n_valid < 4:
             continue
 
-        # Multi-level periodogram with trig recurrence.
-        # Precompute cos/sin of phases (same for all scan bins).
-        # cos(phase - v*dt) = cos_ph*cos(v*dt) + sin_ph*sin(v*dt)
-        # sin(phase - v*dt) = sin_ph*cos(v*dt) - cos_ph*sin(v*dt)
+        # Precompute cos/sin of phases for trig recurrence
         cos_ph = np.empty(n_pairs, dtype=np.float64)
         sin_ph = np.empty(n_pairs, dtype=np.float64)
         for p in range(n_pairs):
@@ -252,7 +261,6 @@ def _velocity_pairs_numba_kernel(
         sin_cur = np.empty(n_pairs, dtype=np.float64)
 
         for level in range(1 + max_refine):
-            # Init trig recurrence for this level
             for p in range(n_pairs):
                 if pixel_valid[p]:
                     st = step * pair_dt[p]
@@ -260,50 +268,84 @@ def _velocity_pairs_numba_kernel(
                     bt = scan_lo * pair_dt[p]
                     cos_cur[p] = np.cos(bt); sin_cur[p] = np.sin(bt)
 
-            for bi in range(N_BIN):
-                sr = 0.0; si = 0.0
-                for p in range(n_pairs):
-                    if not pixel_valid[p]:
-                        continue
-                    sr += pixel_w[p] * (cos_ph[p] * cos_cur[p] + sin_ph[p] * sin_cur[p])
-                    si += pixel_w[p] * (sin_ph[p] * cos_cur[p] - cos_ph[p] * sin_cur[p])
-                S = sr * sr + si * si
-                if S > best_S:
-                    best_S = S
-                    best_v = scan_lo + step * bi
-                # Step recurrence
+            use_seasonal = seasonal
+
+            if use_seasonal:
+                # Compute residual angles once at level start via arctan2
                 for p in range(n_pairs):
                     if pixel_valid[p]:
-                        c = cos_cur[p] * cos_step[p] - sin_cur[p] * sin_step[p]
-                        s = sin_cur[p] * cos_step[p] + cos_cur[p] * sin_step[p]
-                        cos_cur[p] = c; sin_cur[p] = s
+                        r_cos = cos_ph[p]*cos_cur[p] + sin_ph[p]*sin_cur[p]
+                        r_sin = sin_ph[p]*cos_cur[p] - cos_ph[p]*sin_cur[p]
+                        res[p] = np.arctan2(r_sin, r_cos)
+                # Precompute angle step per pair for this level
+                angle_step = step  # res advances by -step*dt per bin
 
-            # Next level: refine within ±1 bin of current best
+            for bi in range(N_BIN):
+                if use_seasonal:
+                    A_s = 0.0; B_s = 0.0
+                    for irls in range(3):
+                        sy = 0.0; cy = 0.0
+                        for p in range(n_pairs):
+                            if not pixel_valid[p]: continue
+                            r = res[p] - A_s*sin_diff[p] - B_s*cos_diff[p]
+                            r = r - TWO_PI*np.floor((r+np.pi)/TWO_PI)
+                            y = A_s*sin_diff[p] + B_s*cos_diff[p] + r
+                            sy += sin_diff[p]*y; cy += cos_diff[p]*y
+                        A_s = (cc*sy - sc*cy)/seas_det
+                        B_s = (ss*cy - sc*sy)/seas_det
+
+                    sr = 0.0; si = 0.0
+                    for p in range(n_pairs):
+                        if not pixel_valid[p]: continue
+                        a = res[p] - A_s*sin_diff[p] - B_s*cos_diff[p]
+                        a = a - TWO_PI*np.floor((a+np.pi)/TWO_PI)
+                        sr += pixel_w[p]*np.cos(a); si += pixel_w[p]*np.sin(a)
+                else:
+                    sr = 0.0; si = 0.0
+                    for p in range(n_pairs):
+                        if not pixel_valid[p]: continue
+                        sr += pixel_w[p]*(cos_ph[p]*cos_cur[p] + sin_ph[p]*sin_cur[p])
+                        si += pixel_w[p]*(sin_ph[p]*cos_cur[p] - cos_ph[p]*sin_cur[p])
+
+                S = sr*sr + si*si
+                if S > best_S:
+                    best_S = S
+                    best_v = scan_lo + step*bi
+
+                # Advance: trig recurrence + angle subtraction
+                for p in range(n_pairs):
+                    if pixel_valid[p]:
+                        c = cos_cur[p]*cos_step[p] - sin_cur[p]*sin_step[p]
+                        s = sin_cur[p]*cos_step[p] + cos_cur[p]*sin_step[p]
+                        cos_cur[p] = c; sin_cur[p] = s
+                if use_seasonal:
+                    for p in range(n_pairs):
+                        if pixel_valid[p]:
+                            res[p] -= angle_step * pair_dt[p]
+                            res[p] = res[p] - TWO_PI*np.floor((res[p]+np.pi)/TWO_PI)
+
             scan_lo = best_v - step
             step = 2.0 * step / N_BIN
 
         velocity[px] = np.float32(best_v)
 
-        # RMSE: weighted RMS of wrapped residuals after velocity removal (rad).
-        # Clean pixel: ~0.3 rad. Noise: ~1.8 rad. Clear separation.
+        # RMSE after velocity removal
         rms_sum = 0.0; w_sum = 0.0
         for p in range(n_pairs):
-            if not pixel_valid[p]:
-                continue
+            if not pixel_valid[p]: continue
             bt = best_v * pair_dt[p]
             cv = np.cos(bt); sv = np.sin(bt)
-            res_cos = cos_ph[p] * cv + sin_ph[p] * sv
-            res_sin = sin_ph[p] * cv - cos_ph[p] * sv
-            res = np.arctan2(res_sin, res_cos)
-            rms_sum += pixel_w[p] * res * res
-            w_sum += pixel_w[p]
+            r_cos = cos_ph[p]*cv + sin_ph[p]*sv
+            r_sin = sin_ph[p]*cv - cos_ph[p]*sv
+            r = np.arctan2(r_sin, r_cos)
+            rms_sum += pixel_w[p]*r*r; w_sum += pixel_w[p]
         if w_sum > 1e-10:
             rmse[px] = np.float32(np.sqrt(rms_sum / w_sum))
 
     return velocity, rmse
 
 
-def velocity_pairs_array(data_chunk, weight_chunk, ref_values, rep_values, max_refine=3):
+def velocity_pairs_array(data_chunk, weight_chunk, ref_values, rep_values, max_refine=3, seasonal=False):
     """Estimate global velocity from interferometric pair network.
 
     Parameters
@@ -364,11 +406,18 @@ def velocity_pairs_array(data_chunk, weight_chunk, ref_values, rep_values, max_r
     ns_per_year = 365.25 * 86400 * 1e9
     pair_dt = ((rep_values - ref_values) / ns_per_year).astype(np.float64)
 
+    # Seasonal basis: sin/cos difference between ref and rep dates
+    ref_years = ref_values.astype(np.float64) / ns_per_year
+    rep_years = rep_values.astype(np.float64) / ns_per_year
+    sin_diff = (np.sin(2 * np.pi * ref_years) - np.sin(2 * np.pi * rep_years)).astype(np.float64)
+    cos_diff = (np.cos(2 * np.pi * ref_years) - np.cos(2 * np.pi * rep_years)).astype(np.float64)
+
     # Max velocity: π/2 per shortest interval (unambiguous for noisy phase)
     dt_min_yr = np.min(np.abs(pair_dt[pair_dt != 0]))
     vmax = (np.pi / 2) / dt_min_yr  # rad/year
 
-    vel, rmse = _velocity_pairs_numba_kernel(data_flat, weight_flat, n_pixels, n_pairs, pair_dt, max_refine, vmax)
+    vel, rmse = _velocity_pairs_numba_kernel(data_flat, weight_flat, n_pixels, n_pairs,
+                                              pair_dt, sin_diff, cos_diff, max_refine, vmax, seasonal)
     del data_flat, weight_flat
 
     return vel.reshape(ny, nx), rmse.reshape(ny, nx)
@@ -1251,6 +1300,240 @@ def _bilinear_interp_trend(grid_re, grid_im, gy, gx, ny, nx, is_complex):
                 if is_complex:
                     out_im[i, j] = vi / wsum
     return out_re, out_im
+
+
+@nb.njit(cache=True)
+def _gauss_solve(N, rhs, n):
+    """Solve N*x = rhs via Gaussian elimination with partial pivoting. In-place."""
+    x = np.empty(n, dtype=np.float64)
+    for col in range(n):
+        max_val = abs(N[col, col]); max_row = col
+        for row in range(col+1, n):
+            if abs(N[row, col]) > max_val:
+                max_val = abs(N[row, col]); max_row = row
+        if max_val < 1e-30:
+            for i in range(n): x[i] = 0.0
+            return x
+        if max_row != col:
+            for j in range(col, n):
+                N[col, j], N[max_row, j] = N[max_row, j], N[col, j]
+            rhs[col], rhs[max_row] = rhs[max_row], rhs[col]
+        for row in range(col+1, n):
+            factor = N[row, col] / N[col, col]
+            for j in range(col+1, n):
+                N[row, j] -= factor * N[col, j]
+            rhs[row] -= factor * rhs[col]
+            N[row, col] = 0.0
+    for i in range(n-1, -1, -1):
+        s = rhs[i]
+        for j in range(i+1, n):
+            s -= N[i, j] * x[j]
+        x[i] = s / N[i, i] if abs(N[i, i]) > 1e-30 else 0.0
+    return x
+
+
+@nb.njit(cache=True)
+def _lstsq_baseline_kernel(
+    data_flat,         # (n_pairs, n_grid_pixels) complex64 — trend at grid points
+    weight_flat,       # (n_pairs, n_grid_pixels) float32 or dummy
+    n_grid_pixels,
+    n_pairs,
+    n_dates,
+    pair_ref_didx,     # (n_pairs,) int64
+    pair_rep_didx,     # (n_pairs,) int64
+    bpr,               # (n_pairs,) float64 or dummy
+    has_bpr,
+    has_weight,
+):
+    """IRLS decomposition of per-pair trend into per-date + optional BPR at grid points.
+
+    Returns per-date model values at each grid point: (n_dates, n_grid_pixels) float64.
+    """
+    TWO_PI = 2.0 * np.pi
+    n_unknowns = n_dates + (1 if has_bpr else 0)
+    date_model = np.full((n_dates, n_grid_pixels), np.nan, dtype=np.float64)
+
+    angles = np.empty(n_pairs, dtype=np.float64)
+    pair_valid = np.empty(n_pairs, dtype=nb.boolean)
+    base_w = np.empty(n_pairs, dtype=np.float64)
+    N = np.empty((n_unknowns, n_unknowns), dtype=np.float64)
+    rhs = np.empty(n_unknowns, dtype=np.float64)
+    model = np.empty(n_unknowns, dtype=np.float64)
+
+    for gp in range(n_grid_pixels):
+        n_valid = 0
+        for p in range(n_pairs):
+            c = data_flat[p, gp]
+            re = np.float64(c.real); im = np.float64(c.imag)
+            if (re == 0.0 and im == 0.0) or not np.isfinite(re):
+                pair_valid[p] = False; angles[p] = 0.0; base_w[p] = 0.0
+            else:
+                pair_valid[p] = True; n_valid += 1
+                angles[p] = np.arctan2(im, re)
+                base_w[p] = np.sqrt(np.float64(weight_flat[p, gp])) if has_weight else 1.0
+
+        if n_valid < n_unknowns + 3:
+            continue
+
+        for i in range(n_unknowns):
+            model[i] = 0.0
+
+        epsilon = 0.1
+        for irls_iter in range(10):
+            for i in range(n_unknowns):
+                rhs[i] = 0.0
+                for j in range(n_unknowns):
+                    N[i, j] = 0.0
+
+            for p in range(n_pairs):
+                if not pair_valid[p]: continue
+                di = pair_ref_didx[p]
+                dj = pair_rep_didx[p]
+                pred = model[di] - model[dj]
+                if has_bpr:
+                    pred += model[n_dates] * bpr[p]
+                res = angles[p] - pred
+                res = res - TWO_PI * np.floor((res + np.pi) / TWO_PI)
+                y = pred + res
+                irls_w = base_w[p] / (abs(res) + epsilon)
+                if irls_w > 10.0 * base_w[p]:
+                    irls_w = 10.0 * base_w[p]
+
+                N[di, di] += irls_w; N[dj, dj] += irls_w
+                N[di, dj] -= irls_w; N[dj, di] -= irls_w
+                rhs[di] += irls_w * y; rhs[dj] -= irls_w * y
+                if has_bpr:
+                    b = bpr[p]
+                    N[di, n_dates] += irls_w * b; N[n_dates, di] += irls_w * b
+                    N[dj, n_dates] -= irls_w * b; N[n_dates, dj] -= irls_w * b
+                    N[n_dates, n_dates] += irls_w * b * b
+                    rhs[n_dates] += irls_w * b * y
+
+            # Pin first date to 0
+            for j in range(n_unknowns):
+                N[0, j] = 0.0; N[j, 0] = 0.0
+            N[0, 0] = 1.0; rhs[0] = 0.0
+
+            new_model = _gauss_solve(N, rhs, n_unknowns)
+            max_dw = 0.0
+            for i in range(n_unknowns):
+                dw = abs(new_model[i] - model[i])
+                if dw > max_dw: max_dw = dw
+                model[i] = new_model[i]
+            if max_dw < 1e-4:
+                break
+
+        for d in range(n_dates):
+            date_model[d, gp] = model[d]
+
+    return date_model
+
+
+def lstsq_baseline_array(data, weight, ref_values, rep_values, bpr_values=None, stride=1):
+    """Decompose per-pair complex trend into per-date + optional BPR.
+
+    Subsamples at stride, decomposes at grid points, interpolates per-date
+    model back to full resolution, reconstructs consistent per-pair trend.
+
+    Parameters
+    ----------
+    data : np.ndarray (n_pairs, ny, nx) complex64
+        Per-pair trend from trend2d_window.
+    weight : np.ndarray or None
+        Optional per-pair weight.
+    ref_values, rep_values : np.ndarray (n_pairs,) int64
+        Pair date values as nanoseconds.
+    bpr_values : np.ndarray (n_pairs,) or None
+        Perpendicular baseline per pair.
+    stride : int
+        Subsample step for grid computation. Default 1.
+
+    Returns
+    -------
+    np.ndarray (n_pairs, ny, nx) complex64
+        Network-consistent per-pair trend (BPR component removed if bpr_values given).
+    """
+    if isinstance(data, list):
+        data = np.asarray(data[0]) if len(data) == 1 else np.concatenate([np.asarray(c) for c in data], axis=0)
+    n_pairs, ny, nx = data.shape
+
+    # Build date indices
+    ns_per_day = 86400 * 1e9
+    ref_days = ref_values.astype(np.float64) / ns_per_day
+    rep_days = rep_values.astype(np.float64) / ns_per_day
+    unique_days = np.unique(np.concatenate([ref_days, rep_days]))
+    n_dates = len(unique_days)
+    day_to_idx = {d: i for i, d in enumerate(unique_days)}
+    pair_ref_didx = np.array([day_to_idx[d] for d in ref_days], dtype=np.int64)
+    pair_rep_didx = np.array([day_to_idx[d] for d in rep_days], dtype=np.int64)
+
+    has_bpr = bpr_values is not None
+    bpr = bpr_values.astype(np.float64) if has_bpr else np.empty(1, dtype=np.float64)
+
+    # Build stride grid
+    if isinstance(stride, (tuple, list)):
+        stride_y, stride_x = int(stride[0]), int(stride[1])
+    else:
+        stride_y = stride_x = int(stride)
+
+    gy_list = list(range(0, ny, stride_y))
+    if gy_list[-1] != ny - 1:
+        gy_list.append(ny - 1)
+    gx_list = list(range(0, nx, stride_x))
+    if gx_list[-1] != nx - 1:
+        gx_list.append(nx - 1)
+    gy = np.array(gy_list, dtype=np.float64)
+    gx = np.array(gx_list, dtype=np.float64)
+    n_gy, n_gx = len(gy_list), len(gx_list)
+
+    # Subsample trend at grid points
+    data_grid = np.empty((n_pairs, n_gy, n_gx), dtype=np.complex64)
+    for gi, yi in enumerate(gy_list):
+        for gj, xj in enumerate(gx_list):
+            data_grid[:, gi, gj] = data[:, int(yi), int(xj)]
+    n_grid_pixels = n_gy * n_gx
+    data_grid_flat = np.ascontiguousarray(data_grid.reshape(n_pairs, n_grid_pixels))
+
+    # Subsample weights
+    has_weight = weight is not None
+    if has_weight:
+        w_grid = np.empty((n_pairs, n_gy, n_gx), dtype=np.float32)
+        for gi, yi in enumerate(gy_list):
+            for gj, xj in enumerate(gx_list):
+                w_grid[:, gi, gj] = weight[:, int(yi), int(xj)]
+        w_grid_flat = np.ascontiguousarray(w_grid.reshape(n_pairs, n_grid_pixels))
+    else:
+        w_grid_flat = np.empty((1, 1), dtype=np.float32)
+
+    # Decompose at grid points
+    date_model_flat = _lstsq_baseline_kernel(
+        data_grid_flat, w_grid_flat, n_grid_pixels, n_pairs, n_dates,
+        pair_ref_didx, pair_rep_didx, bpr, has_bpr, has_weight,
+    )
+    # date_model_flat: (n_dates, n_grid_pixels)
+
+    # Interpolate per-date model to full resolution
+    date_model_grid = date_model_flat.reshape(n_dates, n_gy, n_gx)
+
+    # Interpolate per-date models to full resolution and reconstruct pairs
+    dummy_im = np.zeros((n_gy, n_gx), dtype=np.float64)
+    if stride_y > 1 or stride_x > 1:
+        date_fullres = np.empty((n_dates, ny, nx), dtype=np.float64)
+        for d in range(n_dates):
+            date_fullres[d], _ = _bilinear_interp_trend(
+                date_model_grid[d], dummy_im, gy, gx, ny, nx, False
+            )
+    else:
+        date_fullres = date_model_grid
+
+    result = np.full((n_pairs, ny, nx), np.nan + 0j, dtype=np.complex64)
+    for p in range(n_pairs):
+        di = pair_ref_didx[p]; dj = pair_rep_didx[p]
+        phase = date_fullres[di] - date_fullres[dj]
+        valid = np.isfinite(phase)
+        result[p][valid] = np.exp(1j * phase[valid]).astype(np.complex64)
+
+    return result
 
 
 def trend2d_window_array(phase_2d, variables, weight_2d, win_y, win_x, stride=1):

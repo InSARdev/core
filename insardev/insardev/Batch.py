@@ -380,34 +380,54 @@ class Batch(BatchCore):
         # Replace NaN with 0 for computation
         y_filled = torch.where(nan_mask, torch.zeros_like(y), y)
 
-        # Closed-form weighted linear regression
-        # slope = (Σw·Σ(w·t·y) - Σ(w·t)·Σ(w·y)) / (Σw·Σ(w·t²) - (Σ(w·t))²)
-        # All sums are over the time dimension (dim=0)
+        # Harmonic weighted regression: y = c0 + c1*t + c2*sin(2πt) + c3*cos(2πt)
+        # Separates velocity from annual seasonal — unbiased for any time span.
+        # Uses normal equations: (A^T W A) x = A^T W y, solved via Cholesky.
 
-        # Broadcast t to match y shape: (n_times,) -> (n_times, n_pixels)
         t_expanded = t.unsqueeze(1)  # (n_times, 1)
+        sin_t = torch.sin(2 * np.pi * t).unsqueeze(1)  # (n_times, 1)
+        cos_t = torch.cos(2 * np.pi * t).unsqueeze(1)  # (n_times, 1)
 
-        # Compute weighted sums (all results are (n_pixels,))
-        sum_w = w.sum(dim=0)                           # Σw
-        sum_wt = (w * t_expanded).sum(dim=0)           # Σ(w·t)
-        sum_wy = (w * y_filled).sum(dim=0)             # Σ(w·y)
-        sum_wt2 = (w * t_expanded * t_expanded).sum(dim=0)  # Σ(w·t²)
-        sum_wty = (w * t_expanded * y_filled).sum(dim=0)    # Σ(w·t·y)
+        # Build A^T W A (4x4) and A^T W y (4) per pixel, vectorized
+        # A columns: [1, t, sin, cos], each (n_times, n_pixels) after broadcast
+        ones = torch.ones_like(t_expanded)  # (n_times, 1)
+        cols = [ones, t_expanded, sin_t, cos_t]  # each (n_times, 1)
 
-        # Compute denominator: Σw·Σ(w·t²) - (Σ(w·t))²
-        denom = sum_w * sum_wt2 - sum_wt * sum_wt
+        # Weighted columns: w * col, each (n_times, n_pixels)
+        wcols = [w * c for c in cols]
 
-        # Compute numerator: Σw·Σ(w·t·y) - Σ(w·t)·Σ(w·y)
-        numer = sum_w * sum_wty - sum_wt * sum_wy
+        # A^T W A: (4, 4, n_pixels)
+        n_cols = 4
+        AtWA = torch.zeros(n_cols, n_cols, data_2d.shape[1], device=dev)
+        AtWy = torch.zeros(n_cols, data_2d.shape[1], device=dev)
+        for i in range(n_cols):
+            AtWy[i] = (wcols[i] * y_filled).sum(dim=0)
+            for j in range(i, n_cols):
+                val = (wcols[i] * cols[j]).sum(dim=0)
+                AtWA[i, j] = val
+                AtWA[j, i] = val
 
-        # Compute slope (velocity)
-        velocity = numer / denom
+        # Solve per pixel: transpose to (n_pixels, 4, 4) and (n_pixels, 4)
+        AtWA = AtWA.permute(2, 0, 1)  # (n_pixels, 4, 4)
+        AtWy = AtWy.permute(1, 0)      # (n_pixels, 4)
 
-        # Compute intercept: intercept = (Σ(w·y) - slope * Σ(w·t)) / Σw
-        intercept = (sum_wy - velocity * sum_wt) / sum_w
+        # Batch solve via torch.linalg.solve
+        try:
+            coeffs = torch.linalg.solve(AtWA, AtWy)  # (n_pixels, 4)
+        except Exception:
+            # Fallback: pseudo-inverse for singular matrices
+            coeffs = torch.zeros(data_2d.shape[1], n_cols, device=dev)
+            for px in range(data_2d.shape[1]):
+                try:
+                    coeffs[px] = torch.linalg.solve(AtWA[px], AtWy[px])
+                except Exception:
+                    coeffs[px] = float('nan')
 
-        # Mask pixels with insufficient valid points or zero denominator
-        valid_mask = (valid_count >= min_valid) & (denom.abs() > 1e-10)
+        intercept = coeffs[:, 0]  # c0
+        velocity = coeffs[:, 1]   # c1 = velocity (unbiased)
+
+        # Mask pixels with insufficient valid points
+        valid_mask = valid_count >= min_valid
         velocity = torch.where(valid_mask, velocity, torch.tensor(float('nan'), device=dev))
         intercept = torch.where(valid_mask, intercept, torch.tensor(float('nan'), device=dev))
 
@@ -426,7 +446,7 @@ class Batch(BatchCore):
 
         return vel_np, int_np
 
-    def velocity(self, min_valid=3, device='auto', debug=False) -> tuple["Batch", "Batch"]:
+    def velocity(self, min_valid=5, device='auto', debug=False) -> tuple["Batch", "Batch"]:
         """
         Compute velocity (linear trend) and intercept from time series.
 
@@ -1635,7 +1655,7 @@ class BatchComplex(BatchCore):
 
         return BatchComplex(results)
 
-    def velocity(self, weight=None, max_refine=3) -> "Batch":
+    def velocity(self, weight=None, max_refine=3, seasonal=False) -> "Batch":
         """
         Estimate global velocity from interferometric pair network using
         periodogram on the unit circle. Fast shortcut that skips the full
@@ -1684,16 +1704,18 @@ class BatchComplex(BatchCore):
 
                 def _velocity_block(data_block, weight_block=None,
                                     _ref=ref_values, _rep=rep_values,
-                                    _max_refine=max_refine):
+                                    _max_refine=max_refine, _seasonal=seasonal):
                     vel, rmse = utils_detrend.velocity_pairs_array(
                         [data_block],
                         [weight_block] if weight_block is not None else None,
                         _ref, _rep,
-                        max_refine=_max_refine,
+                        max_refine=_max_refine, seasonal=_seasonal,
                     )
                     # Stack (2, y, x) so blockwise can return both
                     return np.stack([vel, rmse], axis=0)
 
+                # Include seasonal in name to prevent dask cache collision
+                blk_name = f'velocity_block_s{seasonal}'
                 if weight_dask is not None:
                     stacked_dask = da.blockwise(
                         _velocity_block, 'nyx',
@@ -1703,6 +1725,7 @@ class BatchComplex(BatchCore):
                         concatenate=True,
                         dtype=np.float32,
                         meta=np.empty((0, 0, 0), dtype=np.float32),
+                        name=blk_name,
                     )
                 else:
                     stacked_dask = da.blockwise(
@@ -1712,6 +1735,7 @@ class BatchComplex(BatchCore):
                         concatenate=True,
                         dtype=np.float32,
                         meta=np.empty((0, 0, 0), dtype=np.float32),
+                        name=blk_name,
                     )
 
                 coords = {k: v for k, v in data_da.coords.items() if k in ('y', 'x', 'spatial_ref')}
@@ -1756,6 +1780,97 @@ class BatchComplex(BatchCore):
     def conj(self, **kwargs):
         """intfs.iexp().conj() for np.exp(-1j * intfs)"""
         return self.map_da(lambda da: xr.ufuncs.conj(da), **kwargs)
+
+    def lstsq_baseline(self, weight=None, baseline='BPR', stride=1, debug=False):
+        """
+        Decompose per-pair complex trend into network-consistent per-date model.
+
+        IRLS least-squares on the pair network with optional BPR regressor.
+        Subsamples at stride, solves at grid points, interpolates back.
+
+        Parameters
+        ----------
+        weight : BatchUnit or None
+            Optional correlation weight.
+        baseline : str or None
+            Variable name for BPR regressor (default 'BPR'). None to skip.
+        stride : int
+            Subsample step. Default 1.
+        debug : bool
+            Print diagnostic information.
+
+        Returns
+        -------
+        BatchComplex
+            Network-consistent per-pair trend (BPR component removed).
+        """
+        import dask.array as da
+        import numpy as np
+        import xarray as xr
+        from . import utils_detrend
+
+        BatchCore._require_lazy(self, 'lstsq_baseline')
+
+        result = {}
+        for key, ds in self.items():
+            pols = [v for v in ds.data_vars
+                   if 'y' in ds[v].dims and 'x' in ds[v].dims]
+            if not pols:
+                result[key] = ds
+                continue
+
+            ref_values = ds.coords['ref'].values.astype('datetime64[ns]').astype(np.int64)
+            rep_values = ds.coords['rep'].values.astype('datetime64[ns]').astype(np.int64)
+            has_bpr = baseline is not None and baseline in ds.coords
+            bpr_values = ds.coords[baseline].values.astype(np.float64) if has_bpr else None
+
+            weight_ds = weight[key] if weight is not None else None
+
+            result_ds = {}
+            for pol in pols:
+                data_da = ds[pol]
+                data_dask = data_da.data
+                n_pairs = data_dask.shape[0]
+
+                weight_da = weight_ds[pol] if weight_ds is not None else None
+
+                def _block(data_block, weight_block=None,
+                           _ref=ref_values, _rep=rep_values,
+                           _bpr=bpr_values, _stride=stride):
+                    w = [weight_block] if weight_block is not None else None
+                    return utils_detrend.lstsq_baseline_array(
+                        [data_block], w, _ref, _rep,
+                        bpr_values=_bpr, stride=_stride,
+                    )
+
+                if weight_da is not None:
+                    weight_dask = weight_da.data
+                    result_dask = da.blockwise(
+                        _block, 'pyx',
+                        data_dask, 'pyx',
+                        weight_dask, 'pyx',
+                        new_axes={'p': n_pairs},
+                        concatenate=True,
+                        dtype=np.complex64,
+                        meta=np.empty((0, 0, 0), dtype=np.complex64),
+                    )
+                else:
+                    result_dask = da.blockwise(
+                        _block, 'pyx',
+                        data_dask, 'pyx',
+                        new_axes={'p': n_pairs},
+                        concatenate=True,
+                        dtype=np.complex64,
+                        meta=np.empty((0, 0, 0), dtype=np.complex64),
+                    )
+
+                result_ds[pol] = xr.DataArray(
+                    result_dask, dims=data_da.dims, coords=data_da.coords
+                )
+
+            result[key] = xr.Dataset(result_ds, attrs=ds.attrs)
+
+        return BatchComplex(result)
 
     def angle(self, **kwargs):
         """
@@ -2049,7 +2164,7 @@ class Batches(tuple):
 
     def snapshot(self, store: str | None = None, storage_options: dict[str, str] | None = None,
                  caption: str | None = None,
-                 n_chunks: int = 4, debug: bool = False, **kwargs):
+                 n_chunks: int = 1, debug: bool = False, **kwargs):
         """Save or open a Batches snapshot.
 
         When called on a Batches with data, saves all batches to Zarr store.
@@ -2089,11 +2204,11 @@ class Batches(tuple):
         else:
             result = utils_io.snapshot(*self, store=store, storage_options=storage_options,
                                        caption=caption or 'Snapshotting...',
-                                       n_chunks=n_chunks, debug=debug)
+                                       n_chunks=n_chunks, debug=debug, wrapper=Batches)
 
-        if isinstance(result, tuple):
+        if isinstance(result, Batches):
             return result
-        return Batches((result,))
+        return Batches((result,))  # fallback for stores without __wrapper__
 
     def archive(self, store: str, caption: str | None = None, compression: int = 6,
                 debug: bool = False):
@@ -2721,7 +2836,72 @@ class Batches(tuple):
         elements = [unwrapped] + list(self[1:])
         return Batches(elements)
 
-    def detrend2d(self, transform, degree=1, window=None, stride=1, device='auto', debug=False):
+    def trend2d(self, transform=None, degree=1, window=None, stride=1, device='auto', debug=False):
+        """
+        Compute 2D spatial trend and append it to Batches.
+
+        Appends the per-pair trend as a new BatchComplex element, preserving
+        original data unchanged. Use with lstsq_baseline() + subtract() for
+        network-consistent detrending.
+
+        Parameters
+        ----------
+        transform : Batch
+            Coordinate transform from stack.transform() containing 'azi', 'rng'.
+        degree : int
+            Polynomial degree (1=plane). Default 1.
+        window : int, tuple, or None
+            Window size in pixels. None = global fit.
+        stride : int
+            Subsample step for windowed fit. Default 1.
+        device : str
+            PyTorch device.
+        debug : bool
+            Print diagnostic information.
+
+        Returns
+        -------
+        Batches
+            Original Batches with appended trend BatchComplex.
+
+        Examples
+        --------
+        >>> # Append trend for later network-consistent detrending
+        >>> intfcorr2d = intfcorr.trend2d(transform, window=(500,2000), stride=10)
+        >>> # intfcorr2d = [intfs, corr, trend]  or  [intfs, trend]
+        """
+        if len(self) < 1:
+            raise ValueError("trend2d() requires Batches with at least 1 element: [phase]")
+
+        phase = self[0]
+        weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
+
+        if not isinstance(phase, (Batch, BatchComplex)):
+            raise TypeError(f"First element must be Batch or BatchComplex, got {type(phase).__name__}")
+
+        if window is None:
+            trend = phase.trend2d(transform, weight=weight, degree=degree,
+                                  device=device, detrend=False, debug=debug)
+        else:
+            if degree != 1:
+                raise ValueError("Windowed trend2d only supports degree=1.")
+            if transform is not None:
+                n_vars = len([v for v in transform[list(transform.keys())[0]].data_vars
+                              if 'y' in transform[list(transform.keys())[0]][v].dims])
+                if not (1 <= n_vars <= 3):
+                    raise ValueError(f"Windowed trend2d requires 1-3 transform variables, got {n_vars}.")
+            trend = phase.trend2d_window(transform, weight=weight,
+                                         window=window, stride=stride,
+                                         detrend=False, debug=debug)
+
+        # Preserve non-spatial variables (e.g. BPR, ref, rep)
+        trend = Batches._preserve_nonspatial(phase, trend)
+
+        # Append trend to Batches
+        elements = list(self) + [trend]
+        return Batches(elements)
+
+    def detrend2d(self, transform=None, degree=1, window=None, stride=1, device='auto', debug=False):
         """
         Detrend 2D polynomial trend and return Batches with detrended data.
 
@@ -2773,12 +2953,13 @@ class Batches(tuple):
             if degree != 1:
                 raise ValueError("Windowed detrend2d only supports degree=1. "
                                  "Use window=None for higher-degree global fit.")
-            n_vars = len([v for v in transform[list(transform.keys())[0]].data_vars
-                          if 'y' in transform[list(transform.keys())[0]][v].dims])
-            if not (1 <= n_vars <= 3):
-                raise ValueError(f"Windowed detrend2d requires 1-3 transform variables "
-                                 f"(e.g. ele, azi+rng, azi+rng+ele), got {n_vars}. "
-                                 f"Use window=None for global fit with more variables.")
+            if transform is not None:
+                n_vars = len([v for v in transform[list(transform.keys())[0]].data_vars
+                              if 'y' in transform[list(transform.keys())[0]][v].dims])
+                if not (1 <= n_vars <= 3):
+                    raise ValueError(f"Windowed detrend2d requires 1-3 transform variables "
+                                     f"(e.g. ele, azi+rng, azi+rng+ele), got {n_vars}. "
+                                     f"Use window=None for global fit with more variables.")
             # Local sliding window fit
             detrended = phase.trend2d_window(transform, weight=weight,
                                               window=window, stride=stride,
@@ -2791,13 +2972,123 @@ class Batches(tuple):
         elements = [detrended] + list(self[1:])
         return Batches(elements)
 
-    def detrend1d(self, baseline='BPR', intercept=False, slope=True,
-                  bins=128, debug=False):
+    def lstsq_baseline(self, baseline='BPR', stride=1, batch=-1, debug=False):
         """
-        Detrend linear trend along perpendicular baseline and return Batches.
+        Make per-pair trend network-consistent via SBAS decomposition.
 
-        Removes DEM residual phase proportional to perpendicular baseline at each pixel.
-        Uses numba per-pixel IRLS with analytical 2x2 solve.
+        Decomposes the specified BatchComplex (trend from trend2d) into per-date
+        components via IRLS least-squares on the pair network. Optionally
+        separates BPR-correlated component (DEM leak). Replaces the target
+        BatchComplex with the network-consistent reconstruction.
+
+        Parameters
+        ----------
+        baseline : str or None
+            If str (default 'BPR'), include BPR as regressor to separate
+            DEM contamination. If None, decompose without BPR.
+        stride : int
+            Subsample step — process at grid points, interpolate back.
+            Match with trend2d stride for efficiency.
+        batch : int
+            Index of batch element to process. Default -1 (last).
+        debug : bool
+            Print diagnostic information.
+
+        Returns
+        -------
+        Batches
+            Same structure with target element replaced by consistent trend.
+
+        Examples
+        --------
+        >>> intfcorr = intfs.trend2d(transform, window=(500,2000), stride=10)
+        >>> intfcorr = intfcorr.lstsq_baseline(stride=10)
+        >>> intfcorr = intfcorr.subtract()  # apply consistent trend
+        """
+        if len(self) < 2:
+            raise ValueError("lstsq_baseline requires at least 2 elements (data + trend from trend2d)")
+        trend_idx = batch if batch >= 0 else len(self) + batch
+        trend_batch = self[trend_idx]
+
+        if not isinstance(trend_batch, BatchComplex):
+            raise TypeError(f"lstsq_baseline target must be BatchComplex, got {type(trend_batch).__name__}")
+
+        # Find weight (BatchUnit) if present
+        weight = None
+        for el in self:
+            if isinstance(el, BatchUnit):
+                weight = el
+                break
+
+        consistent = trend_batch.lstsq_baseline(
+            weight=weight, baseline=baseline, stride=stride, debug=debug
+        )
+
+        elements = list(self)
+        elements[trend_idx] = consistent
+        return Batches(elements)
+
+    def subtract(self):
+        """
+        Subtract the next same-type batch from the first batch.
+
+        Finds the first batch element, then the next element of the same type,
+        subtracts the second from the first, replaces the first with the result,
+        and drops the second.
+
+        Type-specific subtraction:
+        - BatchComplex: first * conj(second) (phase subtraction on unit circle)
+        - Batch: first - second (real subtraction)
+        - BatchWrap: wrap(first - second) (wrapped phase subtraction)
+        - BatchUnit: not supported (raises error)
+
+        Returns
+        -------
+        Batches
+            With first element replaced by subtracted result, second dropped.
+
+        Examples
+        --------
+        >>> intfcorr = intfs.trend2d(transform, ...).lstsq_baseline(stride=10).subtract()
+        """
+        if len(self) < 2:
+            raise ValueError("subtract() requires at least 2 elements")
+
+        first_type = type(self[0])
+        if isinstance(self[0], BatchUnit):
+            raise TypeError("subtract() cannot be applied to BatchUnit")
+
+        # Find next element of the same type
+        second_idx = None
+        for i in range(1, len(self)):
+            if type(self[i]) is first_type:
+                second_idx = i
+                break
+        if second_idx is None:
+            raise ValueError(f"subtract() requires a second {first_type.__name__} element")
+
+        first = self[0]
+        second = self[second_idx]
+
+        if isinstance(first, BatchComplex):
+            result = first * second.conj()
+        else:
+            result = first - second
+
+        result = Batches._preserve_nonspatial(first, result)
+
+        elements = list(self)
+        elements[0] = result
+        elements.pop(second_idx)
+        return Batches(elements)
+
+    def detrend1d_baseline(self, baseline='BPR', intercept=False, slope=True,
+                           bins=128, debug=False):
+        """
+        Detrend linear trend along baseline variable (default BPR) and return Batches.
+
+        Removes phase proportional to perpendicular baseline at each pixel.
+        Uses numba per-pixel periodogram init + IRLS with analytical 2x2 solve.
 
         Parameters
         ----------
@@ -2809,43 +3100,44 @@ class Batches(tuple):
         slope : bool
             If True (default), include slope in the trend to subtract.
             If False, zero out the slope (preserve it in data).
+        bins : int
+            Periodogram bins for slope initialization (default 128).
         debug : bool
             Print diagnostic information.
 
         Returns
         -------
         Batches
-            Batches with [detrended_phase, weight] preserving original types.
+            Batches with detrended first element, preserving other elements.
 
         Examples
         --------
-        >>> # Remove both intercept and slope (full trend removal)
-        >>> intf, corr = stack.pairs(baseline).interferogram(wavelength=30).detrend1d()
-        >>> # Remove only slope, preserve intercept (displacement signal)
-        >>> intf, corr = intfcorr.detrend1d(intercept=False)
+        >>> intfcorr.detrend1d_baseline()          # remove BPR slope (DEM residual)
+        >>> intfcorr.detrend1d_baseline(bins=256)   # larger search range for big DEM errors
         """
         if len(self) < 1:
-            raise ValueError("detrend1d() requires Batches with at least 1 element: [phase]")
+            raise ValueError("detrend1d_baseline() requires Batches with at least 1 element: [phase]")
 
         phase = self[0]
         weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
 
         if not isinstance(phase, (Batch, BatchComplex)):
-            raise TypeError(f"detrend1d() requires Batch or BatchComplex, got {type(phase).__name__}.")
+            raise TypeError(f"detrend1d_baseline() requires Batch or BatchComplex, got {type(phase).__name__}.")
 
-        # Fuse fit+subtract into one blockwise call (detrend=True) so the input
-        # phase is referenced only once in the dask graph.
-        detrended = phase.trend1d(weight=weight, baseline=baseline,
-                                  detrend=True,
-                                  intercept=intercept, slope=slope,
-                                  bins=bins, debug=debug)
+        detrended = phase.trend1d_baseline(weight=weight, baseline=baseline,
+                                           detrend=True,
+                                           intercept=intercept, slope=slope,
+                                           bins=bins, debug=debug)
 
-        # Preserve non-spatial variables (e.g. BPR) that may be dropped by arithmetic
         detrended = Batches._preserve_nonspatial(phase, detrended)
 
-        # Rebuild Batches preserving all original elements except first
         elements = [detrended] + list(self[1:])
         return Batches(elements)
+
+    def detrend1d(self, *args, **kwargs):
+        """Alias for detrend1d_baseline(). Use detrend1d_baseline() directly for clarity."""
+        print("NOTE: detrend1d() is an alias. Use detrend1d_baseline() directly.")
+        return self.detrend1d_baseline(*args, **kwargs)
 
     def lstsq(self, cumsum=True,
               max_iter=5, epsilon=0.1, x_tol=0.001, debug=False):
