@@ -800,7 +800,7 @@ class Stack(Stack_plot, BatchCore):
         return Batches(batches).compute()
 
     def snapshot(self, *args, store: str | None = None, storage_options: dict[str, str] | None = None,
-                caption: str | None = None, n_chunks: int = 1, debug=False):
+                caption: str | None = None, debug=False):
         """Open or save a Batch/Batches snapshot.
 
         This is a convenience passthrough to Batches.snapshot(). Stack itself
@@ -847,14 +847,14 @@ class Stack(Stack_plot, BatchCore):
             if len(self) > 0:
                 # Non-empty Stack: save itself, then reopen
                 utils_io.save(self, store=store, storage_options=storage_options,
-                             caption=caption or 'Snapshotting...', n_chunks=n_chunks, debug=debug)
+                             caption=caption or 'Snapshotting...', debug=debug)
                 return utils_io.open(store=store, storage_options=storage_options,
                                      n_jobs=-1, debug=debug)
             return utils_io.open(store=store, storage_options=storage_options,
                                 n_jobs=-1, debug=debug)
 
         # Save mode - args are batches
-        return Batches(args).snapshot(store=store, storage_options=storage_options, caption=caption, n_chunks=n_chunks, debug=debug)
+        return Batches(args).snapshot(store=store, storage_options=storage_options, caption=caption, debug=debug)
 
     def archive(self, *args, store: str | None = None, caption: str | None = None,
                 compression: int = 6, debug=False):
@@ -1222,26 +1222,23 @@ class Stack(Stack_plot, BatchCore):
         data = np.empty(chunk_shape, dtype=np.complex64)
 
         if re_dtype == 'float32':
-            # Float32: NaN is fill value, no scale
             re_full = np.frombuffer(raw, dtype=np.float32).reshape(disk_chunk_shape)
-            re_f32 = re_full[:chunk_shape[0], :chunk_shape[1]]
+            re_arr = re_full[:chunk_shape[0], :chunk_shape[1]]
             del re_full
-            mask = ~np.isfinite(re_f32)
-            data.real[:] = re_f32
-            del re_f32
-
-            # Check for im (float32 complex) or amplitude-only
             im_path = f"{base_path}/im/c/{iy}/{ix}"
             if fs.exists(im_path):
                 with fs.open(im_path, 'rb') as f:
                     im_full = np.frombuffer(codec.decode(f.read()), dtype=np.float32).reshape(disk_chunk_shape)
-                im_f32 = im_full[:chunk_shape[0], :chunk_shape[1]]
+                im_arr = im_full[:chunk_shape[0], :chunk_shape[1]]
                 del im_full
-                mask |= ~np.isfinite(im_f32)
-                data.imag[:] = im_f32
-                del im_f32
+                data.real[:] = re_arr
+                data.imag[:] = im_arr
+                del re_arr, im_arr
             else:
+                data.real[:] = re_arr
                 data.imag[:] = 0
+                del re_arr
+            return data
         else:
             # Int16 with scale_factor
             re_full = np.frombuffer(raw, dtype=np.int16).reshape(disk_chunk_shape)
@@ -1307,22 +1304,19 @@ class Stack(Stack_plot, BatchCore):
             raw = codec.decode(f.read())
 
         if re_dtype == 'float32':
-            # Float32: NaN is the fill value, no scale needed
-            re_f32 = np.frombuffer(raw, dtype=np.float32).reshape(shape)
-            mask = ~np.isfinite(re_f32)
-            data.real[:] = re_f32
-            del re_f32
-
-            # Check for im (float32 complex) or amplitude-only
+            re_arr = np.frombuffer(raw, dtype=np.float32).reshape(shape)
             im_path = f"{base_path}/im/c/0/0"
             if fs.exists(im_path):
                 with fs.open(im_path, 'rb') as f:
-                    im_f32 = np.frombuffer(codec.decode(f.read()), dtype=np.float32).reshape(shape)
-                mask |= ~np.isfinite(im_f32)
-                data.imag[:] = im_f32
-                del im_f32
+                    im_arr = np.frombuffer(codec.decode(f.read()), dtype=np.float32).reshape(shape)
+                data.real[:] = re_arr
+                data.imag[:] = im_arr
+                del re_arr, im_arr
             else:
+                data.real[:] = re_arr
                 data.imag[:] = 0
+                del re_arr
+            return data
         else:
             # Int16 with scale_factor
             re_int16 = np.frombuffer(raw, dtype=np.int16).reshape(shape)

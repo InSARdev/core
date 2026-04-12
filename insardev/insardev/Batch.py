@@ -77,14 +77,12 @@ def _apply_velocity_block(data_block, times_years, min_valid, device):
     Returns
     -------
     np.ndarray
-        3D array (2, chunk_y, chunk_x) where [0] is velocity, [1] is intercept
+        3D array (2, chunk_y, chunk_x) where [0] is velocity, [1] is RMSE
     """
     import numpy as np
-    # Convert times_years back to numpy array (dask serialization may convert to list)
     times_years = np.asarray(times_years, dtype=np.float32)
-    vel, intercept = Batch._velocity_torch(data_block, times_years, min_valid=min_valid, device=device)
-    # Stack velocity and intercept along a new first dimension
-    return np.stack([vel, intercept], axis=0).astype(np.float32)
+    vel, rmse = Batch._velocity_torch(data_block, times_years, min_valid=min_valid, device=device)
+    return np.stack([vel, rmse], axis=0).astype(np.float32)
 
 
 class Batch(BatchCore):
@@ -423,20 +421,27 @@ class Batch(BatchCore):
                 except Exception:
                     coeffs[px] = float('nan')
 
-        intercept = coeffs[:, 0]  # c0
         velocity = coeffs[:, 1]   # c1 = velocity (unbiased)
+
+        # Compute RMSE: residuals = y - A @ coeffs
+        # A @ coeffs per pixel: sum over basis functions
+        predicted = torch.zeros_like(y_filled)
+        for i, c in enumerate(cols):
+            predicted += c * coeffs[:, i].unsqueeze(0)  # (n_times, n_pixels)
+        residuals = (y_filled - predicted) * w  # zero out NaN positions
+        rmse = torch.sqrt((residuals ** 2).sum(dim=0) / valid_count.clamp(min=1))
 
         # Mask pixels with insufficient valid points
         valid_mask = valid_count >= min_valid
         velocity = torch.where(valid_mask, velocity, torch.tensor(float('nan'), device=dev))
-        intercept = torch.where(valid_mask, intercept, torch.tensor(float('nan'), device=dev))
+        rmse = torch.where(valid_mask, rmse, torch.tensor(float('nan'), device=dev))
 
         # Reshape back
         vel_np = velocity.cpu().numpy()
-        int_np = intercept.cpu().numpy()
+        rmse_np = rmse.cpu().numpy()
         if len(original_shape) == 3:
             vel_np = vel_np.reshape(original_shape[1], original_shape[2])
-            int_np = int_np.reshape(original_shape[1], original_shape[2])
+            rmse_np = rmse_np.reshape(original_shape[1], original_shape[2])
 
         # Cleanup GPU memory
         if dev.type == 'mps':
@@ -444,37 +449,35 @@ class Batch(BatchCore):
         elif dev.type == 'cuda':
             torch.cuda.empty_cache()
 
-        return vel_np, int_np
+        return vel_np, rmse_np
 
-    def velocity(self, min_valid=5, device='auto', debug=False) -> tuple["Batch", "Batch"]:
+    def velocity(self, min_valid=5, device='auto', debug=False) -> "Batches":
         """
-        Compute velocity (linear trend) and intercept from time series.
+        Compute velocity and RMSE from time series.
 
-        Calculates the slope per year and intercept for each pixel using linear
-        regression on the 'date' dimension. Uses PyTorch for GPU acceleration.
+        Harmonic regression (linear + seasonal) per pixel on the 'date' dimension.
+        Uses PyTorch for GPU acceleration.
 
         Parameters
         ----------
         min_valid : int, optional
-            Minimum number of valid (non-NaN) data points required to compute
-            velocity. Pixels with fewer valid points will be set to NaN.
-            Default is 3.
+            Minimum number of valid (non-NaN) data points required.
+            Default is 5.
         device : str, optional
             PyTorch device: 'auto' (default), 'cuda', 'mps', or 'cpu'.
-            'auto' uses GPU if Dask client has resources={'gpu': 1}.
         debug : bool, optional
             Print debug information. Default False.
 
         Returns
         -------
-        tuple[Batch, Batch]
-            (velocity, intercept) - velocity is slope per year, intercept is
-            the y-value at t=0 (first date). Both are lazy Batch objects.
+        Batches[Batch, Batch]
+            (velocity, rmse) — velocity is slope per year, RMSE is residual
+            root-mean-square error. Both are lazy Batch objects.
 
         Examples
         --------
-        >>> displacement = stack.lstsq(detrend, corr)
-        >>> velocity, intercept = displacement.velocity()
+        >>> velocity, rmse = displacement.velocity()
+        >>> vel, rmse = detrend0.velocity().displacement_los(transform).compute()
         """
         import dask
         import dask.array as da
@@ -497,10 +500,10 @@ class Batch(BatchCore):
         crs = self.crs
 
         vel_results = {}
-        int_results = {}
+        rmse_results = {}
         for key, ds in self.items():
             vel_vars = {}
-            int_vars = {}
+            rmse_vars = {}
             # Filter for spatial variables (with y, x dims) - excludes converted attributes
             for var in [v for v in ds.data_vars
                        if 'y' in ds[v].dims and 'x' in ds[v].dims]:
@@ -542,33 +545,28 @@ class Batch(BatchCore):
                     chunks=(2,) + data_dask.chunks[1:],
                 )
 
-                # Unpack velocity (index 0) and intercept (index 1)
                 vel_da = xr.DataArray(
-                    result_dask[0],
-                    dims=['y', 'x'],
+                    result_dask[0], dims=['y', 'x'],
                     coords={'y': data_arr.y, 'x': data_arr.x}
                 )
-                int_da = xr.DataArray(
-                    result_dask[1],
-                    dims=['y', 'x'],
+                rmse_da = xr.DataArray(
+                    result_dask[1], dims=['y', 'x'],
                     coords={'y': data_arr.y, 'x': data_arr.x}
                 )
-
                 vel_vars[var] = vel_da
-                int_vars[var] = int_da
+                rmse_vars[var] = rmse_da
 
             vel_ds = xr.Dataset(vel_vars)
             vel_ds.attrs = ds.attrs
-            int_ds = xr.Dataset(int_vars)
-            int_ds.attrs = ds.attrs
-            # Preserve CRS
+            rmse_ds = xr.Dataset(rmse_vars)
+            rmse_ds.attrs = ds.attrs
             if crs is not None:
                 vel_ds = vel_ds.rio.write_crs(crs)
-                int_ds = int_ds.rio.write_crs(crs)
+                rmse_ds = rmse_ds.rio.write_crs(crs)
             vel_results[key] = vel_ds
-            int_results[key] = int_ds
+            rmse_results[key] = rmse_ds
 
-        return Batch(vel_results), Batch(int_results)
+        return Batches((Batch(vel_results), Batch(rmse_results)))
 
     def incidence(self) -> "Batch":
         """Compute incidence angle from azi, rng, ele, and radar geometry parameters.
@@ -1752,7 +1750,7 @@ class BatchComplex(BatchCore):
             vel_results[burst_id] = vel_ds
             rmse_results[burst_id] = rmse_ds
 
-        return Batch(vel_results), Batch(rmse_results)
+        return Batches((Batch(vel_results), Batch(rmse_results)))
 
     def backscatter(self, *args, **kwargs):
         """
@@ -1780,6 +1778,43 @@ class BatchComplex(BatchCore):
     def conj(self, **kwargs):
         """intfs.iexp().conj() for np.exp(-1j * intfs)"""
         return self.map_da(lambda da: xr.ufuncs.conj(da), **kwargs)
+
+    def pairs(self, pairs):
+        """Select date pairs from per-date data, returning ref and rep stacks.
+
+        Parameters
+        ----------
+        pairs : array-like (n_pairs, 2)
+            Pairs as [[ref_date, rep_date], ...]. Dates as datetime64 or indices.
+
+        Returns
+        -------
+        tuple (ref, rep)
+            Two BatchComplex with 'pair' dimension instead of 'date'.
+        """
+        import numpy as np
+        pairs = np.asarray(pairs)
+        ref_dates = pairs[:, 0]
+        rep_dates = pairs[:, 1]
+
+        # Map dates to integer indices (match by day to handle precision differences)
+        key0 = list(self.keys())[0]
+        date_coords = self[key0].coords['date'].values
+        # Truncate to day precision for matching
+        date_days = np.array(date_coords, dtype='datetime64[D]')
+        date_to_idx = {d: i for i, d in enumerate(date_days)}
+        ref_idx = [date_to_idx[np.datetime64(d, 'D')] for d in ref_dates]
+        rep_idx = [date_to_idx[np.datetime64(d, 'D')] for d in rep_dates]
+
+        # Select, rename date→pair, and assign pair coords matching the caller
+        n_pairs = len(ref_idx)
+        pair_coords = np.arange(n_pairs)
+        screen_ref = self.isel(date=ref_idx).rename(date='pair').map(
+            lambda ds: ds.assign_coords(pair=pair_coords))
+        screen_rep = self.isel(date=rep_idx).rename(date='pair').map(
+            lambda ds: ds.assign_coords(pair=pair_coords))
+
+        return screen_ref, screen_rep
 
     def lstsq_baseline(self, weight=None, baseline='BPR', stride=1, debug=False):
         """
@@ -1824,13 +1859,21 @@ class BatchComplex(BatchCore):
             has_bpr = baseline is not None and baseline in ds.coords
             bpr_values = ds.coords[baseline].values.astype(np.float64) if has_bpr else None
 
+            # Compute unique dates (same logic as lstsq_baseline_array)
+            ns_per_day = 86400 * 1e9
+            ref_days = ref_values.astype(np.float64) / ns_per_day
+            rep_days = rep_values.astype(np.float64) / ns_per_day
+            unique_days = np.unique(np.concatenate([ref_days, rep_days]))
+            n_dates = len(unique_days)
+            # Map unique_days back to datetime64
+            date_coords = (unique_days * ns_per_day).astype('datetime64[ns]')
+
             weight_ds = weight[key] if weight is not None else None
 
             result_ds = {}
             for pol in pols:
                 data_da = ds[pol]
                 data_dask = data_da.data
-                n_pairs = data_dask.shape[0]
 
                 weight_da = weight_ds[pol] if weight_ds is not None else None
 
@@ -1846,26 +1889,31 @@ class BatchComplex(BatchCore):
                 if weight_da is not None:
                     weight_dask = weight_da.data
                     result_dask = da.blockwise(
-                        _block, 'pyx',
+                        _block, 'dyx',
                         data_dask, 'pyx',
                         weight_dask, 'pyx',
-                        new_axes={'p': n_pairs},
+                        new_axes={'d': n_dates},
                         concatenate=True,
                         dtype=np.complex64,
                         meta=np.empty((0, 0, 0), dtype=np.complex64),
                     )
                 else:
                     result_dask = da.blockwise(
-                        _block, 'pyx',
+                        _block, 'dyx',
                         data_dask, 'pyx',
-                        new_axes={'p': n_pairs},
+                        new_axes={'d': n_dates},
                         concatenate=True,
                         dtype=np.complex64,
                         meta=np.empty((0, 0, 0), dtype=np.complex64),
                     )
 
+                # Per-date output with date coordinates
                 result_ds[pol] = xr.DataArray(
-                    result_dask, dims=data_da.dims, coords=data_da.coords
+                    result_dask,
+                    dims=['date', 'y', 'x'],
+                    coords={'date': date_coords,
+                            'y': data_da.coords['y'],
+                            'x': data_da.coords['x']}
                 )
 
             result[key] = xr.Dataset(result_ds, attrs=ds.attrs)
@@ -2100,6 +2148,23 @@ class BatchComplex(BatchCore):
         return type(self)(result)
 
 
+def _subtract_date_from_pair(first, second):
+    """Subtract per-date atmospheric screens from per-pair data.
+
+    Uses BatchComplex.pairs() to select ref/rep screens,
+    then: result = data * conj(screen_ref) * screen_rep
+    """
+    import numpy as np
+
+    key0 = list(first.keys())[0]
+    ref_dates = first[key0].coords['ref'].values
+    rep_dates = first[key0].coords['rep'].values
+    pairs = np.column_stack([ref_dates, rep_dates])
+
+    screen_ref, screen_rep = second.pairs(pairs)
+    return first * screen_ref.conj() * screen_rep
+
+
 class Batches(tuple):
     """
     A tuple-like container for multiple Batch objects that allows chained operations.
@@ -2164,7 +2229,7 @@ class Batches(tuple):
 
     def snapshot(self, store: str | None = None, storage_options: dict[str, str] | None = None,
                  caption: str | None = None,
-                 n_chunks: int = 1, debug: bool = False, **kwargs):
+                 debug: bool = False, **kwargs):
         """Save or open a Batches snapshot.
 
         When called on a Batches with data, saves all batches to Zarr store.
@@ -2178,8 +2243,6 @@ class Batches(tuple):
             Storage options for cloud stores.
         caption : str, optional
             Progress bar caption.
-        n_chunks : int
-            Spatial chunks per worker per batch. Default 4.
         debug : bool
             Print debug information.
 
@@ -2200,11 +2263,11 @@ class Batches(tuple):
         if len(self) == 0:
             result = utils_io.snapshot(store=store, storage_options=storage_options,
                                        caption=caption or 'Opening...',
-                                       n_chunks=n_chunks, debug=debug)
+                                       debug=debug)
         else:
             result = utils_io.snapshot(*self, store=store, storage_options=storage_options,
                                        caption=caption or 'Snapshotting...',
-                                       n_chunks=n_chunks, debug=debug, wrapper=Batches)
+                                       debug=debug, wrapper=Batches)
 
         if isinstance(result, Batches):
             return result
@@ -3070,7 +3133,20 @@ class Batches(tuple):
         first = self[0]
         second = self[second_idx]
 
-        if isinstance(first, BatchComplex):
+        # Check if second is per-date (from lstsq_baseline) and first is per-pair
+        is_date_to_pair = False
+        for key in first.keys():
+            first_ds = first[key]
+            second_ds = second[key]
+            first_pol = [v for v in first_ds.data_vars if 'y' in first_ds[v].dims][0]
+            second_pol = [v for v in second_ds.data_vars if 'y' in second_ds[v].dims][0]
+            if 'pair' in first_ds[first_pol].dims and 'date' in second_ds[second_pol].dims:
+                is_date_to_pair = True
+            break
+
+        if is_date_to_pair:
+            result = _subtract_date_from_pair(first, second)
+        elif isinstance(first, BatchComplex):
             result = first * second.conj()
         else:
             result = first - second
@@ -3325,11 +3401,9 @@ class Batches(tuple):
         weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
 
         if isinstance(phase, BatchComplex):
-            vel, rmse = phase.velocity(weight=weight, max_refine=max_refine, **kwargs)
-            return Batches((vel, rmse))
+            return phase.velocity(weight=weight, max_refine=max_refine, **kwargs)
         else:
-            vel, intercept = phase.velocity(**kwargs)
-            return Batches((vel, intercept))
+            return phase.velocity(**kwargs)
 
     def rmse(self, solution):
         """RMSE of phase vs solution, using correlation weight if present.

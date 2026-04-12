@@ -15,6 +15,90 @@ from insardev_toolkit.progressbar_joblib import progressbar_joblib
 import zarr
 zarr.config.set({'array.write_empty_chunks': True})
 
+# TensorStore target for concurrent-safe zarr writes from dask workers.
+# zarr-python v3 has no synchronization for concurrent writes (zarr-python#1596),
+# and da.store lock parameter does not work with distributed (dask#12109).
+# TensorStore handles concurrent writes safely via its own locking.
+# Imported lazily inside _TensorStoreTarget._open() to avoid hard dependency at load time.
+import numpy as _np
+
+def _store_path_to_kvstore(store_path):
+    """Convert local filesystem path to TensorStore kvstore spec."""
+    import os
+    return {'driver': 'file', 'path': os.path.abspath(store_path) + '/'}
+
+def _zarr_codecs_to_ts(zarr_codecs):
+    """Convert zarr v3 codec config to TensorStore codec list."""
+    ts_codecs = []
+    for codec in zarr_codecs:
+        name = codec.name if hasattr(codec, 'name') else str(codec)
+        if 'bytes' in name.lower():
+            endian = getattr(codec, 'endian', None)
+            if endian is not None:
+                endian = str(endian.value) if hasattr(endian, 'value') else str(endian)
+            ts_codecs.append({'name': 'bytes', 'configuration': {'endian': endian or 'little'}})
+        elif 'zstd' in name.lower():
+            ts_codecs.append({'name': 'zstd', 'configuration': {'level': int(getattr(codec, 'level', 0))}})
+        elif 'blosc' in name.lower():
+            ts_codecs.append({'name': 'blosc', 'configuration': {
+                'cname': str(getattr(codec, 'cname', 'lz4')), 'clevel': int(getattr(codec, 'clevel', 5))}})
+        elif 'gzip' in name.lower():
+            ts_codecs.append({'name': 'gzip', 'configuration': {'level': int(getattr(codec, 'level', 6))}})
+    return ts_codecs or [{'name': 'bytes', 'configuration': {'endian': 'little'}}]
+
+def _make_ts_target(zarr_array, store_path, var_name, group_path=None):
+    """Build a picklable TensorStore target from an existing zarr v3 array."""
+    array_path = f'{store_path}/{group_path}/{var_name}' if group_path else f'{store_path}/{var_name}'
+    dtype = zarr_array.dtype
+    dtype_map = {
+        _np.float32: 'float32', _np.float64: 'float64',
+        _np.int16: 'int16', _np.int32: 'int32', _np.int64: 'int64',
+        _np.uint8: 'uint8', _np.uint16: 'uint16', _np.uint32: 'uint32',
+        _np.complex64: 'complex64', _np.complex128: 'complex128',
+    }
+    codecs = zarr_array.metadata.codecs if hasattr(zarr_array.metadata, 'codecs') else []
+    spec = {
+        'driver': 'zarr3',
+        'kvstore': _store_path_to_kvstore(array_path),
+        'metadata': {
+            'shape': list(zarr_array.shape),
+            'chunk_grid': {'name': 'regular', 'configuration': {'chunk_shape': list(zarr_array.chunks)}},
+            'codecs': _zarr_codecs_to_ts(codecs),
+            'data_type': dtype_map.get(dtype.type, str(dtype)),
+        },
+    }
+    fill = zarr_array.fill_value
+    if fill is not None:
+        if _np.issubdtype(dtype, _np.complexfloating):
+            spec['metadata']['fill_value'] = [float('nan'), 0.0] if _np.isnan(fill) else [float(_np.real(fill)), float(_np.imag(fill))]
+        elif _np.issubdtype(dtype, _np.floating):
+            spec['metadata']['fill_value'] = float(fill)
+        else:
+            spec['metadata']['fill_value'] = int(fill)
+    return _TensorStoreTarget(spec)
+
+class _TensorStoreTarget:
+    """Picklable da.store target that writes via TensorStore (concurrent-safe)."""
+    def __init__(self, spec):
+        self.spec = spec
+        self._store = None
+    def _open(self):
+        if self._store is None:
+            import tensorstore as ts
+            self._store = ts.open(self.spec, open=True, write=True).result()
+        return self._store
+    def __setitem__(self, key, value):
+        self._open()[key] = value
+    @property
+    def shape(self):
+        return tuple(self.spec['metadata']['shape'])
+    def __getstate__(self):
+        return {'spec': self.spec}
+    def __setstate__(self, state):
+        self.spec = state['spec']
+        self._store = None
+
+
 # def snapshot_interleave(*args, store: str | None = None, storage_options: dict[str, str] | None = None,
 #                         compat: bool = True, n_jobs: int = -1, debug=False):
 #     """
@@ -25,7 +109,7 @@ zarr.config.set({'array.write_empty_chunks': True})
 
 def snapshot(*args, store: str | None = None, storage_options: dict[str, str] | None = None,
                 caption: str | None = 'Snapshotting...',
-                n_chunks: int = 1, debug=False, **kwargs):
+                debug=False, **kwargs):
     """
     Save and open a Zarr store or just open it when no data arguments are provided.
     This function wraps save(...) and open(...) functions.
@@ -46,13 +130,22 @@ def snapshot(*args, store: str | None = None, storage_options: dict[str, str] | 
     # call the function without data arguments to only open existing store
     if len(args) > 0:
         save(*args, store=store, storage_options=storage_options, caption=caption,
-             n_chunks=n_chunks, debug=debug, **kwargs)
+             debug=debug, **kwargs)
+    # Release input references and worker memory before opening the result
+    import gc
+    del args, kwargs
+    gc.collect()
+    try:
+        from dask.distributed import get_client
+        get_client().run(gc.collect)
+    except (ValueError, ImportError):
+        pass
     # Always use -1 for open (fast parallel loading)
     return open(store=store, storage_options=storage_options,
                 n_jobs=-1, debug=debug)
 
 def save(*args, store, storage_options: dict[str, str] | None = None,
-            caption: str | None = 'Saving...', n_chunks: int = 1, debug=False,
+            caption: str | None = 'Saving...', debug=False,
             wrapper: type | None = None):
     """
     Save Batch/BatchComplex dicts into one Zarr store, each burst under its own subgroup.
@@ -113,11 +206,10 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
         shutil.rmtree(store, ignore_errors=True)
     root = zarr.group(store=store, zarr_format=3, overwrite=True)
     root.attrs['__class__'] = [
-        f'{cls.__module__}.{cls.__qualname__}'
-        for cls in (type(arg) for arg in args)
+        type(arg).__name__ for arg in args
     ]
     if wrapper is not None:
-        root.attrs['__wrapper__'] = f'{wrapper.__module__}.{wrapper.__qualname__}'
+        root.attrs['__wrapper__'] = wrapper.__name__
 
     # Group datasets by burst (keeping interleaved pairs together for shared computation)
     burst_groups = {}  # burst_id -> [(grp, ds), ...]
@@ -189,7 +281,10 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
                         fill_value=np.nan if (np.issubdtype(da_xr.dtype, np.floating) or np.issubdtype(da_xr.dtype, np.complexfloating)) else 0,
                     )
                     sources.append(da_xr.data)
-                    targets.append(z)
+                    if da_xr.ndim >= 3 and not is_store_object:
+                        targets.append(_make_ts_target(z, store, var_name, group_path=grp))
+                    else:
+                        targets.append(z)
                 else:
                     # Non-dask array - write directly with dimension_names
                     ds_grp.create_array(
@@ -221,88 +316,66 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
                 print(f'  source[{i}]: ndim={s.ndim}, shape={s.shape}, '
                       f'chunks={s.chunks if hasattr(s, "chunks") else "N/A"}')
 
-        def _persist_store(arrays, targets, regions, pbar):
-            """Persist on workers, wait, store to zarr.
-            Raises on computation error. Store writes from worker memory
-            directly to zarr — no data transfer to client."""
-            with dask.config.set({'optimization.fuse.active': False}):
-                arrays = list(dask.optimize(*arrays))
-            persisted = list(dask.persist(*arrays))
-            futures = futures_of(persisted)
-            n_total = len(futures)
-            n_done = 0
-            for batch in dask.distributed.as_completed(futures, with_results=False).batches():
-                for f in batch:
-                    if f.status == 'error':
-                        raise f.exception()
-                n_done += len(batch)
-                pbar.set_postfix_str(f'computing {n_done}/{n_total}')
-            pbar.set_postfix_str('writing')
-            da.store(persisted, targets, lock=False, regions=regions)
-            del persisted
-            pbar.set_postfix_str('')
-
-        # Spatial metadata from the best available reference source.
-        ref_spatial = ref_3d if ref_3d is not None else \
-            next((s for s in sources if s.ndim >= 2 and hasattr(s, 'chunks')), None)
-        if ref_spatial is not None:
-            n_y = len(ref_spatial.chunks[-2])
-            n_x = len(ref_spatial.chunks[-1])
-            x_chunks = ref_spatial.chunks[-1]
-            x_boundaries = [0] + list(np.cumsum(x_chunks))
-        else:
-            n_y, n_x = 1, 1
-
         idx_3d = [i for i, s in enumerate(sources) if s.ndim >= 3]
         idx_2d = [i for i, s in enumerate(sources) if s.ndim < 3]
 
+        # Write 2D sources directly (small, no contention)
+        if idx_2d:
+            da.store([dask.optimize(sources[i])[0] for i in idx_2d],
+                     [targets[i] for i in idx_2d], lock=False)
+
+        # Write 3D sources via TensorStore targets (concurrent-safe, no lock needed).
         if idx_3d:
-            # Write 2D sources once (non-batched).
-            if idx_2d:
-                full_reg = [tuple(slice(None) for _ in range(sources[i].ndim)) for i in idx_2d]
-                _persist_store([sources[i] for i in idx_2d],
-                               [targets[i] for i in idx_2d], full_reg, pbar)
-
             if dim0_merged:
-                # 1D chunks (all pairs merged): batch by spatial chunks.
-                # Each chunk is ~1GB — n_chunks chunks per batch.
-                ref_3d_sample = sources[idx_3d[0]]
-                n_spatial = len(ref_3d_sample.chunks[-2]) * len(ref_3d_sample.chunks[-1])
-                n_3d = len(idx_3d)
-                batch_size = max(1, n_chunks * n_workers // max(n_3d, 1))
-                x_chunks = ref_3d_sample.chunks[-1]
-                x_boundaries = [0] + list(np.cumsum(x_chunks))
-                ndim = ref_3d_sample.ndim
-                batch_x = max(1, batch_size // len(ref_3d_sample.chunks[-2]))
-                n_batches = (len(x_chunks) + batch_x - 1) // batch_x
-                pbar.total = n_batches
-
-                for kx in range(0, len(x_chunks), batch_x):
-                    kx_end = min(kx + batch_x, len(x_chunks))
-                    x0, x1 = x_boundaries[kx], x_boundaries[kx_end]
-                    reg = (slice(None),) * (ndim - 1) + (slice(x0, x1),)
-                    _persist_store([sources[i][..., x0:x1] for i in idx_3d],
-                                   [targets[i] for i in idx_3d],
-                                   [reg] * n_3d, pbar)
+                # 1D chunks: single pass, scheduler pipelines optimally
+                arrays = list(dask.optimize(*[sources[i] for i in idx_3d]))
+                store_arr = da.store(arrays, [targets[i] for i in idx_3d],
+                                    lock=False, compute=False)
+                if _client is not None:
+                    persisted = _client.persist(store_arr)
+                    all_futures = futures_of(persisted)
+                    pbar.total = len(all_futures)
+                    for batch in dask.distributed.as_completed(all_futures, with_results=False).batches():
+                        for f in batch:
+                            if f.status == 'error':
+                                raise f.exception()
+                            f.cancel()
+                        pbar.update(len(batch))
+                    del all_futures, persisted
+                else:
+                    pbar.total = 1
+                    dask.compute(store_arr)
                     pbar.update(1)
+                del arrays, store_arr
             else:
-                # 2D chunks (one pair per chunk): batch by pairs.
-                batch_pairs = n_chunks * n_workers
+                # 2D chunks: batch by pairs, same pipeline as 1D per batch.
+                batch_pairs = n_workers
                 pbar.total = (n_pairs + batch_pairs - 1) // batch_pairs
-
                 for k in range(0, n_pairs, batch_pairs):
                     k_end = min(k + batch_pairs, n_pairs)
-                    _persist_store([sources[i][k:k_end] for i in idx_3d],
-                                   [targets[i] for i in idx_3d],
-                                   [(slice(k, k_end),)] * len(idx_3d), pbar)
+                    arrays = list(dask.optimize(*[sources[i][k:k_end] for i in idx_3d]))
+                    store_arr = da.store(arrays, [targets[i] for i in idx_3d],
+                                         lock=False, compute=False,
+                                         regions=[(slice(k, k_end),)] * len(arrays))
+                    if _client is not None:
+                        persisted = _client.persist(store_arr)
+                        all_futures = futures_of(persisted)
+                        n_total = len(all_futures)
+                        n_done = 0
+                        for batch in dask.distributed.as_completed(all_futures, with_results=False).batches():
+                            for f in batch:
+                                if f.status == 'error':
+                                    raise f.exception()
+                                f.cancel()
+                            n_done += len(batch)
+                            pbar.set_postfix_str(f'{n_done}/{n_total}')
+                            pbar.refresh()
+                        del all_futures, persisted
+                    else:
+                        dask.compute(store_arr)
+                    del arrays, store_arr
+                    pbar.set_postfix_str('')
                     pbar.update(1)
-        elif idx_2d:
-            # All sources are 2D (e.g. ADI).
-            pbar.total = 1
-            full_reg = [tuple(slice(None) for _ in range(sources[i].ndim)) for i in idx_2d]
-            _persist_store([sources[i] for i in idx_2d],
-                           [targets[i] for i in idx_2d], full_reg, pbar)
-            pbar.update(1)
 
     # Write xarray metadata (coords, attrs) AFTER data is written
     for grp, ds, grp_store in grp_info:
@@ -316,18 +389,17 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
         else:
             ds_clean.to_zarr(store=grp_store, mode='a', consolidated=True, zarr_format=3)
 
-    del sources, targets, grp_info
-    gc.collect()
-
+    del sources, targets, grp_info, idx_3d, idx_2d
     pbar.close()
 
     # consolidate metadata for the groups in the store
     zarr.consolidate_metadata(store, zarr_format=3)
     del datas, burst_groups
+
     gc.collect()
     try:
         client = get_client()
-        client.run(lambda: __import__('gc').collect())
+        client.run(gc.collect)
     except ValueError:
         pass
 
@@ -358,7 +430,6 @@ def open(store: str, storage_options: dict[str, str] | None = None,
     import xarray as xr
     import joblib
     from tqdm.auto import tqdm
-    from pydoc import locate
     # Suppress zarr v3 consolidated metadata and .DS_Store warnings
     warnings.filterwarnings('ignore', category=UserWarning, module='zarr')
 
@@ -366,7 +437,12 @@ def open(store: str, storage_options: dict[str, str] | None = None,
     is_store_object = not isinstance(store, str)
 
     root = zarr.open_consolidated(store, storage_options=storage_options, zarr_format=3, mode='r')
-    classes = [locate(c) for c in root.attrs.get('__class__')]
+    from .Batch import Batch, BatchComplex, BatchUnit, BatchWrap
+    _class_map = {
+        'Batch': Batch, 'BatchComplex': BatchComplex,
+        'BatchUnit': BatchUnit, 'BatchWrap': BatchWrap,
+    }
+    classes = [_class_map.get(c.rsplit('.', 1)[-1], Batch) for c in root.attrs.get('__class__')]
     interleave = len(classes) > 1
     groups = list(root.group_keys())
 
@@ -388,14 +464,8 @@ def open(store: str, storage_options: dict[str, str] | None = None,
         # 1. save() calls gc.collect + client.run(gc.collect) to release old futures
         # 2. map_blocks identity prevents downstream key collisions
         # 3. Stale source reads only occur if old futures survive gc — rare in practice
-        uid = uuid.uuid4().hex[:8]
-        for var in list(ds.data_vars):
-            arr = ds[var].data
-            if hasattr(arr, 'dask'):
-                new_name = f'{grp}-{var}-{uid}'
-                ds[var].data = da.map_blocks(
-                    lambda x: x, arr, dtype=arr.dtype,
-                    name=new_name, meta=arr._meta)
+        # Note: xr.open_zarr keys are deterministic from the path.
+        # Stale cache collisions are mitigated by save()'s gc.collect cleanup.
         # restore rioxarray CRS from spatial_ref coordinate/variable if present
         if ds.rio.crs is None:
             # check both coords and data_vars for spatial_ref
@@ -449,7 +519,9 @@ def open(store: str, storage_options: dict[str, str] | None = None,
     result = classes[0](dss)
     wrapper_name = root.attrs.get('__wrapper__')
     if wrapper_name is not None:
-        wrapper_cls = locate(wrapper_name)
+        from .Batch import Batches
+        _wrapper_map = {'Batches': Batches}
+        wrapper_cls = _wrapper_map.get(wrapper_name.rsplit('.', 1)[-1])
         if wrapper_cls is not None:
             return wrapper_cls((result,))
     return result

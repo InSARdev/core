@@ -1430,10 +1430,12 @@ def _lstsq_baseline_kernel(
 
 
 def lstsq_baseline_array(data, weight, ref_values, rep_values, bpr_values=None, stride=1):
-    """Decompose per-pair complex trend into per-date + optional BPR.
+    """Decompose per-pair complex trend into per-date atmospheric screens.
 
-    Subsamples at stride, decomposes at grid points, interpolates per-date
-    model back to full resolution, reconstructs consistent per-pair trend.
+    SBAS decomposition with optional BPR regressor to separate atmospheric
+    phase (per-date) from DEM-correlated phase (proportional to BPR).
+    Returns per-date atmospheric screens only — BPR signal is preserved
+    in the data when subtract() removes the atmospheric component.
 
     Parameters
     ----------
@@ -1450,8 +1452,8 @@ def lstsq_baseline_array(data, weight, ref_values, rep_values, bpr_values=None, 
 
     Returns
     -------
-    np.ndarray (n_pairs, ny, nx) complex64
-        Network-consistent per-pair trend (BPR component removed if bpr_values given).
+    np.ndarray (n_dates, ny, nx) complex64
+        Per-date atmospheric phase screens (BPR component excluded).
     """
     if isinstance(data, list):
         data = np.asarray(data[0]) if len(data) == 1 else np.concatenate([np.asarray(c) for c in data], axis=0)
@@ -1515,7 +1517,7 @@ def lstsq_baseline_array(data, weight, ref_values, rep_values, bpr_values=None, 
     # Interpolate per-date model to full resolution
     date_model_grid = date_model_flat.reshape(n_dates, n_gy, n_gx)
 
-    # Interpolate per-date models to full resolution and reconstruct pairs
+    # Interpolate per-date models to full resolution
     dummy_im = np.zeros((n_gy, n_gx), dtype=np.float64)
     if stride_y > 1 or stride_x > 1:
         date_fullres = np.empty((n_dates, ny, nx), dtype=np.float64)
@@ -1526,12 +1528,13 @@ def lstsq_baseline_array(data, weight, ref_values, rep_values, bpr_values=None, 
     else:
         date_fullres = date_model_grid
 
-    result = np.full((n_pairs, ny, nx), np.nan + 0j, dtype=np.complex64)
-    for p in range(n_pairs):
-        di = pair_ref_didx[p]; dj = pair_rep_didx[p]
-        phase = date_fullres[di] - date_fullres[dj]
+    # Return per-date atmospheric screens as complex phasors
+    result = np.empty((n_dates, ny, nx), dtype=np.complex64)
+    for d in range(n_dates):
+        phase = date_fullres[d]
         valid = np.isfinite(phase)
-        result[p][valid] = np.exp(1j * phase[valid]).astype(np.complex64)
+        result[d] = np.nan + 0j
+        result[d][valid] = np.exp(1j * phase[valid]).astype(np.complex64)
 
     return result
 

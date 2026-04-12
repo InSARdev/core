@@ -3438,9 +3438,6 @@ class BatchCore(dict):
                         var_chunks = {'y': optimal['y'], 'x': optimal['x']}
                     rechunked = arr.chunk(var_chunks)
                     if hasattr(rechunked.data, 'dask'):
-                        # Full fusion only when graph has enough layers for linear chains.
-                        # Rechunk-only graphs (≤3 layers) have no fusible chains —
-                        # skip expensive ensure_dict + fuse_linear (22s on 1M keys, 0% reduction).
                         n_layers = len(rechunked.data.__dask_graph__().layers)
                         with dask.config.set({'optimization.fuse.active': n_layers > 3}):
                             (rechunked.data,) = dask.optimize(rechunked.data)
@@ -3753,8 +3750,8 @@ class BatchCore(dict):
         return result
 
     def save(self, store: str, storage_options: dict[str, str] | None = None,
-                caption: str | None = 'Saving...', n_chunks: int = 1, debug=False):
-        return utils_io.save(self, store=store, storage_options=storage_options, caption=caption, n_chunks=n_chunks, debug=debug)
+                caption: str | None = 'Saving...', debug=False):
+        return utils_io.save(self, store=store, storage_options=storage_options, caption=caption, debug=debug)
 
     def open(self, store: str, storage_options: dict[str, str] | None = None, n_jobs: int = -1, debug=False):
         data = utils_io.open(store=store, storage_options=storage_options, n_jobs=n_jobs, debug=debug)
@@ -3763,11 +3760,11 @@ class BatchCore(dict):
         return data
     
     def snapshot(self, store: str | None = None, storage_options: dict[str, str] | None = None,
-                caption: str | None = 'Snapshotting...', n_chunks: int = 1,
+                caption: str | None = 'Snapshotting...',
                 debug=False, **kwargs):
         # Only save if this batch has data; otherwise just open existing store
         if len(self) > 0:
-            utils_io.save(self, store=store, storage_options=storage_options, caption=caption, n_chunks=n_chunks,
+            utils_io.save(self, store=store, storage_options=storage_options, caption=caption,
                          debug=debug)
         return utils_io.open(store=store, storage_options=storage_options,
                             n_jobs=-1, debug=debug)

@@ -56,6 +56,7 @@ setup(
                       'distributed',
                       'dask[complete]',
                       'zarr',
+                      'tensorstore',
                       'numcodecs',
                       'numba',
                       'pyproj',
@@ -66,7 +67,8 @@ setup(
                       'adjustText',
                       'fsspec',
                       'tqdm',
-                      'joblib'
+                      'joblib',
+                      'uvloop'
                       ],
     extras_require={
                       'vtk_support': ['vtk', 'panel'],
