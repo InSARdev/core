@@ -1205,7 +1205,7 @@ class BatchCore(dict):
 
     def trend2d(self, transform: 'BatchCore | None' = None, weight: 'BatchUnit | None' = None,
                 degree: int = 1, device: str = 'auto', detrend: bool = False,
-                debug: bool = False) -> 'BatchCore':
+                extrapolate: bool = False, debug: bool = False) -> 'BatchCore':
         """
         Compute 2D polynomial trend (ramp) from data.
 
@@ -1446,7 +1446,7 @@ class BatchCore(dict):
 
                 # Phase 4: Apply trend per (pair, tile)
                 def make_apply_fn(n_vars, feature_mean, feature_std,
-                                  degree, is_complex, detrend_mode):
+                                  degree, is_complex, detrend_mode, extrapolate):
                     def fn(*args):
                         phase_c = args[0]
                         coeffs_c = args[1]
@@ -1454,12 +1454,12 @@ class BatchCore(dict):
                         return utils_detrend._apply_chunk(
                             phase_c, coeffs_c, var_cs,
                             feature_mean, feature_std,
-                            degree, is_complex, detrend_mode)
+                            degree, is_complex, detrend_mode, extrapolate)
                     return fn
 
                 apply_fn = make_apply_fn(
                     n_vars, feature_mean, feature_std,
-                    degree, is_complex, detrend)
+                    degree, is_complex, detrend, extrapolate)
 
                 out_dtype = phase_da.dtype if is_complex else np.float32
                 blockwise_args_apply = [phase_dask, 'pyx', coeffs, 'pf']
@@ -1493,7 +1493,7 @@ class BatchCore(dict):
 
     def trend2d_window(self, transform: 'BatchCore | None' = None, weight: 'BatchUnit | None' = None,
                         window: 'int | tuple' = 250, stride: 'int | tuple' = 1,
-                        detrend: bool = False,
+                        detrend: bool = False, extrapolate: bool = False,
                         debug: bool = False) -> 'BatchCore':
         """
         Local 2D polynomial trend using 4 half-overlapping window grids.
@@ -1602,7 +1602,7 @@ class BatchCore(dict):
                     _stride = (int(stride), int(stride))
 
                 # Kernel: per-pair sliding window
-                def _make_kernel(_win_y, _win_x, _nv, _hw, _det, _is_complex, _stride):
+                def _make_kernel(_win_y, _win_x, _nv, _hw, _det, _is_complex, _stride, _extrap):
                     def kernel(phase_block, *args):
                         var_arrays = [np.asarray(a) for a in args[:_nv]]
                         w_block = np.asarray(args[_nv]) if _hw else None
@@ -1620,13 +1620,16 @@ class BatchCore(dict):
                                 else:
                                     results.append((phase_block[p] - trend_p)[np.newaxis])
                             else:
+                                if not _extrap:
+                                    nan_mask = np.isnan(phase_block[p].real) if _is_complex else np.isnan(phase_block[p])
+                                    trend_p[nan_mask] = np.nan
                                 results.append(trend_p[np.newaxis])
                         return np.concatenate(results, axis=0).astype(out_dtype)
                     return kernel
 
                 kernel = _make_kernel(win_y, win_x,
                                        len(var_dask_list), has_weight,
-                                       detrend, is_complex, _stride)
+                                       detrend, is_complex, _stride, extrapolate)
 
                 # Build args for map_overlap
                 depth_3d = {0: 0, 1: half_y, 2: half_x}
@@ -1848,8 +1851,9 @@ class BatchCore(dict):
 
                 data_dask = data_da.data
                 weight_dask = weight_da.data if weight_da is not None else None
+                if weight_dask is not None and weight_dask.chunks != data_dask.chunks:
+                    weight_dask = weight_dask.rechunk(data_dask.chunks)
                 n_stack = data_dask.shape[0]
-
 
                 # When detrend=True: return (n_stack, y, x) detrended data.
                 # When detrend=False: return (n_stack+1, y, x) with slope in last row.

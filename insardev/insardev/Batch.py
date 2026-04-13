@@ -1888,6 +1888,8 @@ class BatchComplex(BatchCore):
 
                 if weight_da is not None:
                     weight_dask = weight_da.data
+                    if weight_dask.chunks != data_dask.chunks:
+                        weight_dask = weight_dask.rechunk(data_dask.chunks)
                     result_dask = da.blockwise(
                         _block, 'dyx',
                         data_dask, 'pyx',
@@ -2162,6 +2164,23 @@ def _subtract_date_from_pair(first, second):
     pairs = np.column_stack([ref_dates, rep_dates])
 
     screen_ref, screen_rep = second.pairs(pairs)
+    # Rechunk screens to match first's chunks — isel produces fragmented
+    # dim0 chunks (63,63,...,31) while first has merged (1165,) chunks.
+    # Without this, the multiply triggers an implicit rechunk of first
+    # that re-reads the full upstream graph 19× per spatial tile.
+    key0 = list(first.keys())[0]
+    ref_var = next(v for v in first[key0].data_vars if first[key0][v].ndim >= 3)
+    ref_chunks = first[key0][ref_var].data.chunks
+    for batch in (screen_ref, screen_rep):
+        for key in batch:
+            ds = batch[key]
+            rechunked = {}
+            for v in ds.data_vars:
+                da_xr = ds[v]
+                if da_xr.ndim >= 3 and hasattr(da_xr.data, 'chunks') and da_xr.data.chunks != ref_chunks:
+                    rechunked[v] = da_xr.chunk(dict(zip(da_xr.dims, ref_chunks)))
+            if rechunked:
+                batch[key] = ds.assign(rechunked)
     return first * screen_ref.conj() * screen_rep
 
 
@@ -2899,7 +2918,7 @@ class Batches(tuple):
         elements = [unwrapped] + list(self[1:])
         return Batches(elements)
 
-    def trend2d(self, transform=None, degree=1, window=None, stride=1, device='auto', debug=False):
+    def trend2d(self, transform=None, degree=1, window=None, stride=1, device='auto', extrapolate=False, debug=False):
         """
         Compute 2D spatial trend and append it to Batches.
 
@@ -2944,7 +2963,8 @@ class Batches(tuple):
 
         if window is None:
             trend = phase.trend2d(transform, weight=weight, degree=degree,
-                                  device=device, detrend=False, debug=debug)
+                                  device=device, detrend=False,
+                                  extrapolate=extrapolate, debug=debug)
         else:
             if degree != 1:
                 raise ValueError("Windowed trend2d only supports degree=1.")
@@ -2955,7 +2975,8 @@ class Batches(tuple):
                     raise ValueError(f"Windowed trend2d requires 1-3 transform variables, got {n_vars}.")
             trend = phase.trend2d_window(transform, weight=weight,
                                          window=window, stride=stride,
-                                         detrend=False, debug=debug)
+                                         detrend=False, extrapolate=extrapolate,
+                                         debug=debug)
 
         # Preserve non-spatial variables (e.g. BPR, ref, rep)
         trend = Batches._preserve_nonspatial(phase, trend)

@@ -20,11 +20,24 @@ zarr.config.set({'array.write_empty_chunks': True})
 # and da.store lock parameter does not work with distributed (dask#12109).
 # TensorStore handles concurrent writes safely via its own locking.
 # Imported lazily inside _TensorStoreTarget._open() to avoid hard dependency at load time.
-import numpy as _np
+import numpy as np
 
-def _store_path_to_kvstore(store_path):
-    """Convert local filesystem path to TensorStore kvstore spec."""
+def _store_path_to_kvstore(store_path, storage_options=None):
+    """Convert filesystem path to TensorStore kvstore spec."""
     import os
+    opts = storage_options or {}
+    if store_path.startswith('s3://'):
+        parts = store_path[5:].split('/', 1)
+        kvstore = {'driver': 's3', 'bucket': parts[0], 'path': parts[1] if len(parts) > 1 else ''}
+        if 'endpoint_url' in opts: kvstore['endpoint'] = opts['endpoint_url']
+        if 'key' in opts and 'secret' in opts:
+            kvstore['aws_credentials'] = {'access_key': opts['key'], 'secret_key': opts['secret']}
+        if 'region_name' in opts: kvstore['aws_region'] = opts['region_name']
+        return kvstore
+    elif store_path.startswith(('gs://', 'gcs://')):
+        prefix = 'gs://' if store_path.startswith('gs://') else 'gcs://'
+        parts = store_path[len(prefix):].split('/', 1)
+        return {'driver': 'gcs', 'bucket': parts[0], 'path': parts[1] if len(parts) > 1 else ''}
     return {'driver': 'file', 'path': os.path.abspath(store_path) + '/'}
 
 def _zarr_codecs_to_ts(zarr_codecs):
@@ -46,20 +59,20 @@ def _zarr_codecs_to_ts(zarr_codecs):
             ts_codecs.append({'name': 'gzip', 'configuration': {'level': int(getattr(codec, 'level', 6))}})
     return ts_codecs or [{'name': 'bytes', 'configuration': {'endian': 'little'}}]
 
-def _make_ts_target(zarr_array, store_path, var_name, group_path=None):
+def _make_ts_target(zarr_array, store_path, var_name, group_path=None, storage_options=None):
     """Build a picklable TensorStore target from an existing zarr v3 array."""
     array_path = f'{store_path}/{group_path}/{var_name}' if group_path else f'{store_path}/{var_name}'
     dtype = zarr_array.dtype
     dtype_map = {
-        _np.float32: 'float32', _np.float64: 'float64',
-        _np.int16: 'int16', _np.int32: 'int32', _np.int64: 'int64',
-        _np.uint8: 'uint8', _np.uint16: 'uint16', _np.uint32: 'uint32',
-        _np.complex64: 'complex64', _np.complex128: 'complex128',
+        np.float32: 'float32', np.float64: 'float64',
+        np.int16: 'int16', np.int32: 'int32', np.int64: 'int64',
+        np.uint8: 'uint8', np.uint16: 'uint16', np.uint32: 'uint32',
+        np.complex64: 'complex64', np.complex128: 'complex128',
     }
     codecs = zarr_array.metadata.codecs if hasattr(zarr_array.metadata, 'codecs') else []
     spec = {
         'driver': 'zarr3',
-        'kvstore': _store_path_to_kvstore(array_path),
+        'kvstore': _store_path_to_kvstore(array_path, storage_options),
         'metadata': {
             'shape': list(zarr_array.shape),
             'chunk_grid': {'name': 'regular', 'configuration': {'chunk_shape': list(zarr_array.chunks)}},
@@ -69,9 +82,9 @@ def _make_ts_target(zarr_array, store_path, var_name, group_path=None):
     }
     fill = zarr_array.fill_value
     if fill is not None:
-        if _np.issubdtype(dtype, _np.complexfloating):
-            spec['metadata']['fill_value'] = [float('nan'), 0.0] if _np.isnan(fill) else [float(_np.real(fill)), float(_np.imag(fill))]
-        elif _np.issubdtype(dtype, _np.floating):
+        if np.issubdtype(dtype, np.complexfloating):
+            spec['metadata']['fill_value'] = [float('nan'), 0.0] if np.isnan(fill) else [float(np.real(fill)), float(np.imag(fill))]
+        elif np.issubdtype(dtype, np.floating):
             spec['metadata']['fill_value'] = float(fill)
         else:
             spec['metadata']['fill_value'] = int(fill)
@@ -172,10 +185,9 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
     import xarray as xr
     import dask
     import dask.array as da
-    import numpy as np
     import zarr
     import gc
-    from dask.distributed import get_client, wait as dask_wait, futures_of
+    from dask.distributed import get_client, futures_of
     from tqdm.auto import tqdm
 
     # Suppress zarr v3 consolidated metadata and .DS_Store warnings
@@ -186,11 +198,11 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
     # All args must be dicts (Batch/BatchComplex are dict subclasses)
     datas = {}
     if interleave:
-        if len(args) != 2 or not isinstance(args[0], dict) or not isinstance(args[1], dict):
-            raise ValueError('Interleaved save requires exactly two Batch dicts')
-        for (k0, v0), (k1, v1) in zip(args[0].items(), args[1].items()):
-            datas[f'i0_{k0}'] = v0
-            datas[f'i1_{k1}'] = v1
+        for idx, arg in enumerate(args):
+            if not isinstance(arg, dict):
+                raise ValueError(f'Interleaved save: arg {idx} is {type(arg).__name__}, expected Batch dict')
+            for k, v in arg.items():
+                datas[f'i{idx}_{k}'] = v
     else:
         if not isinstance(args[0], dict):
             raise ValueError(f'Expected Batch dict, got {type(args[0]).__name__}')
@@ -214,15 +226,10 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
     # Group datasets by burst (keeping interleaved pairs together for shared computation)
     burst_groups = {}  # burst_id -> [(grp, ds), ...]
     for grp, ds in datas.items():
-        # Extract burst_id (strip i0_/i1_ prefix for interleaved data)
-        if grp.startswith(('i0_', 'i1_')):
-            burst_id = grp.split('_', 1)[1]
-        else:
-            burst_id = grp
+        burst_id = grp.split('_', 1)[1] if interleave else grp
         burst_groups.setdefault(burst_id, []).append((grp, ds))
 
     burst_ids = list(burst_groups.keys())
-    n_bursts_total = len(burst_ids)
 
     # Get dask distributed client (if available)
     try:
@@ -232,13 +239,11 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
 
     # Pre-scan to get total pairs/chunks for progress bar
     n_pairs = 0
-    _ref_dask = None
     for grp, ds in burst_groups[burst_ids[0]]:
         for var_name in ds.data_vars:
             da_xr = ds[var_name]
             if hasattr(da_xr.data, 'dask') and da_xr.ndim >= 3:
                 n_pairs = da_xr.shape[0]
-                _ref_dask = da_xr.data
                 break
         if n_pairs > 0:
             break
@@ -282,7 +287,8 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
                     )
                     sources.append(da_xr.data)
                     if da_xr.ndim >= 3 and not is_store_object:
-                        targets.append(_make_ts_target(z, store, var_name, group_path=grp))
+                        targets.append(_make_ts_target(z, store, var_name, group_path=grp,
+                                                        storage_options=storage_options))
                     else:
                         targets.append(z)
                 else:
@@ -298,8 +304,6 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
     # Write dask arrays to zarr in memory-controlled batches.
     # Each batch slice is optimized (dask.optimize culls unused keys).
     if sources:
-        import numpy as np
-
         if _client is not None:
             n_workers = max(len(_client.nthreads()), 1)
         else:
@@ -513,9 +517,12 @@ def open(store: str, storage_options: dict[str, str] | None = None,
     if interleave:
         # unpack interleaved datasets and return as Batches for chaining
         from .Batch import Batches
-        dss0 = {k[len('i0_'):]: v for k, v in dss.items() if k.startswith('i0_')}
-        dss1 = {k[len('i1_'):]: v for k, v in dss.items() if k.startswith('i1_')}
-        return Batches((classes[0](dss0), classes[1](dss1)))
+        batches = []
+        for idx, cls in enumerate(classes):
+            prefix = f'i{idx}_'
+            batch_dss = {k[len(prefix):]: v for k, v in dss.items() if k.startswith(prefix)}
+            batches.append(cls(batch_dss))
+        return Batches(batches)
     result = classes[0](dss)
     wrapper_name = root.attrs.get('__wrapper__')
     if wrapper_name is not None:

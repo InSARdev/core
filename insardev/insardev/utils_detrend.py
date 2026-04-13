@@ -1457,6 +1457,8 @@ def lstsq_baseline_array(data, weight, ref_values, rep_values, bpr_values=None, 
     """
     if isinstance(data, list):
         data = np.asarray(data[0]) if len(data) == 1 else np.concatenate([np.asarray(c) for c in data], axis=0)
+    if isinstance(weight, list):
+        weight = np.asarray(weight[0]) if len(weight) == 1 else np.concatenate([np.asarray(c) for c in weight], axis=0)
     n_pairs, ny, nx = data.shape
 
     # Build date indices
@@ -2241,7 +2243,7 @@ def _solve_chunk(accum_block, n_feat, is_complex):
             AtWb = accum[n_feat * n_feat:n_feat * n_feat + n_feat]
         n_valid = accum[-1]
 
-        if n_valid < 10:
+        if n_valid < 2 * n_feat:
             result[p] = np.nan
             continue
 
@@ -2258,7 +2260,7 @@ def _solve_chunk(accum_block, n_feat, is_complex):
 
 def _apply_chunk(phase_chunk, coeffs_packed, var_chunks,
                  feature_mean, feature_std, degree, is_complex,
-                 detrend_mode):
+                 detrend_mode, extrapolate=False):
     """Phase 4: Apply polynomial trend to one spatial tile.
 
     Parameters
@@ -2273,6 +2275,8 @@ def _apply_chunk(phase_chunk, coeffs_packed, var_chunks,
     is_complex : bool
     detrend_mode : bool
         If True, return detrended data.
+    extrapolate : bool
+        If False (default) and not detrend_mode, mask trend to input's valid region.
 
     Returns
     -------
@@ -2348,6 +2352,9 @@ def _apply_chunk(phase_chunk, coeffs_packed, var_chunks,
             else:
                 result[p] = phase_chunk[p] - trend
         else:
+            if not extrapolate:
+                nan_mask = np.isnan(phase_chunk[p].real) if is_complex else np.isnan(phase_chunk[p])
+                trend[nan_mask] = np.nan
             result[p] = trend
 
     return result
