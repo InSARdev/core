@@ -4799,14 +4799,14 @@ class BatchCore(dict):
             # fg is the FacetGrid returned by xarray.plot.imshow
             # Get original limits from first axis before any modifications
             if flip:
-                first_ax = fg.axes.flatten()[0]
+                first_ax = fg.axs.flatten()[0]
                 orig_xlim = first_ax.get_xlim()
                 orig_ylim = first_ax.get_ylim()
                 # Ensure we flip to reversed order (max, min)
                 flipped_xlim = (max(orig_xlim), min(orig_xlim))
                 flipped_ylim = (max(orig_ylim), min(orig_ylim))
 
-            for idx, ax in enumerate(fg.axes.flatten()):
+            for idx, ax in enumerate(fg.axs.flatten()):
                 # flip axes if requested (force consistent flipped limits)
                 if flip:
                     ax.set_xlim(flipped_xlim)
