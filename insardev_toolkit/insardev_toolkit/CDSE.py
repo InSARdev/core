@@ -245,17 +245,21 @@ def _cdse_to_geojson_feature(cdse_burst):
     # Extract relative orbit for path number
     rel_orbit = cdse_burst.get('RelativeOrbitNumber', 0)
 
+    # CDSE returns single-letter platform ('A','B','C','D'); ASF uses 'SENTINEL-1A'/'SENTINEL-1C'/...
+    platform_letter = cdse_burst.get('PlatformSerialIdentifier', 'A')
+    platform = f'SENTINEL-1{platform_letter}'
+
     properties = {
         'fileID': file_id,
         'url': f"{_CDSE_CATALOGUE_URL}({cdse_burst['Id']})/$value",
         'additionalUrls': [],  # CDSE returns zip with all files
-        'bytes': cdse_burst.get('ByteOffset', 0),
+        'bytes': 0,  # CDSE OData has no per-burst size; ByteOffset is offset within parent SLC, not size
         'startTime': content_date.get('Start', ''),
         'stopTime': content_date.get('End', ''),
         'flightDirection': cdse_burst.get('OrbitDirection', 'ASCENDING'),
         'pathNumber': rel_orbit,
         'polarization': cdse_burst.get('PolarisationChannels', 'VV'),
-        'platform': cdse_burst.get('PlatformSerialIdentifier', 'S1A'),
+        'platform': platform,
         'processingLevel': 'BURST',
         'beamModeType': cdse_burst.get('OperationalMode', 'IW'),
         'burst': {
@@ -371,7 +375,7 @@ class CDSE(progressbar_joblib):
 
     @staticmethod
     def search(geometry, startTime=None, stopTime=None, flightDirection=None,
-               platform='SENTINEL-1', polarization='VV', beamMode='IW'):
+               platform='SENTINEL-1', polarization=None, beamMode='IW'):
         """Search for Sentinel-1 bursts in CDSE catalog.
 
         Parameters
@@ -431,7 +435,10 @@ class CDSE(progressbar_joblib):
         # Convert to GeoJSON features
         features = [_cdse_to_geojson_feature(r) for r in results]
 
-        return gpd.GeoDataFrame.from_features(features, crs="EPSG:4326")
+        gdf = gpd.GeoDataFrame.from_features(features, crs="EPSG:4326")
+        if 'burst' in gdf.columns:
+            gdf['fullBurstID'] = gdf['burst'].apply(lambda b: b['fullBurstID'])
+        return gdf
 
     @staticmethod
     def search_by_burst_id(burst_ids):
