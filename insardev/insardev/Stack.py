@@ -1240,35 +1240,36 @@ class Stack(Stack_plot, BatchCore):
                 del re_arr
             return data
         else:
-            # Int16 with scale_factor
-            re_full = np.frombuffer(raw, dtype=np.int16).reshape(disk_chunk_shape)
-            re_int16 = re_full[:chunk_shape[0], :chunk_shape[1]]
+            # Integer (int16 or int32) with scale_factor
+            int_dtype = np.dtype(re_dtype)
+            re_full = np.frombuffer(raw, dtype=int_dtype).reshape(disk_chunk_shape)
+            re_int = re_full[:chunk_shape[0], :chunk_shape[1]]
             del re_full
 
             im_path = f"{base_path}/im/c/{iy}/{ix}"
             # Amplitude-only mode: im doesn't exist → load re as amplitude, im=0
             if not fs.exists(im_path):
                 if fill_value is not None:
-                    mask = (re_int16 == fill_value)
+                    mask = (re_int == fill_value)
                 else:
                     mask = None
-                np.multiply(re_int16, scale, out=data.real, casting='unsafe')
+                np.multiply(re_int, scale, out=data.real, casting='unsafe')
                 data.imag[:] = 0
-                del re_int16
+                del re_int
             else:
                 # Complex mode: load both re and im
                 with fs.open(im_path, 'rb') as f:
-                    im_full = np.frombuffer(codec.decode(f.read()), dtype=np.int16).reshape(disk_chunk_shape)
-                im_int16 = im_full[:chunk_shape[0], :chunk_shape[1]]
+                    im_full = np.frombuffer(codec.decode(f.read()), dtype=int_dtype).reshape(disk_chunk_shape)
+                im_int = im_full[:chunk_shape[0], :chunk_shape[1]]
                 del im_full
                 if fill_value is not None:
-                    mask = (re_int16 == fill_value) | (im_int16 == fill_value)
+                    mask = (re_int == fill_value) | (im_int == fill_value)
                 else:
                     mask = None
-                np.multiply(re_int16, scale, out=data.real, casting='unsafe')
-                del re_int16
-                np.multiply(im_int16, scale, out=data.imag, casting='unsafe')
-                del im_int16
+                np.multiply(re_int, scale, out=data.real, casting='unsafe')
+                del re_int
+                np.multiply(im_int, scale, out=data.imag, casting='unsafe')
+                del im_int
 
         if mask is not None and np.any(mask):
             np.putmask(data, mask, np.nan + 0j)
@@ -1318,24 +1319,25 @@ class Stack(Stack_plot, BatchCore):
                 del re_arr
             return data
         else:
-            # Int16 with scale_factor
-            re_int16 = np.frombuffer(raw, dtype=np.int16).reshape(shape)
+            # Integer (int16 or int32) with scale_factor
+            int_dtype = np.dtype(re_dtype)
+            re_int = np.frombuffer(raw, dtype=int_dtype).reshape(shape)
             if fill_value is not None:
-                mask = (re_int16 == fill_value)
+                mask = (re_int == fill_value)
             else:
                 mask = None
-            np.multiply(re_int16, scale, out=data.real, casting='unsafe')
-            del re_int16
+            np.multiply(re_int, scale, out=data.real, casting='unsafe')
+            del re_int
 
             # Amplitude-only mode: no 'im' directory → im=0
             im_path = f"{base_path}/im/c/0/0"
             if fs.exists(im_path):
                 with fs.open(im_path, 'rb') as f:
-                    im_int16 = np.frombuffer(codec.decode(f.read()), dtype=np.int16).reshape(shape)
+                    im_int = np.frombuffer(codec.decode(f.read()), dtype=int_dtype).reshape(shape)
                 if fill_value is not None:
-                    mask |= (im_int16 == fill_value)
-                np.multiply(im_int16, scale, out=data.imag, casting='unsafe')
-                del im_int16
+                    mask |= (im_int == fill_value)
+                np.multiply(im_int, scale, out=data.imag, casting='unsafe')
+                del im_int
             else:
                 data.imag[:] = 0
 
