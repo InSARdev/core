@@ -4478,10 +4478,12 @@ DEFOMAX_CYCLE  {defomax}
 
             elev_vars: dict[str, xr.DataArray] = {}
             for var_name, data in phase_ds.data_vars.items():
-                if 'y' in data.coords and 'x' in data.coords:
-                    fac_da_i = fac_da.interp(y=data.y, x=data.x, method='linear')
-                else:
-                    fac_da_i = fac_da.reindex_like(data, method='nearest')
+                fac_da_i = fac_da.reindex_like(data, method='nearest')
+                # the geometry is bent to the data's chunks, never the other way round
+                if data.chunks is not None and fac_da_i.chunks is not None:
+                    _ch = tuple(data.chunks[-2:][('y', 'x').index(a)] for a in fac_da_i.dims)
+                    if fac_da_i.chunks != _ch:
+                        fac_da_i = fac_da_i.chunk(dict(zip(fac_da_i.dims, _ch)))
 
                 # ONE geometry, from elevation_phase(). This inlined
                 # SC_height * cos(incidence): the satellite height where the
@@ -4544,10 +4546,12 @@ DEFOMAX_CYCLE  {defomax}
 
             for var_name, data in los_ds.data_vars.items():
                 # align incidence to data grid
-                if 'y' in data.coords and 'x' in data.coords:
-                    incidence = inc_da.interp(y=data.y, x=data.x, method='linear')
-                else:
-                    incidence = inc_da.reindex_like(data, method='nearest')
+                incidence = inc_da.reindex_like(data, method='nearest')
+                # the geometry is bent to the data's chunks, never the other way round
+                if data.chunks is not None and incidence.chunks is not None:
+                    _ch = tuple(data.chunks[-2:][('y', 'x').index(a)] for a in incidence.dims)
+                    if incidence.chunks != _ch:
+                        incidence = incidence.chunk(dict(zip(incidence.dims, _ch)))
 
                 comp = (data / func(incidence)).astype('float32')
 

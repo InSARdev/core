@@ -2481,6 +2481,81 @@ class BatchCore(dict):
     def expand_dims(self, *args, **kw):
         return type(self)({k: ds.expand_dims(*args, **kw) for k, ds in self.items()})
 
+    @staticmethod
+    def _assign_value(name, value, key, ds):
+        """Resolve one assign() value for one burst."""
+        if callable(value):
+            value = value(ds)
+        # a Batch (or any mapping keyed by burst id) carries a different value
+        # per burst -- that is what batch arithmetic returns
+        if isinstance(value, Mapping):
+            if key not in value:
+                raise KeyError(f"assign(): value for '{name}' has no entry for burst '{key}'")
+            value = value[key]
+        if isinstance(value, xr.Dataset):
+            # BATCH ARITHMETIC RETURNS DATASETS, NOT DATAARRAYS. Their single
+            # variable is named for the source (a polarization, or the variable
+            # the caller selected), never for the assignment target, so unwrap
+            # it here; assigning the Dataset itself would add its own name
+            # instead of `name`.
+            names = list(value.data_vars)
+            if name in names:
+                value = value[name]
+            elif len(names) == 1:
+                value = value[names[0]]
+            else:
+                raise ValueError(
+                    f"assign(): value for '{name}' has {len(names)} variables {names} "
+                    f"for burst '{key}'; select one, e.g. batch[['{names[0]}']]"
+                )
+        return value
+
+    def assign(self, variables=None, **variables_kwargs):
+        """
+        Add or replace data variables in every burst, returning a new Batch.
+
+        Works like xarray.Dataset.assign, with one addition: a value may be a
+        Batch (or any mapping keyed by burst id), and then each burst takes its
+        own entry from it. Batch arithmetic returns exactly that, so the result
+        of an expression over this Batch can be assigned straight back.
+
+        The original Batch is not modified, and neither are its Datasets.
+
+        Parameters
+        ----------
+        variables : dict-like, optional
+            Mapping of variable name to value. A value may be a Batch or
+            mapping keyed by burst id, an xr.Dataset holding a single variable,
+            an xr.DataArray, a (dims, data) tuple, a scalar, or a callable
+            invoked with each burst's Dataset.
+        **variables_kwargs : optional
+            The same, as keyword arguments. These take precedence over
+            `variables` on a name collision, as in xarray.
+
+        Returns
+        -------
+        BatchCore
+            A new Batch of the same class, with the variables added or
+            replaced. Names already present are overwritten.
+
+        Examples
+        --------
+        >>> model = model.assign(velocity=model[['velocity']] - DATUM_OFFSET)
+        >>> model = model.assign(velocity=velocity_los['velocity'], rmse=rmse)
+        >>> model = model.assign(velocity_mm=lambda ds: -4.4138 * ds.velocity)
+        """
+        if variables is None:
+            variables = {}
+        variables = dict(variables, **variables_kwargs)
+        if not variables:
+            return type(self)(dict(self))
+
+        return type(self)({
+            key: ds.assign({name: self._assign_value(name, value, key, ds)
+                            for name, value in variables.items()})
+            for key, ds in self.items()
+        })
+
     def drop_vars(self, names, errors='raise'):
         """Return a new Batch with those data-vars removed from each dataset."""
         if isinstance(names, str):
@@ -3938,6 +4013,258 @@ class BatchCore(dict):
         if compute:
             progressbar(output := output.persist(), desc=f'Computing Dataset...'.ljust(25))
         return output
+
+    @staticmethod
+    def _gpkg_block(blocks, yv, xv, decimals):
+        """One spatial block reduced to its FINITE pixels, where it lives.
+
+        `blocks` are the block's OWN arrays -- nothing of the scene's graph
+        travels with them -- so what comes back is the sparse points rather
+        than the raster they came from.
+        """
+        import numpy as np
+        cols, keep = {}, None
+        for name, v in blocks.items():
+            v = np.asarray(v)
+            if v.ndim == 2:
+                cols[name] = v
+            else:
+                for i in range(v.shape[0]):
+                    cols[f'{name}#{i}'] = v[i]
+        for v in cols.values():
+            if np.issubdtype(v.dtype, np.floating):
+                m = np.isfinite(v)
+            elif np.issubdtype(v.dtype, np.complexfloating):
+                m = np.isfinite(v.real) & np.isfinite(v.imag)
+            else:
+                continue
+            keep = m if keep is None else (keep | m)
+        if keep is None:
+            keep = np.ones((len(yv), len(xv)), bool)
+        if not keep.any():
+            return None
+        yy, xx = np.nonzero(keep)
+        out = {'y': np.asarray(yv)[yy], 'x': np.asarray(xv)[xx]}
+        for k, v in cols.items():
+            v = v[yy, xx]
+            if np.issubdtype(v.dtype, np.complexfloating):
+                # A GEOPACKAGE HAS NO COMPLEX COLUMN, and `real`/`imag` are
+                # the FIT'S basis, not a quantity: the annual term is
+                # `real*cos(2 pi t) + imag*sin(2 pi t)`, so neither half means
+                # anything alone. AMPLITUDE AND PHASE are what the same
+                # quantity is called everywhere it is read -- amplitude is the
+                # size of the seasonal swing, in whatever unit the variable
+                # carries, and phase is WHEN it peaks. Phase costs one column
+                # and is what makes the pair lossless: amplitude alone cannot
+                # rebuild the model, nor say whether two points peak in the
+                # same season, which is what separates a real seasonal signal
+                # from a fitting artefact. Degrees, as the products this is
+                # compared against report it.
+                # ROUND IN FLOAT64, whatever came in. A float32 rounded to
+                # 6 decimals cannot HOLD 6 decimals -- the nearest float32 to
+                # -12.294427 is -12.29442691802978..., and the GeoPackage
+                # column is an 8-byte REAL, so every reader displays that
+                # full tail as if nothing had been rounded at all.
+                out[f'{k}_amp'] = np.round(np.abs(v).astype(np.float64),
+                                           decimals)
+                out[f'{k}_phase'] = np.round(
+                    np.degrees(np.angle(v)).astype(np.float64),
+                    min(decimals, 3))
+            elif np.issubdtype(v.dtype, np.floating):
+                out[k] = np.round(v.astype(np.float64), decimals)
+            else:
+                out[k] = v
+        return out
+
+    def to_geopackage(self, filename: str, crs: str | int | None = None,
+                      decimals: int = 3, overwrite: bool = True,
+                      debug: bool = False) -> None:
+        """
+        Write the batch to a GeoPackage, ONE LAYER PER BURST named for it.
+
+        Every pixel holding a value becomes a point in its burst's layer,
+        carrying the batch's variables as attributes. Pixels where every
+        variable is NaN are not written -- a fit3d() model is mostly unsolved,
+        and those rows would multiply the file by the coverage it does not
+        have. A third dimension becomes COLUMNS, one per date or pair, which
+        is how a time series is carried in a vector table. A complex variable
+        becomes `<name>_amp` and `<name>_phase` (degrees) -- the form the
+        quantity is read in, and lossless, where `real`/`imag` are the fit's
+        own basis and neither means anything alone.
+
+        MATERIALISED BLOCK BY BLOCK, NOT ALL AT ONCE. `compute()` persists the
+        whole batch into cluster memory, which is right when the result is a
+        raster the caller keeps; here the result is a FILE, and a scene of a
+        few hundred million pixels never has to exist in memory. Each block is
+        reduced to its finite points ON THE WORKER -- the same shape as
+        `snapshot()`'s batched writes -- and only those points travel. Blocks
+        go out `n_workers` at a time, so the cluster stays busy while the peak
+        stays at one batch of sparse tables.
+
+        THE BLOCKS ARE PASSED AS DELAYED BLOCKS, not as the dataset sliced
+        inside the task: handing a dask-backed object to every task copies the
+        whole scene's graph into every one of them, and the task would then
+        have to compute inside a worker.
+
+        THE WRITE IS SERIAL because a GeoPackage is a SQLite file with exactly
+        one writer. Parallelism belongs on the extraction, which is where the
+        work is; appending the tables is IO the cluster cannot help with.
+
+        Parameters
+        ----------
+        filename : str
+            Path to the output GeoPackage. Created if absent. The `.gpkg`
+            extension is added when missing -- GDAL writes the file either
+            way but warns that a nameless extension does not conform, and
+            nothing else opens it by that name.
+        crs : str | int | None, optional
+            Reproject the points to this CRS. Default None keeps the batch's own.
+        decimals : int, optional
+            Round float attributes to this many decimals. Default 3 --
+            millimetre precision for velocities in mm/yr and heights in
+            metres, which is already below what the estimates resolve.
+        overwrite : bool, optional
+            Replace an existing file. Default True. When False the layers are
+            added to whatever is already there.
+        debug : bool, optional
+            Print per-burst counts and timings.
+
+        Returns
+        -------
+        None
+            Nothing, so a notebook cell ending on this call stays silent
+            instead of echoing the filename back.
+
+        Examples
+        --------
+        >>> model.to_geopackage('model.gpkg')
+        >>> model.to_geopackage('model')            # writes model.gpkg
+        >>> model.to_geopackage('model_wgs84.gpkg', crs=4326)
+        """
+        import os
+        import time
+        import numpy as np
+        import pandas as pd
+        import geopandas as gpd
+        import dask
+        import dask.array as da
+        from tqdm.auto import tqdm
+
+        if not self:
+            raise ValueError('to_geopackage(): the batch is empty')
+        if not filename.lower().endswith('.gpkg'):
+            filename = filename + '.gpkg'
+        native_crs = self.crs
+        if native_crs is None:
+            raise ValueError('to_geopackage(): the batch has no CRS. Check the '
+                             'pipeline that produced it.')
+        if overwrite and os.path.exists(filename):
+            os.remove(filename)
+
+        try:
+            from dask.distributed import get_client
+            n_workers = max(len(get_client().nthreads()), 1)
+        except (ValueError, ImportError):
+            n_workers = 1
+
+        written = 0
+        pbar = tqdm(desc='GeoPackage...'.ljust(25), total=len(self))
+        for key, ds in self.items():
+            t0 = time.monotonic()
+            names = [v for v in ds.data_vars
+                     if ds[v].ndim >= 2 and ds[v].dims[-2:] == ('y', 'x')]
+            if not names:
+                pbar.update(1)
+                continue
+            dim = next((d for d in ('date', 'pair')
+                        if d in ds[names[0]].dims), None)
+            labels = []
+            if dim is not None:
+                vals = np.asarray(ds[dim].values)
+                labels = [np.datetime_as_string(v, unit='D').replace('-', '')
+                          if np.issubdtype(vals.dtype, np.datetime64)
+                          else str(v) for v in vals]
+
+            yv = np.asarray(ds['y'].values)
+            xv = np.asarray(ds['x'].values)
+            # THE DATA'S OWN CHUNKING is the block grid: a chunk is a unit the
+            # pipeline already sized for memory. A dimension that is not
+            # chunked is one block.
+            dl, grid = {}, None
+            for name in names:
+                arr = ds[name]
+                d = arr.data
+                if not hasattr(d, 'to_delayed'):
+                    d = da.from_array(np.asarray(d), chunks=d.shape)
+                if dim is not None and dim in arr.dims:
+                    d = d.rechunk({arr.dims.index(dim): -1})
+                dl[name] = d.to_delayed()
+                g = dl[name].shape[-2:]
+                grid = g if grid is None else grid
+                if g != grid:
+                    raise ValueError(
+                        f'to_geopackage(): {key!r} variable {name!r} is chunked '
+                        f'{g} against {grid} for {names[0]!r}; rechunk the batch '
+                        'so its variables share one block grid.')
+            ychunks = ds[names[0]].chunks
+            if ychunks is None:
+                ysz, xsz = [len(yv)], [len(xv)]
+            else:
+                dims = ds[names[0]].dims
+                ysz = list(ychunks[dims.index('y')])
+                xsz = list(ychunks[dims.index('x')])
+            yb = np.r_[0, np.cumsum(ysz)]
+            xb = np.r_[0, np.cumsum(xsz)]
+
+            mode, rows = ('w' if overwrite else 'a'), 0
+            jobs = [(i, j) for i in range(len(ysz)) for j in range(len(xsz))]
+            for k in range(0, len(jobs), n_workers):
+                tasks = []
+                for i, j in jobs[k:k + n_workers]:
+                    blocks = {n: (v[i, j] if v.ndim == 2 else v[0, i, j])
+                              for n, v in dl.items()}
+                    tasks.append(dask.delayed(BatchCore._gpkg_block)(
+                        blocks, yv[yb[i]:yb[i + 1]], xv[xb[j]:xb[j + 1]],
+                        decimals))
+                for out in dask.compute(*tasks):
+                    if out is None:
+                        continue
+                    cols = {}
+                    for c, v in out.items():
+                        if c in ('y', 'x'):
+                            continue
+                        # the trailing #i is the date/pair index, named here
+                        # where the labels are known
+                        if '#' in c and labels:
+                            base, idx = c.rsplit('#', 1)
+                            suf = idx.split('_', 1)
+                            lab = labels[int(suf[0])]
+                            c = (f'{base}_{lab}' if len(names) > 1 else lab)
+                            if len(suf) > 1:
+                                c = f'{c}_{suf[1]}'
+                        cols[c] = v
+                    gdf = gpd.GeoDataFrame(
+                        pd.DataFrame(cols),
+                        geometry=gpd.points_from_xy(out['x'], out['y']),
+                        crs=native_crs)
+                    if crs is not None:
+                        gdf = gdf.to_crs(crs)
+                    # ONE WRITER AT A TIME: append as the blocks arrive, so the
+                    # file grows and the client never holds the whole layer
+                    gdf.to_file(filename, layer=str(key), driver='GPKG',
+                                mode=mode)
+                    mode = 'a'
+                    rows += len(gdf)
+                    del gdf, cols
+            written += rows
+            if debug:
+                print(f'DEBUG: {key}  {rows:,} points from {len(jobs)} block(s)'
+                      f'   {time.monotonic() - t0:.1f}s', flush=True)
+            pbar.update(1)
+        pbar.close()
+        if debug:
+            print(f'DEBUG: {filename}: {len(self)} layer(s), {written:,} points',
+                  flush=True)
 
     def to_geojson(self, filename: str = None, crs: str = None, decimals: int = 3) -> str:
         """
