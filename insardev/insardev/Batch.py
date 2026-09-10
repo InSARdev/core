@@ -907,20 +907,7 @@ def _apply_goldstein_2d_for_dask(phase_block, corr_block, psize=32, threshold=0.
                                    threshold=threshold, device=device)
 
 
-def _apply_velocity_pairs_block(data_block, dt_years, min_valid, device, weight_block=None):
-    """Module-level so dask can serialise it. One weighted regression per pixel.
-
-    Returns (2, chunk_y, chunk_x): [0] velocity per year, [1] RMSE of the fit.
-    """
-    import numpy as np
-    dt_years = np.asarray(dt_years, dtype=np.float32)
-    vel, rmse = Batch._velocity_pairs_torch(data_block, dt_years, min_valid=min_valid,
-                                            weight=weight_block, device=device)
-    return np.stack([vel, rmse], axis=0).astype(np.float32)
-
-
 class Batch(BatchCore):
-    _velocity_note_shown = False
 
     def __init__(self, mapping: dict[str, xr.Dataset] | Stack | None = None):
         from .Stack import Stack
@@ -1194,181 +1181,6 @@ class Batch(BatchCore):
         if bad is not None:
             out = torch.where(bad.unsqueeze(1), torch.full_like(out, float('nan')), out)
         return out
-
-    @staticmethod
-    def _velocity_note():
-        """Say once that this is an estimator. It is not a measurement."""
-        if Batch._velocity_note_shown:
-            return
-        Batch._velocity_note_shown = True
-        print('NOTE: velocity() is a fast ESTIMATOR, not a precise measurement.',
-              flush=True)
-
-    @staticmethod
-    @serialize_gpu
-    def _velocity_pairs_torch(data, dt_years, min_valid=5, weight=None,
-                              device='auto', debug=False):
-        """Velocity from per-PAIR unwrapped displacement, one parameter per pixel.
-
-        A pair value is a DIFFERENCE, d_ij = v * (t_j - t_i), so there is no
-        constant to fit: this is a weighted regression through the origin,
-
-            v = sum(w * d * dt) / sum(w * dt^2)
-
-        which is better conditioned than the per-date [1, t] form and leaves
-        nothing for a seasonal or a DEM term to trade against.
-
-        It is as accurate as the full per-date route without the network
-        inversion, and a coherence weight improves it further. The weight is
-        per-PAIR, exactly like the correlation this pipeline already produces,
-        so it lines up 1:1 with the data.
-        """
-        import torch
-        import numpy as np
-
-        dev = Batch._get_torch_device(device)
-        original_shape = data.shape
-        n_pairs = original_shape[0]
-        data_2d = data.reshape(n_pairs, -1) if len(original_shape) == 3 else data
-
-        y = torch.from_numpy(np.ascontiguousarray(data_2d, dtype=np.float32)).to(dev)
-        dt = torch.from_numpy(np.asarray(dt_years, np.float32)).to(dev).unsqueeze(1)
-
-        nan_mask = torch.isnan(y)
-        valid_count = (~nan_mask).sum(dim=0)
-        if weight is None:
-            w = (~nan_mask).float()
-        else:
-            g = np.asarray(weight, np.float32)
-            if g.ndim == 3:
-                g = g.reshape(g.shape[0], -1)
-            g = torch.from_numpy(np.ascontiguousarray(g)).to(dev)
-            g = torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 0.999)
-            # coherence -> phase precision; the standard 1/sigma^2 weight
-            w = (~nan_mask).float() * (g * g) / (1.0 - g * g + 1e-6)
-        y_filled = torch.where(nan_mask, torch.zeros_like(y), y)
-
-        den = (w * dt * dt).sum(dim=0)
-        num = (w * dt * y_filled).sum(dim=0)
-        # A pixel whose pairs carry no time spread cannot yield a rate.
-        solvable = (valid_count >= max(int(min_valid), 1)) & (den > 0)
-        velocity = torch.where(solvable, num / torch.where(den > 0, den,
-                                                           torch.ones_like(den)),
-                               torch.full_like(den, float('nan')))
-
-        resid = (y_filled - velocity.unsqueeze(0) * dt) * (~nan_mask).float()
-        # one parameter consumed, so divide by n-1, not n. Dividing by n
-        # under-reports the residual, badly so at small sample counts.
-        dof = (valid_count - 1).clamp(min=1).float()
-        rmse = torch.sqrt((resid ** 2).sum(dim=0) / dof)
-        rmse = torch.where(solvable, rmse, torch.full_like(rmse, float('nan')))
-
-        vel_np = velocity.cpu().numpy()
-        rmse_np = rmse.cpu().numpy()
-        if len(original_shape) == 3:
-            vel_np = vel_np.reshape(original_shape[1], original_shape[2])
-            rmse_np = rmse_np.reshape(original_shape[1], original_shape[2])
-        if dev.type == 'mps':
-            torch.mps.empty_cache()
-        elif dev.type == 'cuda':
-            torch.cuda.empty_cache()
-        return vel_np, rmse_np
-
-
-    def velocity(self, weight=None, min_valid=5, device='auto', debug=False) -> "Batches":
-        """
-        FAST velocity estimate from per-PAIR unwrapped displacement.
-
-        This is a preview, deliberately cheap: it runs BEFORE lstsq, so it costs
-        one weighted regression per pixel instead of a network inversion. Once
-        lstsq has run there is nothing left to estimate quickly -- use
-        detrend1d()/fit3d() for an accurate rate on inverted data.
-
-        A pair value is a difference, d_ij = v*(t_j - t_i), so the fit has no
-        intercept: v = sum(w*d*dt)/sum(w*dt^2).
-
-        Parameters
-        ----------
-        weight : BatchUnit or None
-            Per-pair correlation. Improves the rate materially, and it aligns
-            1:1 with the data because both are per-pair.
-        min_valid : int
-            Minimum valid pairs; below it the pixel is NaN.
-
-        Returns
-        -------
-        Batches
-            Batches[velocity, rmse]; velocity per year in the input units,
-            rmse in the input units.
-
-        Examples
-        --------
-        >>> displacement = phase_detrend.displacement_los(stack.transform())
-        >>> velocity, rmse = displacement.velocity(weight=corr)
-        """
-        import dask
-        import dask.array as da
-        import numpy as np
-        import pandas as pd
-        import xarray as xr
-
-        BatchCore._require_lazy(self, 'velocity')
-        vel_results, rmse_results = {}, {}
-        for key in self.keys():
-            ds = self[key]
-            vel_vars, rmse_vars = {}, {}
-            for var in [v for v in ds.data_vars
-                        if 'y' in ds[v].dims and 'x' in ds[v].dims]:
-                da_ = ds[var]
-                if 'pair' not in da_.dims:
-                    raise TypeError(
-                        f"velocity() operates on per-PAIR displacement, but '{var}' "
-                        f"has dims {tuple(da_.dims)}. Call it BEFORE lstsq; an "
-                        "already-inverted per-date series needs detrend1d() instead.")
-                ref = pd.to_datetime(da_.coords['ref'].values)
-                rep = pd.to_datetime(da_.coords['rep'].values)
-                dt_years = np.array([(b - a).total_seconds() / (365.25 * 86400)
-                                     for a, b in zip(ref, rep)], dtype=np.float32)
-
-                Batch._velocity_note()
-
-                mem_per_pixel = len(dt_years) * 4 * 3
-                ay, ax = dask.array.core.normalize_chunks(
-                    'auto', (da_.y.size, da_.x.size),
-                    dtype=np.dtype(f'V{mem_per_pixel}'))
-                cy, cx = ay[0], ax[0]
-                da_ = da_.chunk({'pair': -1, 'y': cy, 'x': cx})
-                d_dask = da_.data
-
-                if weight is None:
-                    def _blk(b, _dt=dt_years):
-                        return _apply_velocity_pairs_block(b, _dt, min_valid, device)
-                    res = da.map_blocks(_blk, d_dask, dtype=np.float32,
-                                        drop_axis=0, new_axis=0,
-                                        chunks=(2,) + d_dask.chunks[1:])
-                else:
-                    w_dask = weight[key][var].chunk(
-                        {'pair': -1, 'y': cy, 'x': cx}).data
-                    def _blk(b, wb, _dt=dt_years):
-                        return _apply_velocity_pairs_block(b, _dt, min_valid,
-                                                           device, weight_block=wb)
-                    res = da.map_blocks(_blk, d_dask, w_dask, dtype=np.float32,
-                                        drop_axis=0, new_axis=0,
-                                        chunks=(2,) + d_dask.chunks[1:])
-
-                coords = {'y': da_.y, 'x': da_.x}
-                vel_vars[var] = xr.DataArray(res[0], dims=['y', 'x'], coords=coords)
-                rmse_vars[var] = xr.DataArray(res[1], dims=['y', 'x'], coords=coords)
-
-            for out, src in ((vel_results, vel_vars), (rmse_results, rmse_vars)):
-                out_ds = xr.Dataset(src)
-                out_ds.attrs = ds.attrs
-                import rioxarray
-                if ds.rio.crs is not None:
-                    out_ds = out_ds.rio.write_crs(ds.rio.crs)
-                out[key] = out_ds
-
-        return Batches((Batch(vel_results), Batch(rmse_results)))
 
     @staticmethod
     def _ref_index(ref, dates):
@@ -3059,19 +2871,6 @@ class BatchWrap(BatchCore):
             "Use BatchComplex for complex phase fitting, or unwrap first for real polynomial fitting."
         )
 
-    def trend1d(self, *args, **kwargs):
-        raise TypeError(
-            "trend1d() does not support wrapped phase (BatchWrap). "
-            "Use BatchComplex for complex phase fitting, or unwrap first for real polynomial fitting."
-        )
-
-
-    def trend1d_pairs(self, *args, **kwargs):
-        raise TypeError(
-            "trend1d_pairs() requires BatchComplex (complex wrapped phase). "
-            "Place fit3d() before unwrapping in the pipeline."
-        )
-
     def __add__(self, other: Batch):
         keys = self.keys()
         return type(self)({k: (self[k] + other[k] if k in other else self[k]) for k in keys})
@@ -4227,7 +4026,8 @@ class BatchComplex(BatchCore):
         half-power width, but a trend separated from zero by a null of a
         NEAR-UNIFORM sampling -- a multi-cycle ramp in `northing` -- is not,
         and comes back as the small stationary point near zero. Fit map
-        ramps with detrend1d/trend components, not here; this estimator is
+        ramps with Batch.trend2d(degree=...) on real phase, not here; this
+        estimator is
         for covariates whose sampling has structure, elevation above all.
 
         THE OBJECTIVE IS BOUNDED, AND THAT PROTECTS THE GROUND PHASE: residuals
@@ -6898,9 +6698,6 @@ class Batches(tuple):
         elements = [result] + list(self[1:])
         return Batches(elements)
 
-    def regression1d_baseline(self, *args, **kwargs):
-        raise NotImplementedError("Batches.regression1d_baseline() is removed. Use Batches.detrend1d() or Batch.trend1d() instead.")
-
     def threshold(self, threshold=np.pi/2):
         """
         Filter pixels by circular standard deviation (cstd) of pair phases.
@@ -6927,31 +6724,6 @@ class Batches(tuple):
         filtered = phase.threshold(weight=weight, threshold=threshold)
         elements = [filtered] + list(self[1:])
         return Batches(elements)
-
-    def velocity(self, **kwargs):
-        """
-        Fast rate estimate from the first element, with the weight from the
-        second when it carries one.
-
-        Returns
-        -------
-        Batches
-            Batches[velocity, rmse].
-        """
-        phase = self[0]
-        weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
-        if isinstance(phase, BatchComplex):
-            # Not a rename away: the per-date complex fit returns a MODEL
-            # (velocity, height, seasonal, coherence, rmse), not the
-            # Batches[velocity, rmse] this method promises, so dispatching here
-            # would change the return type on the basis of the input type.
-            raise TypeError(
-                'velocity() on a complex per-date stack is now fit1d(), which '
-                'returns the full per-pixel model rather than a rate alone. '
-                'Call .fit1d() and read model.velocity, or predict(model) to '
-                'rebuild the phase.')
-        return phase.velocity(**kwargs) if weight is None \
-            else phase.velocity(weight=weight, **kwargs)
 
     def fit1d(self, **kwargs):
         """
@@ -7010,12 +6782,6 @@ class Batches(tuple):
             elements = [rmse_result]
 
         return Batches(elements)
-
-    def regression1d_pairs(self, *args, **kwargs):
-        raise NotImplementedError("Batches.regression1d_pairs() is removed. Use fit3d() instead.")
-
-    def trend1d_pairs(self, *args, **kwargs):
-        raise NotImplementedError("Batches.trend1d_pairs() is removed. Use fit3d() instead.")
 
     def stl(self, freq='W', periods=52, robust=False):
         """
