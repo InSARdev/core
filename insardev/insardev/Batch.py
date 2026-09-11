@@ -3437,7 +3437,7 @@ class BatchComplex(BatchCore):
     def fit1d(self, baseline: str = 'BPR',
               max_dh: float = 200.0, max_dv: float = 25.0,
               step_dh: float = 4.0, step_dv: float = 2.0,
-              max_seasonal: 'float | None' = None,
+              max_seasonal: float = 0.0,
               budget: 'str | None' = None) -> 'Batch':
         """
         Full per-pixel model on the per-date complex stack -- NO network.
@@ -3594,16 +3594,8 @@ class BatchComplex(BatchCore):
         # DELEGATE BY STACK TYPE. The same call fits the same model whether the
         # samples are dates or pairs; only the design columns differ, so the
         # caller writes fit1d() either way and never selects a variant by hand.
-        # THE ANNUAL'S DEFAULT FOLLOWS THE STACK, because the model does. On
-        # dates the kernel's cos(2 pi t) IS the basis, so 5 mm is the useful
-        # default. On pairs the annual is a DIFFERENCE of two epochs, which is
-        # the kernel's basis at the mean epoch rotated 90 degrees and scaled by
-        # 2 sin(pi dt) -- a PER-PAIR scale no single t can carry. So pairs
-        # default to no annual and raise only if one is actually asked for.
         _pairs = any('pair' in ds[v].dims
                      for ds in self.values() for v in ds.data_vars)
-        if max_seasonal is None:
-            max_seasonal = 5.0
         if _pairs:
             # the split is kept so a pair-domain fit has a home when one works
             raise NotImplementedError(
