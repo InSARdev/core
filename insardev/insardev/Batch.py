@@ -3727,8 +3727,7 @@ class BatchComplex(BatchCore):
             stacked = da.blockwise(
                 _fit_block, 'nyx', data_dask, 'dyx',
                 new_axes={'n': 5}, concatenate=True, dtype=np.complex64,
-                meta=np.empty((0, 0, 0), dtype=np.complex64),
-                name='fit1d_arcfit')
+                meta=np.empty((0, 0, 0), dtype=np.complex64))
 
             coords = {kk: vv for kk, vv in data_da.coords.items()
                       if kk in ('y', 'x', 'spatial_ref')}
