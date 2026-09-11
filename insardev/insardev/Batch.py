@@ -5658,6 +5658,105 @@ class BatchComplex(BatchCore):
         """intfs.iexp().conj() for np.exp(-1j * intfs)"""
         return self.map_da(lambda da: xr.ufuncs.conj(da), **kwargs)
 
+    def singlelook(self, baseline: 'str | None' = 'BPR') -> 'BatchComplex':
+        """The stack referenced to ONE epoch: `u_d * conj(u_ref)`, per date.
+
+        The scatterer's own phase is constant in time, so one multiplication by
+        the reference epoch cancels it and what is left in each date is the
+        change since that epoch -- the quantity every later step actually
+        models. Nothing is filtered and nothing is resampled: this is still one
+        look per pixel, which is what the name says.
+
+        It is also the only form in which neighbouring pixels may be averaged.
+        Raw SLC neighbours hold independent speckle phase and their phasors sum
+        toward zero; referenced, they share the same temporal phase change and
+        the sum is a real multilook -- see multilook(), which is this followed
+        by gaussian().
+
+        THE REFERENCE EPOCH IS WHERE THE BASELINE IS SMALLEST, so the height
+        term vanishes there and fit3d()'s origin is the same epoch. The choice
+        is free for anything that differences dates or pixels, since a constant
+        per pixel cancels; matching fit3d only keeps the conventions aligned.
+        `baseline=None` takes the middle epoch. A baseline NAMED AND ABSENT
+        raises rather than quietly picking another epoch.
+
+        Returns
+        -------
+        BatchComplex
+            Same dates, same metadata; the reference epoch becomes real and
+            positive, since a phasor times its own conjugate is its power.
+        """
+        import numpy as np
+
+        ds0 = self[list(self.keys())[0]]
+        if baseline:
+            if baseline not in ds0.variables:
+                raise KeyError(
+                    f'singlelook(): no {baseline!r} to pick the reference epoch from; '
+                    f'the stack carries {sorted(v for v in ds0.variables if v not in ds0.dims)}. '
+                    f'Pass baseline=None to reference the middle epoch instead.')
+            b = np.asarray(ds0[baseline].values, dtype=float).ravel()
+            if b.size != ds0.sizes['date']:
+                raise ValueError(
+                    f'singlelook(): {baseline!r} holds {b.size} values for '
+                    f'{ds0.sizes["date"]} dates')
+            index = int(np.argmin(np.abs(b)))
+        else:
+            index = int(ds0.sizes['date']) // 2
+
+        # dates differ between bursts of one acquisition, so the epoch is taken
+        # by POSITION and every burst is referenced to its own copy of it
+        return self * self.isel(date=index).conj()
+
+    def multilook(self, wavelength: float, baseline: 'str | None' = 'BPR',
+                  weight: 'BatchUnit | None' = None, threshold: float = 0.5,
+                  device: str = 'auto', debug: bool = False) -> 'BatchComplex':
+        """Spatial looks on a per-date complex stack: singlelook() then gaussian().
+
+        Averaging the stack itself is a random walk -- neighbouring SLC pixels
+        hold independent speckle phase, so their phasors sum toward zero and
+        the ground phase does not survive it. singlelook() first, and the
+        neighbours share the SAME temporal phase change, which is the quantity
+        being averaged; the same filter is then a real multilook.
+
+        THIS IS WHAT A DISTRIBUTED SCATTERER NEEDS BEFORE A PER-PIXEL FIT.
+        fit3d() builds every arc from single pixel columns, so a candidate's
+        own phase noise is COMMON to all of its arcs: no number of partners, no
+        `consensus` and no `err_dv` can average it out, because the consensus
+        can only reject the pixel, never improve it. Supply the looks here and
+        the fit is handed a phase it can resolve; leave them out and a
+        vegetated target survives only with its gates opened, which is the same
+        as not filtering at all.
+
+        Parameters
+        ----------
+        wavelength : float
+            Gaussian cutoff in metres, as in interferogram(). It states the
+            ground scale over which the scatterers are taken to be alike, and
+            nothing here guesses it. Where the posting is finer than the radar
+            resolution the neighbours are already correlated, so looks taken up
+            to that scale cost no resolution the data ever held.
+        baseline : str or None
+            Passed to singlelook() to name the reference epoch.
+        weight, threshold, device, debug
+            Passed to gaussian().
+
+        Returns
+        -------
+        BatchComplex
+            The referenced stack, spatially multilooked. Same dates, same
+            metadata, still one value per pixel -- no resampling.
+
+        Examples
+        --------
+        >>> model = stack.multilook(wavelength=60).fit3d(threshold=0)
+        """
+        if not wavelength > 0:
+            raise ValueError(f'multilook() needs a positive wavelength in metres, got {wavelength}')
+        return self.singlelook(baseline).gaussian(
+            weight=weight, wavelength=wavelength, threshold=threshold,
+            device=device, debug=debug)
+
     def pairs(self, pairs):
         """Select date pairs from per-date data, returning ref and rep stacks.
 
