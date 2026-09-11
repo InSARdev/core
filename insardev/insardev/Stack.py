@@ -142,6 +142,24 @@ class Stack(BatchComplex):
 
     _STRUCTURE_4CONN = utils_unwrap2d.STRUCTURE_4CONN
 
+    @staticmethod
+    def _carry_meta(src_ds, out_vars):
+        """The 1-D metadata rides along with the grids it describes.
+
+        Every step of the pipeline carries the radar geometry it does not
+        itself use, because a later one does: `radar_wavelength`, `near_range`,
+        `rng_samp_rate`, `SC_height_*`, `earth_radius`, `num_lines`,
+        `num_rng_bins`. Rebuilding a Dataset from the computed grids alone
+        drops them, and nothing notices until a fit asks -- `fit1d()` raising
+        `KeyError: near_range` several cells after the step that lost it.
+
+        Computed variables win on a name collision; the coordinates are already
+        carried by the DataArrays themselves.
+        """
+        return {**{v: src_ds[v] for v in src_ds.data_vars
+                   if v not in out_vars and src_ds[v].ndim <= 1},
+                **out_vars}
+
     def _reorder_conncomp_by_size(self, conncomp_labels):
         """
         Reorder connected component labels by size (largest=1, smallest=max).
@@ -230,7 +248,8 @@ class Stack(BatchComplex):
                 )
                 reordered_vars[var] = reordered_da
 
-            result[key] = xr.Dataset(reordered_vars, coords=ds.coords, attrs=ds.attrs)
+            result[key] = xr.Dataset(Stack._carry_meta(ds, reordered_vars),
+                                     coords=ds.coords, attrs=ds.attrs)
 
         return BatchUnit(result)
 
@@ -292,7 +311,8 @@ class Stack(BatchComplex):
                 )
                 label_vars[var] = label_da
 
-            result[key] = xr.Dataset(label_vars, coords=phase_ds.coords, attrs=phase_ds.attrs)
+            result[key] = xr.Dataset(Stack._carry_meta(phase_ds, label_vars),
+                                     coords=phase_ds.coords, attrs=phase_ds.attrs)
 
         return BatchUnit(result)
 
@@ -455,7 +475,8 @@ class Stack(BatchComplex):
                 )
                 linked_vars[var] = linked_da
 
-            result[key] = xr.Dataset(linked_vars, coords=ds.coords, attrs=ds.attrs)
+            result[key] = xr.Dataset(Stack._carry_meta(ds, linked_vars),
+                                     coords=ds.coords, attrs=ds.attrs)
 
         return Batch(result)
 
@@ -940,8 +961,10 @@ class Stack(BatchComplex):
                 conncomp_vars[var] = conncomp_da
 
             # Preserve dataset attributes (subswath, pathNumber, etc.)
-            unwrap_result[key] = xr.Dataset(unwrap_vars, attrs=phase_ds.attrs)
-            conncomp_result[key] = xr.Dataset(conncomp_vars, attrs=phase_ds.attrs)
+            unwrap_result[key] = xr.Dataset(Stack._carry_meta(phase_ds, unwrap_vars),
+                                            attrs=phase_ds.attrs)
+            conncomp_result[key] = xr.Dataset(Stack._carry_meta(phase_ds, conncomp_vars),
+                                              attrs=phase_ds.attrs)
             # Preserve CRS from input dataset
             if phase_ds.rio.crs is not None:
                 unwrap_result[key].rio.write_crs(phase_ds.rio.crs, inplace=True)
@@ -1090,7 +1113,7 @@ class Stack(BatchComplex):
                 unwrap_da.attrs['units'] = 'radians'
                 unwrap_vars[var] = unwrap_da
 
-            result[key] = xr.Dataset(unwrap_vars, attrs=ds.attrs)
+            result[key] = xr.Dataset(Stack._carry_meta(ds, unwrap_vars), attrs=ds.attrs)
             if ds.rio.crs is not None:
                 result[key].rio.write_crs(ds.rio.crs, inplace=True)
 
@@ -1559,7 +1582,7 @@ DEFOMAX_CYCLE  {defomax}
 
                 result_vars[var] = unwrap_da
 
-            result_ds = xr.Dataset(result_vars)
+            result_ds = xr.Dataset(Stack._carry_meta(phase_ds, result_vars))
             result_ds.attrs = phase_ds.attrs
             results[key] = result_ds
 

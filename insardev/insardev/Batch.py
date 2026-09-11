@@ -1748,9 +1748,12 @@ class Batch(BatchCore):
             Per-pair correlation, aligned 1:1 with the pairs. Enters as
             gamma^2/(1-gamma^2), the phase-precision weight.
         baseline : str
-            Per-pair perpendicular baseline coordinate, default 'BPR'. Without
-            it the height column is dropped and `height` comes back NaN -- which
-            is only right when the topographic phase is already removed.
+            Per-pair perpendicular baseline coordinate, default 'BPR'. RAISES
+            when it is absent: a height-free fit reports a velocity that has
+            absorbed the topographic phase, and nothing downstream can tell.
+            Pass None to ask for that fit deliberately -- which is only right
+            when the topographic phase is already removed -- and `height` then
+            comes back NaN.
         max_dh, max_seasonal : float
             In metres and in mm of LOS half-amplitude. BOTH ENTER THE FIT, which
             is why they are arguments: `max_dh` sets the shrinkage prior on the
@@ -1871,11 +1874,34 @@ class Batch(BatchCore):
             # elevation_phase() = 4 pi / (lambda R sin(inc))
             bp = None
             for src in (da_.coords, ds):
-                if baseline in src:
+                if baseline and baseline in src:
                     bp = np.asarray(src[baseline].values, dtype=float).ravel()
                     break
+            # A MISSING BASELINE IS AN ERROR, NOT A SMALLER MODEL. Dropping the
+            # height column silently returns a velocity that has absorbed the
+            # topographic phase -- on a stack whose baselines drift with time
+            # that is a rate wrong by tens of mm/yr, reported with the same
+            # coherence as a good one. The usual way it goes missing is not a
+            # pipeline that never had it: it is xarray dropping a non-index
+            # coordinate when two batches disagree on its value, which happens
+            # the moment phases from two bands or two stacks are combined.
+            # Passing baseline=None is the way to ask for a height-free fit.
+            if baseline and bp is None:
+                _have = sorted(set(da_.coords) | set(ds.data_vars))
+                raise KeyError(
+                    f"fit1d() found no {baseline!r} for '{key}' to build the "
+                    f"height column; the dataset carries {_have}. It is dropped "
+                    f"when two operands disagree on it -- re-attach the one you "
+                    f"mean with .assign_coords({baseline}=('pair', values)), or "
+                    f"pass baseline=None for a deliberate height-free fit.")
+            if bp is not None and bp.shape != dt.shape:
+                raise ValueError(
+                    f"fit1d(): {baseline!r} has {bp.shape[0]} value(s) for '{key}' "
+                    f"but the batch has {dt.shape[0]} pair(s). Per-PAIR baselines "
+                    f"are what this fit takes -- pairs() attaches them; a per-DATE "
+                    f"BPR has to be differenced first.")
             e2p = None
-            if bp is not None and bp.shape == dt.shape:
+            if bp is not None:
                 # FROM THIS BATCH. A transform= argument used to select the
                 # source of this scalar; every step of the pair pipeline carries
                 # the metadata it reads, so it never supplied anything missing,
@@ -1884,8 +1910,8 @@ class Batch(BatchCore):
                 _fac = Batch._elevation_phase_approximate(self)[key]
                 e2p = bp / ((4.0 * np.pi / lam) / _fac)
             if e2p is None:
-                print(f"fit1d(): no {baseline!r} for '{key}' -- the height "
-                      "column is dropped and the topographic phase stays in the "
+                print(f"fit1d(): baseline=None for '{key}' -- the height column "
+                      "is dropped and the topographic phase stays in the "
                       "residual.", flush=True)
 
             # THE PAIR CONVENTION, which is this method's own -- pairs are not
@@ -2080,8 +2106,11 @@ class Batch(BatchCore):
         model : Batch
             Output of fit1d() or fit3d(): `velocity`, `height`, `seasonal`.
         baseline : str
-            Per-pair or per-date perpendicular baseline, default 'BPR'. None,
-            or absent, drops the height term.
+            Per-pair or per-date perpendicular baseline, default 'BPR'. None
+            drops the height term -- a prediction of the deformation alone,
+            which is what to ask for when the topographic phase is to stay in
+            the data. ABSENT RAISES, as in fit1d(): removing less than intended
+            is invisible in the result and shows up only in the residual.
 
         ref : None, int, str or datetime
             Which acquisition reads zero in the returned per-date series.
@@ -2175,9 +2204,30 @@ class Batch(BatchCore):
 
             # ele2phase = B_perp / median(R sin(incidence)), from
             # elevation_phase() = 4 pi / (lambda R sin(inc))
-            e2p = None
+            #
+            # ABSENT AND None ARE DIFFERENT ANSWERS, as in fit1d(). None asks
+            # for a prediction without the topographic term; a baseline that
+            # went missing -- xarray drops a non-index coordinate the moment two
+            # operands disagree on its value, which is what combining two bands
+            # or two stacks does -- would quietly remove LESS than the caller
+            # believes, and the term left behind shows up only as a
+            # baseline-correlated pattern in the residual.
             n_obs = da_.sizes['pair' if per_pair else 'date']
-            if bp is not None and bp.shape == (n_obs,):
+            if baseline and bp is None:
+                _have = sorted(set(da_.coords) | set(ds.data_vars))
+                raise KeyError(
+                    f"predict() found no {baseline!r} for '{key}' to rebuild the "
+                    f"height term; the dataset carries {_have}. Re-attach the one "
+                    f"you mean with .assign_coords({baseline}=('pair', values)), "
+                    f"or pass baseline=None to predict without topography.")
+            if bp is not None and bp.shape != (n_obs,):
+                raise ValueError(
+                    f"predict(): {baseline!r} has {bp.shape[0]} value(s) for "
+                    f"'{key}' but the batch has {n_obs} "
+                    f"{'pair' if per_pair else 'date'}(s). The height term needs "
+                    f"one baseline per observation.")
+            e2p = None
+            if bp is not None:
                 _fac = Batch._elevation_phase_approximate(self)[key]
                 e2p = bp / ((4.0 * np.pi / lam) / _fac)
 
