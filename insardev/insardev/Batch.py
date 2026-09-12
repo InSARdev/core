@@ -3256,41 +3256,6 @@ class BatchWrap(BatchCore):
                                        conncomp_linkcount=conncomp_linkcount, union=union,
                                        device=device, debug=debug, **kwargs)
 
-    def unwrap2d_chunk(self, weight: 'BatchUnit | None' = None, overlap=None,
-                       device: str = 'auto', debug: bool = False, **kwargs) -> 'Batch':
-        """
-        Unwrap phase per spatial chunk with overlap using IRLS algorithm.
-
-        Unlike unwrap2d() which requires a single spatial chunk (global unwrapping),
-        this method unwraps each spatial chunk independently with overlap margins.
-        Suitable for large rasters where global unwrapping would exceed memory.
-
-        Parameters
-        ----------
-        weight : BatchUnit or None
-            Optional weight for the unwrapping (typically correlation).
-        overlap : float, int, or tuple, optional
-            Overlap size. Float = fraction of chunk size (0.25 = 25%).
-            Int = pixels. Tuple (y, x) for different overlap per axis. Default 0.25.
-        device : str
-            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
-        debug : bool
-            Print diagnostic information.
-        **kwargs
-            Additional arguments: max_iter, tol, cg_max_iter, cg_tol, epsilon,
-            conncomp_size.
-
-        Returns
-        -------
-        Batch
-            Batch of unwrapped phase.
-        """
-        from .Stack import Stack
-
-        return Stack.unwrap2d_chunk(Stack(), self, weight=weight,
-                                              overlap=overlap, device=device,
-                                              debug=debug, **kwargs)
-
     def unwrap2d_irls(self, weight: 'BatchUnit | None' = None, device: str = 'auto',
                       max_iter: int = 50, tol: float = 1e-2, cg_max_iter: int = 10,
                       cg_tol: float = 1e-3, epsilon: float = 1e-2,
@@ -6692,59 +6657,6 @@ class Batches(tuple):
                               conncomp_gap=conncomp_gap, conncomp_linksize=conncomp_linksize,
                               conncomp_linkcount=conncomp_linkcount, union=union,
                               device=device, debug=debug, **kwargs)
-
-    def unwrap2d_chunk(self, overlap=None, device='auto', debug=False, **kwargs):
-        """
-        Unwrap phase per spatial chunk with overlap using IRLS algorithm.
-
-        Expects Batches with [BatchWrap or BatchComplex (phase), BatchUnit (weight, optional)].
-        If the first element is BatchComplex, .angle() is called automatically.
-
-        Unlike unwrap2d() which requires a single spatial chunk, this method
-        unwraps each spatial chunk independently with overlap margins.
-
-        Parameters
-        ----------
-        overlap : float, int, or tuple, optional
-            Overlap size. Float = fraction of chunk size. Default 0.25.
-        device : str
-            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
-        debug : bool
-            Print diagnostic information.
-        **kwargs
-            Additional arguments: max_iter, tol, cg_max_iter, cg_tol, epsilon,
-            conncomp_size.
-
-        Returns
-        -------
-        Batches
-            Batches with [unwrapped_phase, weight] preserving original types.
-
-        Examples
-        --------
-        >>> phase, corr = stack.pairs(baseline).interferogram(wavelength=30).angle()
-        >>> unwrapped, corr = phase.chunk2d('128MiB').unwrap2d_chunk()
-        """
-        if len(self) < 1:
-            raise ValueError("unwrap2d_chunk() requires Batches with at least 1 element: [phase]")
-
-        phase = self[0]
-        weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
-
-        # Auto-convert complex phase to wrapped phase
-        if isinstance(phase, BatchComplex):
-            phase = phase.angle()
-
-        if not isinstance(phase, BatchWrap):
-            raise TypeError(f"First element must be BatchWrap or BatchComplex, got {type(phase).__name__}")
-
-        unwrapped = phase.unwrap2d_chunk(weight=weight, overlap=overlap,
-                                          device=device, debug=debug, **kwargs)
-
-        elements = [unwrapped] + list(self[1:])
-        return Batches(elements)
-
-
 
     def subtract(self):
         """
