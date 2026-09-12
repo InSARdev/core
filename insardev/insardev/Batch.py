@@ -3484,6 +3484,10 @@ class BatchWrap(BatchCore):
         """
         Phase-aware Gaussian smoothing by filtering sin(θ) and cos(θ) separately,
         then recombining via arctan2.
+
+        Takes what BatchCore.gaussian() takes and in the same order --
+        `gaussian(wavelength, weight=None, threshold=0.5, ...)`, the wavelength
+        in metres, first and required.
         """
         from .Batch import Batch
         import xarray as xr
@@ -6933,9 +6937,9 @@ class Batches(tuple):
         return Batches([filtered_phase, corr] + list(self[2:]))
 
     def interferogram(self,
+                  wavelength: float | None = None,
                   weight: 'BatchUnit | None' = None,
                   phase: 'BatchComplex | None' = None,
-                  wavelength: float | None = None,
                   gaussian_threshold: float = 0.5,
                   device: str = 'auto') -> 'Batches':
         """
@@ -6945,6 +6949,17 @@ class Batches(tuple):
 
         Parameters
         ----------
+        wavelength : float or None
+            Filter wavelength in metres, passed to gaussian(). FIRST, as
+            gaussian() and multilook() take it -- it is the argument that
+            decides what comes back, and it used to sit third behind two
+            optional objects, so `interferogram(400)` bound 400 to the weight.
+
+            None IS A MODE, not a missing value: the interferogram is returned
+            single-look and there is no correlation to report with it, so the
+            result holds ONE element instead of two. Unpacking
+            `phase, corr = ...` then fails, which is the intended signal that
+            a correlation was never computed.
         weight : BatchUnit or None
             Per-burst weights for Gaussian filtering and masking.
         phase : BatchComplex or None
@@ -6961,10 +6976,9 @@ class Batches(tuple):
 
         Examples
         --------
-        >>> ref, rep = stack.pairs(baseline.tolist())
-        >>> phase, corr = ref.interferogram(rep, wavelength=30)
-        >>> # Or chained:
-        >>> phase, corr = stack.pairs(baseline.tolist()).interferogram(wavelength=30)
+        >>> phase, corr = stack.pairs(baseline.tolist()).interferogram(30)
+        >>> # single-look, ONE element back -- no correlation without a filter
+        >>> intf, = stack.pairs(baseline.tolist()).interferogram()
         """
         if len(self) != 2:
             raise ValueError("interferogram() requires Batches with exactly 2 elements: [ref, rep]")
@@ -6973,6 +6987,15 @@ class Batches(tuple):
 
         if not isinstance(ref, BatchComplex) or not isinstance(rep, BatchComplex):
             raise TypeError("Both elements must be BatchComplex")
+
+        # A WEIGHT OR A PHASE WHERE THE WAVELENGTH GOES is the old argument
+        # order; caught here so it says so rather than failing later on a
+        # comparison against a Batch.
+        if wavelength is not None and not isinstance(wavelength, (int, float)):
+            raise TypeError(
+                f'interferogram() takes the wavelength first now, as gaussian() '
+                f'does, and got a {type(wavelength).__name__}. Pass the others '
+                f'by name: interferogram(wavelength, weight=..., phase=...)')
 
         if weight is not None and not isinstance(weight, BatchUnit):
             raise TypeError(

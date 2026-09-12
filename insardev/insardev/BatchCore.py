@@ -4711,8 +4711,8 @@ class BatchCore(dict):
 
     def gaussian(
         self,
+        wavelength: float,
         weight: BatchUnit | None = None,
-        wavelength: float | None = None,
         threshold: float = 0.5,
         device: str = 'auto',
         debug: bool = False
@@ -4722,11 +4722,17 @@ class BatchCore(dict):
 
         Parameters
         ----------
+        wavelength : float
+            The filter, in metres: the sigma follows from it by the 5.3 cutoff
+            formula. FIRST AND REQUIRED, as multilook() takes it -- it is the
+            only argument that decides what this does, and it used to sit
+            second behind an optional weight, so `gaussian(200)` bound 200 to
+            the weight and every caller had to write `wavelength=`. Omitted, it
+            once left sigma None and the kernel returned the input untouched:
+            a filter that silently did nothing, by default.
         weight : BatchUnit or None
             A Batch of 2D DataArrays, one per key, matching this Batch's keys.
             If None, no weighting is applied.
-        wavelength : float or None
-            Gaussian sigma via 5.3 cutoff formula. Must be positive if provided.
         threshold : float
             Drop-off threshold for the kernel.
         device : str, optional
@@ -4746,6 +4752,14 @@ class BatchCore(dict):
         # constant 5.3 defines half-gain at filter_wavelength
         cutoff = 5.3
 
+        # A WEIGHT WHERE THE WAVELENGTH GOES is the old argument order, and it
+        # would otherwise reach the `wavelength <= 0` test and fail there with
+        # something unrelated to what the caller wrote.
+        if isinstance(wavelength, BatchUnit):
+            raise TypeError(
+                'gaussian() takes the wavelength first now, as multilook() does. '
+                'Pass the weight by name: gaussian(wavelength, weight=...)')
+
         # validate weight if provided
         if weight is not None:
             if not isinstance(weight, BatchUnit) or set(weight.keys()) != set(self.keys()):
@@ -4757,17 +4771,17 @@ class BatchCore(dict):
         # precompute pixel sizes for decimation
         dy, dx = self.spacing
 
-        # validate wavelength if provided
-        if wavelength is not None:
-            if wavelength <= 0:
-                raise ValueError('wavelength must be positive')
-            sig_y = wavelength / (dy * cutoff)
-            sig_x = wavelength / (dx * cutoff)
-            if debug:
-                print(f'DEBUG: multilooking sigmas ({sig_y:.2f}, {sig_x:.2f}), wavelength {wavelength:.1f}')
-            sigmas = (sig_y, sig_x)
-        else:
-            sigmas = None
+        # REQUIRED, NOT OPTIONAL. It used to accept None and pass sigma=None to
+        # the kernel, whose first line is `if sigma is None: return data_np` --
+        # so the filter returned its input untouched and said nothing.
+        if wavelength is None or wavelength <= 0:
+            raise ValueError(
+                f'gaussian() needs a positive wavelength in metres, got {wavelength!r}')
+        sig_y = wavelength / (dy * cutoff)
+        sig_x = wavelength / (dx * cutoff)
+        if debug:
+            print(f'DEBUG: multilooking sigmas ({sig_y:.2f}, {sig_x:.2f}), wavelength {wavelength:.1f}')
+        sigmas = (sig_y, sig_x)
 
         import dask.array as da
 
