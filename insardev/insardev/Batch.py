@@ -878,6 +878,37 @@ def _fit3d_model(ds, da_xr, both, date_values, bp):
     return mds
 
 
+def _horn_gradient_2d_for_dask(block, dy=1.0, dx=1.0):
+    """Horn (1981) 3 x 3 terrain gradient of a DEM block, for map_overlap.
+
+    Module level so dask ships it by name. The block arrives WITH its halo and
+    leaves the same shape, so dask trims the depth back off.
+
+    The two derivatives are packed into ONE complex array -- gx + 1j*gy, per
+    metre of easting and northing -- because they come from the same nine
+    reads. Slope and aspect are then elementwise on the result and cost no
+    second pass over the raster.
+
+    `dy`/`dx` are SIGNED coordinate steps per index, so northing running either
+    way down the array gives the same gradient.
+    """
+    import numpy as np
+    z = np.asarray(block, dtype=np.float64)
+    flat = z.ndim == 3
+    if flat:
+        z = z[0]
+    out = np.full(z.shape, np.nan, dtype=np.complex64)
+    if z.shape[0] >= 3 and z.shape[1] >= 3:
+        a, b, c = z[:-2, :-2], z[:-2, 1:-1], z[:-2, 2:]
+        d, f = z[1:-1, :-2], z[1:-1, 2:]
+        g, h, i = z[2:, :-2], z[2:, 1:-1], z[2:, 2:]
+        # each side sums to four weights over a two-step span, hence the 8
+        gx = ((c + 2 * f + i) - (a + 2 * d + g)) / (8.0 * dx)
+        gy = ((g + 2 * h + i) - (a + 2 * b + c)) / (8.0 * dy)
+        out[1:-1, 1:-1] = (gx + 1j * gy).astype(np.complex64)
+    return out[None] if flat else out
+
+
 def _apply_goldstein_2d_for_dask(phase_block, corr_block, psize=32, threshold=0.5, device='cpu'):
     """Module-level function for Goldstein filter map_overlap operation.
 
@@ -2556,6 +2587,100 @@ class Batch(BatchCore):
             incidence = xr.ufuncs.arcsin(sin_inc).astype('float32')
 
             result_ds = xr.Dataset({"incidence": incidence})
+            result_ds.attrs = tfm.attrs
+            # Preserve CRS
+            if crs is not None:
+                result_ds = result_ds.rio.write_crs(crs)
+            out[key] = result_ds
+        return Batch(out)
+
+    def aspect(self) -> "Batch":
+        """Terrain slope and aspect from `ele`, by the Horn (1981) 3 x 3 kernel.
+
+        Both attributes come out of the same pass, so both are returned, in
+        DEGREES:
+
+          slope  -- steepness from horizontal, zero on level ground;
+          aspect -- the DOWNSLOPE direction clockwise from north, so a face
+                    falling east reads 90. NaN where the ground is level and
+                    there is no direction to report, rather than the 0 that
+                    would read as due north.
+
+        HORN, NOT A CENTRAL DIFFERENCE. The kernel weights the diagonals as
+        well as the cardinal neighbours, which is steadier wherever the DEM is
+        posted finer than its own resolution -- `ele` is resampled onto the
+        radar grid, so it always is. A central difference sees only the four
+        cardinal cells and passes the resampling's own structure straight
+        through.
+
+        The spacing comes from the y/x coordinates and each axis divides by
+        its OWN, signed, so an anisotropic posting is exact rather than
+        approximated by a mean, and northing running either way down the array
+        gives the same answer.
+
+        The kernel has no answer for the border row and column: those are NaN,
+        not a one-sided estimate, which is a different quantity wearing the
+        same name.
+
+        `incidence()` returns radians; these return degrees, which is what
+        every DEM tool reports (gdaldem, xarray-spatial, xDEM, GRASS) and what
+        a reader of a slope map expects.
+        """
+        import numpy as np
+        import xarray as xr
+        import dask.array as da
+        import rioxarray  # for .rio accessor
+
+        crs = self.crs
+
+        out: dict[str, xr.Dataset] = {}
+        for key, tfm in self.items():
+            if 'ele' not in tfm.variables:
+                raise KeyError(
+                    f'aspect(): {key!r} carries no {"ele"!r} to differentiate. '
+                    'Call it on transform(), which delivers the DEM.')
+            z = tfm['ele']
+            if z.dims[-2:] != ('y', 'x'):
+                raise ValueError(
+                    f'aspect(): {key!r} has ele on {z.dims}, not a (y, x) '
+                    'raster; there is no map grid to take a gradient on.')
+            yv = np.asarray(z.y.values, dtype=np.float64)
+            xv = np.asarray(z.x.values, dtype=np.float64)
+            if yv.size < 3 or xv.size < 3:
+                raise ValueError(
+                    f'aspect(): the 3 x 3 kernel needs three posts on each '
+                    f'axis; {key!r} has y={yv.size}, x={xv.size}.')
+            # SIGNED, because the derivative is with respect to the COORDINATE
+            # and not the index
+            dy = float(yv[1] - yv[0])
+            dx = float(xv[1] - xv[0])
+
+            # ONE OVERLAPPED PASS. The kernel reaches one pixel each way, so
+            # that is the halo; NaN at the raster's own border comes from the
+            # NaN the boundary pads with, and needs no special case. Float
+            # first, since an integer DEM cannot carry that pad.
+            dsk = z.data
+            if not isinstance(dsk, da.Array):
+                dsk = da.from_array(dsk, chunks=dsk.shape)
+            dsk = dsk.astype('float32')
+            depth = ({0: 0, 1: 1, 2: 1} if z.ndim == 3 else {0: 1, 1: 1})
+            grad = da.map_overlap(
+                _horn_gradient_2d_for_dask, dsk,
+                depth=depth, boundary=np.nan, trim=True, dtype=np.complex64,
+                dy=dy, dx=dx)
+
+            mag = da.abs(grad)
+            slope = da.rad2deg(da.arctan(mag)).astype('float32')
+            # THE GRADIENT IS NEGATED because aspect names where the surface
+            # FALLS, not where it rises; atan2(east, north) is then already
+            # clockwise from north, which is the compass convention reported
+            # everywhere else
+            aspect = (da.rad2deg(da.arctan2(-grad.real, -grad.imag)) % 360.0)
+            aspect = da.where(mag > 0, aspect, np.nan).astype('float32')
+
+            result_ds = xr.Dataset({
+                'slope': xr.DataArray(slope, dims=z.dims, coords=z.coords),
+                'aspect': xr.DataArray(aspect, dims=z.dims, coords=z.coords)})
             result_ds.attrs = tfm.attrs
             # Preserve CRS
             if crs is not None:
