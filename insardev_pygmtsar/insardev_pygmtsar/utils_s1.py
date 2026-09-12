@@ -16,6 +16,27 @@ import pandas as pd
 from datetime import datetime, timedelta
 
 
+# Days before the 1st of each month in a common year, for the 0-based julian day
+# GMTSAR wants. Leap years add one from March on.
+_DOY_CUM = (0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334)
+
+
+def _ydf_to_iso(ydf: float) -> str:
+    """`year.day_fraction` (GMTSAR's SC_clock format) as an ISO-8601 timestamp.
+
+    Only used to bracket a text search, so the seconds are truncated rather than
+    rounded -- widening the window by under a second either way is harmless when
+    an exact numeric test follows.
+    """
+    from datetime import datetime, timedelta
+    year = int(ydf // 1000)
+    rest = ydf - year * 1000
+    jd = int(rest)
+    sec = (rest - jd) * 86400.0
+    dt = datetime(year, 1, 1) + timedelta(days=jd, seconds=sec)
+    return dt.strftime('%Y-%m-%dT%H:%M:%S.%f')
+
+
 def satellite_orbit(xml_path: str, t1: float, t2: float) -> pd.DataFrame:
     """
     Extract orbit state vectors from Sentinel-1 EOF XML file.
@@ -57,24 +78,61 @@ def satellite_orbit(xml_path: str, t1: float, t2: float) -> pd.DataFrame:
     """
     import xml.etree.ElementTree as ET
 
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
+    # ONLY THE WINDOW IS PARSED. A precise-orbit file covers 26 hours at 10 s --
+    # 9,361 state vectors -- and a burst asks for about 47 minutes of it, so
+    # building the whole DOM and converting every timestamp throws away 97% of
+    # the work, once per burst. ISO-8601 timestamps sort lexicographically in
+    # chronological order, so the blocks can be selected as TEXT first and only
+    # the survivors handed to the XML parser. The string window is widened by a
+    # margin and the exact numeric test below still decides, so the result is
+    # what parsing the whole file would have given.
+    _margin = 60.0 / 86400.0
+    root = None
+    try:
+        with open(xml_path, 'r', encoding='utf-8', errors='replace') as f:
+            _text = f.read()
+        _blocks = _text.split('<OSV>')
+        if len(_blocks) > 1:
+            _lo = _ydf_to_iso(t1 - _margin)
+            _hi = _ydf_to_iso(t2 + _margin)
+            _kept = []
+            for _b in _blocks[1:]:
+                _i = _b.find('<UTC>UTC=')
+                _j = _b.find('</OSV>')
+                if _i < 0 or _j < 0:
+                    _kept = None
+                    break
+                _ts = _b[_i + 9:_i + 35]
+                if _lo <= _ts <= _hi:
+                    _kept.append('<OSV>' + _b[:_j + 6])
+            if _kept:
+                root = ET.fromstring('<List_of_OSVs>' + ''.join(_kept) + '</List_of_OSVs>')
+    except (OSError, UnicodeError, ET.ParseError):
+        root = None
+    if root is None:
+        # anything unexpected about the file -- read it whole, as before
+        root = ET.parse(xml_path).getroot()
 
     # Find all OSV (Orbit State Vector) elements
     osvs = root.findall('.//OSV')
 
     records = []
     for osv in osvs:
-        # Parse UTC timestamp: "UTC=2015-01-20T22:59:44.000000"
+        # Parse UTC timestamp: "UTC=2015-01-20T22:59:44.000000". Fixed width, so
+        # it is sliced rather than passed to strptime, which dominated this
+        # function: one call per state vector, almost all of them discarded.
         utc_str = osv.find('UTC').text
-        utc_str = utc_str.replace('UTC=', '')
-        dt = datetime.strptime(utc_str, '%Y-%m-%dT%H:%M:%S.%f')
-
-        # Convert to year, julian day, seconds
-        # Note: GMTSAR uses 0-based julian day (Jan 1 = day 0)
-        year = dt.year
-        jd = dt.timetuple().tm_yday - 1  # Convert to 0-based
-        sec = dt.hour * 3600 + dt.minute * 60 + dt.second + dt.microsecond / 1e6
+        if utc_str.startswith('UTC='):
+            utc_str = utc_str[4:]
+        year = int(utc_str[0:4])
+        month = int(utc_str[5:7])
+        day = int(utc_str[8:10])
+        # GMTSAR uses 0-based julian day (Jan 1 = day 0)
+        jd = _DOY_CUM[month - 1] + day - 1
+        if month > 2 and ((year % 4 == 0 and year % 100 != 0) or year % 400 == 0):
+            jd += 1
+        sec = (int(utc_str[11:13]) * 3600 + int(utc_str[14:16]) * 60
+               + int(utc_str[17:19]) + float(utc_str[19:]))
 
         # Compute year.day_fraction for filtering (GMTSAR format)
         ydf = year * 1000 + jd + sec / 86400.0
@@ -218,21 +276,15 @@ def doppler_centroid(orbit_df: pd.DataFrame,
     def calc_height_velocity(t_center, t_start, t_end):
         """Calculate height and velocity at given times."""
         # Interpolate orbit at center time
-        xs = _hermite_interp(orbit_time, px, vx, np.array([t_center]))[0]
-        ys = _hermite_interp(orbit_time, py, vy, np.array([t_center]))[0]
-        zs = _hermite_interp(orbit_time, pz, vz, np.array([t_center]))[0]
-
-        # Get positions 2 seconds apart for velocity
-        t_minus = t_center - 2.0
-        t_plus = t_center + 2.0
-
-        x1 = _hermite_interp(orbit_time, px, vx, np.array([t_minus]))[0]
-        y1 = _hermite_interp(orbit_time, py, vy, np.array([t_minus]))[0]
-        z1 = _hermite_interp(orbit_time, pz, vz, np.array([t_minus]))[0]
-
-        x2 = _hermite_interp(orbit_time, px, vx, np.array([t_plus]))[0]
-        y2 = _hermite_interp(orbit_time, py, vy, np.array([t_plus]))[0]
-        z2 = _hermite_interp(orbit_time, pz, vz, np.array([t_plus]))[0]
+        # centre, and 2 s either side for the velocity difference -- three
+        # epochs per axis, so three calls rather than nine
+        _t3 = np.array([t_center - 2.0, t_center, t_center + 2.0])
+        _x = _hermite_interp(orbit_time, px, vx, _t3)
+        _y = _hermite_interp(orbit_time, py, vy, _t3)
+        _z = _hermite_interp(orbit_time, pz, vz, _t3)
+        x1, xs, x2 = _x[0], _x[1], _x[2]
+        y1, ys, y2 = _y[0], _y[1], _y[2]
+        z1, zs, z2 = _z[0], _z[1], _z[2]
 
         # Satellite distance from earth center
         rs = np.sqrt(xs**2 + ys**2 + zs**2)
@@ -277,14 +329,15 @@ def doppler_centroid(orbit_df: pd.DataFrame,
         nt = 100
         dt_sample = 200.0 / prf
         times = np.linspace(-dt_sample * nt / 2, dt_sample * nt / 2, nt)
-        ranges = np.zeros(nt)
-
-        for k, time_offset in enumerate(times):
-            t_k = t_center + time_offset
-            xk = _hermite_interp(orbit_time, px, vx, np.array([t_k]))[0]
-            yk = _hermite_interp(orbit_time, py, vy, np.array([t_k]))[0]
-            zk = _hermite_interp(orbit_time, pz, vz, np.array([t_k]))[0]
-            ranges[k] = np.sqrt((xe - xk)**2 + (ye - yk)**2 + (ze - zk)**2) - ro
+        # _hermite_interp is vectorised over its query points and each point is
+        # independent of the others, so the whole sample set goes in ONE call per
+        # axis. Asking for one point at a time cost 300 calls here, three times
+        # per burst, and was the largest remaining item in S1().
+        t_k = t_center + times
+        xk = _hermite_interp(orbit_time, px, vx, t_k)
+        yk = _hermite_interp(orbit_time, py, vy, t_k)
+        zk = _hermite_interp(orbit_time, pz, vz, t_k)
+        ranges = np.sqrt((xe - xk)**2 + (ye - yk)**2 + (ze - zk)**2) - ro
 
         # Fit second-order polynomial
         coeffs = np.polyfit(times, ranges, 2)
