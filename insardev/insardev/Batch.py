@@ -4561,8 +4561,8 @@ class BatchComplex(BatchCore):
             res[key] = ds.assign(upd)
         return type(self)(res)
 
-    def fit3d(self, threshold: float = 0.5, window: tuple = (32, 128),
-                cell: tuple = (2, 8),
+    def fit3d(self, threshold: float = 0.5, window: tuple = (400, 4000),
+                cell: 'float | tuple' = 24,
                 baseline: str = 'BPR',
                 level: int = 1,
                 max_dh: float = 25.0, max_dv: float = 25.0,
@@ -4657,17 +4657,27 @@ class BatchComplex(BatchCore):
         ----------
         threshold : float
             Arc coherence for an arc to count and to be kept in the network.
-        window : tuple of int
-            `(wy, wx)` is the DS window in pixels, centred on each pixel: the
-            neighbourhood the short arc test measures over. `(wy, wx, py, px)`
-            sets the PS extent apart from it, otherwise the extent is derived
-            from the window.
+        window : tuple of float
+            GROUND SIZES IN METRES, divided by the burst's posting once, here,
+            so the same call describes the same neighbourhood on any grid.
+
+            `(ds, ps)` is the DS window and the PS extent, both as squares on
+            the ground: (400, 4000) is a 400 m box inside a 4000 m search.
+            `(dsy, dsx, psy, psx)` states the two axes separately when the
+            ground itself is anisotropic. Everything inside the fit works in
+            pixels; nothing else takes a pixel count.
 
             The PS extent is the reach of everything that tests against a NODE
             -- the long arcs that prove a PS, the network arcs that carry the
             datum, and the DS attachment. It is therefore the caller's cost
             dial as well: widening it grows the candidate partners per pixel
             and the arc fits with them.
+        cell : float or tuple of float
+            The independence cell in METRES: two pixels closer than this in
+            both axes are one sample of the ground measured twice, so arcs
+            between them measure the sensor rather than the terrain. A single
+            number is the same distance on both axes, which is what a
+            resolution cell usually is.
         baseline : str
             Variable holding the perpendicular baseline per date.
         iterations : int
@@ -4939,9 +4949,9 @@ class BatchComplex(BatchCore):
         # pair branch (not implemented), dates take the PS network below.
         if any('pair' in ds[v].dims
                for ds in self.values() for v in ds.data_vars):
-            # `window` is the PS network's (32, 128) tuple on the date path; on the
-            # pair path it is the side of the box the covariance is estimated over, so
-            # a scalar. A tuple is reduced to its smallest side rather than refused.
+            # `window` is the PS network's (DS, PS extent) pair in metres on
+            # the date path; on the pair path it is the side of the box the
+            # covariance is estimated over, so a scalar.
             # the split is kept so a pair-domain fit has a home when one works
             raise NotImplementedError(
                 'fit3d() does not support complex PAIRS. Use the per-DATE stack, '
@@ -5010,8 +5020,6 @@ class BatchComplex(BatchCore):
         # the stack, and a second knob saying the same thing could only
         # contradict it.
         budget_mb = get_dask_chunk_size_mb()
-        wy, wx, pey, pex = utils_arcs._3d_windows(window)
-        utils_arcs._3d_check_window_cell(wy, wx, cell, 'fit3d')
 
         # THE CLUSTER STATES THE SHAPE, as the per-burst path reads it
         _slots = 1
@@ -5073,6 +5081,17 @@ class BatchComplex(BatchCore):
         dy = float(yv0[1] - yv0[0]) if yv0.size > 1 else 1.0
         dx = float(xv0[1] - xv0[0]) if xv0.size > 1 else 1.0
         spacing = (abs(dy), abs(dx))
+        # METRES IN, PIXELS INSIDE. `window` and `cell` are ground distances,
+        # so the same call means the same neighbourhood on any posting. They
+        # are divided by the scene's spacing ONCE, here, and everything below
+        # -- halos, lattices, the dask tasks -- sees pixels only. The pixel
+        # validators run after the division, on the counts they were written
+        # for.
+        wy, wx, pey, pex = utils_xarray.window_meters_to_pixels(window, spacing)
+        cell = utils_xarray.meters_to_pixels(cell, spacing, minimum=1,
+                                             name='cell')
+        wy, wx, pey, pex = utils_arcs._3d_windows((wy, wx, pey, pex))
+        utils_arcs._3d_check_window_cell(wy, wx, cell, 'fit3d')
         _y0s = [float(np.asarray(d['y'].values, dtype=float)[0]) for d in _dss]
         _x0s = [float(np.asarray(d['x'].values, dtype=float)[0]) for d in _dss]
         y_org = max(_y0s) if dy < 0 else min(_y0s)
@@ -5099,7 +5118,7 @@ class BatchComplex(BatchCore):
         bp = _kw_net['bperp']
         return dict(pol=pol, keys=_keys, dss=_dss, kw_of=_kw_of, kw_net=_kw_net,
                     cores=_cores, threads=_threads, width=_width,
-                    chain=chain, tag=str(tag),
+                    chain=chain, tag=str(tag), cell=tuple(cell),
                     window=(wy, wx, pey, pex), origin=(y_org, x_org),
                     step=(dy, dx), date_values=date_values, bperp=bp,
                     budget=budget_mb)
@@ -5136,6 +5155,9 @@ class BatchComplex(BatchCore):
         _kw_of, _kw_net = _su['kw_of'], _su['kw_net']
         _cores, _threads, _width = _su['cores'], _su['threads'], _su['width']
         chain = _su['chain']
+        # the PIXEL cell, converted from metres in _fit3d_setup: the block
+        # lattice below is scene-pixel arithmetic
+        cell = _su['cell']
         wy, wx, _pey, _pex = _su['window']
         y_org, x_org = _su['origin']
         dy, dx = _su['step']
@@ -5847,6 +5869,13 @@ class BatchComplex(BatchCore):
             psize_y, psize_x = psize['y'], psize['x']
         else:
             psize_y, psize_x = int(psize), int(psize)
+        # the kernels mirror a half-size quadrant into the patch weight, so
+        # the patch has to be even; see goldstein() above
+        psize_y, psize_x = 2 * (int(psize_y) // 2), 2 * (int(psize_x) // 2)
+        if psize_y < 2 or psize_x < 2:
+            raise ValueError(f'goldstein needs a patch of at least 2 pixels '
+                             f'per axis after rounding down to even, got '
+                             f'({psize_y}, {psize_x})')
 
         # Ensure correct dtypes (goldstein functions require complex64/float32)
         if phase_np.dtype != np.complex64:
@@ -5871,7 +5900,7 @@ class BatchComplex(BatchCore):
             result = result[np.newaxis, ...]
         return result
 
-    def goldstein(self, corr: BatchUnit, window: int | dict[str, int] = 32, threshold: float = 0.5,
+    def goldstein(self, corr: BatchUnit, window: 'float | tuple | dict' = 200, threshold: float = 0.5,
                   device: str = 'auto', debug: bool = False):
         """
         Apply Goldstein adaptive filter to each dataset in the batch.
@@ -5880,9 +5909,14 @@ class BatchComplex(BatchCore):
         ----------
         corr : BatchUnit
             Batch of correlation values to use for filtering.
-        window : int or dict[str, int], optional
-            Patch size for the filter. If int, same size used for both dimensions.
-            If dict, specify {'y': size_y, 'x': size_x}. Default is 32.
+        window : float or tuple or dict, optional
+            Patch size in METRES on the ground, divided by each burst's
+            posting here. A single number is a square patch; a pair or a
+            {'y': ..., 'x': ...} dict states the axes apart. Default 200.
+
+            The pixel count it becomes is rounded DOWN to even per axis: the
+            filter weight is a mirrored quadrant, so odd patches have no
+            weight.
         threshold : float, optional
             Minimum fraction of valid (non-NaN) pixels required to process a patch.
             Default 0.5 means at least 50% of pixels must be valid.
@@ -5916,10 +5950,12 @@ class BatchComplex(BatchCore):
         # Validate lazy data
         BatchCore._require_lazy(self, 'goldstein')
 
-        if isinstance(window, int):
-            window = {'y': window, 'x': window}
-        elif isinstance(window, (tuple, list)):
-            window = {'y': window[0], 'x': window[1]}
+        # METRES IN, PIXELS PER BURST. The patch is a ground size, so each
+        # burst divides it by its own posting inside the loop below.
+        if isinstance(window, dict):
+            window_m = (window['y'], window['x'])
+        else:
+            window_m = window
 
         # Resolve device ONCE here, not in every task
         if device == 'auto':
@@ -5932,6 +5968,21 @@ class BatchComplex(BatchCore):
             ds = self[k]
             corr_ds = corr[k]
             filtered_vars = {}
+            _wy, _wx = utils_xarray.meters_to_pixels(
+                window_m, utils_xarray.spacing_of(ds), minimum=2,
+                name='goldstein() window')
+            # EVEN PATCHES, BECAUSE THE WEIGHT IS BUILT BY MIRRORING A
+            # QUADRANT. The triangular weight is a (psize//2, psize//2)
+            # quadrant reflected twice, so its side is 2*(psize//2) -- equal
+            # to the patch only when the patch is even. An odd patch used to
+            # fail deep inside the filter with a numpy broadcast error about
+            # shapes one sample apart. Rounded DOWN, so the patch never grows
+            # past what the caller asked for.
+            window = {'y': 2 * (_wy // 2), 'x': 2 * (_wx // 2)}
+            if window['y'] < 2 or window['x'] < 2:
+                raise ValueError(
+                    f'goldstein() window {window_m} m is under two pixels per '
+                    f'axis on burst {k} after rounding down to even')
 
             # Process each complex data variable in the dataset
             for var_name, var_data in ds.data_vars.items():
@@ -6400,15 +6451,16 @@ class Batches(tuple):
                 results.append(b)
         return Batches(results)
 
-    def goldstein(self, window: int | list[int, int] = 32, threshold: float = 0.5, device: str = 'auto'):
+    def goldstein(self, window: 'float | tuple' = 200, threshold: float = 0.5, device: str = 'auto'):
         """Apply Goldstein filter to phase using correlation as weight.
 
         Expects Batches with [BatchComplex (phase), BatchUnit (correlation)].
 
         Parameters
         ----------
-        window : int or list[int, int]
-            Goldstein filter patch size, default 32.
+        window : float or tuple
+            Goldstein filter patch size in METRES on the ground, default 200.
+            Converted per burst and rounded down to an even pixel count.
         threshold : float
             Minimum fraction of valid (non-NaN) pixels required to process a patch.
             Default 0.5 means at least 50% of pixels must be valid.

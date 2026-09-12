@@ -1474,7 +1474,7 @@ class BatchCore(dict):
     # Backward compatibility alias
     def neighbors(
         self,
-        window: tuple = (5, 5),
+        window: 'float | tuple' = 40,
         neighbors: tuple | None = None,
         device: str = 'auto'
     ) -> 'Batch':
@@ -1486,8 +1486,10 @@ class BatchCore(dict):
 
         Parameters
         ----------
-        window : tuple of int
-            Window size (y, x). Must be odd numbers.
+        window : float or tuple of float
+            Window size in METRES on the ground, one number for a square
+            or (y, x). Rounded up to an odd number of pixels per axis, since
+            the count is centred on a pixel.
         neighbors : tuple of int or None
             If provided, filter output: (min, max)
             - Pixels with count < min: set to NaN
@@ -1506,52 +1508,54 @@ class BatchCore(dict):
         >>> # Count neighbors on similarity result
         >>> sim = S_opt.similarity(window=(5, 5), neighbors=(5, 5))
         >>> sparse_sim = sim.where(sim < 0.5)
-        >>> nbrs = sparse_sim.neighbors(window=(15, 15))
+        >>> nbrs = sparse_sim.neighbors(window=120)
         >>> dense_mask = nbrs >= 10
         """
         import torch
         import dask.array as da
 
-        window_y, window_x = window
-
-        # Validate window sizes are odd
-        if window_y % 2 == 0 or window_x % 2 == 0:
-            raise ValueError(f"Window sizes must be odd, got ({window_y}, {window_x})")
-
-        # Validate neighbors if provided
-        if neighbors is not None:
-            neighbors_min, neighbors_max = neighbors
-            max_possible = window_y * window_x - 1
-            if neighbors_max > max_possible:
-                raise ValueError(
-                    f"neighbors max={neighbors_max} exceeds maximum for window ({window_y}, {window_x}): {max_possible}"
-                )
-            if neighbors_min > neighbors_max:
-                raise ValueError(
-                    f"neighbors min={neighbors_min} cannot exceed max={neighbors_max}"
-                )
+        # METRES IN, PIXELS PER BURST: the window is a ground size, and the
+        # count it becomes is rounded UP to odd, because the kernel is centred
+        # on a pixel and a metre request cannot choose parity.
+        from . import utils_xarray
+        import functools
 
         # Resolve device once and convert to string for clean serialization
         resolved = BatchCore._get_torch_device(device)
         device_str = resolved.type  # 'cpu', 'cuda', or 'mps'
-        half_y, half_x = window_y // 2, window_x // 2
-
-        # Use functools.partial with module-level function to avoid closure
-        # Closures capturing variables can cause memory explosions in dask workers
-        import functools
-        neighbors_func = functools.partial(
-            _neighbors_kernel_2d_for_dask,
-            window_y=window_y,
-            window_x=window_x,
-            half_y=half_y,
-            half_x=half_x,
-            device=device_str
-        )
 
         results = {}
 
         for burst_id, ds in self.items():
             count_vars = {}
+            window_y, window_x = utils_xarray.meters_to_pixels(
+                window, utils_xarray.spacing_of(ds), minimum=3, odd=True,
+                name='neighbors() window')
+            half_y, half_x = window_y // 2, window_x // 2
+
+            # Validate neighbors if provided, against the count this grid gives
+            if neighbors is not None:
+                neighbors_min, neighbors_max = neighbors
+                max_possible = window_y * window_x - 1
+                if neighbors_max > max_possible:
+                    raise ValueError(
+                        f"neighbors max={neighbors_max} exceeds maximum for window ({window_y}, {window_x}): {max_possible}"
+                    )
+                if neighbors_min > neighbors_max:
+                    raise ValueError(
+                        f"neighbors min={neighbors_min} cannot exceed max={neighbors_max}"
+                    )
+
+            # Use functools.partial with module-level function to avoid closure
+            # Closures capturing variables can cause memory explosions in dask workers
+            neighbors_func = functools.partial(
+                _neighbors_kernel_2d_for_dask,
+                window_y=window_y,
+                window_x=window_x,
+                half_y=half_y,
+                half_x=half_x,
+                device=device_str
+            )
 
             for var_name in ds.data_vars:
                 data = ds[var_name]

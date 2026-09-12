@@ -2099,7 +2099,7 @@ DEFOMAX_CYCLE  {defomax}
         return Batch._elevation_phase_approximate(self)
 
     def optimize2(self, angle_coarse: float = 15, angle_fine: float = 5,
-                  window: tuple = None, device: str = 'auto') -> "Stack":
+                  window: 'float | tuple | None' = 40, device: str = 'auto') -> "Stack":
         """
         Polarimetric optimization of amplitude and phase for dual-pol data.
 
@@ -2124,8 +2124,8 @@ DEFOMAX_CYCLE  {defomax}
             Coarse grid step in degrees. Default 15°.
         angle_fine : float
             Fine grid step in degrees. Default 5°.
-        window : tuple of int or None
-            Spatial window (azimuth, range) for the coherence estimate used by the
+        window : float or tuple or None
+            Spatial window in METRES for the coherence estimate used by the
             phase search. None (default) skips it and keeps the original co-pol
             phase — unchanged behaviour. Pass e.g. (3, 12) to optimize the phase.
         device : str
@@ -2263,7 +2263,7 @@ DEFOMAX_CYCLE  {defomax}
 
     def neighbors(
         self,
-        window: tuple = (5, 5),
+        window: 'float | tuple' = 40,
         neighbors: tuple | None = None,
         valid_threshold: float = 0.5,
         device: str = 'auto'
@@ -2278,8 +2278,9 @@ DEFOMAX_CYCLE  {defomax}
 
         Parameters
         ----------
-        window : tuple of int
-            Window size (y, x). Must be odd numbers.
+        window : float or tuple of float
+            Window size in METRES on the ground, one number for a square
+            or (y, x). Rounded up to an odd number of pixels per axis.
         neighbors : tuple of int or None
             If provided, filter output: (min, max)
             - Pixels with count < min: set to NaN
@@ -2296,7 +2297,7 @@ DEFOMAX_CYCLE  {defomax}
 
         Examples
         --------
-        >>> counts = stack.neighbors(window=(15, 15))
+        >>> counts = stack.neighbors(window=120)
         >>> dense_mask = counts >= 10
         """
         # Get complex variables
