@@ -1319,8 +1319,19 @@ class BatchCore(dict):
         for key, ds in self.items():
             # the fastest way to align mask to burst coordinates
             mask_burst = mask.reindex(y=ds.y, x=ds.x, method='nearest')
+            # THE GRIDS ONLY, as downsample() does it. Dataset.where() broadcasts
+            # EVERY variable against the mask's (y, x), so the 1-D radar metadata
+            # that rides along -- `burst` is a STRING -- comes back as a (y, x)
+            # raster of strings. Nothing downstream survives that: plot() takes
+            # any variable ending in (y, x) for a polarization and dies on it
+            # with "can only concatenate str to str", and a mask says nothing
+            # about the burst a grid was measured in anyway.
+            _grids = [v for v in ds.data_vars
+                      if ds[v].ndim >= 2 and tuple(ds[v].dims[-2:]) == ('y', 'x')]
+            _meta = [v for v in ds.data_vars if v not in _grids]
             # preserve original chunking structure for lazy computation
-            out[key] = ds.where(mask_burst, other)
+            masked = ds[_grids].where(mask_burst, other)
+            out[key] = masked.assign({v: ds[v] for v in _meta}) if _meta else masked
         return type(self)(out)
 
 
@@ -2243,7 +2254,12 @@ class BatchCore(dict):
         """
         import xarray as xr
         from .Batch import Batch
-        return Batch({k: xr.merge([ds, other[k]]) for k, ds in self.items() if k in other})
+        # 'no_conflicts' STATED, and deliberately not the 'override' xarray is
+        # moving to. This merges two products a caller built separately, so a
+        # variable carrying the same name in both is a mistake worth hearing
+        # about -- 'override' would silently keep the first and drop the other.
+        return Batch({k: xr.merge([ds, other[k]], compat='no_conflicts')
+                      for k, ds in self.items() if k in other})
 
     def reindex(self, **kw):
         return type(self)({k: ds.reindex(**kw) for k, ds in self.items()})
@@ -3654,7 +3670,19 @@ class BatchCore(dict):
             output = results[polarization]
         else:
             # All polarizations - return Dataset (even if only one)
-            output = xr.merge(list(results.values()))
+            #
+            # BOTH KWARGS STATED, not left to the default. Every DataArray here
+            # was built from the SAME `ys`, `xs` and `stackval` -- the grid is
+            # read once from the first polarization, above -- and the names are
+            # the polarizations, so nothing overlaps and nothing needs
+            # reconciling. `compat='override'` says exactly that and skips the
+            # comparison; it is also the default xarray is moving to, so the
+            # result cannot change under us. `join='exact'` turns the shared
+            # grid from an assumption into a check: if two polarizations ever
+            # arrive on different axes this raises, where the default outer
+            # join would quietly pad the union with NaN.
+            output = xr.merge(list(results.values()),
+                              compat='override', join='exact')
 
         if compute:
             progressbar(output := output.persist(), desc=f'Computing Dataset...'.ljust(25))
