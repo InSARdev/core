@@ -1025,6 +1025,22 @@ class BatchCore(dict):
     def isfinite(self, **kwargs):
         return self.map_da(lambda da: xr.ufuncs.isfinite(da), **kwargs)
 
+    def fillna(self, value=0, **kwargs):
+        """Replace NaN with `value`, e.g. `velocity.fillna(0)`.
+
+        The twin of `where()`: that one makes holes, this one closes them. It
+        is what a plot or an export wants, where NaN is drawn as nothing and a
+        reader cannot tell an unsolved pixel from a missing one -- and nothing
+        the analysis wants, since a filled pixel then carries a number no
+        measurement produced.
+
+        NUMERIC VARIABLES ONLY, as every elementwise method here works:
+        map_da() passes strings and objects through untouched, so the burst id
+        and the rest of the metadata that rides along in each dataset are not
+        candidates for filling.
+        """
+        return self.map_da(lambda da: da.fillna(value), **kwargs)
+
     # def where(self, cond, other=0):
     #     # cond can be a BatchWrap of booleans
     #     if isinstance(cond, BatchWrap):
