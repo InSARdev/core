@@ -26,14 +26,22 @@ _RAYLEIGH_MEAN = np.sqrt(np.pi) / 2.0
 # not pinned against a boundary. Solutions landing in the guard band are
 # rejected -- their truth is beyond the range and cannot be recovered.
 _GUARD = 1.1
-# cells either way across the annual amplitude range: the lattice picks the
-# BASIN and the refinement does the rest, so this is resolution, not accuracy
-_SEASONAL_STEPS = 0   # 0 = spacing `sat` (one seed for small ranges)
-
-# How many times the (dh, v) and seasonal lattices are alternated. One pass
-# leaves the height anchored to a fit that never saw the annual term, which is
-# harmless at small amplitudes and fatal at large ones.
-_SEASONAL_ROUNDS = 3
+# The refinement after the lattice: `_ZOOM_LEVELS` finer lattices around the
+# winner, each `_ZOOM_SUB` times finer than the one before and `_ZOOM_BOX`
+# cells wide either side of it. sqrt(2) of a cell, because a winner that is
+# one cell off in BOTH parameters -- the diagonal, where a fine step in one
+# moves the best value of the other -- must still be inside the box. Two
+# levels of five leave a cell twenty-five times finer than the coarse one,
+# already far below what the noise on a single arc can resolve.
+_ZOOM_SUB = 5
+_ZOOM_BOX = 1.4
+_ZOOM_LEVELS = 2
+# A SEEDED fit -- the caller predicts the arc from the network -- is refined
+# inside a fixed PHYSICAL tolerance, metres and mm/yr, not a multiple of the
+# caller's lattice step: the prediction's error is set by the network's
+# measurements, and a caller refining the grid must not tighten who survives.
+_SEED_TOL_H = 8.0
+_SEED_TOL_V = 4.0
 
 # How many partners each pixel offers the spanning forest, ranked by raw
 # coherence. The forest takes only what connectivity needs -- about one arc per
@@ -887,8 +895,26 @@ def _3d_arcs_select(U, quality, window, threshold, cell=(2, 8)):
     return out, E
 
 
+def _3d_arc_product(A, B):
+    """The arc `A * conj(B)` from explicit float32 parts, complex64 out.
+
+    numpy's complex multiply takes a different arithmetic path below a few
+    hundred columns, so the SAME pair formed in a small batch and in a large
+    one differs in its last bits. A continuous refinement never noticed; a
+    lattice can answer a near-tie one cell apart on the two, and an arc's
+    fit then depended on how many arcs were formed alongside it. Four plain
+    float32 products and two sums are the same IEEE operations at any size,
+    so the bytes -- and the fit -- are a property of the pair alone.
+    """
+    out = np.empty(np.broadcast_shapes(A.shape, B.shape), np.complex64)
+    ar, ai, br, bi = A.real, A.imag, B.real, B.imag
+    np.add(ar * br, ai * bi, out=out.real)
+    np.subtract(ai * br, ar * bi, out=out.imag)
+    return out
+
+
 def _3d_arc_fit(arc, ele2phase, t, meter2rad, max_dh=25.0, max_dv=25.0,
-                step_dh=8.0, step_dv=2.0, budget=None, max_seasonal=5.0,
+                step_dh=8.0, step_dv=2.0, budget=None, max_seasonal=0.0,
                 iterations=8, seed_th=None):
     """Joint (height, velocity) fit on many arcs at once, WITHOUT priors.
 
@@ -907,6 +933,14 @@ def _3d_arc_fit(arc, ele2phase, t, meter2rad, max_dh=25.0, max_dv=25.0,
               accuracy: the refinement below is continuous and absorbs the
               quantisation over a wide range of steps.
     step_dv : mm/yr,   lattice step in rate.
+    iterations : 0 stops at the lattice argmax -- enough to RANK candidates,
+              which is what the shortlist stages ask for. Any positive value
+              runs the zoom below; the count itself no longer means anything.
+    max_seasonal : must be 0. The annual term is not fitted by this kernel and
+              a positive bound raises ValueError -- see the end of this note.
+    seed_th : (n_arcs, 2) prior solutions in radians. The lattice is skipped
+              and the zoom runs around the seed inside a fixed physical
+              tolerance -- see UNRESOLVABLE ARCS.
 
     Two stages, because neither alone is both correct and affordable.
 
@@ -916,39 +950,34 @@ def _3d_arc_fit(arc, ele2phase, t, meter2rad, max_dh=25.0, max_dv=25.0,
     solution by half a cell, and at +-200 m with a 16 m step -- 200/16 = 12.5
     -- that took the largest connected component from 862 nodes to 63.
 
-    REFINEMENT. Majorise-minimise on the phasors, seeded at the lattice
-    argmax. h(psi) = 1 - cos(psi) has h'' <= 1 for ALL psi, so the unit-
-    curvature quadratic is a GLOBAL majoriser and the step
-
-        delta = pinv(U) @ Im(R conj(mu/|mu|)),   U = [hh - mean, tt - mean]
-
-    is non-descending from any start, with no line search, damping or trust
-    region. The constant phase is profiled out exactly by the rotation, never
-    estimated and never gauged to one epoch -- gauging injects that epoch's
-    noise into every other. Against an exhaustive scan of the same space it is
-    never below the scan on a single arc.
-
-    Omitting the mu rotation is not a small error: the same refinement without
-    it loses coherence outright and fails silently on some arcs.
-
-    WHY NOT A LADDER. Rungs on doubling baselines are discontinuous by
-    construction -- each searches a window around wherever the last one landed
-    -- so one bad step is never undone, and against an exhaustive scan it
-    returns badly wrong heights at a fraction of the achievable coherence.
+    REFINEMENT. A ZOOM: finer lattices around the winner, each five times
+    finer than the last and 1.4 cells wide either side of it, every level on
+    every date and the same objective. The coarse lattice only has to land in
+    the right basin -- its cell is a fraction of the main lobe in both
+    parameters, which is what the lobe widths above the steps guarantee --
+    and the zoom then resolves the peak to a small fraction of a cell, below
+    what the noise on one arc can resolve. Nothing iterates, nothing is
+    inverted and nothing has to converge: the same input gives the same
+    answer on any machine, and a solution can never drift out of the basin
+    it was found in, because every box is centred on the last winner.
 
     WHY NOT A GRID ALONE. A grid argmax is discontinuous in the data: perturb
     every phase slightly and a small fraction of arcs jump a FULL cell while
     the median does not move at all -- the instability is rare, large, and
-    invisible in any summary statistic. The refined answer barely moves.
+    invisible in any summary statistic. After the zoom the jump is a
+    twenty-fifth of a cell and the answer moves as the data does.
 
-    UNRESOLVABLE ARCS RETURN NaN. Two conditions, both of which detect truth
-    planted OUTSIDE the search range without rejecting in-range arcs.
+    UNRESOLVABLE ARCS RETURN NaN. Two conditions.
 
-      edge     the solution sits outside max_dh/max_dv, i.e. in the guard band
-               the scan adds beyond them, so the truth is past the range the
-               caller asked for and the peak is a boundary, not a maximum
-      runaway  the refinement travelled more than two lattice cells, so the
-               lattice argmax was not the basin the data actually prefer
+      edge   the solution sits outside max_dh/max_dv, i.e. in the guard band
+             the scan adds beyond them, so the truth is past the range the
+             caller asked for and the peak is a boundary, not a maximum
+      seed   a SEEDED fit whose first zoom lands on the tolerance box: the
+             arc's own optimum lies beyond what the prediction is trusted
+             to, so it is a different solution, not a refined one. A LATTICE
+             winner on its box is not gated -- the coarse argmax was a cell
+             off, the next level re-centres on the boundary point and the
+             answer is unchanged.
 
     Height and rate are always solved TOGETHER: the perpendicular baseline is
     not a smooth function of time, so they separate only jointly -- chained, a
@@ -965,33 +994,13 @@ def _3d_arc_fit(arc, ele2phase, t, meter2rad, max_dh=25.0, max_dv=25.0,
     converts to a length. `max_dh`/`max_dv` remain physical, since they
     state what the caller wants bounded.
 
-    `seasonal_rad` is COMPLEX and in radians: the annual term contributes
-    seasonal.real * cos(2 pi t) + seasonal.imag * sin(2 pi t) to the model
-    phase, so abs() is its amplitude and angle() its position.
-
-    THAT POSITION IS MEASURED FROM t = 0, and t = 0 belongs at the MASTER --
-    the epoch where B_perp = 0, which is the one moment a single-master stack
-    defines: the scene differenced with itself, phase zero by construction, and
-    the height term vanishing with the baseline that carries it. Callers here
-    build t that way (see _3d_fit_frame). Anchoring it elsewhere leaves
-    the model referenced to two epochs at once, rotating the annual phase by
-    the offset between them for nothing. Rate and height are indifferent
-    -- a shift in t adds a constant and constants are profiled out exactly -- so
-    only the annual's phase is at stake, and only its phase.
-
-    It is still NOT the day of the year: to land in the calendar add the
-    master's day of year, (angle / 2 pi) * 365.25 + doy(t0) modulo the year.
-    Reconstructing the fitted model needs no conversion at all, only the same
-    `t` the fit was given, so the value is returned unconverted. It
-    is returned because a caller cannot otherwise rebuild the model that was
-    actually fitted, and whatever is not subtracted stays in the RESIDUAL --
-    which is the atmospheric screen. Dropping it leaves the fitted annual in
-    that residual, which shows up as temporal correlation in a screen required
-    to be white in time; returning and removing it clears that. Zero when
-    max_seasonal is 0,
-    because the model then holds no annual term -- that is a value and not an
-    absence, so it is not NaN. NaN only where the arc is unresolved, alongside
-    height and rate.
+    `seasonal_rad` is zeros, complex: the model holds no annual term, which
+    is a value and not an absence. `max_seasonal > 0` raises ValueError. The
+    annual was fitted here once, as one complex amplitude against the yearly
+    carrier with its own lattice of sidebands; on the arcs this kernel serves
+    it read as noise, and the freedom to fit it cost the rate more than the
+    term returned. It comes back when a stack with a real annual signal
+    exists to design it against.
     """
     arc = np.asarray(arc)
     if not np.iscomplexobj(arc):
@@ -1001,6 +1010,11 @@ def _3d_arc_fit(arc, ele2phase, t, meter2rad, max_dh=25.0, max_dv=25.0,
     if not (step_dh > 0 and step_dv > 0 and max_dh > 0 and max_dv > 0):
         raise ValueError('max_dh, max_dv, step_dh, step_dv must all be > 0, '
                          f'got {max_dh}, {max_dv}, {step_dh}, {step_dv}')
+    if max_seasonal and max_seasonal > 0:
+        raise ValueError(
+            f'max_seasonal={max_seasonal}: the annual term is not supported by '
+            'the arc kernel; pass max_seasonal=0. It returns when a stack with '
+            'a real annual signal exists to design it against.')
     n, m = arc.shape
 
     # SCAN 10% WIDER than the caller asked for, and reject what lands outside
@@ -1019,16 +1033,15 @@ def _3d_arc_fit(arc, ele2phase, t, meter2rad, max_dh=25.0, max_dv=25.0,
     # the guard lands exactly on the lattice
     # ele2phase=None means the series carries no usable baseline, so the height
     # term is NOT estimated: its grid collapses to {0} and dh comes back NaN.
-    # Passing zeros instead would leave dh unconstrained and the runaway gate
-    # would then reject every series.
+    # Passing zeros instead would leave dh free to take any value at no cost,
+    # and the reported height would be a random number rather than an absence.
     no_h = ele2phase is None
     # PHASE THROUGHOUT, CONVERTED ONCE AT THE DOOR. `max_dh` and `step_dh` are
     # stated in metres and `max_dv`/`step_dv` in mm/yr because that is what a
     # caller can reason about, but everything inside is radians, as everywhere
     # else in the library. Scaling a bound is exact, so `|dh| > max_dh` and
     # `|dh_rad| > max_dh * meter2rad` are the same gate -- and the constants
-    # come out cleaner in phase: the sideband comb below is exactly 2 pi and
-    # the saturation limit exactly pi/2.
+    # come out cleaner in phase.
     #
     # The alternative, converting at the RETURN, put a unit boundary in the
     # middle of the function: `dh` meant metres above it and radians below,
@@ -1075,6 +1088,19 @@ def _3d_arc_fit(arc, ele2phase, t, meter2rad, max_dh=25.0, max_dv=25.0,
     Z = np.where(A > 0, arc / np.where(A > 0, A, 1.0), 0).astype(np.complex64)
     nv = (A > 0).sum(axis=0)
     del A
+    # ONE ORIENTATION PER ARC, CHOSEN BY THE ARC. An arc and its reverse are
+    # the same measurement, and a continuous refinement returned exactly
+    # negated answers for them; a lattice does not quite: between two
+    # candidates the data cannot tell apart it takes the first in the bank's
+    # order, and that is not the mirror of the first among the mirrored
+    # candidates. So every arc is fitted in the orientation that makes the
+    # sum of its imaginary parts non-negative -- a sum the reverse arc
+    # negates exactly -- and the answer is negated back. fit(reverse) is
+    # then -fit(arc) to the bit, whichever way a tree, a tile or a batch
+    # handed the arc over, and no caller has to know.
+    _rev = Z.imag.sum(axis=0) < 0
+    if _rev.any():
+        Z[:, _rev] = np.conj(Z[:, _rev])
     # the model phase is dh_rad * ele2phase_t + dv_rad * t_t, so with the
     # parameters in phase the design columns are the geometry itself
     tt = np.asarray(t, dtype=np.float64)
@@ -1083,6 +1109,18 @@ def _3d_arc_fit(arc, ele2phase, t, meter2rad, max_dh=25.0, max_dv=25.0,
 
     # ---- stage 1: lattice, one product ---------------------------------
     P = np.stack(np.meshgrid(gh, gv, indexing='ij'), -1).reshape(-1, 2)
+    # ORDERED BY DISTANCE FROM (0, 0), THE ORIGIN FIRST, as fit1d's rate grid
+    # is: an argmax returns the FIRST of equal scores, so a tie between
+    # candidates that explain an arc equally well resolves to the smallest
+    # model rather than to whichever corner the row-major grid happened to
+    # start at. Rings of the lattice (Chebyshev distance in steps), then the
+    # Manhattan distance inside a ring; stable, so the order is deterministic.
+    # Nothing downstream reads the grid's shape -- every use is P[k].
+    _ring = np.maximum(np.abs(P[:, 0]) / max(step_dh_r, 1e-30),
+                       np.abs(P[:, 1]) / max(step_dv_r, 1e-30))
+    _diag = (np.abs(P[:, 0]) / max(step_dh_r, 1e-30)
+             + np.abs(P[:, 1]) / max(step_dv_r, 1e-30))
+    P = P[np.lexsort((_diag, np.round(_ring, 6)))]
     C = np.exp(-1j * (np.outer(hh, P[:, 0])
                       + np.outer(tt, P[:, 1]))).astype(np.complex64)
     # no division by nv here: it is constant per arc, so it cannot move the
@@ -1098,341 +1136,118 @@ def _3d_arc_fit(arc, ele2phase, t, meter2rad, max_dh=25.0, max_dv=25.0,
     # refinement below still runs, because the seed is a prediction and the arc
     # is entitled to move within its own cell. What is dropped is the (arcs x
     # candidates) product, which is the whole cost.
+    _mb = _3d_budget_mb(budget)
     if seed_th is not None:
         # SEEDED: the caller already knows where this arc's optimum is, because
         # the network has solved both ends onto one datum. The search that
         # finds the basin has nothing left to find, so the (arcs x candidates)
-        # product -- the whole cost -- is skipped. The refinement below still
-        # runs: a seed is a prediction, and the arc is entitled to move within
-        # its own cell.
-        TH0 = np.ascontiguousarray(
-            np.asarray(seed_th, dtype=np.float64).reshape(m, -1))
-        if no_h and TH0.shape[1] > 1:
-            TH0 = TH0[:, 1:]
-        if not (max_seasonal and max_seasonal > 0):
-            del C
+        # product -- the whole cost -- is skipped. The zoom below still runs:
+        # a seed is a prediction, and the arc is entitled to move within the
+        # tolerance a prediction is trusted to, and no further.
+        _S = np.asarray(seed_th, dtype=np.float64).reshape(m, -1)
+        TH = np.zeros((m, 2))
+        TH[:, 1] = _S[:, -1]
+        if not no_h and _S.shape[1] > 1:
+            TH[:, 0] = _S[:, 0]
+        TH[_rev] = -TH[_rev]          # the seed follows the arc's orientation
+        del C
     else:
         _L = C.shape[1]
-        _mb = _3d_budget_mb(budget)
         _blk = max(1, int(_mb * 1024 * 1024 // max(_L * 8, 1)))
-        k = np.empty(Z.shape[1], dtype=np.int64)
-        for _b0 in range(0, Z.shape[1], _blk):
-            _sl = slice(_b0, min(_b0 + _blk, Z.shape[1]))
-            k[_sl] = np.argmax(np.abs(Z[:, _sl].T @ C), axis=1)
-        if not (max_seasonal and max_seasonal > 0):
-            del C                  # kept below: the seasonal stage re-solves on it
-        TH0 = (P[k][:, 1:] if no_h else P[k]).astype(np.float64)
+        k = np.empty(m, dtype=np.int64)
+        for _b0 in range(0, m, _blk):
+            _sl = slice(_b0, min(_b0 + _blk, m))
+            k[_sl] = _3d_argmax_first(np.abs(Z[:, _sl].T @ C))
+        del C
+        # (m, 2) whatever the design: without a baseline the height column
+        # is identically zero and the zoom never moves it
+        TH = P[k].astype(np.float64)
 
-    # ---- stage 2: majorise-minimise refinement -------------------------
-    U = (np.stack([tt - tt.mean()], 1) if no_h
-         else np.stack([hh - hh.mean(), tt - tt.mean()], 1))
-    # COLUMN-NORMALISE BEFORE THE PSEUDO-INVERSE. The two columns carry
-    # different physical units -- ele2phase is O(1e-4) per metre while dt is
-    # O(1) in years -- so U as built is ill-conditioned by four orders of
-    # magnitude for no reason other than the choice of units. Some LAPACK
-    # builds fail to converge on it (`LinAlgError: SVD did not converge`),
-    # and whether they do depends on the thread that gets there, so it
-    # surfaces as an intermittent failure deep inside a dask block.
-    #
-    # Scaling is EXACT, not a tolerance: U = Us diag(sc), so
-    # pinv(U) = diag(1/sc) pinv(Us) whenever the columns are non-zero. The
-    # refinement below is unchanged; only the conditioning of the solve is.
-    _sc = np.linalg.norm(U, axis=0)
-    _sc = np.where(_sc > 0, _sc, 1.0)
-    PINV = np.linalg.pinv(U / _sc) / _sc[:, None]
+    # ---- stage 2: zoom ----------------------------------------------------
+    # See the module constants: `_ZOOM_LEVELS` lattices around the winner,
+    # each `_ZOOM_SUB` times finer, `_ZOOM_BOX` cells either side. Every
+    # level divides the winner so far out of the data, so ONE bank of fine
+    # offsets serves every arc and the level is a single product, exactly as
+    # the coarse stage is.
+    seed_edge = np.zeros(m, dtype=bool)
     if iterations <= 0:
-        # NO REFINEMENT: the lattice argmax IS the answer. The refinement
-        # starts at that argmax and stays
-        # inside that cell, so the lattice value already orders candidates the
-        # way the refined one does -- close enough to choose WHICH partners
-        # are worth refining. It is the same code and the same model, just
-        # stopped one step early; the chosen few are then refined normally.
-        TH = TH0
+        # NO REFINEMENT: the lattice argmax IS the answer. Its value already
+        # orders candidates the way the refined one does -- close enough to
+        # choose WHICH partners are worth refining; the chosen few are then
+        # refined normally. Same code, same model, stopped one stage early.
+        R = _3d_rotate(Z, np.outer(hh, TH[:, 0]) + np.outer(tt, TH[:, 1]))
+        gam = (np.abs(R.sum(axis=0)) / np.maximum(nv, 1)).astype(np.float32)
+        del R
     else:
-        TH = TH0.copy()
-        for _ in range(iterations):
-            R = _3d_rotate(Z, U @ TH.T)
-            mu = R.sum(axis=0)
-            R *= np.conj(mu / np.where(np.abs(mu) > 0, np.abs(mu), 1.0))[None, :]
-            TH = TH + (PINV @ R.imag).T
+        if seed_th is None:
+            bh, bv = _ZOOM_BOX * step_dh_r, _ZOOM_BOX * step_dv_r
+        else:
+            bh, bv = _SEED_TOL_H * _m2h, _SEED_TOL_V * _m2v
+        _nz = int(round(_ZOOM_BOX * _ZOOM_SUB))   # sub-cells either side
+        gam = np.empty(m, dtype=np.float32)
+        for _lv in range(_ZOOM_LEVELS):
+            ch, cv = bh / _nz, bv / _nz            # this level's cell
+            # THE GRID IS GLOBAL, NOT THE SEED'S. The box is centred on the
+            # nearest point of a lattice with this level's cell anchored at
+            # the origin, so two runs that arrive with slightly different
+            # seeds -- the network solved from batches in another order --
+            # search the same points and return the same answer. A lattice
+            # winner already sits on that grid; a predicted seed does not,
+            # and moving it by up to half a cell costs nothing the box does
+            # not have.
+            TH[:, 0] = np.round(TH[:, 0] / ch) * ch if not no_h else 0.0
+            TH[:, 1] = np.round(TH[:, 1] / cv) * cv
+            fh = np.zeros(1) if no_h else np.arange(-_nz, _nz + 1) * ch
+            fv = np.arange(-_nz, _nz + 1) * cv
+            F = np.stack(np.meshgrid(fh, fv, indexing='ij'), -1).reshape(-1, 2)
+            # ORIGIN FIRST, as the coarse lattice: a tie resolves to the
+            # smallest move, never to a corner of the box
+            _rh = np.abs(F[:, 0]) / max(ch, 1e-30)
+            _rv = np.abs(F[:, 1]) / max(cv, 1e-30)
+            _o = np.lexsort((_rh + _rv, np.round(np.maximum(_rh, _rv), 6)))
+            F = F[_o]
+            _ring = np.maximum(_rh, _rv)[_o] >= _nz - 1e-9   # on the box
+            Cf = np.exp(-1j * (np.outer(hh, F[:, 0])
+                               + np.outer(tt, F[:, 1]))).astype(np.complex64)
+            # the product AND the divided-out copy of the block fit the budget
+            _blk = max(1, int(_mb * 1024 * 1024
+                              // max((Cf.shape[1] + n) * 8, 1)))
+            for _b0 in range(0, m, _blk):
+                _sl = slice(_b0, min(_b0 + _blk, m))
+                Zr = _3d_rotate(Z[:, _sl], np.outer(hh, TH[_sl, 0])
+                                + np.outer(tt, TH[_sl, 1]))
+                A_ = np.abs(Zr.T @ Cf)
+                kf = _3d_argmax_first(A_)
+                TH[_sl] += F[kf]
+                gam[_sl] = A_[np.arange(len(kf)), kf] / np.maximum(nv[_sl], 1)
+                if _lv == 0 and seed_th is not None:
+                    seed_edge[_sl] = _ring[kf]
+                del Zr, A_
+            del Cf
+            bh, bv = _ZOOM_BOX * ch, _ZOOM_BOX * cv   # the next box, on this cell
 
-    R = _3d_rotate(Z, U @ TH.T)
-    gam = (np.abs(R.sum(axis=0)) / np.maximum(nv, 1)).astype(np.float32)
-
-    if max_seasonal and max_seasonal > 0:
-        # The annual term as ONE COMPLEX AMPLITUDE C against the carrier
-        # exp(2 pi i t) built from the DATES: the model phase gains
-        # Re(C exp(2 pi i t)). No angle of the data is taken and nothing wraps.
-        #
-        # C enters the phase LINEARLY, exactly like (dh, v), so it gets a
-        # LATTICE of its own rather than a swarm of refinements: for each
-        # candidate sideband the (dh, v) model is divided out and the residual
-        # correlated against a grid of complex amplitudes as one product. At
-        # max_seasonal = 60 mm the annual phase is 13.6 rad, which Jacobi-Anger
-        # spreads over ~14 sidebands either side, so a seeded-MM search would
-        # need ~1800 refinements; this needs one GEMM per sideband and a single
-        # refinement at the end.
-        k_mm = meter2rad * 1e-3                  # radians per mm of LOS
-        car = np.exp(2j * np.pi * np.asarray(t, dtype=np.float64))
-        # IN PHASE THESE ARE CONSTANTS, not stack properties: one sideband is
-        # exactly a cycle of rate, and the linearised amplitude step saturates
-        # at a quarter cycle. Carrying them in mm/yr obscured that.
-        comb = 2.0 * np.pi                       # sideband spacing, rad/yr
-        sat = np.pi / 2.0                        # linearised step saturation, rad
-        # sidebands to cover: |k| <~ A in radians, plus margin
-        nt = int(np.ceil(k_mm * _GUARD * float(max_seasonal))) + 2
-        # amplitude lattice, spaced by the saturation limit so the final
-        # refinement never has to travel further than it can
-        # SCANNED 10% WIDE AND REJECTED OUTSIDE, exactly as dh and dv are. The
-        # bound was previously a hard wall on the lattice, so a fit that wanted
-        # more annual than the caller allowed came back PRESSED AGAINST it
-        # rather than refused -- and that is the signature of an annual being
-        # spent to buy a sideband instead of to describe a real signal: aliased
-        # attachments press against the bound while clean ones sit well inside
-        # it.
-        #
-        # The guard band makes `max_seasonal` mean what the other two bounds
-        # mean: a solution inside it is admissible and one outside returns NaN,
-        # rather than being quietly clipped to the boundary and reported as a
-        # maximum. A peak AT the wall is an edge, not an optimum.
-        c_guard_r = _GUARD * float(max_seasonal) * k_mm
-        c_guard = c_guard_r
-        # ONE SEED IS ENOUGH HERE, AND THAT IS MEASURED, NOT ASSUMED. Spaced
-        # at `sat` the bank collapses to a SINGLE POINT {0} for every
-        # max_seasonal <= 6.3 mm, which looks alarming next to the full lattice
-        # (dh, v) get. It is not: the annual is still fitted, because the MM
-        # refinement below solves every parameter jointly and continuously --
-        # the two seasonal columns included -- starting from that seed, and the
-        # objective is unimodal in C over this range (the basin half-width is
-        # pi/k_mm = 13.9 mm, wider than any admissible amplitude).
-        #
-        # Planted annuals on real dates and baselines, 3000 arcs at 0.55 rad of
-        # noise, one seed against a 197-point lattice:
-        #
-        #   planted   1 seed   197 seeds
-        #     1.0 mm    1.06      1.05
-        #     2.0 mm    2.05      2.04
-        #     3.0 mm    3.04      3.03
-        #
-        # identical to two decimals, |C| error 0.25 mm either way, and the same
-        # rate error (0.22 mm/yr). The dense lattice buys nothing and costs a
-        # GEMM per bank point per sideband -- at 197 points it exhausted numpy's
-        # array limit on a real block. `_SEASONAL_STEPS` can force the dense
-        # bank for anyone who wants to re-measure this; 0 keeps the seed.
-        c_step = (min(sat, c_guard / _SEASONAL_STEPS)
-                  if (_SEASONAL_STEPS and c_guard > 0) else sat)
-        ka = int(np.ceil(c_guard / c_step - 1e-9))
-        ax = np.arange(-ka, ka + 1) * c_step
-        CR, CI = np.meshgrid(ax, ax, indexing='ij')
-        keepc = (CR ** 2 + CI ** 2) <= c_guard ** 2 + 1e-9
-        CG = np.stack([CR[keepc], CI[keepc]], 1)          # (nC, 2)
-        Cbank = np.exp(-1j * (np.outer(car.real, CG[:, 0])
-                              + np.outer(car.imag, CG[:, 1]))
-                       ).astype(np.complex64)             # (n, nC)
-        rate_col = -1 if no_h else 1
-
-        # TWO ANCHORS, because neither is reliable alone.
-        #
-        # The (dh, v) lattice above never saw the annual term, and at large
-        # amplitude its height is meaningless, leaving the whole search far
-        # from a truth that would score well.
-        #
-        # The second anchor exploits the term being exactly ONE YEAR long: two
-        # acquisitions a year apart carry the SAME annual phase, so it cancels in
-        # their difference while dh and v survive. The residual leakage is a
-        # small fraction of the amplitude, which brings a large annual back
-        # below the sideband crossover and the height back with it.
-        # But every such pair has the same one-year separation, so a rate folds
-        # at 2 pi / k = one sideband: that anchor fixes dh and leaves v ambiguous
-        # by exactly the spacing the sideband loop already scans.
-        #
-        # Under noise the year-pair anchor is the WORSE of the two (it spends 115
-        # pairs where the full series has 88 dates, each pair carrying two dates'
-        # noise): at 0 mm seasonal and sigma 0.8 it aliases 25.5% against 0.0%.
-        # So both run and the higher gamma wins -- legitimate here only because
-        # the annual is IN the model, which is what makes gamma rank correctly.
-        # EFFORT FOLLOWS THE AMPLITUDE. Both the second anchor and the extra
-        # alternation rounds exist for the LARGE-amplitude case, where the
-        # seasonal-blind (dh, v) lattice is useless: its median height error is
-        # 3.5 m at 12 mm of annual, 8.6 m at 30 mm, and 101.9 m at 50 mm. Below
-        # that they buy nothing and cost 6x -- each extra round re-runs the full
-        # (dh, v) lattice, and each anchor doubles the whole thing.
-        ann_rad = k_mm * float(max_seasonal)      # annual phase in radians
-        n_rounds = 1 if ann_rad <= 1.435 else (2 if ann_rad <= 4.0
-                                              else _SEASONAL_ROUNDS)
-        two_anchors = ann_rad > 4.0
-        anchors = [TH.copy()]
-        dsec = ((np.asarray(t, dtype=np.float64) - t[0]) * 365.25)
-        iu_, ju_ = np.triu_indices(n, 1)
-        dtp = dsec[ju_] - dsec[iu_]
-        ytol = float(np.median(np.diff(np.sort(dsec)))) if n > 1 else 0.0
-        ysel = np.abs(dtp - 365.25) <= max(ytol, 1.0)
-        if two_anchors and ysel.sum() >= max(8, n // 8):
-            ia_, ib_ = iu_[ysel], ju_[ysel]
-            Bp = np.stack([hh[ib_] - hh[ia_], tt[ib_] - tt[ia_]], 1)
-            bank_p = np.exp(-1j * (np.outer(Bp[:, 0], P[:, 0])
-                                   + np.outer(Bp[:, 1], P[:, 1]))
-                            ).astype(np.complex64)
-            Zp = (Z[ib_] * np.conj(Z[ia_])).astype(np.complex64)
-            kp_ = np.argmax(np.abs(Zp.T @ bank_p), axis=1)
-            anchors.append((P[kp_][:, 1:] if no_h else P[kp_]).astype(np.float64))
-            del bank_p, Zp
-
-        Us = np.concatenate(
-            [U, np.stack([car.real, car.imag], 1)], axis=1)
-        Us = Us - Us.mean(axis=0, keepdims=True)
-        PINVs = np.linalg.pinv(Us)
-        # THE SEASONAL-FREE SOLUTION COMPETES. Seeding gbest at -1 discarded it
-        # unconditionally, so the annual model won even when it was WORSE, and
-        # that is how a whole sideband gets returned: the (dh, v) lattice is
-        # scanned across sidebands below and the argmax is taken, so with two
-        # extra free parameters a wrong basin can outscore the right one, and
-        # attached pixels then come back a whole sideband from their
-        # neighbourhood. The same arcs peak next to the neighbourhood when the
-        # annual is not free to move them.
-        #
-        # Seeded with the plain answer the annual has to EARN the basin it
-        # moves to, which is what the crossover argument above assumes: below
-        # 6.3 mm of real annual {height, rate} is already the higher maximum and
-        # must be allowed to stay.
-        gbest = gam.astype(np.float64).copy()
-        thbest = np.concatenate([TH, np.zeros((m, 2))], axis=1)
-        # THE SEED, NOT THE ANSWER. The runaway gate below judges the winner
-        # against the seed its refinement started from; the plain candidate
-        # started from the lattice argmax TH0, and seeding the tracker with
-        # the refined TH would hand the gate the answer to compare against
-        # itself -- it could then never fire on a plain winner.
-        seedbest = TH0.copy()
-
-        for TH_a in anchors:
-            TH_r = TH_a.copy()
-            # ALTERNATE the two lattices: solve (dh, v), solve C, re-solve
-            # (dh, v) with C divided out. Each block is solved exactly by its own
-            # lattice and each pass can only raise gamma, so this is monotone.
-            for _rnd in range(n_rounds):
-                bg = np.full(m, -1.0)
-                bth = np.zeros((m, U.shape[1] + 2))
-                bseed = np.zeros((m, U.shape[1]))
-                for kt in range(-nt, nt + 1):
-                    TH_k = TH_r.copy()
-                    TH_k[:, rate_col] = TH_k[:, rate_col] + kt * comb
-                    Rk = _3d_rotate(Z, U @ TH_k.T)
-                    G = np.abs(Rk.T @ Cbank)              # (m, nC)
-                    kc = np.argmax(G, axis=1)
-                    g_ = G[np.arange(m), kc] / np.maximum(nv, 1)
-                    up = g_ > bg
-                    bg = np.where(up, g_, bg)
-                    bth = np.where(up[:, None],
-                                   np.concatenate([TH_k, CG[kc]], axis=1), bth)
-                    bseed = np.where(up[:, None], TH_k, bseed)
-                    del Rk, G
-                if _rnd + 1 < n_rounds:
-                    Cm = np.exp(1j * (np.outer(car.real, np.ones(m)) * bth[:, -2]
-                                      + np.outer(car.imag, np.ones(m)) * bth[:, -1])
-                                ).astype(np.complex64)
-                    k2 = np.argmax(np.abs((Z * np.conj(Cm)).T @ C), axis=1)
-                    TH_r = (P[k2][:, 1:] if no_h else P[k2]).astype(np.float64)
-                    del Cm
-            THs = bth
-            for _ in range(iterations):
-                Rs = _3d_rotate(Z, Us @ THs.T)
-                mus = Rs.sum(axis=0)
-                Rs *= np.conj(mus / np.where(np.abs(mus) > 0,
-                                             np.abs(mus), 1.0))[None, :]
-                THs = THs + (PINVs @ Rs.imag).T
-            Rs = _3d_rotate(Z, Us @ THs.T)
-            g_a = np.abs(Rs.sum(axis=0)) / np.maximum(nv, 1)
-            up = g_a > gbest
-            gbest = np.where(up, g_a, gbest)
-            thbest = np.where(up[:, None], THs, thbest)
-            seedbest = np.where(up[:, None], bseed, seedbest)
-            del Rs, THs, bth, bseed
-
-        gam = gbest.astype(np.float32)
-        TH = thbest[:, :U.shape[1]]
-        # THE ANNUAL IS KEPT, NOT DROPPED. It was fitted and refined alongside
-        # (dh, dv) -- these are the last two columns of the same solution -- and
-        # slicing it away here used to end its life. That was not free: the term
-        # then stays in the residual, and the residual IS the atmospheric
-        # screen. The discarded annual leaves the node screen correlated in
-        # time, which is the one property the screen is required not to have.
-        # Returning it clears that and removes the energy it carried, since
-        # its phase resultant across nodes is 0.064, so it is not one season
-        # over the scene and therefore not a stratified delay.
-        seas = thbest[:, U.shape[1]] + 1j * thbest[:, U.shape[1] + 1]
-        TH0 = seedbest
-        del Cbank, C, Us, PINVs, thbest, seedbest
-
-    else:
-        # not fitted means the model contains no annual, which is a value and
-        # not an absence: zero, where NaN would claim it could not be assessed
-        seas = np.zeros(m, dtype=np.complex128)
-    if no_h:
-        dh, dv = np.full(m, np.nan), TH[:, 0]
-    else:
-        dh, dv = TH[:, 0], TH[:, 1]
-
+    TH[_rev] = -TH[_rev]              # back to the caller's orientation
+    dh = np.full(m, np.nan) if no_h else TH[:, 0]
+    dv = TH[:, 1]
     # An arc we cannot resolve returns NaN, never a plausible number: a wrong
     # value that clears the threshold is invisible to everything downstream,
-    # while a NaN is simply not an arc.
-    # How far the refinement may travel from its seed before the answer is
-    # a different solution rather than a refined one. Plain path: the seeds are
-    # lattice cells, and travel stays well inside one, so two cells is
-    # generous. Seasonal path: the rate seeds are spaced by a whole sideband,
-    # so the basin is half a sideband -- using two cells there rejects many
-    # correctly recovered pixels as runaways.
-    seasonal = bool(max_seasonal and max_seasonal > 0)
-    # THE GATE MUST MATCH THE KIND OF SEED IT IS JUDGING.
-    #
-    # From a LATTICE seed, two cells is exact reasoning: the grid search found
-    # the global maximum, so the optimum is within half a cell and anything
-    # travelling further has left its basin. That rule is scale-free because
-    # the seed error IS the cell.
-    #
-    # From a PREDICTED seed it is wrong. The seed is the network's estimate of
-    # this arc, and its error is set by the measurements, not by a grid the
-    # prediction never touched -- measured at p50 0.48 and p90 1.70 of a
-    # default cell. Expressed in cells that gate tightens as the caller
-    # refines the grid: at `step_dh=2` the same physical travel becomes 3.4
-    # cells and is rejected, which cost 26% of the pixels for no reason in the
-    # data. So a predicted seed is judged against a fixed physical distance,
-    # stated as the default cell, and the caller's step no longer decides who
-    # survives.
-    _PRED_H, _PRED_V = 4.0 * _m2h, 2.0 * _m2v      # the documented defaults
-    if seed_th is None:
-        rate_tol = np.pi if seasonal else 2.0 * step_dv_r
-        dh_tol = 2.0 * step_dh_r
-    else:
-        rate_tol = np.pi if seasonal else 2.0 * _PRED_V
-        dh_tol = 2.0 * _PRED_H
-    if seasonal and not no_h:
-        # Height and rate are CORRELATED in this design, so when the refinement
-        # moves the rate to another sideband the height must follow, dragged
-        # by their correlation. Gating dh at two lattice cells then rejects
-        # pixels whose rate is correct. The tolerance follows the coupling
-        # instead of a fixed cell count.
-        cor = abs(float(np.corrcoef(hh, tt)[0, 1]))
-        dh_tol = max(dh_tol, cor * (np.std(tt) / max(np.std(hh), 1e-30))
-                     * rate_tol)
+    # while a NaN is simply not an arc. The two conditions are documented
+    # above (UNRESOLVABLE ARCS): outside the caller's bounds, or a seeded fit
+    # whose first zoom sits on the tolerance box.
     edge = np.abs(dv) > max_dv_r
-    if max_seasonal and max_seasonal > 0:
-        # the annual is bounded like the other two: outside the range the
-        # caller stated, the answer is NaN and not a clipped one
-        edge = edge | (np.abs(seas) > c_guard_r / _GUARD)
-    runaway = np.abs(dv - TH0[:, -1]) > rate_tol
     if not no_h:
         edge = edge | (np.abs(dh) > max_dh_r)
-        runaway = runaway | (np.abs(dh - TH0[:, 0]) > dh_tol)
-    bad = (nv < 1) | edge | runaway
+    bad = (nv < 1) | edge | seed_edge
     gam = np.where(bad, np.nan, gam).astype(np.float32)
+    # no annual in the model is a value and not an absence: zero, where NaN
+    # would claim it could not be assessed
+    seas = np.zeros(m, dtype=np.complex128)
     # RADIANS OUT. The gates above run in the units the ARGUMENTS are stated in
     # -- max_dh in metres, max_dv in mm/yr -- because that is what the caller
     # asked to bound. Everything downstream works in phase, so the conversion
     # happens once, here, and nothing converts again: velocity() returns this
     # value untouched and displacement_los() is the single place a length is
-    # produced. The round trip it replaces (mm -> rad in velocity(), rad -> m in
-    # displacement_los) applied a sign convention at each end, which is where
-    # the sign of the reported rate became hard to trace.
+    # produced.
     return (gam,
             np.where(bad, np.nan, dh),                 # rad per unit ele2phase
             np.where(bad, np.nan, dv),                 # rad/yr
@@ -1573,15 +1388,27 @@ def _3d_arc_batch(Us, Ut, src, tgt, ele2phase, t, meter2rad, max_dh, max_dv,
         with ThreadPoolExecutor(_th) as ex:
             list(ex.map(_slice, range(_th * 4)))
         return ga, dha, dva, dsa
+    # arcs within ONE set are formed lower column first, as _3d_ps_network
+    # forms them, so the same arc has the same bytes whoever enumerated it
+    src = np.asarray(src); tgt = np.asarray(tgt)
+    if Us is Ut:
+        _neg = src > tgt
+        src, tgt = np.minimum(src, tgt), np.maximum(src, tgt)
+        if seed_th is not None:
+            seed_th = np.where(_neg[:, None], -np.asarray(seed_th), seed_th)
+    else:
+        _neg = np.zeros(len(src), dtype=bool)
     step = max(1, int(_3d_budget_mb(budget) * 1024 * 1024 // max(n * 16, 1)))
     for b0 in range(0, len(src), step):
         sl = slice(b0, min(b0 + step, len(src)))
-        arc = np.ascontiguousarray(
-            (Us[:, src[sl]] * np.conj(Ut[:, tgt[sl]])).astype(np.complex64))
+        arc = _3d_arc_product(Us[:, src[sl]], Ut[:, tgt[sl]])
         ga[sl], dha[sl], dva[sl], dsa[sl] = _3d_arc_fit(
             arc, ele2phase, t, meter2rad, max_dh, max_dv, step_dh, step_dv,
             budget, 0.0, iterations=iterations,
             seed_th=None if seed_th is None else seed_th[sl])
+    if _neg.any():
+        dha[_neg] = -dha[_neg]
+        dva[_neg] = -dva[_neg]
     return ga, dha, dva, dsa
 
 
@@ -1729,6 +1556,22 @@ def _3d_predict_gamma(Us_c, Ut_c, src, tgt, budget, threads=1):
         out[sl] = (np.abs(np.einsum('tj,tj->j', Us_c[:, src[sl]],
                                     np.conj(Ut_c[:, tgt[sl]]))) / n)
     return out
+
+
+def _3d_argmax_first(A, rtol=1e-6):
+    """The first column within `rtol` of each row's maximum.
+
+    A plain argmax picks between two candidates that score within the last
+    bit of each other by whichever a GEMM of this particular shape rounded
+    up, so a result could depend on how the arcs were batched. The banks are
+    ordered origin-first, so taking the FIRST candidate inside a tolerance
+    that sits above float32 rounding makes the pick a property of the data:
+    the smallest model among those the data cannot tell apart, whatever the
+    batch. Values inside the tolerance differ by less than any noise on a
+    single arc, so nothing of the answer is spent on this.
+    """
+    mx = A.max(axis=1, keepdims=True)
+    return np.argmax(A >= mx * (1.0 - rtol), axis=1)
 
 
 def _3d_rotate(Z, X):
@@ -2394,17 +2237,28 @@ def _3d_ps_network(U, iy, ix, date_values, *, bperp=None, window=(32, 128),
         dv_ = np.empty(m)
         ds2 = np.empty(m, np.complex128)
 
+        # ONE ORIENTATION PER ARC IN THE NODE TABLE. The tree hands pairs
+        # over as (min, max) of ITS indices and a caller as it likes; formed
+        # the two ways the same arc differs in its last bits -- the complex
+        # product is not symmetric under a swap -- and a lattice fit can
+        # answer a near-tie one cell apart on them, where a continuous one
+        # converged to the same point. Formed lower column first and negated
+        # back, the arc's bytes, and so its fit, are the same whoever
+        # enumerated it.
+        _lo, _hi, _neg = np.minimum(a_, b_), np.maximum(a_, b_), a_ > b_
+
         def _run(sel, budget_):
             step = max(1, int(_3d_budget_mb(budget_) * 1024 * 1024
                               // max(n * 16, 1)))
             for b0 in range(0, len(sel), step):
                 s_ = sel[b0:min(b0 + step, len(sel))]
-                arc = np.ascontiguousarray(
-                    (Un[:, a_[s_]] * np.conj(Un[:, b_[s_]])
-                     ).astype(np.complex64))
+                arc = _3d_arc_product(Un[:, _lo[s_]], Un[:, _hi[s_]])
                 g_[s_], dh_[s_], dv_[s_], ds2[s_] = _3d_arc_fit(
                     arc, ele2phase, t, meter2rad, max_dh, max_dv, step_dh,
                     step_dv, budget_, max_seasonal, iterations=iterations)
+                _n = s_[_neg[s_]]
+                dh_[_n] = -dh_[_n]
+                dv_[_n] = -dv_[_n]
         if _nth > 1 and m > _nth:
             # arcs are independent; slices of them fit concurrently
             from concurrent.futures import ThreadPoolExecutor
@@ -2545,6 +2399,14 @@ def _3d_ps_network(U, iy, ix, date_values, *, bperp=None, window=(32, 128),
             ai, aj = ai[_cap_keep], aj[_cap_keep]
             dh, dv, ds_ = dh[_cap_keep], dv[_cap_keep], ds_[_cap_keep]
             gk = gk[_cap_keep]
+    # ONE ORDER FOR THE SOLVE. The arcs arrive in whatever order the tree or
+    # a caller enumerated them, and the solve below is iterative: its last
+    # bits, and with them a knife-edge rejection, follow the row order.
+    # Sorted by their ends the same arcs give the same system whoever handed
+    # them over, so the network is a function of the arcs alone.
+    if len(ai):
+        _o = np.lexsort((aj, ai))
+        ai, aj, dh, dv, ds_, gk = ai[_o], aj[_o], dh[_o], dv[_o], ds_[_o], gk[_o]
     N = len(iy)
     gtake = gk
 

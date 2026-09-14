@@ -878,194 +878,12 @@ def _fit3d_model(ds, da_xr, both, date_values, bp):
     return mds
 
 
-def _fit1d_sequential(U, ele2phase, t, meter2rad, idx, max_dv,
-                      reject=True):
-    """Rate and height from one pixel's own series, as THREE 1-D problems.
-
-    Module level so dask ships it by name. `U` is (dates, pixels) of unit
-    phasors with invalid samples zeroed, and `idx` the epochs to use -- the
-    whole stack for the answer, a half of it for the error estimate. The valid
-    count is taken over `idx` and not passed in, so a subset is never scored
-    against the whole stack's count.
-
-    WHY NOT ONE 2-D LATTICE. Searching height and rate together maximises over
-    the product of two grids, and the largest of that many candidates climbs
-    with the count: on a noisy pixel the winner is then set by the SEARCH
-    RANGE rather than by the ground, and widening a bound changes answers that
-    were already reported. Split into stages, each parameter is estimated
-    where the geometry makes it the only thing the data can explain, so
-    neither can absorb the other and neither can run away:
-
-      1. RATE, on every epoch, weighted DOWN with |baseline| -- a linear ramp
-         from one at zero baseline to zero at the largest. An unmodelled
-         height leaks into a rate-only fit in proportion to the baseline, so
-         the epochs that would carry the leak are the ones that count least.
-
-         MEASURED AGAINST BOTH EXTREMES, across DEM error and noise. Dropping
-         the large baselines outright costs too much data: at high noise and a
-         small DEM error it doubles the rate error against either alternative.
-         Weighting them equally costs too much bias: at a large DEM error it
-         triples it. The ramp matches the better of the two everywhere inside
-         the range geocoding allows, and degrades gracefully outside it, which
-         no fixed subset does.
-      2. HEIGHT, with the stage-1 rate removed and every epoch WEIGHTED BY
-         |baseline| -- the thing that carries the height. A short-baseline
-         epoch contributes noise and almost no signal to this parameter, so it
-         is down-weighted in proportion rather than cut, which keeps the
-         estimator continuous as a baseline crosses any threshold. This stage
-         is a REGRESSION, not a search, so the height needs no bound at all:
-         it is solved from zero and cannot run to the edge of a range that
-         does not exist.
-      3. Both together on EVERY epoch, in a box a couple of lattice steps
-         wide. The first two stages only have to find the basin; this is what
-         delivers the precision, and the box is too small to overfit.
-
-    The stage-3 box is centred per pixel, so the data is DE-ROTATED by the
-    stage 1-2 model first and the box becomes one shared bank -- a single
-    product rather than one per pixel.
-
-    Returns (gamma, dh_rad, dv_rad); dh is 0 when no baseline was given.
-    """
-    import numpy as np
-    tt = np.asarray(t, dtype=np.float64)[idx]
-
-    # BLOCKED OVER PIXELS, because every stage here is pixelwise and the
-    # temporaries are not: the rate bank is (pixels x candidates) and stages 2
-    # and 3 rotate a (dates x pixels) copy. Sized from the caller's chunk those
-    # grow without limit -- a stack chunked one chunk per date hands this the
-    # whole burst at once, and `max_dv` scales the bank on top of that, so the
-    # task asks for many GB and the worker is killed.
-    #
-    # THE SLICE IS ONE DASK CHUNK. dask already runs as many tasks at once as
-    # the cluster has room for at that size, so an intermediate that costs a
-    # chunk costs what the scheduler has already budgeted -- and the size
-    # follows `array.chunk-size` rather than a constant nobody can see. A
-    # pixel's answer cannot depend on which slice it landed in, so the result
-    # is what the unblocked call returns.
-    from .utils_dask import get_dask_chunk_size_mb
-    _cands = int(2.0 * float(max_dv) * float(meter2rad) * 1e-3
-                 / ((2.0 * np.pi / max(float(tt.max() - tt.min()), 1e-9)) / 8.0)) + 2
-    # bytes per pixel of the largest intermediate: the bank counts 12 -- the
-    # complex product and the modulus taken from it -- a rotated copy counts 8
-    _per_pixel = max(12 * _cands, 8 * len(idx), 1)
-    _slice = max(1, int(get_dask_chunk_size_mb() * 1024 * 1024) // _per_pixel)
-    if U.shape[1] > _slice:
-        _g, _h, _v = [], [], []
-        for _s in range(0, U.shape[1], _slice):
-            _r = _fit1d_sequential(U[:, _s:_s + _slice], ele2phase, t, meter2rad,
-                                   idx, max_dv, reject=reject)
-            _g.append(_r[0]); _h.append(_r[1]); _v.append(_r[2])
-        return (np.concatenate(_g), np.concatenate(_h), np.concatenate(_v))
-
-    Uu = np.ascontiguousarray(U[idx])
-    n_ = np.maximum((np.abs(Uu) > 0).sum(axis=0).astype(np.float64), 1.0)
-    npix = Uu.shape[1]
-    no_h = ele2phase is None
-    hh = None if no_h else np.asarray(ele2phase, dtype=np.float64)[idx] * meter2rad
-    if no_h:
-        hh = np.zeros(len(idx))
-
-    # ---- 1: rate alone, every epoch, weighted down with |baseline| --------
-    if no_h:
-        w1 = np.ones(len(idx))
-    else:
-        _a = np.abs(hh)
-        w1 = 1.0 - _a / max(float(_a.max()), 1e-30)
-    # PHASE THROUGHOUT, converted once here exactly as _3d_arc_fit converts at
-    # its own door: max_dv is mm/yr. THERE IS NO HEIGHT BOUND -- the height is
-    # solved and never searched, so nothing here needs one.
-    _m2h = float(meter2rad)
-    _m2v = float(meter2rad) * 1e-3
-    max_dv_r = float(max_dv) * _m2v
-    # THE SCAN RESOLUTION IS NOT A CALLER'S QUESTION. The scan only has to land
-    # inside the right main lobe -- stage 3 climbs to the top from anywhere in
-    # it -- so the only scale that matters is where each objective first nulls:
-    # 2 pi over the span of its own design column. An eighth of that is well
-    # inside the lobe and costs a scan of a few hundred candidates.
-    _sp_t = max(float(tt.max() - tt.min()), 1e-9)
-    step_dv_r = (2.0 * np.pi / _sp_t) / 8.0
-    # only the RATE is scanned; the height is solved
-    gv = np.arange(-max_dv_r, max_dv_r + 1e-12, step_dv_r)
-    Cv = np.exp(-1j * np.outer(tt, gv)).astype(np.complex64)
-    v1 = gv[np.argmax(np.abs(np.ascontiguousarray(w1[:, None] * Uu).T @ Cv), axis=1)]
-
-    # ---- 2: height alone, where the baseline dominates, rate removed ------
-    if no_h:
-        h2 = np.zeros(npix, dtype=np.float64)
-    else:
-        # A REGRESSION, NOT A SEARCH. Over the height range geocoding permits
-        # the topographic phase spans well under half a turn, so there is
-        # nothing to wrap and nothing to scan: the height is solved
-        # continuously from zero. That is why there is no height bound to pass
-        # -- a scan would need one, and would then make the ANSWER depend on
-        # it, which is not something a regression should ever do. A caller who
-        # wants large heights gone filters the height that comes back.
-        #
-        # WEIGHTED BY |baseline|, normalised so the weight is a shape and not
-        # a scale: the epoch that carries the most height signal counts most,
-        # and one that carries none counts for nothing.
-        w = np.abs(hh)
-        w = w / max(float(w.max()), 1e-30)
-        Ur = Uu * np.exp(-1j * np.outer(tt, v1)).astype(np.complex64)
-        _Ah = np.c_[hh / _m2h]
-        _vw = (np.abs(Ur) > 0).astype(np.float64) * w[:, None]
-        h2 = np.zeros((1, npix))
-        for _ in range(10):
-            _p = Ur * np.exp(-1j * (_Ah @ h2))
-            _S = (_vw * _p).sum(axis=0)
-            _q = _p * np.conj(_S / np.maximum(np.abs(_S), 1e-30))
-            _r = (_vw * np.imag(_q) * _Ah[:, 0:1]).sum(axis=0)
-            _c = (_vw * np.maximum(np.real(_q), 0.0) * _Ah[:, 0:1] ** 2).sum(axis=0)
-            h2 = h2 + (_r / np.maximum(_c, 1e-30))[None, :]
-        h2 = h2[0]
-
-    # ---- 3: both together, on every epoch, solved CONTINUOUSLY ------------
-    # Gauss-Newton on the coherence itself, entirely in complex space. Taking
-    # the angle of a residual would wrap, and the wrap lands exactly where the
-    # fit is worst; centring each epoch on the RESULTANT direction instead
-    # profiles out the pixel's constant scatterer phase and leaves the SINE of
-    # the residual, which is smooth and bounded. The step sizes therefore pick
-    # which basin stages 1-2 land in and NOTHING about the answer -- the same
-    # contract `step_dh`/`step_dv` document.
-    A = (np.c_[tt] if no_h else np.c_[hh / _m2h, tt])
-    th = (np.vstack([v1]) if no_h else np.vstack([h2, v1]))
-    valid = (np.abs(Uu) > 0).astype(np.float64)
-    kk = A.shape[1]
-    _eye = np.eye(kk)
-    for _ in range(8):
-        pr = Uu * np.exp(-1j * (A @ th))
-        Sr = (valid * pr).sum(axis=0)
-        q = pr * np.conj(Sr / np.maximum(np.abs(Sr), 1e-30))
-        # the sine of each residual about the mean direction, and the
-        # curvature that goes with it -- clipped at zero so a half-turn-away
-        # sample cannot push the solve the wrong way
-        rr = valid * np.imag(q)
-        cc = valid * np.maximum(np.real(q), 0.0)
-        H = np.einsum('ni,nj,np->pij', A, A, cc, optimize=True)
-        g = np.einsum('ni,np->pi', A, rr, optimize=True)
-        H = H + _eye * 1e-12 * np.maximum(
-            np.trace(H, axis1=1, axis2=2), 1.0)[:, None, None]
-        th = th + np.linalg.solve(H, g[..., None])[..., 0].T
-    dv = th[-1]
-    dh = np.zeros(npix) if no_h else th[0]
-    gam = (np.abs((valid * Uu * np.exp(-1j * (A @ th))).sum(axis=0))
-           / n_).astype(np.float32)
-    # A BOUND MAY ONLY REFUSE. Stages 1 and 2 search inside the bounds, so only
-    # the refinement box can step out of them, and a pixel it carries out is
-    # NaN rather than a value quietly pulled back to the edge.
-    #
-    # `reject` is off for the half-stack fits, which exist only to be
-    # DIFFERENCED against the whole-stack answer. Half the epochs is a
-    # noisier measurement of the same ground, so a half sits a little either
-    # side of the full model as a matter of course -- and near the edge of
-    # the range that lands outside it. Refusing there would drop the pixel
-    # for the half's noise rather than for its disagreement, which is what
-    # `err_dh`/`err_dv` are for and what they alone should decide.
-    bad = ~np.isfinite(dv)
-    if reject:
-        bad = bad | (np.abs(dv) > max_dv_r)
-    return (np.where(bad, np.nan, gam).astype(np.float32),
-            np.where(bad, np.nan, dh), np.where(bad, np.nan, dv))
+# fit1d's per-block screen: the share of a block's pixels, ranked by raw
+# resultant, whose fit residuals define the block's common phase per date
+# (never fewer than one). A per-date constant is a mild correction that only
+# has to be LOCAL; it is not an elevation slope, so a dask block is a fine
+# unit for it and no window in metres is needed.
+_FIT1D_SCREEN_TOP = 0.01
 
 
 def _horn_gradient_2d_for_dask(block, dy=1.0, dx=1.0):
@@ -3722,203 +3540,67 @@ class BatchUnit(BatchCore):
 
 class BatchComplex(BatchCore):
     def fit1d(self, threshold: float = 0.5, baseline: str = 'BPR',
-              max_dv: float = 100.0,
-              err_dh: 'float | None' = 40.0,
-              err_dv: 'float | None' = 10.0) -> 'Batch':
+              max_dh: float = 25.0, max_dv: float = 100.0,
+              step_dh: float = 8.0, step_dv: float = 2.0,
+              adaptive: bool = True) -> 'Batch':
         """
-        Full per-pixel model on the per-date complex stack -- NO network.
+        Per-pixel {height, rate} fit on the per-date complex stack, no network.
 
-        The 1d twin of fit3d(): the SAME {height, rate} model, fitted on each
-        pixel's own time series instead of on arcs between neighbours. 1d is
-        the time axis alone; 3d adds the two spatial ones. Returns the MODEL
-        ONLY, named and scaled exactly as fit3d() names and scales it, so
-        predict(model) is the single inverse for both.
+        The 1d twin of fit3d(): the same `_3d_arc_fit` kernel on each pixel's
+        own series instead of on arcs. `velocity` and `height` are named and
+        scaled as fit3d()'s, so predict(model) inverts both. No self-check: a
+        pixel is NaN where its solution lies beyond `max_dh`/`max_dv` or it has
+        no non-zero date, and its `coherence` says what the rest is worth.
 
-        Velocity is the ROTATION RATE of the per-date phase vectors, and the
-        estimator is `_fit1d_sequential`: each parameter solved where the
-        geometry makes it the only thing the data can explain, then both
-        refined together, with the constant scatterer phase profiled out by
-        rotation and never estimated. Nothing is wrapped or unwrapped, and no
-        reference date is needed. fit3d()'s lattice kernel is NOT used here --
-        a pixel's own series has no neighbour to lean on, so a joint search
-        over several parameters is what the staging exists to avoid.
-
-        WHY THIS REPLACED THE MOVING-WINDOW ESTIMATOR. The previous version
-        reported the constant term of a {1, cos, sin} fit to per-window rates,
-        each estimated over a short window of few samples searching +-pi/dt.
-        That path holds up only at high coherence and degrades where real
-        pixels live: its neighbourhood disagreement came out FLAT with radius,
-        which is what a noise field looks like, while this fit's grows with the
-        box, like a real field. It was also far worse conditioned and more
-        expensive.
-
-        WHAT IT GIVES UP. An annual term of amplitude A rad leaves the model
-        misspecified, and the coherence of the true rate is |J0(A)| while a
-        sideband one cycle/yr away gets |J1(A)|; they cross at A = 1.435 rad,
-        above which the sideband is genuinely the higher maximum and NO
-        coherence-maximising estimator returns the truth. Whether a stack
-        reaches that amplitude is a property of the stack, not of the fit;
-        where it does, the rate is not identifiable from one pixel's phase
-        alone, and the annual term belongs in the model.
+        No annual term (the kernel refuses one). For evenly spread dates, an
+        annual amplitude above 1.435 rad lets a sideband one cycle/yr away
+        outscore the true rate.
 
         Parameters
         ----------
-        baseline : str
-            Variable holding the perpendicular baseline per date. With it the
-            per-pixel DEM error is solved jointly with the rate, which matters:
-            they are NOT separable one at a time, because the perpendicular
-            baseline is not a smooth function of time. Without it (absent
-            variable, or None) the height term is not estimated at all and the
-            rate carries whatever the DEM error contributes.
-        max_dv : float
-            Largest rate (mm/yr) to admit. A pixel solving outside it returns
-            NaN rather than a plausible wrong number. It also sizes the rate
-            scan, so the search runs wider than it says and the default detects
-            99 mm/yr on its merits and never against a boundary.
-
-            IT DEFAULTS WIDE, at 100 mm/yr, because this function exists to
-            find fast ground before anything else has been decided about it: no
-            network, no neighbours, one pixel's own series. A bound set for
-            ordinary ground would make the fast ground it is for disappear,
-            and the cost of the wide default is only that an incoherent pixel
-            reports a larger number -- which `threshold`, `err_dv` and the
-            returned `coherence` are there to catch.
-        NO HEIGHT BOUND. There is no `max_dh`. The height is SOLVED, not
-            searched -- a weighted regression from zero, refined jointly -- so
-            no bound is needed to keep the search in range, and a bound could
-            then do only one thing: drop pixels whose height came out large.
-            `height` is returned, so `.where(abs(height) < h)` does exactly
-            that, at any threshold, after the fact and without refitting.
-
-            A large height is worth filtering on, but it is a COHERENCE
-            symptom, not a separate fault: the height's precision is set by the
-            baseline distribution alone, sigma_h = sigma_phi / |B_perp spread|,
-            so the pixels reporting big heights are the incoherent ones and
-            `threshold` reaches them more directly. Past half the ambiguity
-            height, 2 pi over the span of the height-to-phase column, a
-            reported height is an alias of a smaller one in any case.
-        THE SPATIAL CHUNKING DECIDES THE PARALLELISM. Every pixel is fitted
-            from its own dates and nothing else, so the blocks are independent
-            and there is one task per SPATIAL chunk -- the date axis is
-            contracted, not split. A stack straight from load() carries one
-            spatial chunk per burst, and the whole burst is then fitted by one
-            task on one worker while the rest of the cluster idles; `chunk2d`
-            splits it and the same call returns the same answer from as many
-            tasks as it has blocks. Nothing here rechunks on the caller's
-            behalf -- how the work is split is theirs to state.
-        NO STEP SIZES. The staged fit scans each 1-D objective only to find
-            which main lobe the answer is in, and solves continuously from
-            there, so the scan's resolution cannot reach the answer. It is
-            derived from the data -- an eighth of where each objective first
-            nulls, 2 pi over the span of its own design column -- and there is
-            nothing for a caller to choose. Measured: quartering it moves the
-            reported rate by 0.000 mm/yr at the median.
         threshold : float
-            INPUT gate, named and placed as fit3d() names and places it, but
-            measured on the RAW phase before anything is fitted: the resultant
-            length of the pixel's own normalised phasors, |sum z_d| / n. It is
-            the coherence the no-model solution scores, so it is what the fit
-            starts from, and a pixel below it is refused rather than fitted --
-            the fit is skipped, not just the answer discarded.
+            Input gate: |sum z_d| / n over the non-zero dates, after the block
+            screen and before the pixel's fit; pixels below it are NaN.
+        baseline : str
+            Name of the per-date perpendicular baseline variable; the DEM error
+            is solved jointly with the rate. None or a missing variable (no
+            error raised) fits no height; the DEM error then biases the rate.
+        max_dh : float
+            Largest DEM error, metres; a solution beyond it is NaN. A geocoding
+            limit, not a prior: a DEM error shifts the sample on the ground.
+        max_dv : float
+            Largest rate, mm/yr; a solution beyond it is NaN. The scan runs 10%
+            past it, so a rate near the bound is a maximum, not an edge.
+        step_dh, step_dv : float
+            Lattice steps, metres and mm/yr, as fit3d()'s. Two zoom levels,
+            each 5x finer and 1.4 cells either side, refine the lattice winner,
+            so a step must stay inside its main lobe; a long stack narrows the
+            rate lobe and wants a finer `step_dv`.
+        adaptive : bool
+            Remove each block's common phase per date first: fit its top 1% of
+            finite pixels by raw resultant (at least one), average their
+            residual phasors per date and rotate that angle out of each series.
+            One constant per date per block, not a substitute for detrend2d().
+            A block whose references all fail the bounds is NaN.
 
-            IT IS AN INPUT GATE AND NOTHING ELSE. `coherence` in the output is
-            the resultant length about the model the fit CHOSE, which is never
-            lower; comparing the two says how much the two free parameters
-            bought. Gating on the output instead would keep whatever the
-            lattice managed to explain, which on a wide `max_dv` is noise.
-
-            IT ALSO ANSWERS WHETHER THIS STACK NEEDS DETRENDING. The gate reads
-            the phase as it arrives, so running it before and after
-            `detrend2d()` measures what the per-date screen costs, in pixels,
-            on this stack rather than on a rule of thumb: a screen that matters
-            moves the whole distribution, and one that does not leaves the
-            retention where it was. Nothing here requires the screen to be gone
-            first -- the fit runs either way -- but the two numbers are the
-            cheapest evidence for the decision.
-        err_dh, err_dv : float or None
-            Absolute agreement bounds, in metres and mm/yr, against a HALF
-            STACK refitted on its own. None skips the check and the refit with
-            it. They are ON BY DEFAULT because a fit with no network and no
-            neighbours has nothing else to check itself against: every other
-            estimator here is cross-examined by its arcs, and this one can only
-            be cross-examined by its own dates.
-
-            THE DEFAULTS ARE 40 m AND 10 mm/yr. They are not the same strength
-            -- a millimetre a year is worth about four metres of height on a
-            typical geometry, so err_dh = 4 err_dv is the setting that makes
-            the two bite equally, and 40 against 10 deliberately leaves the
-            height bound the looser of the two. The height is the noisier
-            parameter and the one with no independent interest here; letting it
-            veto pixels the rate agrees about would cost coverage for a
-            quantity the caller did not ask for.
-
-            WITHOUT A BASELINE err_dh is dropped, not refused: there is no
-            height in the model for it to check.
-
-            Both are measured on the SAME split: the whole staged fit is
-            repeated on the odd dates and again on the even dates, and the
-            model must agree
-            with BOTH within the bound. Alternating dates keep the baseline
-            distribution and the time span, so a half differs from the full
-            stack by its noise draw alone -- and requiring both removes the
-            arbitrariness of picking one, which tracks the true error better
-            than either half on its own.
-
-            A pixel whose half-model disagrees by more than the bound returns
-            NaN, as every other bound in this library does -- it may refuse a
-            pixel, never adjust one. A pixel the half cannot solve at all is
-            also NaN: unverified is not the same as verified good.
-
-            The half fits themselves are UNBOUNDED -- `max_dv` does not refuse
-            them. A half sees half the epochs, so it sits either side of the
-            whole-stack answer as a matter of course and near the edge of a
-            range that lands outside it; refusing there would drop a pixel for
-            the half's noise instead of for its disagreement, which is the one
-            thing these bounds are meant to judge.
         Returns
         -------
         Batch
-            ONE dataset of model parameters, named by quantity, identical in
-            name, unit and convention to fit3d()'s:
+            `velocity` rad/yr, `height` rad per unit ele2phase, `coherence` the
+            resultant length maximised, `rmse` sqrt(-2 ln gamma * n/(n-p)) with
+            p = 2, or 3 with a baseline. No `conncomp` or `seasonal`; predict()
+            treats a missing `seasonal` as none.
 
-              `velocity`   rad/yr
-              `height`     rad per unit ele2phase
-              `coherence`  gamma, the resultant length the fit maximised
-              `rmse`       radians, circular deviation about that same model
-
-            NO `conncomp`. fit3d() carries one because its network solves in
-            connected components; every pixel here is solved alone, so there is
-            no component to report and none is invented. predict() never reads
-            it -- it is pixelwise.
-
-            NO `seasonal`. fit3d() reports an annual term; this does not fit
-            one. The staged estimator exists to solve one parameter at a time
-            where the geometry makes it the only thing the data can explain,
-            and an annual term has no such geometry -- it is a third unknown in
-            the same objective, which is the joint search the staging replaced.
-            A stack that needs one is a stack for fit3d(). predict() treats a
-            model without this variable as having no annual term, so a fit1d
-            model removes and predicts exactly as a fit3d model does.
-
-            HEIGHT COSTS NOTHING. This is not a richer fit, it is the same fit
-            reporting what it already had: the kernel solves height jointly
-            with rate because they do not separate.
-
-            THE RMSE IS EXACT. gamma is the resultant length of the residual
-            about the model that was actually REPORTED -- it is the objective
-            the fit maximised -- so
-
-                sigma = sqrt(-2 ln gamma)
-
-            is self-consistent by construction, equals the RMS for small
-            residuals, and has no ceiling as the phase decorrelates. It is
-            inflated by n/(n-p) for the parameters spent -- phi0 and rate
-            always, height when a baseline was given.
+        Notes
+        -----
+        One task per spatial chunk, with the date axis contracted. With
+        `adaptive` the chunk is also the screen's block, so rechunking the
+        stack (e.g. chunk2d()) changes the result.
 
         Examples
         --------
         >>> model = stack.fit1d()
-        >>> noise = stack * stack.predict(model, baseline='BPR').iexp()
+        >>> noise = stack * stack.predict(model, baseline='BPR').iexp(sign=1)
         """
         import dask.array as da
         import numpy as np
@@ -3927,13 +3609,11 @@ class BatchComplex(BatchCore):
 
         BatchCore._require_lazy(self, 'fit1d')
 
-        # DELEGATE BY STACK TYPE. The same call fits the same model whether the
-        # samples are dates or pairs; only the design columns differ, so the
-        # caller writes fit1d() either way and never selects a variant by hand.
+        # a stack with any `pair` variable is refused; use the per-date stack
         _pairs = any('pair' in ds[v].dims
                      for ds in self.values() for v in ds.data_vars)
         if _pairs:
-            # the split is kept so a pair-domain fit has a home when one works
+            # kept as its own branch for a future pair-domain fit
             raise NotImplementedError(
                 'fit1d() does not support complex PAIRS. Use the per-DATE stack, '
                 'or unwrap and call Batch.fit1d() on the unwrapped pairs.')
@@ -3949,9 +3629,8 @@ class BatchComplex(BatchCore):
                 raise TypeError(
                     f'fit1d() found no complex (date, y, x) variables in '
                     f'burst {burst_id}')
-            # ONE polarisation, exactly as fit3d(): the model variables are
-            # named by quantity alone so predict() can look them up directly,
-            # and two polarisations would collide on those names.
+            # one polarisation: the model variables are named by quantity and
+            # would collide
             if len(pols) > 1:
                 raise ValueError(
                     f"fit1d() fits ONE polarisation; burst '{burst_id}' carries "
@@ -3961,8 +3640,7 @@ class BatchComplex(BatchCore):
                     "batch[['VV']].")
             pol = pols[0]
 
-            # ele2phase = B_perp / (R sin theta), one value per burst: it
-            # varies about a percent across it, which keeps the fit a matmul
+            # ele2phase_d = B_perp_d / (R sin theta), one R sin theta per burst
             dates = np.asarray(ds.coords['date'].values)
             dday = dates.astype('datetime64[D]').astype(np.float64)
             bp = None
@@ -3983,14 +3661,9 @@ class BatchComplex(BatchCore):
                     f'fit1d() needs radar_wavelength in burst {burst_id} to '
                     f'turn a rotation rate into a velocity')
 
-            # t = 0 AT THE MASTER, where B_perp is smallest -- the same origin
-            # _3d_fit_frame and predict() use. Rate and height do not care
-            # (a shift in t adds a constant and the constant is profiled out),
-            # but the annual does: car = exp(2j*pi*t) rotates by
-            # exp(2j*pi*delta), so a model fitted on one origin and removed on
-            # another leaves a residual annual of 2|sin(pi*delta)|*|seasonal|.
-            # This used to run from dates[0], which was invisible only because
-            # the seasonal was discarded before anyone could subtract it.
+            # t = 0 at the master (smallest |B_perp|, else the first date); it
+            # is written to the model's `date`, which predict() reads as its
+            # origin
             _b = bp if (bp is not None and bp.shape == dday.shape) \
                 else np.zeros_like(dday)
             _master = int(np.argmin(np.abs(_b)))
@@ -4001,45 +3674,13 @@ class BatchComplex(BatchCore):
                 data_da = data_da.transpose('date', ...)
             data_dask = data_da.data
 
-            # THE ERROR ESTIMATE IS THE SAME FIT ON EACH HALF OF THE EPOCHS.
-            # Alternating dates keep the full baseline distribution and the full
-            # time span, so a half model differs from the full one by its noise
-            # draw and by nothing else -- which is what makes the difference an
-            # error bar rather than a comparison of two different problems.
-            #
-            # BOTH HALVES, NOT ONE. A single half is an arbitrary choice and the
-            # two disagree about which pixels are stable, so whichever was
-            # picked would decide what ships. Judging against the worse of the
-            # two asks the question the caller means -- does this pixel hold up
-            # on ANY half of its own data -- and it tracks the true error better
-            # than either half alone.
-            #
-            # Chosen once per burst, never per block, or two blocks would
-            # compare two different halves.
-            _half = None
-            if err_dv is not None or err_dh is not None:
-                _half = (np.arange(1, len(tyr), 2), np.arange(0, len(tyr), 2))
-                if min(len(_half[0]), len(_half[1])) < 6:
-                    raise ValueError(
-                        f'fit1d(): err_dv/err_dh are ON BY DEFAULT and estimate '
-                        f'the error from each half of the dates; {len(tyr)} '
-                        f'dates leave only '
-                        f'{min(len(_half[0]), len(_half[1]))} in a half. Pass '
-                        f'err_dv=None, err_dh=None to fit without them.')
-            # WITHOUT A BASELINE THERE IS NO HEIGHT, so err_dh has nothing to
-            # check and is dropped rather than refused: the model does not
-            # carry the variable either, so this is a bound with no subject
-            # rather than a bound a caller set wrongly. err_dv still applies.
-            if ele2phase is None:
-                err_dh = None
-            _full = np.arange(len(tyr))
-
             def _fit_block(block, _h=ele2phase, _t=tyr, _m=meter2rad,
-                           _mv=float(max_dv),
-                           _thr=float(threshold),
-                           _full=_full, _half=_half,
-                           _ev=(None if err_dv is None else float(err_dv)),
-                           _eh=(None if err_dh is None else float(err_dh))):
+                           _mh=float(max_dh), _mv=float(max_dv),
+                           _sh=float(step_dh), _sv=float(step_dv),
+                           _thr=float(threshold), _adaptive=bool(adaptive)):
+                # imported inside the task
+                from .utils_arcs import _3d_arc_fit
+                from .utils_dask import get_dask_chunk_size_mb
                 S = np.asarray(block)
                 nd = S.shape[0]
                 shape = S.shape[1:]
@@ -4047,85 +3688,86 @@ class BatchComplex(BatchCore):
                 npix = Z.shape[1]
                 if npix == 0:
                     e = np.empty(0, np.complex64).reshape(shape)
-                    return np.stack([e, e, e, e, e], axis=0)
-                # THE INPUT GATE, on the RAW phase and before any model: the
-                # resultant length of the pixel's own normalised phasors. A
-                # constant scatterer phase multiplies the sum and not its
-                # modulus, so this needs no reference epoch and no detrending
-                # to mean what it says.
+                    return np.stack([e, e, e, e], axis=0)
+                # input gate: resultant length of the normalised phasors, which
+                # a constant scatterer phase leaves unchanged
                 _A = np.abs(Z)
+                # a NaN on any date refuses the pixel; a zero date drops out of
+                # every sum and of n, and an all-zero series is NaN
+                _finite = np.isfinite(_A).all(axis=0)
                 _ok = np.isfinite(_A) & (_A > 0)
                 _U = np.where(_ok, Z / np.where(_ok, _A, 1.0), 0)
-                g0 = np.abs(_U.sum(axis=0)) / np.maximum(_ok.sum(axis=0), 1)
-                sel = np.nonzero(g0 >= _thr)[0]
-                # REFUSED PIXELS ARE NOT FITTED, which is the point of gating
-                # the input: the lattice product is the cost here, and a pixel
-                # below the gate never reaches it.
+                _nok = np.maximum(_ok.sum(axis=0), 1)
+                g0 = np.abs(_U.sum(axis=0)) / _nok
+                _budget = get_dask_chunk_size_mb()
+                # block screen: fit the top share of the finite pixels by raw
+                # resultant (so their own rate and DEM error stay out), average
+                # their residual phasors per date, rotate every series by that
+                # angle and recompute the gate
+                _k = max(int(round(_FIT1D_SCREEN_TOP * npix)), 1) if _adaptive else 0
+                _ref = np.argsort(np.where(_finite, -g0, np.inf),
+                                  kind='stable')[:_k]
+                _ref = _ref[_finite[_ref]]
+                if len(_ref):
+                    _Ur = np.ascontiguousarray(_U[:, _ref])
+                    _, _hr, _vr = _3d_arc_fit(
+                        _Ur, _h, _t, _m, max_dh=_mh, max_dv=_mv, step_dh=_sh,
+                        step_dv=_sv, budget=_budget, max_seasonal=0.0)[:3]
+                    _fok = np.isfinite(_vr)
+                    if not _fok.any():
+                        _finite[:] = False
+                    else:
+                        _ph = np.outer(_t, _vr[_fok])
+                        if _h is not None:
+                            _ph = _ph + np.outer(_h, _hr[_fok])
+                        _R = _Ur[:, _fok] * np.exp(-1j * _ph)
+                        _S = _R.sum(axis=0)
+                        _R = _R * np.conj(_S / np.maximum(np.abs(_S), 1e-30))
+                        # a date no reference holds gets angle 0, so it is not
+                        # rotated
+                        _c = np.angle(_R.mean(axis=1))
+                        _U = (_U * np.exp(-1j * _c)[:, None]).astype(np.complex64)
+                        g0 = np.abs(_U.sum(axis=0)) / _nok
+                sel = np.nonzero(_finite & (g0 >= _thr))[0]
+                # only pixels at or above the gate are fitted for output
                 vel = np.full(npix, np.nan, np.float64)
                 hgt = np.full(npix, np.nan, np.float64)
                 gam = np.full(npix, np.nan, np.float32)
                 if len(sel):
                     Us = np.ascontiguousarray(_U[:, sel])
-                    g_, h_, v_ = _fit1d_sequential(
-                        Us, _h, _t, _m, _full, _mv)
-                    # THE ERROR BAR, stated in metres and mm/yr and used in
-                    # radians as every other bound here is. Written so a NaN
-                    # half FAILS: a pixel its own half cannot solve is
-                    # unverified, which is not the same as verified good.
-                    # The halves are UNREFUSED (`reject=False`) so that the
-                    # only thing a pixel is dropped for is the disagreement
-                    # itself -- see _fit1d_sequential.
-                    _bad = np.zeros(len(sel), bool)
-                    if _half is not None:
-                        for _ix in _half:
-                            _, h2, v2 = _fit1d_sequential(
-                                Us, _h, _t, _m, _ix, _mv, reject=False)
-                            if _ev is not None:
-                                _bad |= ~(np.abs(np.asarray(v2) - np.asarray(v_))
-                                          <= _ev * _m * 1e-3)
-                            if _eh is not None:
-                                _bad |= ~(np.abs(np.asarray(h2) - np.asarray(h_))
-                                          <= _eh * _m)
-                    vel[sel] = np.where(_bad, np.nan, v_)
-                    hgt[sel] = np.where(_bad, np.nan, h_)
-                    gam[sel] = np.where(_bad, np.nan, g_)
-                # ONE CONVENTION ACROSS EVERY FIT: displacement_los() must turn
-                # this model into a negative rate where the ground subsides,
-                # whichever fit produced it. _3d_arc_fit solves the per-DATE
-                # phase, and a pair runs opposite to it -- an SLC phase is
-                # -(4pi/lambda)r, so ref*conj(rep) carries +m2r*dr while a date
-                # series carries -m2r*dr. displacement_los()'s -lambda/4pi is
-                # derived for the pair, so the pair sense is the one the library
-                # converts. Returning the date sense reports subsidence as uplift.
-                #
-                # HEIGHT IS NOT NEGATED. Its per-date term +hgt*e2p_d
-                # differences to -hgt*e2p_pair, which already matches the pair
-                # convention, and it is why a global sign flip on the
-                # prediction does not work.
+                    # NaN beyond either bound or with no non-zero date; the
+                    # batching budget is the dask chunk size
+                    g_, h_, v_ = _3d_arc_fit(
+                        Us, _h, _t, _m, max_dh=_mh, max_dv=_mv, step_dh=_sh,
+                        step_dv=_sv, budget=_budget, max_seasonal=0.0)[:3]
+                    if _h is None:
+                        # no baseline: the height is 0 by model, not unassessed
+                        h_ = np.where(np.isfinite(v_), 0.0, np.nan)
+                    vel[sel] = v_
+                    hgt[sel] = h_
+                    gam[sel] = g_
+                # publish the pair sign that displacement_los() converts: a
+                # per-date series runs opposite to a pair, so the rate is
+                # negated. The height keeps its sign; its per-date +h*e2p_d
+                # differences to -h*e2p_p.
                 vel = -vel
-                # circular deviation about the REPORTED model, inflated for the
-                # parameters the fit spent: phi0 and rate always, height when a
-                # baseline was given.
+                # rmse = sqrt(-2 ln gamma * n/(n-p)): n non-zero dates, p
+                # parameters spent
                 nok = np.maximum((np.abs(Z) > 0).sum(axis=0), 1)
                 npar = 2 + (0 if _h is None else 1)
                 infl = nok / np.maximum(nok - npar, 1)
                 Rres = np.clip(gam.astype(np.float64), 1e-9, 1.0)
                 rms = np.sqrt(np.maximum(-2.0 * np.log(Rres), 0.0) * infl)
                 rms = np.where(np.isfinite(gam), rms, np.nan)
-                # one dtype ships every plane; complex64 carries the real
-                # ones without rounding
+                # one complex64 array carries every plane
                 return np.stack([vel.reshape(shape).astype(np.complex64),
                                  hgt.reshape(shape).astype(np.complex64),
                                  gam.reshape(shape).astype(np.complex64),
                                  rms.reshape(shape).astype(np.complex64)],
                                 axis=0)
 
-            # ONE TASK PER SPATIAL CHUNK, the way adi() states the same thing:
-            # the blocks are independent -- a pixel's fit reads that pixel's
-            # dates and nothing else -- so there is no halo, no network and no
-            # driver to build. `concatenate=True` hands the task its block with
-            # the date axis assembled, and the caller's spatial chunking is what
-            # decides how the work is split.
+            # one task per spatial chunk, dates contracted; with `adaptive` the
+            # screen couples the pixels of a block
             stacked = da.blockwise(
                 _fit_block, 'nyx', data_dask, 'dyx',
                 new_axes={'n': 4}, concatenate=True, dtype=np.complex64,
@@ -4140,8 +3782,7 @@ class BatchComplex(BatchCore):
                               ('rmse', stacked[3].real.astype(np.float32))):
                 mvars[nm_] = xr.DataArray(arr_, dims=('y', 'x'), coords=coords)
             mds = xr.Dataset(mvars, attrs=ds.attrs)
-            # the epoch the model is referenced to, named as every other date
-            # in this library is named
+            # the epoch the model is referenced to
             mds = mds.assign_coords(date=np.datetime64(int(dday[_master]), 'D'))
             if 'spatial_ref' in ds.coords:
                 mds = mds.assign_coords(spatial_ref=ds.spatial_ref)
@@ -5128,19 +4769,12 @@ class BatchComplex(BatchCore):
         baseline : str
             Variable holding the perpendicular baseline per date.
         iterations : int
-            Refinement passes per arc, for the arcs that reach the final fit. The per-arc search is a lattice followed
-            by a majorise-minimise refinement, and the refinement's step
-            contracts by exactly `(1 - gamma)` per pass -- so the useful count
-            follows from `threshold`, not from taste. At a 0.4 gate the
-            contraction is 0.6 and eight passes leave 0.6**8, under two percent
-            of a lattice cell: 0.07 m at `step_dh=4`, 0.03 mm/yr at
-            `step_dv=2`. Refining far below the step it sits inside buys
-            nothing.
-
-            It is also the larger half of the attachment's cost, since stage 1
-            is one product over the box while this runs on every arc this many
-            times. A lower `threshold` contracts more slowly and wants more
-            passes; a higher one wants fewer.
+            0 stops the per-arc fit at the lattice argmax, which is enough to
+            RANK candidates and is what the shortlist stages use. Any positive
+            value runs the refinement -- a zoom of two lattices, each five
+            times finer than the last, around the winner -- and the number
+            itself no longer matters: the refinement used to iterate, and the
+            count is kept only so existing calls still read.
         consensus : int
             How much agreement is required before a value is reported, asked
             once for both halves of the solve: a node must keep this many
@@ -5304,49 +4938,15 @@ class BatchComplex(BatchCore):
             are one bound. Tightening err_dh from 5 to 4 m drops about 4% of
             the marginal DS at the gate and leaves the rest untouched.
         max_seasonal : float
-            Largest annual amplitude to admit, in mm of LOS (HALF amplitude, so
-            60 means a 120 mm peak-to-peak swing). 0 (default) leaves the annual
-            term out of the model entirely.
-
-            It is not a refinement: an annual term of amplitude A radians leaves
-            coherence |J0(A)| at the true rate and |J1(A)| one cycle/yr away,
-            and they cross at A = 1.435 rad. Above that the sideband IS the
-            higher maximum, so a {height, rate} fit returns the sideband rather
-            than the truth; with the term in the model the rate returns to its
-            no-seasonal accuracy.
-
-            It costs search time, and a little accuracy when there is no annual
-            signal at all, so it is cheap to leave on. Large amplitudes are
-            only partly recovered, but they fail LOUDLY -- NaN rather than
-            silent wrong rates. Where a stack carries no seasonal signal the
-            default 0 is right; zones with a real one are what this is for.
-            ON ARCS, KEEP IT SMALL. A seasonal signal is long-wavelength, so
-            an arc -- two pixels tens of metres apart -- sees only the small
-            residue that does not cancel in the difference. A large
-            max_seasonal there is wrong twice over, since it searches thousands
-            of lattice points for an amplitude that cannot be present.
-
-            Small, it earns its keep: marginal arcs are rescued and nodes
-            isolated at any threshold join the network. Set too small, the arcs
-            are rescued but fitted poorly, so the amplitude does need room to
-            move.
-
-            Judge any gain against a MATCHED-gamma null, not a raw one: two free
-            parameters always raise gamma, and pure-noise arcs sit low enough
-            that there is far more room to climb there than at a real arc, so an
-            unmatched comparison understates the real gain.
-
-            Whether the atmosphere is itself seasonal is a property of the
-            stack and has to be checked there, against a permuted-date null
-            rather than by eye. On a stack with genuinely seasonal delay the
-            annual term would absorb it, and per pixel the two are not
-            separable.
-
-            What it does fix, where a real seasonal signal exists, is the
-            contamination of dh and dv by leaving it out: an unmodelled annual
-            term biases the height and can push the rate onto a whole sideband,
-            while modelling it returns both to their clean values.
-
+            Must be 0, the default: the annual term is not fitted by the arc
+            kernel and a positive value raises ValueError. The physics has not
+            changed -- an annual of amplitude A radians leaves coherence
+            |J0(A)| at the true rate and |J1(A)| one cycle/yr away, crossing at
+            A = 1.435 rad, above which a {height, rate} fit returns the
+            sideband -- but on the arcs fitted here the term read as noise and
+            the freedom to fit it cost the rate more than it returned. It
+            comes back when a stack with a real annual signal exists to design
+            it against.
         Returns
         -------
         BatchCore
