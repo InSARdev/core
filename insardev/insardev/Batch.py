@@ -3542,7 +3542,7 @@ class BatchComplex(BatchCore):
     def fit1d(self, threshold: float = 0.5, baseline: str = 'BPR',
               max_dh: float = 25.0, max_dv: float = 100.0,
               step_dh: float = 8.0, step_dv: float = 2.0,
-              adaptive: bool = True) -> 'Batch':
+              adaptive: bool = False) -> 'Batch':
         """
         Per-pixel {height, rate} fit on the per-date complex stack, no network.
 
