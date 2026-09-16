@@ -4558,6 +4558,11 @@ class BatchComplex(BatchCore):
         Batch of covariates at this posting when the stack does not hold
         them.
 
+        THE MODEL'S DATES ARE THE OUTPUT'S DATES. A model holding a subset of
+        the stack's acquisitions, or holding them in another order, selects
+        the stack; only a date the model names and the stack does not is an
+        error.
+
         LAZY. The per-date numbers are constants in the graph, a few
         kilobytes; the covariates are read from the store as the data are.
         Nothing of raster size is materialised anywhere, and a block window
@@ -4580,15 +4585,25 @@ class BatchComplex(BatchCore):
                 raise TypeError(
                     f"predict() found no (date, y, x) complex variable in "
                     f"'{key}' to evaluate the trend on.")
-            ref = ds[grids[0]].transpose('date', 'y', 'x')
-            data = ref.data
             _md = np.asarray(mds.coords['date'].values)
             _sd = np.asarray(ds.coords['date'].values)
             if _md.shape != _sd.shape or not np.array_equal(_md, _sd):
-                raise ValueError(
-                    f"predict(): the trend2d() model of '{key}' holds "
-                    f"{len(_md)} dates, this stack {len(_sd)}; they must be "
-                    f"the same acquisitions in the same order.")
+                # A MODEL MAY HOLD FEWER DATES THAN THE STACK, and in another
+                # order: trend2d() leaves out a date it cannot fit, and a
+                # caller drops the ones it does not trust. Neither is an error.
+                # THE PREDICTION FOLLOWS THE MODEL -- the stack is selected
+                # down to the model's acquisitions, in the model's order, so a
+                # date carrying no trend is left out rather than predicted
+                # from some other date's coefficients.
+                _miss = _md[~np.isin(_md, _sd)]
+                if _miss.size:
+                    raise ValueError(
+                        f"predict(): the trend2d() model of '{key}' holds "
+                        f"{_miss.size} date(s) this stack does not: "
+                        f"{[str(d) for d in _miss[:5]]}.")
+                ds = ds.sel(date=_md)
+            ref = ds[grids[0]].transpose('date', 'y', 'x')
+            data = ref.data
             # the model per date, as CONSTANTS in the graph; the phase is
             # evaluated in float64 -- an intercept at zero and a slope times
             # a covariate in the thousands cancel to a few radians -- and
@@ -4658,7 +4673,9 @@ class BatchComplex(BatchCore):
         Parameters
         ----------
         trend : Batch
-            What trend2d() returned for this stack.
+            What trend2d() returned for this stack. It may hold FEWER dates
+            than the stack: those dates are what comes back, since a date with
+            no trend cannot be detrended.
         vars : Batch or None
             Covariates at this posting, only when the stack does not carry
             the ones the model names.
@@ -4667,7 +4684,7 @@ class BatchComplex(BatchCore):
         -------
         BatchComplex
             The stack with the trend rotated out of every polarisation,
-            everything else untouched.
+            everything else untouched, over the trend's dates.
         """
         import numpy as np
         import xarray as xr
@@ -4681,6 +4698,14 @@ class BatchComplex(BatchCore):
         res = {}
         for key, ds in self.items():
             phi = pred[key]['phase']
+            _pd = np.asarray(phi.coords['date'].values)
+            _sd = np.asarray(ds.coords['date'].values)
+            if _pd.shape != _sd.shape or not np.array_equal(_pd, _sd):
+                # predict() gave back the MODEL's dates; the stack follows.
+                # A date the trend does not carry is DROPPED, never passed
+                # through untouched -- a stack mixing detrended and raw dates
+                # is not a stack, and the mix is invisible downstream.
+                ds = ds.sel(date=_pd)
             # THE SAME NUMBERS THE RASTER USED TO HOLD: float32 phase into a
             # complex64 exponential, rotated out
             rot = xr.DataArray(

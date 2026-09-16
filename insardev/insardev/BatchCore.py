@@ -2006,6 +2006,119 @@ class BatchCore(dict):
             for i in idxs
         })
 
+    def drop_sel(self, keys: dict|list|str|None = None, errors='raise', **indexers):
+        """
+        Drop bursts by key and/or drop coordinate labels from every dataset.
+
+        The inverse of sel(): burst keys listed here are removed from the batch,
+        and dimension indexers are passed to each xarray.Dataset.drop_sel(), which
+        drops the named labels (not slices) along that dimension.
+
+        Parameters
+        ----------
+        keys : str, list, dict, or None
+            - str: Single burst key to drop
+            - list: Burst keys to drop
+            - dict/Batch: Drop the bursts named by its keys
+            - None: Use only keyword indexers
+        errors : {'raise', 'ignore'}
+            'raise' reports burst keys or coordinate labels that are not present,
+            'ignore' silently skips them.
+        **indexers : label or list of labels
+            Coordinate labels dropped from each dataset.
+            Example: date=['2021-01-01'], pair=[('2021-01-01', '2021-01-13')]
+
+        Returns
+        -------
+        Batch
+            New Batch without the dropped bursts and labels.
+
+        Examples
+        --------
+        Drop bursts by key:
+        >>> subset = batch.drop_sel('burst1')
+        >>> subset = batch.drop_sel(['burst1', 'burst2'])
+
+        Drop dates from every burst:
+        >>> subset = stack.drop_sel(date=['2021-01-01', '2021-01-13'])
+
+        Combine both:
+        >>> subset = stack.drop_sel('burst1', date='2021-01-01')
+        """
+        if keys is None and not indexers:
+            # no selection, cast to dict to prevent special logic in the class constructor
+            return type(self)(dict(self))
+
+        result = self
+        if keys is not None:
+            if isinstance(keys, str):
+                keys = [keys]
+            elif isinstance(keys, Mapping):
+                keys = list(keys.keys())
+            keys = list(keys)
+            if errors == 'raise':
+                missing = [k for k in keys if k not in result]
+                if missing:
+                    raise KeyError(f'ERROR: bursts are not available in the batch: {missing}')
+            dropped = set(keys)
+            result = type(self)({k: ds for k, ds in result.items() if k not in dropped})
+
+        if indexers:
+            result = type(self)({k: ds.drop_sel(indexers, errors=errors) for k, ds in result.items()})
+
+        return result
+
+    def drop_isel(self, indices=None, **indexers):
+        """
+        Drop by integer locations, either by:
+        keyword dimension indexers (delegated to each xarray.Dataset.drop_isel)
+        a single positional index/slice/list over the *keys* of the batch
+        a single dict positional argument of dimension indexers
+
+        Like isel(), dimension indexers take precedence: when they are given the
+        positional argument is not applied to the batch keys.
+
+        Examples
+        --------
+        Drop bursts by position:
+        >>> subset = batch.drop_isel(0)
+        >>> subset = batch.drop_isel([0, -1])
+        >>> subset = batch.drop_isel(slice(2, None))
+
+        Drop dates from every burst:
+        >>> subset = stack.drop_isel(date=[0, 1])
+        """
+        import numpy as np
+
+        # dict as a keyword indexers
+        if isinstance(indices, dict):
+            indexers = indices
+            indices = None
+
+        # xarray-style keyword drop_isel (including dict-via-positional)
+        if indexers:
+            return type(self)({
+                k: ds.drop_isel(**indexers)
+                for k, ds in self.items()
+            })
+
+        # fallback: positional drop over the batch keys
+        keys = list(self.keys())
+        if indices is None:
+            # no selection, cast to dict to prevent special logic in the class constructor
+            return type(self)(dict(self))
+        if isinstance(indices, (int, np.integer)):
+            idxs = [indices]
+        elif isinstance(indices, slice):
+            idxs = list(range(*indices.indices(len(keys))))
+        else:
+            idxs = list(indices)
+
+        dropped = {keys[i] for i in idxs}
+        return type(self)({
+            k: ds for k, ds in self.items() if k not in dropped
+        })
+
     @property
     def dims(self):
         return {k: self[k].dims for k in self.keys()}
