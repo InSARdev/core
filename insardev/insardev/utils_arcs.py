@@ -3996,23 +3996,31 @@ def _cascade_count_max(S, wy, wx, cell, thr, floor2=None):
     return cnt, best, cnt2, np.sqrt(mx2, out=mx2) / n
 
 
-def _3d_check_window_cell(wy, wx, cell, name='fit3d'):
+def _3d_check_window_cell(wy, wx, cell, name='fit3d', spacing=None):
     """The DS window must span at least FOUR independence cells per dimension.
 
     A window is a patch of independent ground samples in which a distributed
     scatterer is looked for, and 4 x 4 cells -- sixteen samples -- is already
     a small one: fewer is not a search for distributed scattering at all, and
     the consensus a DS needs cannot be drawn from a handful of samples. Raised
-    here rather than answered with an empty product.
+    here rather than answered with an empty product. The counts are pixels;
+    with the grid `spacing` the message speaks in the metres the caller used.
     """
     cy, cx = int(cell[0]), int(cell[1])
     if int(wy) < 4 * cy or int(wx) < 4 * cx:
+        if spacing is not None:
+            dy, dx = abs(float(spacing[0])), abs(float(spacing[1]))
+            size = (f'DS window ({int(wy) * dy:g}, {int(wx) * dx:g}) m must span at least '
+                    f'four independence cells per dimension -- cell=({cy * dy:g}, {cx * dx:g}) m '
+                    f'needs a DS window of ({4 * cy * dy:g}, {4 * cx * dx:g}) m or larger')
+        else:
+            size = (f'DS window ({int(wy)}, {int(wx)}) px must span at least four '
+                    f'independence cells per dimension -- cell={(cy, cx)} px needs a '
+                    f'window of ({4 * cy}, {4 * cx}) px or larger')
         raise ValueError(
-            f'{name}(): the DS window ({int(wy)}, {int(wx)}) must span at '
-            f'least four independence cells per dimension -- cell={(cy, cx)} '
-            f'needs a window of ({4 * cy}, {4 * cx}) or larger. A window of '
-            f'fewer than 4 x 4 cells is too small a patch of independent '
-            f'samples to search for a distributed scatterer.')
+            f'{name}(): the {size}. A window of fewer than 4 x 4 cells is too '
+            f'small a patch of independent samples to search for a distributed '
+            f'scatterer.')
 
 
 def _3d_ps_lattice(cell):

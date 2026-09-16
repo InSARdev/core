@@ -1532,10 +1532,10 @@ class BatchCore(dict):
 
         Examples
         --------
-        >>> # Count neighbors on similarity result
-        >>> sim = S_opt.similarity(window=(5, 5), neighbors=(5, 5))
-        >>> sparse_sim = sim.where(sim < 0.5)
-        >>> nbrs = sparse_sim.neighbors(window=120)
+        >>> # Count valid neighbours of a sparse selection
+        >>> adi = S_opt.adi()
+        >>> sparse = adi.where(adi < 0.5)
+        >>> nbrs = sparse.neighbors(window=120)
         >>> dense_mask = nbrs >= 10
         """
         import torch
@@ -3200,8 +3200,8 @@ class BatchCore(dict):
         intfs.downsample(60)
         intfs.coarsen({'y':2, 'x':2}, boundary='trim').mean()
 
-        If the data is already at or finer than the requested spacing,
-        returns the input unchanged.
+        If the requested spacing rounds to one pixel per axis -- the data is
+        already at, or coarser than, it -- returns the input unchanged.
         """
         if isinstance(new_spacing, (int, float)):
             new_spacing = (new_spacing, new_spacing)

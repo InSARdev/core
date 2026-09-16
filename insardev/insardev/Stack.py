@@ -2233,7 +2233,7 @@ DEFOMAX_CYCLE  {defomax}
         """A box MEDIAN filter over the grid, the robust twin of gaussian().
 
         `stack.singlelook().median(30)` replaces every pixel by the median of
-        the samples within 30 m of it. Where gaussian() averages, this picks
+        the samples in a 30 m box centred on it. Where gaussian() averages, this picks
         the middle sample, so a bright neighbour, a layover spike or a single
         decorrelated date cannot drag the answer.
 
@@ -2325,8 +2325,8 @@ DEFOMAX_CYCLE  {defomax}
             Fine grid step in degrees. Default 5°.
         window : float or tuple or None
             Spatial window in METRES for the coherence estimate used by the
-            phase search. None (default) skips it and keeps the original co-pol
-            phase — unchanged behaviour. Pass e.g. (3, 12) to optimize the phase.
+            phase search, one number for a square or (y, x). Default 40. None
+            skips it and keeps the original co-pol phase.
         device : str
             PyTorch device: 'auto', 'cuda', 'mps', or 'cpu'.
 
@@ -3805,9 +3805,18 @@ DEFOMAX_CYCLE  {defomax}
 
             return group, ds
 
+        # A LOCAL PATH IS THE CALLER'S. The chunks are read by the workers, and a
+        # process worker keeps the directory it was started in, so a relative
+        # path resolves somewhere else -- where every tile is missing, which a
+        # zarr store legitimately reads as NaN. Made absolute here, once, where
+        # the caller stands; URLs with a protocol are left as they are.
+        def _local_abspath(u):
+            u = os.path.expanduser(str(u))
+            return u if '://' in u else os.path.abspath(u)
+
         if isinstance(urls, str):
             # note: isinstance(urls, zarr.storage.ZipStore) can be loaded too but it is less efficient
-            urls = os.path.expanduser(urls)
+            urls = _local_abspath(urls)
             zarr_path = urls  # Store for delayed loading
             root = zarr.open_consolidated(urls, zarr_format=3, mode='r')
             groups = list(root.group_keys())
@@ -3842,6 +3851,7 @@ DEFOMAX_CYCLE  {defomax}
                 #groups = {key: group[urls.columns[0]].tolist() for key, group in urls.groupby(level=0)}
             else:
                 raise ValueError(f'ERROR: urls is not a list, or Pandas Dataframe with multiindex: {type(urls)}')
+            urls = urls.assign(**{urls.columns[0]: [_local_abspath(u) for u in urls.iloc[:, 0].values]})
 
             dss = {}
             for fullBurstID in tqdm(urls.index.get_level_values(0).unique(), desc='Loading Datasets...'.ljust(25)):

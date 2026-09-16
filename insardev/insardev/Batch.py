@@ -43,7 +43,7 @@ def _trend2d_accumulate_half_for_dask(data_blk, *args, stats=None,
 
 
 def _trend2d_finalize_for_dask(total, half=None, dates=None, *, stats=None,
-                               cells=0, k=0, axes=(), label=''):
+                               cells=0, k=0, axes=(), label='', degree=1):
     """One date block of accumulators -> its coefficients.
 
     Columns are the k gradients, the constant, why the date failed if it
@@ -52,13 +52,15 @@ def _trend2d_finalize_for_dask(total, half=None, dates=None, *, stats=None,
     the coherence at the solution, the coherence at ZERO trend (their
     difference is what the trend bought), the sample count, and the k
     reaches -- the half-power width of each variable's own sampling.
+    At degree 0 the gradients are zero, the reaches NaN, and the first error
+    column is the constant's one-sigma in radians.
     """
     import numpy as np
     from . import utils_detrend
     stats = np.asarray(stats, np.float64).ravel()
     g, c, coh, coh0, det, why, lim, err = utils_detrend.trend2d_fit(
         np.asarray(total), cells, k, axes=axes,
-        half=(np.asarray(half) if half is not None else None))
+        half=(np.asarray(half) if half is not None else None), degree=degree)
     span = np.maximum(stats[k:2 * k], 1e-30)[None, :]
     # the transform answers in turns across the extent; the plane wants a rate
     g = g * (2 * np.pi) / span
@@ -81,10 +83,13 @@ def _trend2d_finalize_for_dask(total, half=None, dates=None, *, stats=None,
                   f"(coherence {coh[_i]:.3f})", flush=True)
     M = int(cells) + 2 * utils_detrend.TREND2D_W
     n = np.asarray(total)[:, 4 * (M ** k):4 * (M ** k) + 1]
+    # a gradient's error is in turns across the extent like the gradient; the
+    # constant's is already radians
+    if degree:
+        err = err * (2 * np.pi) / span
     return np.concatenate(
         [g, c[:, None], why[:, None].astype(np.float64), coh[:, None],
-         coh0[:, None], n, lim * (2 * np.pi) / span,
-         err * (2 * np.pi) / span], axis=1)
+         coh0[:, None], n, lim * (2 * np.pi) / span, err], axis=1)
 
 
 class _Fit3dChain:
@@ -369,8 +374,9 @@ def _fit3d_level1_for_dask(parts, kw, threads):
             f'scene{kw.get("tag", "")} at threshold={float(kw["threshold"]):g}. '
             'Nothing can be '
             'attached without a network, so the fit would return an empty '
-            'model. Lower `threshold`, widen the PS extent (window[2:]), or '
-            'check that the stack carries coherent scatterers.')
+            'model. Lower `threshold`, widen the PS extent (the second window '
+            'value, or window[2:] in the four-value form), or check that the '
+            'stack carries coherent scatterers.')
     U, iy, ix = got['U'], got['iy'], got['ix']
     if kw['debug']:
         # LEVEL 0, which is what this stage produces: the PS test and the
@@ -388,8 +394,8 @@ def _fit3d_level1_for_dask(parts, kw, threads):
             f'whole scene{kw.get("tag", "")} at '
             f'threshold={float(kw["threshold"]):g}; a network '
             'needs at least two. The fit would return an empty model. Lower '
-            '`threshold`, widen the PS extent (window[2:]), or check the '
-            'stack.')
+            '`threshold`, widen the PS extent (the second window value, or '
+            'window[2:] in the four-value form), or check the stack.')
     return utils_arcs._3d_ps_network(
         U, iy, ix, kw['date_values'], bperp=kw['bperp'], window=kw['window'],
         threshold=float(kw['threshold']), geometry=kw['geometry'],
@@ -4086,12 +4092,12 @@ class BatchComplex(BatchCore):
         cmean = resid.mean(dim='date')
         return disp - (resid * cmean.conj()).angle()
 
-    def trend2d(self, vars, union: bool = False,
-                range: float = None,
-                debug: bool = False) -> 'Batch':
+    def trend2d(self, vars, degree: int = 1, range: float = None,
+                union: bool = False, debug: bool = False) -> 'Batch':
         """
         Spatial trend of the complex phase, PER DATE, as a unit-magnitude
-        phasor: `phi_d = sum_i g_di * v_i + k_d`, so removing it is a rotation.
+        phasor: `phi_d = sum_i g_di * v_i + k_d`, or `phi_d = k_d` alone at
+        degree=0, so removing it is a rotation.
 
         >>> trend = stack.where(stack.adi() < 0.25).trend2d(
         ...     stack.transform()[['northing','easting','ele']])
@@ -4148,6 +4154,8 @@ class BatchComplex(BatchCore):
           stderr_<var> -- one-sigma of the fitted slope, same units, measured
               as half the disagreement of two checkerboard halves of the
               scene (one degree of freedom: honest scale, noisy itself);
+          stderr_intercept -- at degree=0, the constant's one-sigma in
+              radians, from the same halves;
           pixels -- samples fitted.
         NaN only when there is no fit at all: no pixels, a degenerate
         covariate, a trend walking out of `range`, or no convergence.
@@ -4164,11 +4172,12 @@ class BatchComplex(BatchCore):
             too. And mind the frame -- `azi` and `rng` restart at every burst,
             so one plane cannot be written in them across bursts; `northing`
             and `easting` are the same grid for all of them.
-        union : bool
-            False (default) fits each burst on its own pixels, so overlapping
-            bursts can disagree over the ground they share. True adds every
-            burst's accumulators into one fit per date; nothing is merged or
-            resampled, a sum over pixels not caring where they came from.
+        degree : int
+            1 (default) fits a gradient per variable and the constant. 0 fits
+            the constant alone -- the angle of the pixels' phasor sum -- on
+            the same pixels, the variables only deciding which ones count;
+            the model then names no covariate and carries no slopes, and
+            'stderr_intercept' prices the constant instead.
         range : float
             How much of gradient space the accumulator can represent, radians
             across each variable's extent. Default None self-sizes: 128
@@ -4179,9 +4188,15 @@ class BatchComplex(BatchCore):
             same fit on a grid twice the size returns the same numbers); it
             only has to be big enough, and the fit says so if it ever is not.
             Leave it alone.
+        union : bool
+            False (default) fits each burst on its own pixels, so overlapping
+            bursts can disagree over the ground they share. True adds every
+            burst's accumulators into one fit per date; nothing is merged or
+            resampled, a sum over pixels not caring where they came from.
         debug : bool
-            Print each date's turn across every variable, its coherence and
-            its reach, and name the dates that did not resolve.
+            Print each date's turn across every variable (the constant at
+            degree=0), its coherence and its reach, and name the dates that
+            did not resolve.
 
         Returns
         -------
@@ -4193,7 +4208,9 @@ class BatchComplex(BatchCore):
             unit of it), 'resolution_<var>' (how far apart two slopes must be
             for this sampling to tell them apart, same units), 'stderr_<var>'
             (the slope's one-sigma, same units), and 'coherence', 'coherence0',
-            'gain', 'pixels'; the covariate names ride as attributes. No
+            'gain', 'pixels'; the covariate names ride as attributes. At
+            degree=0 only 'intercept', 'stderr_intercept', 'coherence',
+            'coherence0', 'gain' and 'pixels', with no covariate named. No
             raster: `stack.predict(trend)` evaluates the phase per chunk when
             asked, `stack.detrend2d(trend)` removes it.
         """
@@ -4203,6 +4220,14 @@ class BatchComplex(BatchCore):
         import dask as _dask
         import dask.array as da
         from . import utils_detrend
+
+        if (isinstance(degree, bool)
+                or not isinstance(degree, (int, np.integer))
+                or degree not in (0, 1)):
+            raise ValueError(f"trend2d(): degree is 1 (a gradient per variable "
+                             f"and the constant) or 0 (the constant alone), "
+                             f"got {degree!r}.")
+        degree = int(degree)
 
         # ---- per burst: the lazy pieces, nothing computed yet --------------
         preps = []
@@ -4406,7 +4431,7 @@ class BatchComplex(BatchCore):
                 sum(_acc0[1:], _acc0[0]), 'df',
                 _dts, 'd',
                 concatenate=True, stats=_stats, cells=_cells, k=k,
-                axes=_axes,
+                axes=_axes, degree=degree,
                 label=grp[0]['key'] if not union else 'union',
                 new_axes={'c': 3 * k + 5},
                 dtype=np.float64, meta=np.empty((0, 0), np.float64))
@@ -4426,32 +4451,38 @@ class BatchComplex(BatchCore):
                 _cf = np.asarray(_coef)
                 _det = _cf[:, k + 1] == 0
                 _span = _stats[k:2 * k]
+                # degree 0 has no gradient columns to show, only the constant
+                _tv = p['var_names'] if degree else []
+                _kt = len(_tv)
                 print(f"trend2d('{p['key']}'): {p['nd']} dates, {k} "
-                      f"variables {p['var_names']}, referenced to date "
-                      f"{p['iref']}"
+                      f"variables {p['var_names']}, degree {degree}, "
+                      f"referenced to date {p['iref']}"
                       + (" [one fit for every burst]" if union else ""),
                       flush=True)
-                hdr = "    date " + " ".join(f"{v:>12s}" for v in p['var_names'])
+                hdr = ("    date " + " ".join(f"{v:>12s}" for v in _tv)
+                       + ("" if degree else f"{'intercept':>12s} {'stderr':>9s}"))
                 print(hdr + f"{'coh':>9s} {'pixels':>12s}  "
-                      + " ".join(f"{'resolution ' + v:>13s}"
-                                 for v in p['var_names'])
-                      + "   [rad across the variable's span]", flush=True)
+                      + " ".join(f"{'resolution ' + v:>13s}" for v in _tv)
+                      + ("   [rad across the variable's span]" if degree
+                         else "   [rad]"), flush=True)
                 _tag = {1: 'no pixels', 2: 'walked out of `range`',
                         3: 'degenerate covariate', 4: 'did not converge'}
                 for d in _builtins.range(p['nd']):
                     _coh = _cf[d, k + 2]
                     _reach = " ".join(
                         f"{_cf[d, k + 5 + i] * _span[i]:13.4f}"
-                        for i in _builtins.range(k))
+                        for i in _builtins.range(_kt))
                     if not _det[d]:
                         print(f"    {d:4d} " + " ".join(f"{chr(45) * 2:>12s}"
-                              for _ in _builtins.range(k))
+                              for _ in _builtins.range(max(_kt, 1)))
+                              + ("" if degree else f" {chr(45) * 2:>9s}")
                               + f" {_coh:8.5f} {int(_cf[d, k + 4]):12,d}  "
                               f"{_reach}   {_tag[int(_cf[d, k + 1])]}",
                               flush=True)
                         continue
-                    row = " ".join(f"{_cf[d, i] * _span[i]:12.4f}"
-                                   for i in _builtins.range(k))
+                    row = (" ".join(f"{_cf[d, i] * _span[i]:12.4f}"
+                                    for i in _builtins.range(_kt)) if degree
+                           else f"{_cf[d, k]:12.4f} {_cf[d, 2 * k + 5]:9.4f}")
                     print(f"    {d:4d} {row} {_coh:8.5f} "
                           f"{int(_cf[d, k + 4]):12,d}  {_reach}", flush=True)
                 if union:
@@ -4475,11 +4506,13 @@ class BatchComplex(BatchCore):
             o = xr.Dataset(coords={'date': np.asarray(
                 p['data_da'].coords['date'].values)}, attrs=dict(ds.attrs))
             _icpt = _coef[:, k].astype(np.float64)
-            for i in _builtins.range(k):
+            for i in _builtins.range(k if degree else 0):
                 _icpt = _icpt - _coef[:, i].astype(np.float64) * np.float64(_stats[i])
             o['intercept'] = xr.DataArray(_icpt, dims=('date',))
-            o.attrs['trend2d_vars'] = list(p['var_names'])
-            o.attrs['trend2d_dims'] = [''.join(_d) for _d in p['vars_dims']]
+            # a constant names no covariate, so predict() needs none
+            o.attrs['trend2d_vars'] = list(p['var_names']) if degree else []
+            o.attrs['trend2d_dims'] = ([''.join(_d) for _d in p['vars_dims']]
+                                       if degree else [])
             o.attrs['trend2d_ref'] = int(p['iref'])
             o['coherence'] = xr.DataArray(
                 _coef[:, k + 2].astype(np.float32), dims=('date',))
@@ -4492,7 +4525,12 @@ class BatchComplex(BatchCore):
                 dims=('date',))
             o['pixels'] = xr.DataArray(
                 _coef[:, k + 4].astype(np.int64), dims=('date',))
-            for i, var in enumerate(p['var_names']):
+            if not degree:
+                # the constant's one-sigma, radians: half the disagreement of
+                # the two checkerboard halves' constants
+                o['stderr_intercept'] = xr.DataArray(
+                    _coef[:, 2 * k + 5].astype(np.float64), dims=('date',))
+            for i, var in enumerate(p['var_names'] if degree else []):
                 # per unit of the covariate, all three, so they read against
                 # each other: the slope, how far apart two slopes must be for
                 # this sampling to tell them apart, and the slope's one-sigma
@@ -4596,6 +4634,11 @@ class BatchComplex(BatchCore):
                 elif _d == ('x',):
                     _v = _v[None, :]
                 phi = phi + gd[:, None, None] * _v[None]
+            # a constant, or a model over vectors along one axis only, does
+            # not vary along the other, so the phase is broadcast to the
+            # raster it is applied to
+            if tuple(phi.shape) != tuple(data.shape):
+                phi = da.broadcast_to(phi, data.shape, chunks=data.chunks)
             coords = {k_: v_ for k_, v_ in ref.coords.items()
                       if k_ in ('date', 'y', 'x', 'spatial_ref')}
             out[key] = xr.Dataset({'phase': xr.DataArray(
@@ -5138,7 +5181,7 @@ class BatchComplex(BatchCore):
         cell = utils_xarray.meters_to_pixels(cell, spacing, minimum=1,
                                              name='cell')
         wy, wx, pey, pex = utils_arcs._3d_windows((wy, wx, pey, pex))
-        utils_arcs._3d_check_window_cell(wy, wx, cell, 'fit3d')
+        utils_arcs._3d_check_window_cell(wy, wx, cell, 'fit3d', spacing=spacing)
         _y0s = [float(np.asarray(d['y'].values, dtype=float)[0]) for d in _dss]
         _x0s = [float(np.asarray(d['x'].values, dtype=float)[0]) for d in _dss]
         y_org = max(_y0s) if dy < 0 else min(_y0s)
@@ -5360,6 +5403,7 @@ class BatchComplex(BatchCore):
                             len(_blocks)))
         _threads2 = max(1, _cores // _conc2)
         _cells = {}
+        _dly = {}
         _l2in, _l2tab = [], []
         for (key, _sub, _origin, _ny, _nx, _part, _i, _j, _c,
              _hsub, _horg, _hown) in _blocks:
@@ -5389,6 +5433,7 @@ class BatchComplex(BatchCore):
             else:
                 _cells[(key, _i, _j)] = da.from_delayed(
                     _o[0], shape=(6, _ny, _nx), dtype=np.complex64)
+                _dly[(key, _i, _j)] = _o[0]
 
         # ---- PASS 3: LEVEL 2, over the FINISHED level-1 nodes ------------
         # Level 1 is complete before this starts, so its values are fixed input
@@ -5411,8 +5456,12 @@ class BatchComplex(BatchCore):
         if int(level) < 2:
             _kk0 = next(iter(_cells))
             _ny0, _nx0 = _cells[_kk0].shape[1], _cells[_kk0].shape[2]
+            # THE DELAYED, NOT THE ARRAY: a dask array handed to delayed() is
+            # finalized under new keys that carry a second copy of its whole
+            # upstream graph, so every scan, the network and one attach ran
+            # twice per compute
             _cells[_kk0] = da.from_delayed(
-                _dask.delayed(_fit3d_keep)(_cells[_kk0], _rep1),
+                _dask.delayed(_fit3d_keep)(_dly[_kk0], _rep1),
                 shape=(6, _ny0, _nx0), dtype=np.complex64)
         _cur, _tabs = _l2in, ([_rep1] if int(level) >= 2 else [])
         for _lv in range(2, int(level) + 1):
@@ -5919,8 +5968,10 @@ class BatchComplex(BatchCore):
         # the kernels mirror a half-size quadrant into the patch weight, so
         # the patch has to be even; see goldstein() above
         psize_y, psize_x = 2 * (int(psize_y) // 2), 2 * (int(psize_x) // 2)
-        if psize_y < 2 or psize_x < 2:
-            raise ValueError(f'goldstein needs a patch of at least 2 pixels '
+        # the triangular weight divides by psize/2 - 1, so a 2-pixel patch has
+        # no weight at all and the whole output would come back NaN
+        if psize_y < 4 or psize_x < 4:
+            raise ValueError(f'goldstein needs a patch of at least 4 pixels '
                              f'per axis after rounding down to even, got '
                              f'({psize_y}, {psize_x})')
 
@@ -6016,7 +6067,7 @@ class BatchComplex(BatchCore):
             corr_ds = corr[k]
             filtered_vars = {}
             _wy, _wx = utils_xarray.meters_to_pixels(
-                window_m, utils_xarray.spacing_of(ds), minimum=2,
+                window_m, utils_xarray.spacing_of(ds), minimum=4,
                 name='goldstein() window')
             # EVEN PATCHES, BECAUSE THE WEIGHT IS BUILT BY MIRRORING A
             # QUADRANT. The triangular weight is a (psize//2, psize//2)
@@ -6026,9 +6077,9 @@ class BatchComplex(BatchCore):
             # shapes one sample apart. Rounded DOWN, so the patch never grows
             # past what the caller asked for.
             window = {'y': 2 * (_wy // 2), 'x': 2 * (_wx // 2)}
-            if window['y'] < 2 or window['x'] < 2:
+            if window['y'] < 4 or window['x'] < 4:
                 raise ValueError(
-                    f'goldstein() window {window_m} m is under two pixels per '
+                    f'goldstein() window {window_m} m is under four pixels per '
                     f'axis on burst {k} after rounding down to even')
 
             # Process each complex data variable in the dataset
@@ -6521,7 +6572,7 @@ class Batches(tuple):
 
         Examples
         --------
-        >>> phase, corr = stack.phasediff(pairs, wavelength=30).goldstein(32).angle()
+        >>> phase, corr = stack.pairs(pairs).interferogram(30).goldstein(200)
         """
         if len(self) < 2:
             raise ValueError("goldstein() requires Batches with at least 2 elements: [phase, correlation]")

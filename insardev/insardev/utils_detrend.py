@@ -421,8 +421,14 @@ def trend2d_moment_width(k):
 
 
 def trend2d_fit(total, cells, k, axes=(), half=None, maxiter=1000,
-                tol=1e-10):
+                tol=1e-10, degree=1):
     """The accumulator -> one gradient and one constant per date, SOLVED.
+
+    degree=0 fits the constant alone: the same closed form the constant has at
+    any gradient, read at zero, so the gradients come back zero and the
+    coherence is the zero-trend one; no ascent and no limit. Its error bar is
+    the same halves' disagreement, of the constant, in radians, in the first
+    error column.
 
     THE OBJECTIVE IS ALREADY A ROBUST REGRESSION. Maximising
     `sum cos(phi - 2 pi g.A - c)` is an M-estimator whose score is `sin` of
@@ -501,7 +507,7 @@ def trend2d_fit(total, cells, k, axes=(), half=None, maxiter=1000,
         # THE HALF-POWER WIDTH OF THE SAMPLING, per variable: walk W -- what
         # a perfectly coherent, trend-free date would score -- until it
         # halves or turns back up into its own lobes. Diagnostic only.
-        for a in range(k):
+        for a in (range(k) if degree else ()):
             step = 0.02
             prev = 1.0
             lim[d, a] = reach
@@ -535,6 +541,11 @@ def trend2d_fit(total, cells, k, axes=(), half=None, maxiter=1000,
             why[d] = 3
             continue
         coh0[d] = float(abs(T0) / max(n[d], 1.0))
+        if not degree:
+            g[d] = 0.0
+            c[d] = float(np.angle(T0))
+            coh[d] = coh0[d]
+            continue
 
         # branch starts: always zero; plus the profile-scan ramp start for
         # the axis covariates, whose marginals are clean 1-D tones -- this is
@@ -572,7 +583,7 @@ def trend2d_fit(total, cells, k, axes=(), half=None, maxiter=1000,
     # one-sigma scale of the estimate. One degree of freedom -- honest about
     # the size, noisy about itself.
     err = np.full((nd, k), np.nan)
-    if half is not None:
+    if half is not None and degree:
         half = np.asarray(half, np.float64)
         for d in range(nd):
             if why[d]:
@@ -598,6 +609,24 @@ def trend2d_fit(total, cells, k, axes=(), half=None, maxiter=1000,
                 gh.append(r[0])
             if len(gh) == 2:
                 err[d] = 0.5 * np.abs(gh[0] - gh[1])
+    elif half is not None:
+        # the constant of each half, closed form like the full one; the
+        # difference is an angle, so it is taken on the circle
+        half = np.asarray(half, np.float64)
+        for d in range(nd):
+            if why[d]:
+                continue
+            ch = []
+            for tot_h in (half[d], total[d] - half[d]):
+                if tot_h[4 * K] <= 0:
+                    break
+                Th = trend2d_read(tot_h[:K] + 1j * tot_h[K:2 * K], cells, k,
+                                  np.zeros(k), kg)[0]
+                if not np.isfinite(Th) or abs(Th) < 1e-30:
+                    break
+                ch.append(float(np.angle(Th)))
+            if len(ch) == 2:
+                err[d, 0] = 0.5 * abs(float(np.angle(np.exp(1j * (ch[0] - ch[1])))))
     resolved = why == 0
     g[~resolved] = np.nan
     c[~resolved] = np.nan
