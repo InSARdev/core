@@ -659,6 +659,11 @@ class BatchCore(dict):
         -------
         Batch
             Batch of the requested coordinate/variable or selected datasets
+
+        Raises
+        ------
+        KeyError
+            if the key is neither a burst nor a name any burst carries.
         """
         # Handle list/tuple keys for dataset selection
         if isinstance(key, (list, tuple)):
@@ -672,12 +677,20 @@ class BatchCore(dict):
             return super().__getitem__(key)
         except KeyError:
             # If not a dataset key, try to access as coordinate/variable
-            return type(self)({
+            subset = {
                 k: ds[key] if not isinstance(ds, self.CoordCollection) else ds._ds.coords[key]
                 for k, ds in self.items()
                 if (isinstance(ds, self.CoordCollection) and key in ds._ds.coords) or 
                    (not isinstance(ds, self.CoordCollection) and (key in ds.coords or key in ds.data_vars))
-            })
+            }
+            # NEITHER A BURST NOR A NAME ANY BURST CARRIES: that is a miss, and
+            # a miss raises -- as __getattr__ raises AttributeError and
+            # Stack.__getitem__ raises here. An empty Batch made a typo, and a
+            # burst a selection dropped, read as a result that simply held
+            # nothing. A name some bursts carry still returns those bursts.
+            if not subset:
+                raise KeyError(key) from None
+            return type(self)(subset)
 
     def __getattr__(self, name: str):
         """Attribute-style access to coords or data variables (e.g., batch.ele)."""
@@ -1741,6 +1754,49 @@ class BatchCore(dict):
     #         keys = [keys]
     #     return type(self)({k: self[k] for k in (keys if isinstance(keys, list) else keys.keys())})
 
+    @staticmethod
+    def _burst_indexer(value, key, dim, func='sel'):
+        """One burst's indexer out of a per-burst object.
+
+        An indexer's value may be a Batch -- what `batch.coherence > 0.5` or
+        any other batch expression returns -- and then EACH BURST IS INDEXED
+        BY ITS OWN: the mask a burst was measured on is the mask it is
+        selected by. A burst carrying a different number of dates, or a
+        different verdict on the same date, is the normal case, and one
+        shared mask cannot express it. Anything else is passed through
+        untouched, the same indexer for every burst.
+        """
+        if not isinstance(value, BatchCore):
+            return value
+        if key not in value:
+            raise KeyError(
+                f"{func}(): the '{dim}' indexer has no burst '{key}'.")
+        v = value[key]
+        if isinstance(v, xr.Dataset):
+            names = list(v.data_vars)
+            if len(names) != 1:
+                raise ValueError(
+                    f"{func}(): the '{dim}' indexer of burst '{key}' carries "
+                    f"{len(names)} variables {names}, it must carry one.")
+            v = v[names[0]]
+        return v
+
+    @staticmethod
+    def _drop_empty(mapping):
+        """Bursts left holding no samples are DROPPED, not returned empty.
+
+        A selection that misses a burst says so by the burst's ABSENCE: a
+        batch whose count changed is visible at a glance, where a burst
+        carrying a zero-length dimension reads as data right up until
+        something computes over its pixels -- save(), coarsen(), chunk2d()
+        and mask() all raise on one. crop() has always dropped them.
+
+        A dimension indexed down to nothing is the only way a selector makes
+        one, so this never removes a burst the caller still holds data for.
+        """
+        return {k: ds for k, ds in mapping.items()
+                if not any(n == 0 for n in getattr(ds, 'sizes', {}).values())}
+
     def sel(self, keys: dict|list|str|pd.DataFrame|None = None, **indexers):
         """
         Select data by burst keys or coordinate values.
@@ -1753,14 +1809,18 @@ class BatchCore(dict):
             - dict/Batch: Align dimensions between batches
             - DataFrame: Complex filtering by dates/polarizations
             - None: Use only keyword indexers
-        **indexers : slice or value
+        **indexers : slice, value, mask or Batch
             Coordinate-based selection applied to each dataset.
             Example: x=slice(650_000, 700_000), y=slice(4_100_000, 4_150_000)
+            A Batch indexes EACH BURST BY ITS OWN, so a per-burst boolean
+            mask selects per burst: date=trend.coherence > 0.5
 
         Returns
         -------
         Batch
-            New Batch with selected data.
+            New Batch with selected data. A burst whose selection came back
+            EMPTY IS DROPPED, so the batch's own count reports what the
+            window reached, as crop() does.
 
         Examples
         --------
@@ -1773,6 +1833,9 @@ class BatchCore(dict):
 
         Combine both:
         >>> subset = batch.sel(['burst1'], x=slice(650_000, 700_000))
+
+        Keep the dates a per-burst mask marks, each burst by its own:
+        >>> trend = trend.sel(date=trend.coherence > 0.5)
         """
         import pandas as pd
         import numpy as np
@@ -1785,10 +1848,11 @@ class BatchCore(dict):
                 result = result.sel(keys)
 
             # Convert slices to index-based selection (fast, order-agnostic)
-            def select_with_slices(ds, indexers):
+            def select_with_slices(ds, indexers, key):
                 for dim, idx in indexers.items():
                     if dim not in ds.coords:
                         continue
+                    idx = self._burst_indexer(idx, key, dim)
                     if isinstance(idx, slice):
                         coord_vals = ds.coords[dim].values
                         # Get bounds from slice, use coord min/max as defaults
@@ -1809,48 +1873,18 @@ class BatchCore(dict):
                         ds = ds.sel({dim: idx})
                 return ds
 
-            # Apply coordinate selection to each dataset
-            # Bursts outside the range get NaN-filled with the target coordinates
-            out = {}
-            target_coords = {}  # Will store target y/x from first non-empty result
-
-            for k, ds in result.items():
-                selected = select_with_slices(ds, indexers)
-                if all(selected.sizes[d] > 0 for d in ('y', 'x') if d in selected.sizes):
-                    out[k] = selected
-                    # Capture target coordinates from first non-empty result
-                    if not target_coords:
-                        for dim in ('y', 'x'):
-                            if dim in selected.coords:
-                                target_coords[dim] = selected.coords[dim].values
-
-            # If no burst had data, compute target coords from slice bounds and spacing
-            if not target_coords and result:
-                sample_ds = next(iter(result.values()))
-                for dim in ('y', 'x'):
-                    if dim in indexers and isinstance(indexers[dim], slice) and dim in sample_ds.coords:
-                        coord_vals = sample_ds.coords[dim].values
-                        # Get spacing from original data
-                        spacing = abs(coord_vals[1] - coord_vals[0]) if len(coord_vals) > 1 else 1
-                        # Get bounds from slice
-                        start = indexers[dim].start if indexers[dim].start is not None else coord_vals.min()
-                        stop = indexers[dim].stop if indexers[dim].stop is not None else coord_vals.max()
-                        min_val, max_val = min(start, stop), max(start, stop)
-                        # Create target coordinates
-                        is_descending = len(coord_vals) > 1 and coord_vals[0] > coord_vals[-1]
-                        if is_descending:
-                            target_coords[dim] = np.arange(max_val, min_val - spacing/2, -spacing)
-                        else:
-                            target_coords[dim] = np.arange(min_val, max_val + spacing/2, spacing)
-
-            # Fill empty bursts with NaN using target coordinates
-            if target_coords:
-                for k, ds in result.items():
-                    if k not in out:
-                        # Reindex to target coords with NaN fill
-                        out[k] = ds.reindex(**target_coords, fill_value=np.nan)
-
-            return type(result)(out)
+            # EVERY BURST IS SELECTED ON ITS OWN COORDINATES, and nothing
+            # here reindexes one onto another's grid. Bursts carry independent
+            # extents and independent lattice phases: one overlapping the
+            # window part way returns that part, and one that does not reach
+            # the window returns the EMPTY selection -- its own coordinates,
+            # zero samples. Reindexing it onto whichever burst happened to be
+            # selected first invented a raster at coordinates that burst never
+            # had, and an all-NaN raster reads downstream like observed
+            # no-data rather than like nothing at all.
+            return type(result)(self._drop_empty(
+                {k: select_with_slices(ds, indexers, k)
+                 for k, ds in result.items()}))
 
         # Original key-based selection logic
         if keys is None:
@@ -1974,6 +2008,8 @@ class BatchCore(dict):
         keyword dimension selectors (delegated to each xarray.Dataset.isel)
         a single positional index/slice/list over the *keys* of the batch
         (NEW) a single dict positional argument of dimension indexers
+
+        A burst indexed down to nothing is DROPPED, not returned empty.
         """
         import numpy as np
 
@@ -1984,10 +2020,11 @@ class BatchCore(dict):
 
         # xarray‐style keyword isel (including dict-via-positional)
         if indexers:
-            return type(self)({
-                k: ds.isel(**indexers)
+            return type(self)(self._drop_empty({
+                k: ds.isel(**{d: self._burst_indexer(v, k, d, 'isel')
+                              for d, v in indexers.items()})
                 for k, ds in self.items()
-            })
+            }))
 
         # fallback: positional isel over the batch keys (old behavior)
         keys = list(self.keys())
@@ -2024,14 +2061,17 @@ class BatchCore(dict):
         errors : {'raise', 'ignore'}
             'raise' reports burst keys or coordinate labels that are not present,
             'ignore' silently skips them.
-        **indexers : label or list of labels
+        **indexers : label, list of labels, mask or Batch
             Coordinate labels dropped from each dataset.
             Example: date=['2021-01-01'], pair=[('2021-01-01', '2021-01-13')]
+            A boolean mask marks WHAT TO DROP, and a Batch of masks drops
+            per burst: date=trend.coherence < 0.5
 
         Returns
         -------
         Batch
-            New Batch without the dropped bursts and labels.
+            New Batch without the dropped bursts and labels. A burst left
+            holding nothing is dropped too.
 
         Examples
         --------
@@ -2044,6 +2084,9 @@ class BatchCore(dict):
 
         Combine both:
         >>> subset = stack.drop_sel('burst1', date='2021-01-01')
+
+        Drop the dates a per-burst mask marks, each burst by its own:
+        >>> trend = trend.drop_sel(date=trend.coherence < 0.5)
         """
         if keys is None and not indexers:
             # no selection, cast to dict to prevent special logic in the class constructor
@@ -2064,7 +2107,19 @@ class BatchCore(dict):
             result = type(self)({k: ds for k, ds in result.items() if k not in dropped})
 
         if indexers:
-            result = type(self)({k: ds.drop_sel(indexers, errors=errors) for k, ds in result.items()})
+            out = {}
+            for k, ds in result.items():
+                idx = {}
+                for dim, v in indexers.items():
+                    v = self._burst_indexer(v, k, dim, 'drop_sel')
+                    _v = np.asarray(v.values if isinstance(v, (xr.DataArray, xr.Variable)) else v)
+                    if _v.dtype == bool and _v.ndim == 1:
+                        # a MASK MARKS WHAT TO DROP here, the mirror of sel():
+                        # the labels it stands for, so xarray sees labels
+                        v = np.asarray(ds.coords[dim].values)[_v]
+                    idx[dim] = v
+                out[k] = ds.drop_sel(idx, errors=errors)
+            result = type(self)(self._drop_empty(out))
 
         return result
 
@@ -2076,7 +2131,8 @@ class BatchCore(dict):
         a single dict positional argument of dimension indexers
 
         Like isel(), dimension indexers take precedence: when they are given the
-        positional argument is not applied to the batch keys.
+        positional argument is not applied to the batch keys. A burst left
+        holding nothing is dropped.
 
         Examples
         --------
@@ -2087,6 +2143,9 @@ class BatchCore(dict):
 
         Drop dates from every burst:
         >>> subset = stack.drop_isel(date=[0, 1])
+
+        A boolean mask marks what to drop, a Batch of masks drops per burst:
+        >>> trend = trend.drop_isel(date=trend.coherence < 0.5)
         """
         import numpy as np
 
@@ -2097,10 +2156,18 @@ class BatchCore(dict):
 
         # xarray-style keyword drop_isel (including dict-via-positional)
         if indexers:
-            return type(self)({
-                k: ds.drop_isel(**indexers)
-                for k, ds in self.items()
-            })
+            out = {}
+            for k, ds in self.items():
+                idx = {}
+                for dim, v in indexers.items():
+                    v = self._burst_indexer(v, k, dim, 'drop_isel')
+                    _v = np.asarray(v.values if isinstance(v, (xr.DataArray, xr.Variable)) else v)
+                    if _v.dtype == bool and _v.ndim == 1:
+                        # a MASK MARKS WHAT TO DROP: the positions it stands for
+                        v = np.flatnonzero(_v)
+                    idx[dim] = v
+                out[k] = ds.drop_isel(**idx)
+            return type(self)(self._drop_empty(out))
 
         # fallback: positional drop over the batch keys
         keys = list(self.keys())
