@@ -50,8 +50,9 @@ def _trend2d_finalize_for_dask(total, half=None, dates=None, *, stats=None,
     did (0 solved, 1 no pixels, 2 the trend walked out of `range`, 3 the
     covariate is degenerate on this date, 4 the iteration did not converge),
     the coherence at the solution, the coherence at ZERO trend (their
-    difference is what the trend bought), the sample count, and the k
-    reaches -- the half-power width of each variable's own sampling.
+    difference is what the trend bought), the sample count, the k
+    reaches -- the half-power width of each variable's own sampling -- the
+    k errors and the k centroids of the date's pixels.
     At degree 0 the gradients are zero, the reaches NaN, and the first error
     column is the constant's one-sigma in radians.
     """
@@ -83,13 +84,17 @@ def _trend2d_finalize_for_dask(total, half=None, dates=None, *, stats=None,
                   f"(coherence {coh[_i]:.3f})", flush=True)
     M = int(cells) + 2 * utils_detrend.TREND2D_W
     n = np.asarray(total)[:, 4 * (M ** k):4 * (M ** k) + 1]
+    # the centroid of each date's pixels in the variable's own units: the
+    # accumulator carries the first moment of the centred, scaled covariate
+    _m1 = np.asarray(total)[:, 4 * (M ** k) + 1:4 * (M ** k) + 1 + k]
+    cen = stats[:k][None, :] + (_m1 / np.maximum(n, 1.0)) * span
     # a gradient's error is in turns across the extent like the gradient; the
     # constant's is already radians
     if degree:
         err = err * (2 * np.pi) / span
     return np.concatenate(
         [g, c[:, None], why[:, None].astype(np.float64), coh[:, None],
-         coh0[:, None], n, lim * (2 * np.pi) / span, err], axis=1)
+         coh0[:, None], n, lim * (2 * np.pi) / span, err, cen], axis=1)
 
 
 class _Fit3dChain:
@@ -4096,8 +4101,8 @@ class BatchComplex(BatchCore):
                 union: bool = False, debug: bool = False) -> 'Batch':
         """
         Spatial trend of the complex phase, PER DATE, as a unit-magnitude
-        phasor: `phi_d = sum_i g_di * v_i + k_d`, or `phi_d = k_d` alone at
-        degree=0, so removing it is a rotation.
+        phasor: `phi_d = sum_i g_di * (v_i - z_i) + k_d`, or `phi_d = k_d`
+        alone at degree=0, so removing it is a rotation.
 
         >>> trend = stack.where(stack.adi() < 0.25).trend2d(
         ...     stack.transform()[['northing','easting','ele']])
@@ -4172,6 +4177,12 @@ class BatchComplex(BatchCore):
             too. And mind the frame -- `azi` and `rng` restart at every burst,
             so one plane cannot be written in them across bursts; `northing`
             and `easting` are the same grid for all of them.
+
+            A variable named `<name>²` is the square of `<name>`, built
+            on demand about the midpoint of its actual_range and rebuilt
+            about the model's own point wherever the model is evaluated:
+            `stack.transform()[['ele', 'ele²']]`. Pass it alongside its
+            base, since a squared term alone pins the parabola's vertex.
         degree : int
             1 (default) fits a gradient per variable and the constant. 0 fits
             the constant alone -- the angle of the pixels' phasor sum -- on
@@ -4203,7 +4214,8 @@ class BatchComplex(BatchCore):
         BatchComplex
             A model dataset per burst, nothing of the stack in it:
             The MODEL, per date, in scipy's terms and in float64:
-            'intercept' (radians where every covariate is zero, relative to
+            'intercept' (radians where every covariate sits at its
+            'trend2d_zero' -- the centroid of the fitted pixels -- relative to
             the reference date), per covariate 'slope_<var>' (radians per
             unit of it), 'resolution_<var>' (how far apart two slopes must be
             for this sampling to tell them apart, same units), 'stderr_<var>'
@@ -4329,10 +4341,14 @@ class BatchComplex(BatchCore):
                 _mn.append(np.float32(_ar[0]))
                 _mx.append(np.float32(_ar[1]))
             stats = np.asarray(_mx + _mn, np.float32)
+            # where each variable contributes nothing: 0, or a square's centre
+            _zeros = [float(tds[v].attrs.get('square_centre', 0.0))
+                      for v in var_names]
             preps.append({'key': key, 'pol': pols[0], 'ds': ds,
                           'data_da': data_da, 'data_ref': data_dask * _R,
                           'vars_dask': vars_dask, 'var_names': var_names,
                           'nd': nd, 'k': k, 'stats': stats,
+                          'zero': _zeros,
                           'vars_dims': vars_dims, 'iref': _iref})
 
         if not preps:
@@ -4433,7 +4449,9 @@ class BatchComplex(BatchCore):
                 concatenate=True, stats=_stats, cells=_cells, k=k,
                 axes=_axes, degree=degree,
                 label=grp[0]['key'] if not union else 'union',
-                new_axes={'c': 3 * k + 5},
+                # k gradients, the constant, why, coh, coh0, pixels, k
+                # reaches, k errors, k centroids
+                new_axes={'c': 4 * k + 5},
                 dtype=np.float64, meta=np.empty((0, 0), np.float64))
 
             for p in grp:
@@ -4497,22 +4515,60 @@ class BatchComplex(BatchCore):
             # stack, which compute() then persisted across the cluster and
             # every block read had to fetch pieces of. predict() evaluates
             # it lazily where it is asked for; detrend2d() applies it so.
-            # SCIPY'S NAMES AND CONVENTIONS, IN FLOAT64: `slope_<var>` is the
-            # gradient per unit of the covariate and `intercept` the phase
-            # where every covariate is zero, as linregress reports them, so
-            # the model reads without any centre or span beside it. The fit
-            # itself is centred for conditioning; the constant is moved to
-            # zero here, in float64, where the shift costs nothing.
+            # SCIPY'S NAMES, IN FLOAT64: `slope_<var>` is the gradient per
+            # unit of the covariate and `intercept` the phase where every
+            # covariate sits at its 'trend2d_zero'. The fit itself is centred
+            # on the extent's midpoint for the grid; the constant is moved
+            # here, in float64.
             o = xr.Dataset(coords={'date': np.asarray(
                 p['data_da'].coords['date'].values)}, attrs=dict(ds.attrs))
+            # every variable is re-centred at the centroid of the fitted
+            # pixels, pooled over dates by count, and 'intercept' is the phase
+            # there; a square follows its base to the same point, which the
+            # base's linear term makes exact, and keeps its own centre when
+            # the base was not passed
+            _names = list(p['var_names']) if degree else []
+            _orig = [_coef[:, i].astype(np.float64)
+                     for i in _builtins.range(len(_names))]
+            _npx = _coef[:, k + 4].astype(np.float64)
+            _zeros = []
+            for i, _v in enumerate(_names):
+                _cen = _coef[:, 3 * k + 5 + i].astype(np.float64)
+                _ok = np.isfinite(_cen) & (_npx > 0)
+                _z = (float((_cen[_ok] * _npx[_ok]).sum() / _npx[_ok].sum())
+                      if _ok.any() else float(_stats[i]))
+                if _v.endswith('²'):
+                    _b = _v[:-1]
+                    _z = float(p['zero'][i])
+                    if _b in _names:
+                        _j = _names.index(_b)
+                        _cb = _coef[:, 3 * k + 5 + _j].astype(np.float64)
+                        _okb = np.isfinite(_cb) & (_npx > 0)
+                        if _okb.any():
+                            _z = float((_cb[_okb] * _npx[_okb]).sum()
+                                       / _npx[_okb].sum())
+                _zeros.append(_z)
             _icpt = _coef[:, k].astype(np.float64)
-            for i in _builtins.range(k if degree else 0):
-                _icpt = _icpt - _coef[:, i].astype(np.float64) * np.float64(_stats[i])
+            _slopes = list(_orig)
+            for i, _v in enumerate(_names):
+                if _v.endswith('²'):
+                    _d = np.float64(_zeros[i]) - np.float64(p['zero'][i])
+                    _icpt = _icpt + _orig[i] * (_d * _d - np.float64(_stats[i]))
+                    _b = _v[:-1]
+                    if _b in _names and _d != 0.0:
+                        _j = _names.index(_b)
+                        _slopes[_j] = _slopes[_j] + 2.0 * _orig[i] * _d
+                else:
+                    _icpt = (_icpt + _orig[i]
+                             * (np.float64(_zeros[i]) - np.float64(_stats[i])))
             o['intercept'] = xr.DataArray(_icpt, dims=('date',))
             # a constant names no covariate, so predict() needs none
             o.attrs['trend2d_vars'] = list(p['var_names']) if degree else []
             o.attrs['trend2d_dims'] = ([''.join(_d) for _d in p['vars_dims']]
                                        if degree else [])
+            # aligned with trend2d_vars: where each variable contributes
+            # nothing, and for a square the point it is squared about
+            o.attrs['trend2d_zero'] = _zeros
             o.attrs['trend2d_ref'] = int(p['iref'])
             o['coherence'] = xr.DataArray(
                 _coef[:, k + 2].astype(np.float32), dims=('date',))
@@ -4534,8 +4590,7 @@ class BatchComplex(BatchCore):
                 # per unit of the covariate, all three, so they read against
                 # each other: the slope, how far apart two slopes must be for
                 # this sampling to tell them apart, and the slope's one-sigma
-                o[f'slope_{var}'] = xr.DataArray(
-                    _coef[:, i].astype(np.float64), dims=('date',))
+                o[f'slope_{var}'] = xr.DataArray(_slopes[i], dims=('date',))
                 o[f'resolution_{var}'] = xr.DataArray(
                     _coef[:, k + 5 + i].astype(np.float64), dims=('date',))
                 o[f'stderr_{var}'] = xr.DataArray(
@@ -4548,8 +4603,9 @@ class BatchComplex(BatchCore):
 
     def _trend2d_predict(self, model, vars=None) -> 'Batch':
         """The trend2d() model evaluated on this stack's grid: a dask
-        expression `intercept_d + sum_i slope_di * v_i` over the covariate
-        rasters, evaluated in float64 and handed on as float32 phase.
+        expression `intercept_d + sum_i slope_di * (v_i - zero_i)` over the
+        covariate rasters, `(base - zero)**2` for a `<var>²`, evaluated
+        in float64 and handed on as float32 phase.
 
         THE COVARIATES ARE THE STACK'S OWN. The model names them; each is
         taken from this stack's variables, or from its map coordinates for
@@ -4613,19 +4669,39 @@ class BatchComplex(BatchCore):
                                chunks=(_dc,))
             phi = kd[:, None, None]
             src = vars[key] if vars is not None else ds
+            # absent in a model fitted before the attribute existed: zero
+            _zero = list(mds.attrs.get('trend2d_zero', []))
+
+            def _plain(nm):
+                if nm in src.data_vars:
+                    return src[nm]
+                if nm == 'northing' and 'y' in src.coords:
+                    return xr.DataArray(np.asarray(src.y.values, np.float32),
+                                        dims=('y',))
+                if nm == 'easting' and 'x' in src.coords:
+                    return xr.DataArray(np.asarray(src.x.values, np.float32),
+                                        dims=('x',))
+                return None
+
             for i, (v, d) in enumerate(zip(names, dims)):
-                if v in src.data_vars:
-                    cov = src[v]
-                elif v == 'northing' and 'y' in src.coords:
-                    cov = xr.DataArray(np.asarray(src.y.values, np.float32),
-                                       dims=('y',))
-                elif v == 'easting' and 'x' in src.coords:
-                    cov = xr.DataArray(np.asarray(src.x.values, np.float32),
-                                       dims=('x',))
+                _z = float(_zero[i]) if i < len(_zero) else 0.0
+                if v.endswith('²'):
+                    # A SQUARE IS REBUILT, NEVER LOOKED UP: the model records
+                    # the point it is squared about, so a crop with another
+                    # extent still evaluates the model that was fitted
+                    _bc = _plain(v[:-1])
+                    cov = (None if _bc is None
+                           else (_bc.astype(np.float64) - _z) ** 2)
                 else:
+                    cov = _plain(v)
+                    if cov is not None and _z:
+                        cov = cov.astype(np.float64) - _z
+                if cov is None:
+                    _extra = (f" It is the square of '{v[:-1]}', which is not "
+                              f"there either." if v.endswith('²') else "")
                     raise KeyError(
                         f"predict(): the trend2d() model needs covariate "
-                        f"'{v}', which '{key}' does not carry. Pass "
+                        f"'{v}', which '{key}' does not carry.{_extra} Pass "
                         f"`vars=stack.transform()[[...]]` at this posting.")
                 _d = tuple(cov.dims)
                 if ''.join(_d) != d:

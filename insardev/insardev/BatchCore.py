@@ -667,11 +667,17 @@ class BatchCore(dict):
         """
         # Handle list/tuple keys for dataset selection
         if isinstance(key, (list, tuple)):
-            return type(self)({
-                burst_id: ds[key]
-                for burst_id, ds in self.items()
-            })
-            
+            out = {}
+            for burst_id, ds in self.items():
+                miss = [k for k in key
+                        if isinstance(k, str) and k.endswith('²')
+                        and k not in getattr(ds, 'data_vars', ())]
+                if miss:
+                    ds = ds.assign({k: self._square_of(ds, k, burst_id)
+                                    for k in miss})
+                out[burst_id] = ds[list(key)]
+            return type(self)(out)
+
         # Try to access as a dataset key first
         try:
             return super().__getitem__(key)
@@ -691,6 +697,43 @@ class BatchCore(dict):
             if not subset:
                 raise KeyError(key) from None
             return type(self)(subset)
+
+    @staticmethod
+    def _square_of(ds, name, key=''):
+        """`<var>²` built on demand from `<var>`: a VIRTUAL VARIABLE, no
+        store holds it.
+
+        It is `(v - centre)²` about the midpoint of the variable's own
+        actual_range, not the raw square. `span{1, v, (v-c)²}` is
+        `span{1, v, v²}` for any c, so the fit is the same either way
+        while the numbers are not: the raw square of a map coordinate is a
+        straight line to float32. The centre travels in the variable's own
+        attrs, so whatever evaluates the model later rebuilds exactly this
+        and not a square about some other point.
+        """
+        base = name[:-1]
+        if base not in getattr(ds, 'data_vars', ()) and base not in ds.coords:
+            raise KeyError(
+                f"'{name}' is the square of '{base}', which "
+                f"{'burst ' + repr(key) if key else 'this dataset'} does not "
+                f"carry. Nothing stores a squared variable; it is built from "
+                f"its base, so the base has to be there.")
+        v = ds[base]
+        ar = v.attrs.get('actual_range')
+        if ar is None:
+            raise ValueError(
+                f"'{base}' carries no actual_range, so the centre of "
+                f"'{name}' is unknown. Squaring about a measured midpoint "
+                f"instead would make the variable depend on which crop it was "
+                f"built from -- write the attribute.")
+        c = 0.5 * (float(ar[0]) + float(ar[1]))
+        q = ((v.astype('float64') - c) ** 2).astype('float32')
+        q.attrs = {k: val for k, val in v.attrs.items() if k != 'actual_range'}
+        q.attrs['square_of'] = base
+        q.attrs['square_centre'] = c
+        _hi = (max(abs(float(ar[0]) - c), abs(float(ar[1]) - c))) ** 2
+        q.attrs['actual_range'] = [0.0, float(_hi)]
+        return q
 
     def __getattr__(self, name: str):
         """Attribute-style access to coords or data variables (e.g., batch.ele)."""
