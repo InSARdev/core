@@ -22,27 +22,22 @@ if TYPE_CHECKING:
 
 
 
-def _trend2d_accumulate_for_dask(data_blk, *transform_blk, stats=None, **kwargs):
+def _trend2d_accumulate_for_dask(data_blk, *args, stats=None, n_vars=0,
+                                 **kwargs):
     """Module-level entry point for the trend2d() accumulator.
 
-    Module level so dask ships it by name; blockwise hands the transform
-    rasters over as separate positional arguments.
+    Module level so dask ships it by name; blockwise hands over the covariate
+    blocks and then the block's own y and x coordinates -- the checkerboard
+    halves are read off them -- as separate positional arguments. The date
+    axis is contracted, so `data_blk` is the task's date chunks merged.
     """
-    from . import utils_detrend
-    return utils_detrend.trend2d_accumulate(data_blk, tuple(transform_blk),
-                                            stats, **kwargs)
-
-
-def _trend2d_accumulate_half_for_dask(data_blk, *args, stats=None,
-                                      n_vars=0, **kwargs):
-    """One checkerboard half; the other is the full total minus this one."""
     from . import utils_detrend
     return utils_detrend.trend2d_accumulate(
         data_blk, tuple(args[:n_vars]), stats,
         coords=(args[n_vars], args[n_vars + 1]), **kwargs)
 
 
-def _trend2d_finalize_for_dask(total, half=None, dates=None, *, stats=None,
+def _trend2d_finalize_for_dask(acc, dates=None, *, stats=None,
                                cells=0, k=0, axes=(), label='', degree=1):
     """One date block of accumulators -> its coefficients.
 
@@ -59,9 +54,9 @@ def _trend2d_finalize_for_dask(total, half=None, dates=None, *, stats=None,
     import numpy as np
     from . import utils_detrend
     stats = np.asarray(stats, np.float64).ravel()
+    acc = np.asarray(acc)
     g, c, coh, coh0, det, why, lim, err = utils_detrend.trend2d_fit(
-        np.asarray(total), cells, k, axes=axes,
-        half=(np.asarray(half) if half is not None else None), degree=degree)
+        acc, cells, k, axes=axes, degree=degree)
     span = np.maximum(stats[k:2 * k], 1e-30)[None, :]
     # the transform answers in turns across the extent; the plane wants a rate
     g = g * (2 * np.pi) / span
@@ -82,11 +77,14 @@ def _trend2d_finalize_for_dask(total, half=None, dates=None, *, stats=None,
             print(f"trend2d('{label}'): {_nm} did not resolve and comes back "
                   f"NaN -- {_reason.get(int(why[_i]), 'unknown')} "
                   f"(coherence {coh[_i]:.3f})", flush=True)
-    M = int(cells) + 2 * utils_detrend.TREND2D_W
-    n = np.asarray(total)[:, 4 * (M ** k):4 * (M ** k) + 1]
+    L = utils_detrend.trend2d_layout(cells, k, len(tuple(axes)))
+    K, hw = L['K'], L['half']
+    # the two halves' counts and first moments add up to the total's
+    n = acc[:, 2 * K:2 * K + 1] + acc[:, hw + 2 * K:hw + 2 * K + 1]
     # the centroid of each date's pixels in the variable's own units: the
     # accumulator carries the first moment of the centred, scaled covariate
-    _m1 = np.asarray(total)[:, 4 * (M ** k) + 1:4 * (M ** k) + 1 + k]
+    _m1 = (acc[:, 2 * K + 1:2 * K + 1 + k]
+           + acc[:, hw + 2 * K + 1:hw + 2 * K + 1 + k])
     cen = stats[:k][None, :] + (_m1 / np.maximum(n, 1.0)) * span
     # a gradient's error is in turns across the extent like the gradient; the
     # constant's is already radians
@@ -3801,7 +3799,7 @@ class BatchComplex(BatchCore):
         return Batch(model_result)
 
     def predict(self, model, baseline: 'str | None' = 'BPR',
-                ref=None) -> 'Batch':
+                ref=None, vars=None) -> 'Batch':
         """
         Predicted per-date phase from a fit3d() or fit1d() model.
 
@@ -3835,6 +3833,10 @@ class BatchComplex(BatchCore):
             already had topography removed. Pass 'BPR' to include it and predict
             the raw phase instead. Verified: predict('BPR') / predict(None) is
             exactly exp(1j*ele2phase*height) to 4e-07 rad.
+        vars : Batch or None
+            Only for a trend2d() model: the covariates it names, at this
+            stack's posting, when the stack does not carry them itself -- the
+            same argument detrend2d() takes.
 
         Returns
         -------
@@ -3867,7 +3869,10 @@ class BatchComplex(BatchCore):
         # velocity or height, but per-date coefficients over the stack's own
         # covariates. Recognised by what it carries, evaluated per chunk.
         if all('trend2d_vars' in model[k].attrs for k in model):
-            return self._trend2d_predict(model)
+            return self._trend2d_predict(model, vars=vars)
+        if vars is not None:
+            raise TypeError("predict(): `vars` are the covariates of a trend2d() "
+                            "model; a fit3d() / fit1d() model names none.")
         out = {}
         for key, ds in self.items():
             pols = [v for v in ds.data_vars
@@ -4097,15 +4102,16 @@ class BatchComplex(BatchCore):
         cmean = resid.mean(dim='date')
         return disp - (resid * cmean.conj()).angle()
 
-    def trend2d(self, vars, degree: int = 1, range: float = None,
+    def trend2d(self, *vars, transform=None, range: float = None,
                 union: bool = False, debug: bool = False) -> 'Batch':
         """
         Spatial trend of the complex phase, PER DATE, as a unit-magnitude
         phasor: `phi_d = sum_i g_di * (v_i - z_i) + k_d`, or `phi_d = k_d`
-        alone at degree=0, so removing it is a rotation.
+        alone when no covariate is given, so removing it is a rotation.
 
+        >>> trend = stack.where(stack.adi() < 0.25).trend2d('northing', 'easting', 'ele')
         >>> trend = stack.where(stack.adi() < 0.25).trend2d(
-        ...     stack.transform()[['northing','easting','ele']])
+        ...     stack.transform()[['northing','easting','ele']])       # the same
         >>> flat  = stack.detrend2d(trend)
 
         IT RUNS ON THE RAW STACK, where detrending belongs. The scatterer phase
@@ -4114,11 +4120,11 @@ class BatchComplex(BatchCore):
         is zero. Its own plane is then common to every date, so no velocity
         depends on it.
 
-        NOTHING IS UNWRAPPED, AND NOTHING IS SEARCHED. Maximising
+        NOTHING IS UNWRAPPED, AND THE ANSWER IS SOLVED FOR. Maximising
         `sum cos(phi - g.v - k)` is a bounded-influence regression whose score
-        is the SINE of the residual, and it is SOLVED for, by an ascent from
-        zero. One pass over the data; the accumulator is read at whatever
-        gradient the iteration asks for, not at lattice nodes.
+        is the SINE of the residual, and it is SOLVED, by an ascent. One pass
+        over the data; the accumulator is read at whatever gradient the
+        iteration asks for, not at lattice nodes.
 
         THE OLD GLOBAL ARGMAX WAS THE BUG. A variable's own distribution has a
         transform -- what a perfectly coherent, TREND-FREE date would score --
@@ -4126,14 +4132,18 @@ class BatchComplex(BatchCore):
         into a fraction of the elevation range. Taking the largest peak over a
         wide band then answered with the elevation histogram rather than the
         phase whenever a date was weak. The ascent from zero follows the
-        objective instead, to the stationary point CONNECTED to zero: strong
-        trends on a connected slope are still reached, well past the
-        half-power width, but a trend separated from zero by a null of a
-        NEAR-UNIFORM sampling -- a multi-cycle ramp in `northing` -- is not,
-        and comes back as the small stationary point near zero. Fit map
-        ramps with Batch.trend2d(degree=...) on real phase, not here; this
-        estimator is
-        for covariates whose sampling has structure, elevation above all.
+        objective instead, to the stationary point CONNECTED to zero -- and
+        misses a peak that sits across a dip from it. So the ascent gets more
+        STARTS, and the highest stationary point wins: the ramp read off the
+        profiles of `northing`/`easting`, and the date's own accumulator
+        searched over every covariate's whole reach -- that one taken ONLY
+        where the two checkerboard halves of the scene, searched on their own,
+        land within the sampling's resolution of the same point. The halves
+        are independent pixels of the same sampling: a lobe that noise lifted
+        is not lifted in both, and a date whose halves disagree keeps the
+        starts it had. Fit map ramps with Batch.trend2d(degree=...) on real
+        phase, not here; this estimator is for covariates whose sampling has
+        structure, elevation above all.
 
         THE OBJECTIVE IS BOUNDED, AND THAT PROTECTS THE GROUND PHASE: residuals
         enter as UNIT phasors, never angles, so one pixel pulls the fit by at
@@ -4159,7 +4169,7 @@ class BatchComplex(BatchCore):
           stderr_<var> -- one-sigma of the fitted slope, same units, measured
               as half the disagreement of two checkerboard halves of the
               scene (one degree of freedom: honest scale, noisy itself);
-          stderr_intercept -- at degree=0, the constant's one-sigma in
+          stderr_intercept -- with no covariate, the constant's one-sigma in
               radians, from the same halves;
           pixels -- samples fitted.
         NaN only when there is no fit at all: no pixels, a degenerate
@@ -4168,10 +4178,18 @@ class BatchComplex(BatchCore):
 
         Parameters
         ----------
-        vars : Batch
-            `stack.transform()[['northing','easting','ele']]` at this stack's
-            posting; each variable becomes one gradient, as a raster or, like
-            the map coordinates, a vector along one axis.
+        *vars : str, or one Batch
+            The covariates, three at most, each one gradient -- a raster or,
+            like the map coordinates, a vector along one axis. Either NAMED,
+            `trend2d('ele')` or `trend2d('northing', 'easting', 'ele')`, and
+            taken from `transform`; or the Batch itself,
+            `trend2d(stack.transform()[['northing','easting','ele']])`, at this
+            stack's posting.
+
+            NONE GIVEN, the model is the constant alone -- the angle of the
+            phasor sum of every valid pixel: it names no covariate and carries
+            no slopes, and 'stderr_intercept' prices the constant instead. A
+            higher degree is not an argument either: it is named, `'ele²'`.
 
             TAKE THEM FROM THE UNFILTERED STACK: where() masks the geometry
             too. And mind the frame -- `azi` and `rng` restart at every burst,
@@ -4183,12 +4201,9 @@ class BatchComplex(BatchCore):
             about the model's own point wherever the model is evaluated:
             `stack.transform()[['ele', 'ele²']]`. Pass it alongside its
             base, since a squared term alone pins the parabola's vertex.
-        degree : int
-            1 (default) fits a gradient per variable and the constant. 0 fits
-            the constant alone -- the angle of the pixels' phasor sum -- on
-            the same pixels, the variables only deciding which ones count;
-            the model then names no covariate and carries no slopes, and
-            'stderr_intercept' prices the constant instead.
+        transform : Batch or None
+            Where named covariates are read: `stack.transform()`, this stack's
+            own when left out. Not used when the covariates come as a Batch.
         range : float
             How much of gradient space the accumulator can represent, radians
             across each variable's extent. Default None self-sizes: 128
@@ -4205,23 +4220,24 @@ class BatchComplex(BatchCore):
             burst's accumulators into one fit per date; nothing is merged or
             resampled, a sum over pixels not caring where they came from.
         debug : bool
-            Print each date's turn across every variable (the constant at
-            degree=0), its coherence and its reach, and name the dates that
+            Print each date's turn across every variable (the constant when
+            there is no covariate), its coherence and its reach, and name the dates that
             did not resolve.
 
         Returns
         -------
-        BatchComplex
+        Batch
             A model dataset per burst, nothing of the stack in it:
             The MODEL, per date, in scipy's terms and in float64:
             'intercept' (radians where every covariate sits at its
-            'trend2d_zero' -- the centroid of the fitted pixels -- relative to
-            the reference date), per covariate 'slope_<var>' (radians per
+            'trend2d_zero' -- the midpoint of its actual_range, read from the
+            store and never measured, so that building the model runs nothing
+            -- relative to the reference date), per covariate 'slope_<var>' (radians per
             unit of it), 'resolution_<var>' (how far apart two slopes must be
             for this sampling to tell them apart, same units), 'stderr_<var>'
             (the slope's one-sigma, same units), and 'coherence', 'coherence0',
-            'gain', 'pixels'; the covariate names ride as attributes. At
-            degree=0 only 'intercept', 'stderr_intercept', 'coherence',
+            'gain', 'pixels'; the covariate names ride as attributes. With no
+            covariate only 'intercept', 'stderr_intercept', 'coherence',
             'coherence0', 'gain' and 'pixels', with no covariate named. No
             raster: `stack.predict(trend)` evaluates the phase per chunk when
             asked, `stack.detrend2d(trend)` removes it.
@@ -4233,13 +4249,39 @@ class BatchComplex(BatchCore):
         import dask.array as da
         from . import utils_detrend
 
-        if (isinstance(degree, bool)
-                or not isinstance(degree, (int, np.integer))
-                or degree not in (0, 1)):
-            raise ValueError(f"trend2d(): degree is 1 (a gradient per variable "
-                             f"and the constant) or 0 (the constant alone), "
-                             f"got {degree!r}.")
-        degree = int(degree)
+        # the covariates: named, or the Batch they always were; a gradient per
+        # covariate and the constant, or -- with none -- the constant alone
+        degree = 1
+        if not vars:
+            degree = 0
+            # EVERY VALID PIXEL COUNTS: the accumulator is handed a covariate
+            # that is finite everywhere, which the constant then never reads
+            vars = Batch({key: xr.Dataset({'northing': xr.DataArray(
+                np.asarray(ds.y.values, np.float32), dims=('y',),
+                attrs={'actual_range': [float(ds.y.min()), float(ds.y.max())]})})
+                for key, ds in self.items()})
+        elif len(vars) == 1 and not isinstance(vars[0], str):
+            vars = vars[0]
+        elif all(isinstance(v, str) for v in vars):
+            if len(vars) > 3:
+                raise ValueError(f"trend2d(): three covariates at most -- the transform "
+                                 f"is gridded in them -- got {list(vars)}.")
+            if len(set(vars)) != len(vars):
+                raise ValueError(f"trend2d(): each covariate once, got {list(vars)}.")
+            if transform is None:
+                if not hasattr(self, 'transform'):
+                    raise TypeError(
+                        "trend2d(): named covariates are read from the geometry, and "
+                        "this batch has none of its own -- pass "
+                        "transform=stack.transform().")
+                transform = self.transform()
+            vars = transform[list(vars)]
+        else:
+            raise TypeError(
+                "trend2d() takes the covariates' names -- trend2d('northing', "
+                "'easting', 'ele') -- or ONE Batch of them -- "
+                "trend2d(stack.transform()[['ele']]); got "
+                f"{[type(v).__name__ for v in vars]}.")
 
         # ---- per burst: the lazy pieces, nothing computed yet --------------
         preps = []
@@ -4390,6 +4432,8 @@ class BatchComplex(BatchCore):
 
         # ---- the search geometry, all of it known before any read --------
         _K = int(np.prod(utils_detrend.trend2d_grid_shape([_cells] * k)))
+        from .utils_dask import get_dask_chunk_size_mb
+        _budget = get_dask_chunk_size_mb() * 2 ** 20
 
         # ---- the fit, as a graph: nothing is read here, so asking for one
         # burst or one date later pays for that burst or that date -----------
@@ -4401,50 +4445,65 @@ class BatchComplex(BatchCore):
             _stats = np.concatenate([0.5 * (_hi + _lo),          # centre
                                      _hi - _lo])                 # extent
             _acc = []
-            _acc0 = []
             for p in grp:
                 _args = []
                 for var_dask, _d in zip(p['vars_dask'], p['vars_dims']):
                     _args += [var_dask, ''.join(_d)]
                 _w = utils_detrend.trend2d_width(_cells, k, len(_axes))
-                _acc.append(da.blockwise(
-                    _trend2d_accumulate_for_dask, 'dyxf',
-                    p['data_ref'], 'dyx', *_args,
-                    stats=_stats, cells=_cells,
-                    dims=[''.join(_d) for _d in p['vars_dims']],
-                    adjust_chunks={'y': 1, 'x': 1},
-                    new_axes={'f': _w},
-                    dtype=np.float64,
-                    meta=np.empty((0, 0, 0, 0), np.float64)
-                ).sum(axis=(1, 2)))
-                # ONE CHECKERBOARD HALF of the same sums (the other half is
-                # total minus this one): two independent coarse pixel sets,
-                # whose disagreement prices the estimate per date
+                # BOTH CHECKERBOARD HALVES IN THE ONE PASS: two independent
+                # coarse pixel sets, whose disagreement prices the estimate
+                # per date. A pixel is spread once, into the grid of its own
+                # half, and the total is their sum; the board is read off the
+                # block's own coordinates.
                 _yc = np.asarray(p['data_da'].coords['y'].values, float)
                 _xc = np.asarray(p['data_da'].coords['x'].values, float)
-                _yd = da.from_array(_yc, chunks=p['data_ref'].chunks[1])
-                _xd = da.from_array(_xc, chunks=p['data_ref'].chunks[2])
-                _acc0.append(da.blockwise(
-                    _trend2d_accumulate_half_for_dask, 'dyxf',
-                    p['data_ref'], 'dyx', *_args, _yd, 'y', _xd, 'x',
-                    stats=_stats, cells=_cells, n_vars=k,
-                    dims=[''.join(_d) for _d in p['vars_dims']],
-                    checker=0,
-                    extent=(float(_yc.min()), float(_yc.max()),
-                            float(_xc.min()), float(_xc.max())),
-                    adjust_chunks={'y': 1, 'x': 1},
-                    new_axes={'f': _w},
-                    dtype=np.float64,
-                    meta=np.empty((0, 0, 0, 0), np.float64)
-                ).sum(axis=(1, 2)))
+                _ref = p['data_ref']
+                _yd = da.from_array(_yc, chunks=_ref.chunks[1])
+                _xd = da.from_array(_xc, chunks=_ref.chunks[2])
+                # THE CALLER'S DATE CHUNKS, WHOLE, MERGED INSIDE THE TASK. A
+                # pixel's kernel weights do not depend on the date, so they
+                # serve every date a task carries: the date axis is contracted,
+                # as fit1d() does, over runs of consecutive date chunks that
+                # together fit one dask chunk. A date chunk larger than that is
+                # taken as it is. Nothing is rechunked and no chunk is split --
+                # a run is a slice at chunk boundaries.
+                _slice = (max(_ref.chunks[1]) * max(_ref.chunks[2])
+                          * _ref.dtype.itemsize)
+                _cap = max(1, int(_budget // max(_slice, 1)))
+                _runs, _t0, _n = [], 0, 0
+                for _c in _ref.chunks[0]:
+                    if _n and _n + _c > _cap:
+                        _runs.append((_t0, _t0 + _n))
+                        _t0, _n = _t0 + _n, 0
+                    _n += _c
+                _runs.append((_t0, _t0 + _n))
+                _parts = []
+                for _a, _b in _runs:
+                    _parts.append(da.blockwise(
+                        _trend2d_accumulate_for_dask, 'Dyxf',
+                        _ref if len(_runs) == 1 else _ref[_a:_b], 'dyx',
+                        *_args, _yd, 'y', _xd, 'x',
+                        stats=_stats, cells=_cells, n_vars=k,
+                        dims=[''.join(_d) for _d in p['vars_dims']],
+                        extent=(float(_yc.min()), float(_yc.max()),
+                                float(_xc.min()), float(_xc.max())),
+                        adjust_chunks={'y': 1, 'x': 1},
+                        new_axes={'D': _b - _a, 'f': _w},
+                        concatenate=True, dtype=np.float64,
+                        meta=np.empty((0, 0, 0, 0), np.float64)
+                    ).sum(axis=(1, 2)))
+                _acc.append(_parts[0] if len(_parts) == 1
+                            else da.concatenate(_parts, axis=0))
+            # ONE DATE PER FIT, however many dates an accumulator task took:
+            # the dates are solved alone, so they are solved side by side. The
+            # accumulator is the fit's own small intermediate, a row per date.
+            _total = sum(_acc[1:], _acc[0]).rechunk({0: 1})
             _dts = da.from_array(
                 np.asarray(grp[0]['data_da'].coords['date'].values)
-                .astype('datetime64[D]').astype(np.int64),
-                chunks=grp[0]['data_da'].data.chunks[0])
+                .astype('datetime64[D]').astype(np.int64), chunks=1)
             _coef = da.blockwise(
                 _trend2d_finalize_for_dask, 'dc',
-                sum(_acc[1:], _acc[0]), 'df',
-                sum(_acc0[1:], _acc0[0]), 'df',
+                _total, 'df',
                 _dts, 'd',
                 concatenate=True, stats=_stats, cells=_cells, k=k,
                 axes=_axes, degree=degree,
@@ -4453,6 +4512,10 @@ class BatchComplex(BatchCore):
                 # reaches, k errors, k centroids
                 new_axes={'c': 4 * k + 5},
                 dtype=np.float64, meta=np.empty((0, 0), np.float64))
+            if debug:
+                # the table needs the numbers, so they are computed here, ONCE,
+                # and the model carries them: computing it runs nothing again
+                _coef = da.from_array(np.asarray(_coef), chunks=-1)
 
             for p in grp:
                 p['coef'] = (_coef, _stats)
@@ -4522,32 +4585,17 @@ class BatchComplex(BatchCore):
             # here, in float64.
             o = xr.Dataset(coords={'date': np.asarray(
                 p['data_da'].coords['date'].values)}, attrs=dict(ds.attrs))
-            # every variable is re-centred at the centroid of the fitted
-            # pixels, pooled over dates by count, and 'intercept' is the phase
-            # there; a square follows its base to the same point, which the
-            # base's linear term makes exact, and keeps its own centre when
-            # the base was not passed
+            # THE ZERO IS READ, NEVER MEASURED, so that nothing here needs the
+            # fit: a variable's zero is the midpoint of its actual_range --
+            # where the fit's own constant already sits -- and a square's is
+            # the centre it was built about. An attribute has to be a number
+            # now; a zero taken from the fitted pixels would run the whole fit
+            # inside this call.
             _names = list(p['var_names']) if degree else []
             _orig = [_coef[:, i].astype(np.float64)
                      for i in _builtins.range(len(_names))]
-            _npx = _coef[:, k + 4].astype(np.float64)
-            _zeros = []
-            for i, _v in enumerate(_names):
-                _cen = _coef[:, 3 * k + 5 + i].astype(np.float64)
-                _ok = np.isfinite(_cen) & (_npx > 0)
-                _z = (float((_cen[_ok] * _npx[_ok]).sum() / _npx[_ok].sum())
-                      if _ok.any() else float(_stats[i]))
-                if _v.endswith('²'):
-                    _b = _v[:-1]
-                    _z = float(p['zero'][i])
-                    if _b in _names:
-                        _j = _names.index(_b)
-                        _cb = _coef[:, 3 * k + 5 + _j].astype(np.float64)
-                        _okb = np.isfinite(_cb) & (_npx > 0)
-                        if _okb.any():
-                            _z = float((_cb[_okb] * _npx[_okb]).sum()
-                                       / _npx[_okb].sum())
-                _zeros.append(_z)
+            _zeros = [float(p['zero'][i]) if _v.endswith('²') else float(_stats[i])
+                      for i, _v in enumerate(_names)]
             _icpt = _coef[:, k].astype(np.float64)
             _slopes = list(_orig)
             for i, _v in enumerate(_names):
