@@ -5262,7 +5262,7 @@ class BatchComplex(BatchCore):
 
         # THE CLUSTER STATES THE SHAPE, as the per-burst path reads it
         _slots = 1
-        _cores = max(1, _os.process_cpu_count() or 1)
+        _cores = None
         try:
             from dask.distributed import get_client as _gc
             _winfo = _gc().scheduler_info().get('workers', {})
@@ -5275,6 +5275,16 @@ class BatchComplex(BatchCore):
                     _cores = int(max(_decl))
         except (ValueError, ImportError):
             pass
+        # THE DECLARED CORES FIRST, the process's own count only without them:
+        # os.process_cpu_count() is new in Python 3.13, and asking it before
+        # the cluster failed on 3.11/3.12 even with the cores declared.
+        if _cores is None:
+            if not hasattr(_os, 'process_cpu_count'):
+                raise RuntimeError(
+                    "fit3d() cannot count the CPU cores. Use Python 3.13+, or "
+                    "declare the cores in the Dask cluster init: Client(..., "
+                    "resources={'cpu': N}) with N the machine's CPU cores.")
+            _cores = max(1, _os.process_cpu_count() or 1)
         _threads = max(1, _cores // max(1, _slots))
         _width = _slots
         if chain is None:
