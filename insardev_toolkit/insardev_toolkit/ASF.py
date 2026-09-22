@@ -1040,7 +1040,7 @@ class ASF(progressbar_joblib):
                                             for url in properties['additionalUrls']]
             results.append(_ASFSearchResult(dict(feature, properties=properties)))
             print(f'NOTE: burst {burst} is missing in the ASF catalog, '
-                  f'restored from {feature["properties"]["fileID"]}.')
+                  f'catalog record rebuilt from {feature["properties"]["fileID"]}.')
 
         # Check for conflicting bursts from different paths with same burstNum_subswath pattern
         # Such data cannot be stored in the same basedir without conflicts
