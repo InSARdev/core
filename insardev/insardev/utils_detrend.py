@@ -31,6 +31,19 @@ def _warmup_numba_cache():
     for _k in (1, 2, 3):
         trend2d_spread(np.ones((1, 1), np.complex128),
                        np.zeros((1, _k)), 8)
+    # the accumulator's own kernels and the reader, on the shapes of covariates
+    # a caller can name: a raster, vectors along y and x with a raster, none
+    _z = np.ones((2, 3, 4), np.complex64)
+    _r = np.linspace(0.0, 1.0, 12, dtype=np.float32).reshape(3, 4)
+    _y = np.linspace(0.0, 1.0, 3, dtype=np.float32)
+    _x = np.linspace(0.0, 1.0, 4, dtype=np.float32)
+    for _tb, _dm in (((_r,), ['yx']), ((_y, _x, _r), ['y', 'x', 'yx']), ((_y,), ['y'])):
+        _k = len(_tb)
+        _st = np.array([0.5] * _k + [1.0] * _k)
+        _a = trend2d_accumulate(_z, _tb, _st, 8, dims=_dm, extent=(0.0, 1.0, 0.0, 1.0),
+                                coords=(_y, _x))
+        trend2d_fit(_a[:, 0, 0, :], 8, _k,
+                    axes=tuple(i for i, d in enumerate(_dm) if d != 'yx')[:2])
 
 
 @nb.njit(cache=True)
@@ -135,6 +148,13 @@ def threshold_pairs_array(data_chunk, weight_chunk, threshold=np.pi/2):
 TREND2D_W = 7                 # kernel half-support in cells, each side
 TREND2D_BETA = 2.30           # exponential-of-semicircle shape, per unit width
 TREND2D_PROFILE = 64          # coarse cells per axis for the ramp-start scan
+# `resolution` is the HALF-POWER width of the sampling's own transform: |W|/n is
+# an amplitude, so half of the power is this level of it
+TREND2D_RESOLUTION_LEVEL = float(np.sqrt(0.5))
+# the searched start reads each covariate's whole reach on a lattice this many
+# times finer than a turn; False leaves the starts at zero and the axis profiles
+TREND2D_SEARCH_OVER = 8
+TREND2D_SEARCHED_START = True
 
 
 @nb.njit(parallel=False, cache=True, fastmath=True)
@@ -212,6 +232,302 @@ def _trend2d_spread3(A, ur, ui, cells, w, beta, M, st, gr, gi):
                     for q in range(ur.shape[0]):
                         gr[q, idx] += ur[q, p] * kk
                         gi[q, idx] += ui[q, p] * kk
+
+
+# ---------------------------------------------------------------------------
+# The accumulator's own kernels. The samples are held as (pixels, dates) and
+# every grid as (cells, dates), so the DATE is the innermost loop and walks
+# memory in order: a pixel's kernel weights are computed once and serve every
+# date of the call. Both checkerboard halves come out of the one pass -- a
+# pixel goes into the grid of ITS half and the total is their sum.
+# ---------------------------------------------------------------------------
+
+@nb.njit(cache=True, nogil=True)
+def _trend2d_anyvalid(blk, flags):
+    """blk (dates, pixels) complex -> flags[p] = 1 where any date holds a
+    finite non-zero sample. Stops reading once every pixel is flagged."""
+    nq, npix = blk.shape
+    left = npix
+    for t in range(nq):
+        row = blk[t]
+        for p in range(npix):
+            if flags[p] == 0:
+                z = row[p]
+                zr = np.float64(z.real)
+                zi = np.float64(z.imag)
+                a = zr * zr + zi * zi
+                if a > 0.0 and np.isfinite(a):
+                    flags[p] = 1
+                    left -= 1
+        if left == 0:
+            break
+
+
+@nb.njit(cache=True, nogil=True)
+def _trend2d_gather(blk, idx, ur, ui, cnt):
+    """blk (dates, pixels) complex -> the unit phasors of the kept pixels as
+    ur, ui (kept pixels, dates), zero where a date has no sample; cnt per date.
+
+    In runs of pixels short enough that a run's (pixels, dates) rows stay in
+    cache while every date writes its column of them."""
+    nq = blk.shape[0]
+    n = idx.size
+    step = 4096
+    for p0 in range(0, n, step):
+        p1 = min(p0 + step, n)
+        for t in range(nq):
+            row = blk[t]
+            c = 0
+            for p in range(p0, p1):
+                z = row[idx[p]]
+                zr = np.float64(z.real)
+                zi = np.float64(z.imag)
+                a = np.sqrt(zr * zr + zi * zi)
+                if a > 0.0 and np.isfinite(a):
+                    ur[p, t] = zr / a
+                    ui[p, t] = zi / a
+                    c += 1
+                else:
+                    ur[p, t] = 0.0
+                    ui[p, t] = 0.0
+            cnt[t] += c
+
+
+@nb.njit(cache=True, fastmath=True, nogil=True)
+def _trend2d_spread_rows(rows, colsi, par, ur, ui, full, w, beta, cells, M,
+                         ncols, WY, BY, AY, WX, BX, AX, AR, xlo, xhi,
+                         oslot, ovar, ikind, islot, ivar,
+                         vclass, vslot, pclass, pslot, PY, PX, P,
+                         tr, ti, gr, gi, Hg, mn, m1, m2, pr, pi):
+    """Every sum of one call, row by row.
+
+    THE KERNEL IS A PRODUCT, and a covariate that is a vector along y has one
+    weight vector per ROW. So a row's pixels are spread over the OTHER axes only
+    -- the inner grid tr, ti -- and that small grid then goes into the rows of
+    the full grid the row's own kernel touches: the same sums in another order,
+    at the footprint of the inner axes per pixel instead of all of them. Inner
+    axes are vectors along x (weights from a per-column table) and rasters
+    (weights per pixel). With no y-vector the inner grid IS the grid.
+
+    Alongside, from the same weights: the sampling's transform Hg per VARIABLE
+    (one-dimensional -- the fit reads it one gradient at a time), the count and
+    the moments per half, and the coarse profile over the axis covariates.
+    `full` says every kept pixel has every date of the call, so what depends on
+    the sampling alone is summed once (last axis of length one) not per date.
+    """
+    n = rows.size
+    nq = ur.shape[1]
+    nqh = mn.shape[1]
+    nout = oslot.size
+    nin = ikind.size
+    k = vclass.size
+    m = pclass.size
+    itap = np.ones(3, np.int64)
+    ist = np.zeros(3, np.int64)
+    otap = np.ones(3, np.int64)
+    ost = np.zeros(3, np.int64)
+    s = 1
+    for j in range(nin - 1, -1, -1):
+        itap[j] = w
+        ist[j] = s
+        s *= M
+    s = 1
+    for j in range(nout - 1, -1, -1):
+        otap[j] = w
+        ost[j] = s
+        s *= M
+    win = np.zeros((3, w))
+    win[:, 0] = 1.0
+    wout = np.zeros((3, w))
+    wout[:, 0] = 1.0
+    ib = np.zeros(3, np.int64)
+    ob = np.zeros(3, np.int64)
+    lo = np.zeros(3, np.int64)
+    hi = np.ones(3, np.int64)
+    Av = np.zeros(3)
+    rowcnt = np.zeros(nqh)
+    colcnt = np.zeros((ncols, nqh))
+    anyx = False
+    for j in range(nin):
+        if ikind[j] == 1:
+            anyx = True
+    p = 0
+    while p < n:
+        r = rows[p]
+        q_end = p
+        while q_end < n and rows[q_end] == r:
+            q_end += 1
+        if nout > 0:
+            # the window of the inner grid this row can touch
+            for j in range(nin):
+                if ikind[j] == 1:
+                    lo[j] = xlo[islot[j]]
+                    hi[j] = xhi[islot[j]]
+                else:
+                    a0 = M
+                    a1 = 0
+                    for s_ in range(p, q_end):
+                        t = (AR[islot[j], s_] + 0.5) * cells + w
+                        i0 = int(np.ceil(t - 0.5 * w))
+                        if i0 < a0:
+                            a0 = i0
+                        if i0 + w > a1:
+                            a1 = i0 + w
+                    lo[j] = a0
+                    hi[j] = a1
+            for hh in range(2):
+                for i0_ in range(lo[0], hi[0]):
+                    for i1_ in range(lo[1], hi[1]):
+                        for i2_ in range(lo[2], hi[2]):
+                            fi = i0_ * ist[0] + i1_ * ist[1] + i2_ * ist[2]
+                            for q in range(nq):
+                                tr[hh, fi, q] = 0.0
+                                ti[hh, fi, q] = 0.0
+        for qh in range(nqh):
+            rowcnt[qh] = 0.0
+        for s_ in range(p, q_end):
+            c = colsi[s_]
+            h = par[s_]
+            for j in range(nin):
+                sl = islot[j]
+                if ikind[j] == 1:
+                    ib[j] = BX[sl, c]
+                    for d in range(w):
+                        win[j, d] = WX[sl, c, d]
+                else:
+                    t = (AR[sl, s_] + 0.5) * cells + w
+                    i0 = int(np.ceil(t - 0.5 * w))
+                    ib[j] = i0
+                    for d in range(w):
+                        z = 2.0 * (i0 + d - t) / w
+                        win[j, d] = (np.exp(beta * (np.sqrt(1.0 - z * z) - 1.0))
+                                     if -1.0 < z < 1.0 else 0.0)
+            for d0 in range(itap[0]):
+                w0 = win[0, d0]
+                if w0 == 0.0:
+                    continue
+                f0 = (ib[0] + d0) * ist[0]
+                for d1 in range(itap[1]):
+                    w1 = w0 * win[1, d1]
+                    if w1 == 0.0:
+                        continue
+                    f1 = f0 + (ib[1] + d1) * ist[1]
+                    for d2 in range(itap[2]):
+                        ww = w1 * win[2, d2]
+                        if ww == 0.0:
+                            continue
+                        fi = f1 + (ib[2] + d2) * ist[2]
+                        for q in range(nq):
+                            tr[h, fi, q] += ur[s_, q] * ww
+                            ti[h, fi, q] += ui[s_, q] * ww
+            for a in range(k):
+                if vclass[a] == 0:
+                    Av[a] = AY[vslot[a], r]
+                elif vclass[a] == 1:
+                    Av[a] = AX[vslot[a], c]
+                else:
+                    Av[a] = AR[vslot[a], s_]
+            if full:
+                mn[h, 0] += 1.0
+                pp = 0
+                for a in range(k):
+                    m1[h, a, 0] += Av[a]
+                    for b in range(a, k):
+                        m2[h, pp, 0] += Av[a] * Av[b]
+                        pp += 1
+                rowcnt[0] += 1.0
+                if anyx:
+                    colcnt[c, 0] += 1.0
+                for j in range(nin):
+                    if ikind[j] == 2:
+                        for d in range(w):
+                            Hg[ivar[j], ib[j] + d, 0] += win[j, d]
+            else:
+                for q in range(nq):
+                    if ur[s_, q] != 0.0 or ui[s_, q] != 0.0:
+                        mn[h, q] += 1.0
+                        pp = 0
+                        for a in range(k):
+                            m1[h, a, q] += Av[a]
+                            for b in range(a, k):
+                                m2[h, pp, q] += Av[a] * Av[b]
+                                pp += 1
+                        rowcnt[q] += 1.0
+                        if anyx:
+                            colcnt[c, q] += 1.0
+                        for j in range(nin):
+                            if ikind[j] == 2:
+                                for d in range(w):
+                                    Hg[ivar[j], ib[j] + d, q] += win[j, d]
+            if m > 0:
+                flat = 0
+                for j in range(m):
+                    if pclass[j] == 0:
+                        flat = flat * P + PY[pslot[j], r]
+                    else:
+                        flat = flat * P + PX[pslot[j], c]
+                for q in range(nq):
+                    pr[flat, q] += ur[s_, q]
+                    pi[flat, q] += ui[s_, q]
+        if nout > 0:
+            for j in range(nout):
+                sl = oslot[j]
+                ob[j] = BY[sl, r]
+                for d in range(w):
+                    wout[j, d] = WY[sl, r, d]
+                    for qh in range(nqh):
+                        Hg[ovar[j], ob[j] + d, qh] += wout[j, d] * rowcnt[qh]
+            for e0 in range(otap[0]):
+                v0 = wout[0, e0]
+                if v0 == 0.0:
+                    continue
+                g0 = (ob[0] + e0) * ost[0]
+                for e1 in range(otap[1]):
+                    v1 = v0 * wout[1, e1]
+                    if v1 == 0.0:
+                        continue
+                    g1 = g0 + (ob[1] + e1) * ost[1]
+                    for e2 in range(otap[2]):
+                        vv = v1 * wout[2, e2]
+                        if vv == 0.0:
+                            continue
+                        fo = g1 + (ob[2] + e2) * ost[2]
+                        for hh in range(2):
+                            for i0_ in range(lo[0], hi[0]):
+                                for i1_ in range(lo[1], hi[1]):
+                                    for i2_ in range(lo[2], hi[2]):
+                                        fi = (i0_ * ist[0] + i1_ * ist[1]
+                                              + i2_ * ist[2])
+                                        for q in range(nq):
+                                            gr[hh, fo, fi, q] += vv * tr[hh, fi, q]
+                                            gi[hh, fo, fi, q] += vv * ti[hh, fi, q]
+        p = q_end
+    # a vector along x: its sampling is the count of kept pixels per column
+    for j in range(nin):
+        if ikind[j] == 1:
+            sl = islot[j]
+            for c in range(ncols):
+                for d in range(w):
+                    for qh in range(nqh):
+                        Hg[ivar[j], BX[sl, c] + d, qh] += WX[sl, c, d] * colcnt[c, qh]
+
+
+def _trend2d_axis_tables(Aax, cells, bad=None):
+    """A covariate that is a vector along one axis: its kernel weights and first
+    cell per row (or column), the routine the pixels go through made a table."""
+    w = TREND2D_W
+    beta = TREND2D_BETA * w
+    Aax = np.asarray(Aax, np.float64)
+    if bad is not None and bad.any():
+        Aax = np.where(bad, 0.0, Aax)
+    t = (Aax + 0.5) * float(cells) + w
+    i0 = np.ceil(t - 0.5 * w).astype(np.int64)
+    z = 2.0 * (i0[:, None] + np.arange(w)[None, :] - t[:, None]) / w
+    inside = (z > -1.0) & (z < 1.0)
+    kv = np.where(inside, np.exp(beta * (np.sqrt(np.where(inside, 1.0 - z * z, 1.0)) - 1.0)), 0.0)
+    if bad is not None and bad.any():
+        kv[bad] = 0.0
+    return np.ascontiguousarray(kv), np.ascontiguousarray(i0)
 
 
 def trend2d_grid_shape(cells):
@@ -302,51 +618,211 @@ def trend2d_read(S, cells, k, g, kg=None):
     divided by the kernel's own transform so one sample at A contributes
     exp(-2 pi i g.A) and nothing besides.
     """
-    import numpy as _np
-    cells = int(cells)
-    M = cells + 2 * TREND2D_W
-    Am = trend2d_nodes(cells)
+    Sr, Si = _trend2d_parts(S)
     if kg is None:
         kg = trend2d_kernel(cells)
+    return _trend2d_read_parts(Sr, Si, cells, k, g, kg)
+
+
+def _trend2d_parts(S):
+    """A spread grid as the two contiguous float64 vectors the reader walks:
+    (real, imaginary) handed over as they are, a complex vector split."""
+    import numpy as _np
+    if isinstance(S, tuple):
+        return S
+    S = _np.asarray(S)
+    return (_np.ascontiguousarray(S.real, dtype=_np.float64).ravel(),
+            _np.ascontiguousarray(S.imag, dtype=_np.float64).ravel()
+            if _np.iscomplexobj(S) else _np.zeros(S.size, _np.float64))
+
+
+def _trend2d_read_parts(Sr, Si, cells, k, g, kg):
+    """trend2d_read() on the grid's real and imaginary parts."""
+    import numpy as _np
+    cells = int(cells)
     g = _np.atleast_1d(_np.asarray(g, _np.float64))
-    ph, dph = [], []
-    kh = 1.0 + 0j
-    dkh = _np.zeros(k, _np.complex128)
-    for a in range(k):
-        e = _np.exp(-2j * _np.pi * g[a] * Am)
-        d = e * (-2j * _np.pi * Am)
-        ph.append(e)
-        dph.append(d)
-        ka = complex((kg * e).sum())
-        kh *= ka
-        dkh[a] = complex((kg * d).sum())
-    if abs(kh) < 1e-12:
+    kgr = _np.ascontiguousarray(_np.asarray(kg).real, dtype=_np.float64)
+    T, dT, ok = _trend2d_read_kernel(Sr, Si, int(k), cells + 2 * TREND2D_W,
+                                     float(cells), TREND2D_W, g, kgr)
+    if not ok:
         return _np.nan + 0j, _np.full(k, _np.nan + 0j)
-    # the per-axis factor cancels out of dkh/kh, so build it as a log-derivative
-    for a in range(k):
-        dkh[a] = kh * dkh[a] / complex((kg * ph[a]).sum())
+    return complex(T), dT
 
-    def _contract(vecs):
-        out = _np.asarray(S, _np.complex128).reshape((M,) * k)
-        for v in vecs:
-            out = _np.tensordot(out, v, axes=([0], [0]))
-        return complex(out)
 
-    That = _contract(ph)
-    dThat = _np.empty(k, _np.complex128)
+@nb.njit(cache=True, fastmath=True, nogil=True)
+def _trend2d_read_kernel(Sr, Si, k, M, cells, w, g, kg):
+    """The contraction of trend2d_read(), ONE pass over the grid: the last axis
+    is contracted against the phasors and against their derivative together, so
+    the value and its k derivatives share the walk through the cells."""
+    two_pi = 2.0 * np.pi
+    pr = np.empty((k, M))
+    pi = np.empty((k, M))
+    dr = np.empty((k, M))
+    di = np.empty((k, M))
+    ka = np.empty(k, np.complex128)
+    dka = np.empty(k, np.complex128)
+    kh = 1.0 + 0.0j
     for a in range(k):
-        dThat[a] = _contract([dph[b] if b == a else ph[b] for b in range(k)])
+        sr = 0.0
+        si = 0.0
+        tr = 0.0
+        ti = 0.0
+        for c in range(M):
+            am = (c - w) / cells - 0.5
+            ang = -two_pi * g[a] * am
+            cr = np.cos(ang)
+            sn = np.sin(ang)
+            f = two_pi * am
+            pr[a, c] = cr
+            pi[a, c] = sn
+            # e * (-2 pi i am)
+            dr[a, c] = f * sn
+            di[a, c] = -f * cr
+            sr += kg[c] * cr
+            si += kg[c] * sn
+            tr += kg[c] * dr[a, c]
+            ti += kg[c] * di[a, c]
+        ka[a] = complex(sr, si)
+        dka[a] = complex(tr, ti)
+        kh *= ka[a]
+    dT = np.zeros(k, np.complex128)
+    if abs(kh) < 1e-12:
+        return 0.0 + 0.0j, dT, False
+    That = 0.0 + 0.0j
+    la = k - 1
+    if k == 1:
+        ar = 0.0
+        ai = 0.0
+        br = 0.0
+        bi = 0.0
+        for l in range(M):
+            ar += Sr[l] * pr[0, l] - Si[l] * pi[0, l]
+            ai += Sr[l] * pi[0, l] + Si[l] * pr[0, l]
+            br += Sr[l] * dr[0, l] - Si[l] * di[0, l]
+            bi += Sr[l] * di[0, l] + Si[l] * dr[0, l]
+        That = complex(ar, ai)
+        dT[0] = complex(br, bi)
+    elif k == 2:
+        t_ = 0.0 + 0.0j
+        d0 = 0.0 + 0.0j
+        d1 = 0.0 + 0.0j
+        for i in range(M):
+            base = i * M
+            ar = 0.0
+            ai = 0.0
+            br = 0.0
+            bi = 0.0
+            for l in range(M):
+                s_r = Sr[base + l]
+                s_i = Si[base + l]
+                ar += s_r * pr[la, l] - s_i * pi[la, l]
+                ai += s_r * pi[la, l] + s_i * pr[la, l]
+                br += s_r * dr[la, l] - s_i * di[la, l]
+                bi += s_r * di[la, l] + s_i * dr[la, l]
+            p0 = complex(pr[0, i], pi[0, i])
+            t_ += p0 * complex(ar, ai)
+            d0 += complex(dr[0, i], di[0, i]) * complex(ar, ai)
+            d1 += p0 * complex(br, bi)
+        That = t_
+        dT[0] = d0
+        dT[1] = d1
+    else:
+        t_ = 0.0 + 0.0j
+        d0 = 0.0 + 0.0j
+        d1 = 0.0 + 0.0j
+        d2 = 0.0 + 0.0j
+        for i in range(M):
+            a1 = 0.0 + 0.0j
+            b1 = 0.0 + 0.0j
+            c1 = 0.0 + 0.0j
+            for j in range(M):
+                base = (i * M + j) * M
+                ar = 0.0
+                ai = 0.0
+                br = 0.0
+                bi = 0.0
+                for l in range(M):
+                    s_r = Sr[base + l]
+                    s_i = Si[base + l]
+                    ar += s_r * pr[la, l] - s_i * pi[la, l]
+                    ai += s_r * pi[la, l] + s_i * pr[la, l]
+                    br += s_r * dr[la, l] - s_i * di[la, l]
+                    bi += s_r * di[la, l] + s_i * dr[la, l]
+                p1 = complex(pr[1, j], pi[1, j])
+                va = complex(ar, ai)
+                a1 += p1 * va
+                b1 += complex(dr[1, j], di[1, j]) * va
+                c1 += p1 * complex(br, bi)
+            p0 = complex(pr[0, i], pi[0, i])
+            t_ += p0 * a1
+            d0 += complex(dr[0, i], di[0, i]) * a1
+            d1 += p0 * b1
+            d2 += p0 * c1
+        That = t_
+        dT[0] = d0
+        dT[1] = d1
+        dT[2] = d2
     T = That / kh
-    dT = (dThat - T * dkh) / kh
-    return T, dT
+    for a in range(k):
+        # the per-axis factor cancels out of dkh/kh: a log-derivative
+        dkh = kh * dka[a] / ka[a]
+        dT[a] = (dT[a] - T * dkh) / kh
+    return T, dT, True
+
+
+@nb.njit(cache=True, fastmath=True, nogil=True)
+def _trend2d_resolution_kernel(H, M, cells, w, kg, n, reach, step, level):
+    """Walk the sampling's own transform along ONE variable until it falls to
+    `level` of its value at zero or turns back up into its own lobes."""
+    two_pi = 2.0 * np.pi
+    prev = 1.0
+    steps = int(reach / step)
+    for i in range(1, steps + 1):
+        g = i * step
+        ar = 0.0
+        ai = 0.0
+        kr = 0.0
+        ki = 0.0
+        for c in range(M):
+            ang = -two_pi * g * ((c - w) / cells - 0.5)
+            cr = np.cos(ang)
+            sn = np.sin(ang)
+            ar += H[c] * cr
+            ai += H[c] * sn
+            kr += kg[c] * cr
+            ki += kg[c] * sn
+        kabs = np.sqrt(kr * kr + ki * ki)
+        if kabs < 1e-12:
+            # past what the grid represents: nothing to compare any more
+            return reach
+        Wv = np.sqrt(ar * ar + ai * ai) / kabs / n
+        if Wv <= level or Wv > prev:
+            return g
+        prev = Wv
+    return reach
+
+
+def trend2d_layout(cells, k, m=0):
+    """Where one date's accumulator keeps what.
+
+    TWO CHECKERBOARD HALVES, each its own phasor grid (real, imaginary), count
+    and moments -- `half` columns each, the second straight after the first; the
+    total is their sum, so nothing is accumulated twice. Then what only the
+    total is read for: the sampling's own transform, ONE-DIMENSIONAL per
+    variable (k grids of M cells, real), and the coarse profile over the m axis
+    covariates.
+    """
+    M = int(cells) + 2 * TREND2D_W
+    K = M ** k
+    half = 2 * K + trend2d_moment_width(k)
+    prof = 2 * half + k * M
+    return {'M': M, 'K': K, 'half': half, 'H': 2 * half, 'profile': prof,
+            'width': prof + (2 * TREND2D_PROFILE ** m if m else 0)}
 
 
 def trend2d_width(cells, k, m=0):
-    """Total accumulator columns: grids, count, moments, and -- when m axis
-    covariates (dims 'y'/'x') are present -- their coarse profile grid."""
-    M = int(cells) + 2 * TREND2D_W
-    return (4 * M ** k + trend2d_moment_width(k)
-            + (2 * TREND2D_PROFILE ** m if m else 0))
+    """Total accumulator columns, see trend2d_layout()."""
+    return trend2d_layout(cells, k, m)['width']
 
 
 def trend2d_profile(u, Aax):
@@ -420,9 +896,12 @@ def trend2d_moment_width(k):
     return 1 + k + k * (k + 1) // 2
 
 
-def trend2d_fit(total, cells, k, axes=(), half=None, maxiter=1000,
-                tol=1e-10, degree=1):
+def trend2d_fit(acc, cells, k, axes=(), maxiter=1000, tol=1e-10, degree=1):
     """The accumulator -> one gradient and one constant per date, SOLVED.
+
+    `acc` is (dates, trend2d_width()) as trend2d_accumulate() lays it out: the
+    two checkerboard halves, whose sum is the total this fits, and the
+    sampling's one-dimensional transforms and axis profiles of the total.
 
     degree=0 fits the constant alone: the same closed form the constant has at
     any gradient, read at zero, so the gradients come back zero and the
@@ -436,19 +915,22 @@ def trend2d_fit(total, cells, k, axes=(), half=None, maxiter=1000,
     one unit. That is the same bounded influence the phasor form has always
     bought, written as a regression.
 
-    IT IS SOLVED FROM ZERO, NOT SEARCHED. The old code took the global argmax
-    over a lattice reaching `range`. Where the samples crowd into a fraction
-    of the variable's extent -- real topography -- the sampling's own
-    transform keeps grating lobes far out in the band, and the global argmax
-    landed on one of them whenever the date was weak, answering with the
-    histogram rather than the phase. The ascent from zero instead follows the
-    objective to the stationary point CONNECTED to zero. That is a choice,
-    not a theorem: a strong trend on a smooth slope of the objective is still
-    reached (dates on this estimator's own test stack converge well past the
-    half-power width), but a trend separated from zero by a null of a
-    near-uniform sampling is not, and comes back as the small stationary
-    point near zero. The reported `limit` is what tells the two sampling
-    regimes apart.
+    IT IS SOLVED, AND THE SEARCH ONLY OFFERS STARTS. The old code took the
+    global argmax over a lattice reaching `range`. Where the samples crowd
+    into a fraction of the variable's extent -- real topography -- the
+    sampling's own transform keeps grating lobes far out in the band, and the
+    global argmax landed on one of them whenever the date was weak, answering
+    with the histogram rather than the phase. The ascent from zero follows the
+    objective to the stationary point CONNECTED to zero instead, which a
+    strong trend on a smooth slope still reaches; a peak across a dip of the
+    objective it does not. So the ascent is given more starts and the highest
+    stationary point wins: the ramp read off the axis covariates' profiles,
+    and the date's own grid SEARCHED over every covariate's whole reach
+    (trend2d_search) -- the latter only where the two checkerboard halves,
+    independent pixels of the same sampling, searched on their own, land
+    within the sampling's resolution of the same point. A lobe lifted by
+    noise is not lifted in both halves, and a date whose halves disagree keeps
+    the starts it had. The reported `limit` is that resolution.
 
     THE STEP IS NEWTON-SCALED WITH A GUARANTEED FALLBACK. The minorant step
     `Xg^-1 s` (Xg the centred second moment of A, s = d|T|/dg) is provably
@@ -464,7 +946,7 @@ def trend2d_fit(total, cells, k, axes=(), half=None, maxiter=1000,
 
     Returns (gradients in cycles across the extent, constants, coherence at
     the solution, coherence at ZERO trend, resolved, why, limit, err --
-    per-variable one-sigma from the checkerboard halves when `half` is given) -- the pair
+    per-variable one-sigma from the two checkerboard halves) -- the pair
     of coherences is the verification: the ascent starts at zero, so the
     solution's coherence can only exceed the zero-trend one, and their
     difference is what removing the trend actually bought. why: 0 solved; 1 no pixels; 2 the
@@ -477,20 +959,24 @@ def trend2d_fit(total, cells, k, axes=(), half=None, maxiter=1000,
     told apart.
     """
     import numpy as np
-    total = np.asarray(total, np.float64)
+    acc = np.asarray(acc, np.float64)
     cells = int(cells)
-    M = cells + 2 * TREND2D_W
-    K = M ** k
-    nd = total.shape[0]
-    S = total[:, :K] + 1j * total[:, K:2 * K]
-    H = total[:, 2 * K:3 * K] + 1j * total[:, 3 * K:4 * K]
-    n = total[:, 4 * K]
-    m1 = total[:, 4 * K + 1:4 * K + 1 + k]
-    m2f = total[:, 4 * K + 1 + k:4 * K + trend2d_moment_width(k)]
     axes = tuple(axes)
     m = len(axes)
-    prof = (total[:, 4 * K + trend2d_moment_width(k):] if m else None)
+    L = trend2d_layout(cells, k, m)
+    M, K, hw = L['M'], L['K'], L['half']
+    nd = acc.shape[0]
+    halves = (acc[:, :hw], acc[:, hw:2 * hw])
+    # THE TOTAL IS THE SUM OF THE HALVES: every pixel is in exactly one
+    total = np.ascontiguousarray(halves[0] + halves[1])
+    Sr, Si = total[:, :K], total[:, K:2 * K]
+    H = acc[:, L['H']:L['H'] + k * M].reshape(nd, k, M)
+    n = total[:, 2 * K]
+    m1 = total[:, 2 * K + 1:2 * K + 1 + k]
+    m2f = total[:, 2 * K + 1 + k:hw]
+    prof = (acc[:, L['profile']:] if m else None)
     kg = trend2d_kernel(cells)
+    kgr = np.ascontiguousarray(kg.real, dtype=np.float64)
     reach = trend2d_reach(cells)
     two_pi = 2 * np.pi
 
@@ -505,20 +991,18 @@ def trend2d_fit(total, cells, k, axes=(), half=None, maxiter=1000,
             why[d] = 1
             continue
         # THE HALF-POWER WIDTH OF THE SAMPLING, per variable: walk W -- what
-        # a perfectly coherent, trend-free date would score -- until it
-        # halves or turns back up into its own lobes. Diagnostic only.
+        # a perfectly coherent, trend-free date would score -- until its power
+        # halves or it turns back up into its own lobes. Diagnostic only. The
+        # walk moves one gradient at a time, so each variable's own
+        # one-dimensional transform is all it reads; dates that share their
+        # pixels share the walk.
         for a in (range(k) if degree else ()):
-            step = 0.02
-            prev = 1.0
-            lim[d, a] = reach
-            gg = np.zeros(k)
-            for i in range(1, int(reach / step) + 1):
-                gg[a] = i * step
-                Wv = abs(trend2d_read(H[d], cells, k, gg, kg)[0]) / n[d]
-                if Wv <= 0.5 or Wv > prev:
-                    lim[d, a] = gg[a]
-                    break
-                prev = Wv
+            if d and n[d] == n[d - 1] and np.array_equal(H[d, a], H[d - 1, a]):
+                lim[d, a] = lim[d - 1, a]
+                continue
+            lim[d, a] = _trend2d_resolution_kernel(
+                np.ascontiguousarray(H[d, a]), M, float(cells), TREND2D_W, kgr,
+                float(n[d]), float(reach), 0.02, TREND2D_RESOLUTION_LEVEL)
         # THE NORMAL MATRIX OF THE SLOPE, which is the CENTRED second
         # moment of A: the constant is not iterated, it is profiled out, so
         # what the step divides by is the lever the slope actually has.
@@ -536,7 +1020,8 @@ def trend2d_fit(total, cells, k, axes=(), half=None, maxiter=1000,
         # angle(T) + pi, where the objective is -|T| and the gradient step
         # walks downhill -- measured on this estimator's own test stack,
         # seven dates of ninety converged BELOW where they started.
-        T0, dT0 = trend2d_read(S[d], cells, k, np.zeros(k), kg)
+        Sd = (Sr[d], Si[d])
+        T0, dT0 = trend2d_read(Sd, cells, k, np.zeros(k), kg)
         if not np.isfinite(T0) or abs(T0) < 1e-30:
             why[d] = 3
             continue
@@ -559,11 +1044,32 @@ def trend2d_fit(total, cells, k, axes=(), half=None, maxiter=1000,
                 gs[ai] = sv[j]
             if np.max(np.abs(gs)) > 1e-9:
                 starts.append(gs)
+        # A SEARCHED START FOR EVERY COVARIATE, PROVED BY THE HALVES. The
+        # date's own grid is searched over each covariate's whole reach -- a
+        # raster like elevation has no profile to scan, and its peak can sit
+        # across a dip from zero. What the old global argmax got wrong is that
+        # a weak date's largest peak may be a lobe of the SAMPLING lifted by
+        # noise: so the search is repeated on the two checkerboard halves,
+        # independent pixels of the same sampling, and its point is a start
+        # only where both halves' own searches land within the sampling's
+        # resolution of it. A lobe that noise lifted is not lifted twice.
+        if TREND2D_SEARCHED_START and halves[0][d, 2 * K] > 0 \
+                and halves[1][d, 2 * K] > 0:
+            gs = trend2d_search(Sd, cells, k, kg, reach)
+            if np.max(np.abs(gs)) > 1e-9:
+                for tot_h in (halves[0][d], halves[1][d]):
+                    gh = trend2d_search((np.ascontiguousarray(tot_h[:K]),
+                                         np.ascontiguousarray(tot_h[K:2 * K])),
+                                        cells, k, kg, reach)
+                    if np.any(np.abs(gh - gs) > lim[d]):
+                        break
+                else:
+                    starts.append(gs)
 
         best = None
         failed0 = 0
         for bi, g_init in enumerate(starts):
-            r = _trend2d_ascend(S[d], cells, k, g_init, kg, Xg, n[d], reach,
+            r = _trend2d_ascend(Sd, cells, k, g_init, kg, Xg, n[d], reach,
                                 maxiter, tol)
             if r is None:
                 if bi == 0:
@@ -583,20 +1089,20 @@ def trend2d_fit(total, cells, k, axes=(), half=None, maxiter=1000,
     # one-sigma scale of the estimate. One degree of freedom -- honest about
     # the size, noisy about itself.
     err = np.full((nd, k), np.nan)
-    if half is not None and degree:
-        half = np.asarray(half, np.float64)
+    if degree:
         for d in range(nd):
             if why[d]:
                 continue
             gh = []
-            for tot_h in (half[d], total[d] - half[d]):
-                Sh = tot_h[:K] + 1j * tot_h[K:2 * K]
-                nh = tot_h[4 * K]
+            for tot_h in (halves[0][d], halves[1][d]):
+                Sh = (np.ascontiguousarray(tot_h[:K]),
+                      np.ascontiguousarray(tot_h[K:2 * K]))
+                nh = tot_h[2 * K]
                 if nh <= 0:
                     break
-                m1h = tot_h[4 * K + 1:4 * K + 1 + k]
+                m1h = tot_h[2 * K + 1:2 * K + 1 + k]
                 m2h = np.empty((k, k))
-                pp = 4 * K + 1 + k
+                pp = 2 * K + 1 + k
                 for a in range(k):
                     for b in range(a, k):
                         m2h[a, b] = m2h[b, a] = tot_h[pp]
@@ -609,19 +1115,19 @@ def trend2d_fit(total, cells, k, axes=(), half=None, maxiter=1000,
                 gh.append(r[0])
             if len(gh) == 2:
                 err[d] = 0.5 * np.abs(gh[0] - gh[1])
-    elif half is not None:
+    else:
         # the constant of each half, closed form like the full one; the
         # difference is an angle, so it is taken on the circle
-        half = np.asarray(half, np.float64)
         for d in range(nd):
             if why[d]:
                 continue
             ch = []
-            for tot_h in (half[d], total[d] - half[d]):
-                if tot_h[4 * K] <= 0:
+            for tot_h in (halves[0][d], halves[1][d]):
+                if tot_h[2 * K] <= 0:
                     break
-                Th = trend2d_read(tot_h[:K] + 1j * tot_h[K:2 * K], cells, k,
-                                  np.zeros(k), kg)[0]
+                Th = trend2d_read((np.ascontiguousarray(tot_h[:K]),
+                                   np.ascontiguousarray(tot_h[K:2 * K])),
+                                  cells, k, np.zeros(k), kg)[0]
                 if not np.isfinite(Th) or abs(Th) < 1e-30:
                     break
                 ch.append(float(np.angle(Th)))
@@ -633,6 +1139,57 @@ def trend2d_fit(total, cells, k, axes=(), half=None, maxiter=1000,
     return g, c, coh, coh0, resolved, why, lim, err
 
 
+def trend2d_search(Sd, cells, k, kg, reach):
+    """One spread grid searched for a START, every covariate over its whole reach.
+
+    The grid holds the coherent sum at every gradient, so along one covariate,
+    through the current point, it is a one-dimensional transform: the other
+    axes are contracted at the current gradients and ONE padded FFT reads the
+    whole line. Each round reads every covariate's line from the same point and
+    takes only the single change that raises the sum most, until none does --
+    so the order the covariates were named in cannot matter. Starts from zero
+    and returns zero when nothing is higher. A lattice point, not a solution:
+    the ascent still produces the number.
+    """
+    import numpy as np
+    Sr, Si = _trend2d_parts(Sd)
+    cells = int(cells)
+    M = cells + 2 * TREND2D_W
+    S = (Sr + 1j * Si).reshape((M,) * k)
+    N = TREND2D_SEARCH_OVER * cells
+    while N < 2 * M:
+        N *= 2
+    gj = np.fft.fftfreq(N) * cells                 # turns across the extent
+    # the kernel's own transform on the same lattice divides out of the line
+    Kf = np.abs(np.fft.fft(np.asarray(kg).real, N))
+    band = (np.abs(gj) <= reach - 0.25) & (Kf > 1e-12)
+    Am = trend2d_nodes(cells)
+    gd = np.zeros(k)
+    best = abs(_trend2d_read_parts(Sr, Si, cells, k, gd, kg)[0])
+    if not np.isfinite(best):
+        return gd
+    for _ in range(4 * k):
+        pick = None
+        for a in range(k):
+            line = S
+            for b in range(k - 1, -1, -1):
+                if b != a:
+                    line = np.tensordot(line, np.exp(-2j * np.pi * gd[b] * Am),
+                                        axes=([b], [0]))
+            F = np.abs(np.fft.fft(line, N))
+            F = np.where(band, F / np.where(band, Kf, 1.0), 0.0)
+            cand = gd.copy()
+            cand[a] = gj[int(np.argmax(F))]
+            val = abs(_trend2d_read_parts(Sr, Si, cells, k, cand, kg)[0])
+            if np.isfinite(val) and val > best * (1.0 + 1e-9) \
+                    and (pick is None or val > pick[0]):
+                pick = (val, cand)
+        if pick is None:
+            break
+        best, gd = pick
+    return gd
+
+
 def _trend2d_ascend(Sd, cells, k, g_init, kg, Xg, nd_, reach, maxiter, tol):
     """One ascent to a stationary point. Returns (g, T, |T|) or None, the
     failure reason left in .last_fail (2 domain, 3 degenerate, 4 no
@@ -640,6 +1197,7 @@ def _trend2d_ascend(Sd, cells, k, g_init, kg, Xg, nd_, reach, maxiter, tol):
     import numpy as np
     _trend2d_ascend.last_fail = 0
     gd = np.array(g_init, np.float64)
+    Sd = _trend2d_parts(Sd)
     T, dT = trend2d_read(Sd, cells, k, gd, kg)
     if not np.isfinite(T) or abs(T) < 1e-30:
         _trend2d_ascend.last_fail = 3
@@ -698,115 +1256,224 @@ def _trend2d_ascend(Sd, cells, k, g_init, kg, Xg, nd_, reach, maxiter, tol):
     return gd, T, abs(T)
 
 
-def trend2d_accumulate(data_blk, transform_blk, stats, cells, dims=None,
-                       checker=None, extent=None, coords=None):
-    """One spatial block -> the spread grid the fit reads, per date.
+def trend2d_accumulate_samples(u, A, cells, par=None, axes=()):
+    """The accumulator of a LIST of samples, (dates, trend2d_width()).
 
-    Everything the estimator reads is a sum over pixels, so a block
-    contributes its share and the caller adds them: the phasor grid, the
-    ones grid (the sampling's own transform, for the reach), the per-date
-    sample count, and the first and second moments of A (the regression's
-    normal matrix). All real+imaginary interleaved, all additive.
+    `u` (dates, samples) are the unit phasors, zero where a date has no sample;
+    `A` (samples, k) the covariates already centred and scaled into
+    [-1/2, 1/2]; `par` (samples,) the checkerboard half of each, 0 or 1 -- left
+    out, every sample is in the first; `axes` names the covariates the coarse
+    profile is kept over. The same sums trend2d_accumulate() makes of a block,
+    through the plain spreader: what a test or an experiment holding pixels
+    rather than rasters feeds trend2d_fit().
     """
     import numpy as np
+    u = np.atleast_2d(np.asarray(u, np.complex128))
+    A = np.asarray(A, np.float64)
+    if A.ndim == 1:
+        A = A[:, None]
+    nd, k = u.shape[0], A.shape[1]
+    axes = tuple(axes)
+    L = trend2d_layout(cells, k, len(axes))
+    M, K, hw = L['M'], L['K'], L['half']
+    out = np.zeros((nd, L['width']), np.float64)
+    par = (np.zeros(A.shape[0], np.int64) if par is None
+           else np.asarray(par, np.int64))
+    have = (np.abs(u) > 0).astype(np.float64)
+    for h in range(2):
+        sel = par == h
+        if not sel.any():
+            continue
+        gr, gi = trend2d_spread(u[:, sel], A[sel], cells)
+        o = h * hw
+        out[:, o:o + K] = gr
+        out[:, o + K:o + 2 * K] = gi
+        out[:, o + 2 * K] = have[:, sel].sum(axis=1)
+        p = o + 2 * K + 1
+        for i in range(k):
+            out[:, p + i] = have[:, sel] @ A[sel, i]
+        p += k
+        for i in range(k):
+            for j in range(i, k):
+                out[:, p] = have[:, sel] @ (A[sel, i] * A[sel, j])
+                p += 1
+    for a in range(k):
+        out[:, L['H'] + a * M:L['H'] + (a + 1) * M] = trend2d_spread(
+            have.astype(np.complex128), A[:, [a]], cells)[0]
+    if axes:
+        out[:, L['profile']:] = trend2d_profile(u, A[:, list(axes)])
+    return out
+
+
+def trend2d_accumulate(data_blk, transform_blk, stats, cells, dims=None,
+                       extent=None, coords=None):
+    """One spatial block, every date it is handed -> the sums the fit reads,
+    (dates, 1, 1, trend2d_width()), laid out as trend2d_layout() says.
+
+    Everything the estimator reads is a sum over pixels, so a block
+    contributes its share and the caller adds them: per checkerboard half the
+    phasor grid, the sample count and the first and second moments of A (the
+    regression's normal matrix); for the total the sampling's own transform
+    per variable and the coarse profile over the axis covariates. All additive.
+
+    THE HALVES ARE AN 8x8 BOARD OVER `extent` (y0, y1, x0, x1), read off the
+    block's own `coords` (y, x): spatially coarse enough to carry independent
+    atmosphere. Without them every pixel is in the first half and there is no
+    second to disagree with.
+
+    THE DATES ARE TAKEN AS THEY COME AND FED TO THE KERNEL IN GROUPS: a pixel's
+    kernel weights do not depend on the date, so they are computed once per
+    group, and the group is as many dates as hold the samples and the grids
+    within one dask chunk -- the size every other intermediate of a task is
+    budgeted at, whatever the caller's date chunks are.
+    """
+    import numpy as np
+    from .utils_dask import get_dask_chunk_size_mb
     k = len(transform_blk)
     nb = data_blk.shape[0]
     stats = np.asarray(stats, np.float64).ravel()
     mu = stats[:k]
     span = np.maximum(stats[k:2 * k], 1e-30)
-    M = int(cells) + 2 * TREND2D_W
-    K = M ** k
-    ax_idx = ([i for i, d in enumerate(dims) if d in ('y', 'x')][:2]
-              if dims is not None else [])
-    out = np.zeros((nb, 1, 1, trend2d_width(cells, k, len(ax_idx))),
-                   np.float64)
-
-    # the positions this block can contribute: geometry, and a date with phase
+    w = TREND2D_W
+    beta = TREND2D_BETA * w
+    P = TREND2D_PROFILE
     ny, nx = data_blk.shape[-2:]
     if dims is None:
-        dims = ['yx'] * len(transform_blk)
+        dims = ['yx'] * k
+    dims = list(dims)
+    ax_idx = [i for i, d in enumerate(dims) if d in ('y', 'x')][:2]
+    m = len(ax_idx)
+    L = trend2d_layout(cells, k, m)
+    M, K, hw = L['M'], L['K'], L['half']
+    mw = trend2d_moment_width(k)
+    out = np.zeros((nb, 1, 1, L['width']), np.float64)
+
+    # the positions this block can contribute: geometry, and a date with phase
     V = [np.asarray(b, np.float32) for b in transform_blk]
-    keep = np.ones(ny * nx, bool)
+    blk = np.ascontiguousarray(data_blk).reshape(nb, ny * nx)
+    flags = np.zeros(ny * nx, np.uint8)
+    _trend2d_anyvalid(blk, flags)
+    keep = flags.view(np.bool_)
     for v, d in zip(V, dims):
         if d == 'yx':
             keep &= np.isfinite(v.reshape(-1))
-    have = np.zeros(ny * nx, bool)
-    for t in range(nb):
-        a = np.abs(data_blk[t]).reshape(-1)
-        have |= np.isfinite(a) & (a > 0)
-    keep &= have
     # A VARIABLE ALONG ONE AXIS RULES OUT WHOLE ROWS OR COLUMNS, and normally
     # none, so the raster-sized mask is only built if it has to be
-    for v, d in zip(V, dims):
-        if d != 'yx' and not np.isfinite(v).all():
-            bad = ~np.isfinite(v)
-            keep &= ~(np.repeat(bad, nx) if d == 'y' else np.tile(bad, ny))
-    # ONE CHECKERBOARD HALF, when asked: an 8x8 board over the burst
-    # extent, so the halves are spatially coarse enough to carry independent
-    # atmosphere. The other half is total minus this one, for free.
-    if checker is not None:
+    bad = {}
+    for i, (v, d) in enumerate(zip(V, dims)):
+        if d != 'yx':
+            bad[i] = ~np.isfinite(v)
+            if bad[i].any():
+                keep &= ~(np.repeat(bad[i], nx) if d == 'y' else np.tile(bad[i], ny))
+    idx = np.flatnonzero(keep)
+    npts = idx.size
+    if npts == 0:
+        return out
+    rows = idx // nx
+    colsi = idx - rows * nx
+    # the half each pixel belongs to
+    if coords is not None and extent is not None:
         yb, xb = coords
         y0, y1, x0, x1 = extent
         iy = np.minimum((np.asarray(yb, np.float64) - y0)
                         / max(y1 - y0, 1e-30) * 8, 7).astype(np.int64)
         ix = np.minimum((np.asarray(xb, np.float64) - x0)
                         / max(x1 - x0, 1e-30) * 8, 7).astype(np.int64)
-        par = ((iy[:, None] + ix[None, :]) % 2 == int(checker))
-        keep &= par.reshape(-1)
-    idx = np.flatnonzero(keep)
-    npts = idx.size
-    if npts == 0:
-        return out
+        par = ((iy[rows] + ix[colsi]) % 2).astype(np.int64)
+    else:
+        par = np.zeros(npts, np.int64)
 
-    # INDEXED, NEVER BROADCAST, and scaled to the box the grid spans: the
-    # midpoint centring is what puts every sample inside [-1/2, 1/2]
-    rows = idx // nx
-    A = np.empty((npts, k), np.float64)
-    for i, (v, d) in enumerate(zip(V, dims)):
-        if d == 'yx':
-            A[:, i] = v.reshape(-1)[idx]
-        elif d == 'y':
-            A[:, i] = v[rows]
+    # the covariates by what they are: vectors along y lead the grid, vectors
+    # along x and rasters follow -- the kernel's own order, undone at the end.
+    # Scaled to the box the grid spans: the midpoint centring is what puts
+    # every sample inside [-1/2, 1/2]
+    ys = [i for i, d in enumerate(dims) if d == 'y']
+    xs = [i for i, d in enumerate(dims) if d == 'x']
+    rs = [i for i, d in enumerate(dims) if d == 'yx']
+
+    def scaled(i, values):
+        return (np.asarray(values, np.float64) - mu[i]) / span[i]
+    WY = np.zeros((max(len(ys), 1), ny, w))
+    BY = np.zeros((max(len(ys), 1), ny), np.int64)
+    AY = np.zeros((max(len(ys), 1), ny))
+    for j, i in enumerate(ys):
+        AY[j] = np.where(bad[i], 0.0, scaled(i, V[i]))
+        WY[j], BY[j] = _trend2d_axis_tables(AY[j], cells, bad[i])
+    WX = np.zeros((max(len(xs), 1), nx, w))
+    BX = np.zeros((max(len(xs), 1), nx), np.int64)
+    AX = np.zeros((max(len(xs), 1), nx))
+    for j, i in enumerate(xs):
+        AX[j] = np.where(bad[i], 0.0, scaled(i, V[i]))
+        WX[j], BX[j] = _trend2d_axis_tables(AX[j], cells, bad[i])
+    xlo = np.ascontiguousarray(BX.min(axis=1))
+    xhi = np.ascontiguousarray(BX.max(axis=1) + w)
+    AR = np.zeros((max(len(rs), 1), npts))
+    for j, i in enumerate(rs):
+        AR[j] = scaled(i, V[i].reshape(-1)[idx])
+    vclass = np.array([0 if d == 'y' else 1 if d == 'x' else 2 for d in dims], np.int64)
+    vslot = np.array([(ys if d == 'y' else xs if d == 'x' else rs).index(i)
+                      for i, d in enumerate(dims)], np.int64)
+    oslot = np.arange(len(ys), dtype=np.int64)
+    ovar = np.array(ys, np.int64)
+    ikind = np.array([1] * len(xs) + [2] * len(rs), np.int64)
+    islot = np.array(list(range(len(xs))) + list(range(len(rs))), np.int64)
+    ivar = np.array(xs + rs, np.int64)
+    # the coarse profiles' bins, per row or per column
+    pclass = np.array([0 if dims[i] == 'y' else 1 for i in ax_idx], np.int64)
+    pslot = np.array([(ys if dims[i] == 'y' else xs).index(i) for i in ax_idx], np.int64)
+    PY = np.clip(((AY + 0.5) * P).astype(np.int64), 0, P - 1)
+    PX = np.clip(((AX + 0.5) * P).astype(np.int64), 0, P - 1)
+    nout, nin = len(ys), len(xs) + len(rs)
+    Nout, Nin = M ** nout, M ** nin
+    canon = ys + xs + rs
+    back = (0,) + tuple(1 + canon.index(a) for a in range(k)) + (k + 1,)
+
+    # as many dates per pass as keep the samples and the grids within a chunk
+    budget = get_dask_chunk_size_mb() * 2 ** 20
+    per_date = 16 * npts + 16 * 2 * K + 16 * 2 * Nin + 8 * L['width']
+    group = int(max(1, min(nb, budget // per_date)))
+    for t0 in range(0, nb, group):
+        nq = min(group, nb - t0)
+        ur = np.empty((npts, nq))
+        ui = np.empty((npts, nq))
+        cnt = np.zeros(nq, np.int64)
+        _trend2d_gather(blk[t0:t0 + nq], idx, ur, ui, cnt)
+        full = bool((cnt == npts).all())
+        nqh = 1 if full else nq
+        gr = np.zeros((2, Nout, Nin, nq))
+        gi = np.zeros((2, Nout, Nin, nq))
+        if nout:
+            tr = np.zeros((2, Nin, nq))
+            ti = np.zeros((2, Nin, nq))
         else:
-            A[:, i] = v[idx - rows * nx]
-        A[:, i] = (A[:, i] - mu[i]) / span[i]
-    u = np.zeros((nb, npts), np.complex128)
-    for t in range(nb):
-        z = data_blk[t].reshape(-1)[idx]
-        a = np.abs(z)
-        np.divide(z, a, out=u[t], where=np.isfinite(a) & (a > 0))
-    # THE MOMENTS TRAVEL WITH THE GRID. The fit is a regression, so it needs
-    # the normal matrix of [1, 2 pi A] as well as the coherent sum -- and it
-    # must be built from the pixels each DATE actually has, which differ where
-    # a date is missing. Three numbers per variable, summed like everything
-    # else, so the answer still does not depend on the chunking.
-    have = (np.abs(u) > 0)
-    out[:, 0, 0, 4 * K] = have.sum(1)
-    p = 4 * K + 1
-    for i in range(k):
-        out[:, 0, 0, p + i] = have @ A[:, i]
-    p += k
-    for i in range(k):
-        for j in range(i, k):
-            out[:, 0, 0, p] = have @ (A[:, i] * A[:, j])
-            p += 1
-
-    gr, gi = trend2d_spread(u, A, cells)
-    out[:, 0, 0, :K] = gr
-    out[:, 0, 0, K:2 * K] = gi
-    # THE SAMPLING'S OWN TRANSFORM, spread the same way with the phase taken
-    # out. It is what a perfectly coherent, TREND-FREE date would score, so it
-    # says how far apart two gradients have to be before this variable's
-    # distribution can tell them apart -- and where its far lobes are, which
-    # is where a global search would land on a weak date. Same routine, same
-    # additivity, one extra grid.
-    hr, hi = trend2d_spread(have.astype(np.complex128), A, cells)
-    out[:, 0, 0, 2 * K:3 * K] = hr
-    out[:, 0, 0, 3 * K:4 * K] = hi
-    # coarse profiles over the axis covariates: the ramp-start's raw material
-    if ax_idx:
-        out[:, 0, 0, 4 * K + trend2d_moment_width(k):] = \
-            trend2d_profile(u, A[:, ax_idx])
+            tr, ti = gr[:, 0], gi[:, 0]
+        Hg = np.zeros((k, M, nqh))
+        mn = np.zeros((2, nqh))
+        m1 = np.zeros((2, k, nqh))
+        m2 = np.zeros((2, k * (k + 1) // 2, nqh))
+        pr = np.zeros((P ** m if m else 1, nq))
+        pi = np.zeros((P ** m if m else 1, nq))
+        _trend2d_spread_rows(rows, colsi, par, ur, ui, full, w, beta, float(cells), M,
+                             nx, WY, BY, AY, WX, BX, AX, AR, xlo, xhi,
+                             oslot, ovar, ikind, islot, ivar,
+                             vclass, vslot, pclass, pslot, PY, PX, P,
+                             tr, ti, gr, gi, Hg, mn, m1, m2, pr, pi)
+        del ur, ui
+        o = out[t0:t0 + nq, 0, 0]
+        # the grid back in the variables' own order, the date first
+        for part, col in ((gr, 0), (gi, K)):
+            g_ = np.transpose(part.reshape((2,) + (M,) * k + (nq,)), back)
+            g_ = np.moveaxis(g_, -1, 0).reshape(nq, 2, K)
+            for h in range(2):
+                o[:, h * hw + col:h * hw + col + K] = g_[:, h]
+        for h in range(2):
+            o[:, h * hw + 2 * K] = mn[h]
+            o[:, h * hw + 2 * K + 1:h * hw + 2 * K + 1 + k] = m1[h].T
+            o[:, h * hw + 2 * K + 1 + k:h * hw + 2 * K + mw] = m2[h].T
+        o[:, L['H']:L['H'] + k * M] = np.moveaxis(Hg, -1, 0).reshape(nqh, k * M)
+        if m:
+            o[:, L['profile']:L['profile'] + P ** m] = pr.T
+            o[:, L['profile'] + P ** m:] = pi.T
     return out
 
 

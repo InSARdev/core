@@ -3039,15 +3039,17 @@ class BatchCore(dict):
             for k, ds in self.items():
                 # Compute spatial chunks once per burst using 8 bytes (complex64)
                 # so all variables get identical spatial chunks.
-                sample = None
-                n_stack = 0
-                for var in ds.data_vars:
-                    arr = ds[var]
-                    if arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x'):
-                        sample = arr
-                        if arr.ndim == 3 and arr.shape[0] > n_stack:
-                            n_stack = arr.shape[0]
-                        break
+                # y, x ARE THE SPATIAL AXES AND WHAT LEADS THEM -- date or pair --
+                # IS THE STACK, on whichever variable carries it: the stack
+                # length is read off every (stack, y, x) variable and the
+                # spatial chunks off a stack variable when there is one, picked
+                # by name -- never off whichever variable happens to come first
+                rasters = [v for v in ds.data_vars
+                           if ds[v].ndim in (2, 3) and ds[v].dims[-2:] == ('y', 'x')]
+                stacks = [v for v in rasters if ds[v].ndim == 3]
+                n_stack = max((ds[v].shape[0] for v in stacks), default=0)
+                picked = sorted(stacks or rasters, key=str)
+                sample = ds[picked[0]] if picked else None
                 if sample is None:
                     result[k] = ds
                     continue
