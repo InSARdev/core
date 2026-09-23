@@ -53,12 +53,14 @@ setup(
                       'shapely>=2.0.2',
                       'xmltodict',
                       'rioxarray',
+                      'rasterio',
                       'tifffile',
-                      'netCDF4',
                       'remotezip',
                       'matplotlib',
-                      'imageio',
                       'h5py',
+                      'h5netcdf',
+                      'hdf5plugin>=4.1.0',
+                      'imagecodecs',
                       'requests'
                       ],
     extras_require={
@@ -73,10 +75,9 @@ setup(
         'Operating System :: POSIX :: Linux',
         'Operating System :: MacOS',
         'Programming Language :: Python',
-        'Programming Language :: Python :: 3.11',
         'Programming Language :: Python :: 3.12',
         'Programming Language :: Python :: 3.13'
     ],
-    python_requires='>=3.11',
+    python_requires='>=3.12',
     keywords='remote sensing, geospatial analysis, DEM, topography, SRTM, Copernicus, ALOS, OpenStreetMap, OSM, Google Maps, ASF, NetCDF, GeoTIFF, VTK'
 )

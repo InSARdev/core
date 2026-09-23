@@ -10,6 +10,7 @@
 from .S1_gmtsar import S1_gmtsar
 from .PRM import PRM
 from .utils_satellite import _xcorr_refine_slc
+from insardev_toolkit.utils_S1 import measurement_path
 import numpy as np
 
 
@@ -258,11 +259,11 @@ class S1_align(S1_gmtsar):
             if debug:
                 print(f"Running xcorr refinement (patch_size={xcorr_patch_size})...")
 
-            # Get tiff file paths (read patches directly, don't load full images)
+            # Get burst measurement paths, .nc or legacy .tiff (read patches directly, don't load full images)
             prefix_ref = self.fullBurstId(burst_ref)
             prefix_rep = self.fullBurstId(burst_rep)
-            ref_tiff = os.path.join(self.datadir, prefix_ref, 'measurement', f'{burst_ref}.tiff')
-            rep_tiff = os.path.join(self.datadir, prefix_rep, 'measurement', f'{burst_rep}.tiff')
+            ref_tiff = measurement_path(os.path.join(self.datadir, prefix_ref, 'measurement'), burst_ref)
+            rep_tiff = measurement_path(os.path.join(self.datadir, prefix_rep, 'measurement'), burst_rep)
 
             # Check files exist
             if not os.path.exists(ref_tiff) or not os.path.exists(rep_tiff):

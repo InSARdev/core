@@ -50,13 +50,14 @@ class S1_gmtsar(S1_slc):
         >>> prm, orbit_df, slc = s1._make_burst(burst, mode=1)
         """
         import os
+        from insardev_toolkit.utils_S1 import measurement_path
 
         df = self.get_record(burst)
         prefix = self.fullBurstId(burst)
 
-        # File paths
+        # File paths: the burst measurement is <burst>.nc, or the legacy <burst>.tiff
         xml_file = os.path.join(self.datadir, prefix, 'annotation', f'{burst}.xml')
-        tiff_file = os.path.join(self.datadir, prefix, 'measurement', f'{burst}.tiff')
+        tiff_file = measurement_path(os.path.join(self.datadir, prefix, 'measurement'), burst)
         orbit_file = os.path.join(self.datadir, df['orbit'].iloc[0])
 
         if mode == 2:

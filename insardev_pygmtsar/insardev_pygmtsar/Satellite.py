@@ -413,7 +413,7 @@ class Satellite(progressbar_joblib, datagrid):
         See EGM96 geoid heights on http://icgem.gfz-potsdam.de/tom_longtime
         """
         from .utils_satellite import get_geoid
-        return get_geoid(grid, netcdf_engine=self.netcdf_engine_read)
+        return get_geoid(grid)
 
     def get_dem(self, geometry: gpd.GeoDataFrame = None, buffer_degrees: float = 0):
         """
@@ -433,7 +433,6 @@ class Satellite(progressbar_joblib, datagrid):
         """
         import xarray as xr
         import numpy as np
-        import rioxarray as rio
         import pandas as pd
         import os
 
@@ -447,16 +446,10 @@ class Satellite(progressbar_joblib, datagrid):
             ortho = self.DEM[list(self.DEM.data_vars)[0]]
         elif isinstance(self.DEM, xr.DataArray):
             ortho = self.DEM
-        elif isinstance(self.DEM, str) and os.path.splitext(self.DEM)[-1] in ['.tiff', '.tif', '.TIF']:
-            ortho = rio.open_rasterio(self.DEM).squeeze(drop=True) \
-                .rename({'y': 'lat', 'x': 'lon'}) \
-                .drop('spatial_ref')
-            if ortho.lat.diff('lat')[0].item() < 0:
-                ortho = ortho.reindex(lat=ortho.lat[::-1])
-        elif isinstance(self.DEM, str) and os.path.splitext(self.DEM)[-1] in ['.nc', '.netcdf', '.grd']:
-            ortho = xr.open_dataarray(self.DEM, engine=self.netcdf_engine_read)
         elif isinstance(self.DEM, str):
-            raise ValueError('ERROR: filename extension not recognized. Use .tiff, .tif, .TIF, .nc, .netcdf, .grd')
+            # NetCDF4 grid or VRT of NetCDF4 tiles, opened lazily through h5py
+            from insardev_toolkit import utils_tiles
+            ortho = utils_tiles.open_dem(self.DEM)
         else:
             raise ValueError('ERROR: argument is not an Xarray object and it is not a file name')
         ortho = ortho.transpose('lat', 'lon')
@@ -473,7 +466,9 @@ class Satellite(progressbar_joblib, datagrid):
         with warnings.catch_warnings():
             warnings.filterwarnings('ignore', message='.*geographic CRS.*')
             bounds = self.get_bounds(geometry.buffer(buffer_degrees))
-        ortho = ortho.sel(lat=slice(bounds[1], bounds[3]), lon=slice(bounds[0], bounds[2]))
+        # the same crop rule as the window readers: a bound on a pixel centre keeps that pixel
+        from insardev_toolkit import utils_tiles
+        ortho = utils_tiles.crop(ortho, (bounds[0], bounds[1], bounds[2], bounds[3]))
 
         ds = ortho.astype(np.float32).transpose('lat', 'lon').rename("dem")
         return self.spatial_ref(ds, 4326)
@@ -503,8 +498,8 @@ class Satellite(progressbar_joblib, datagrid):
         """
         Get the topography coordinates (lon, lat, z) for decimated DEM.
 
-        Memory-efficient version using netCDF4 direct slicing - never loads full DEM.
-        Supports 200GB+ global DEMs referenced for all scenes/bursts.
+        Memory-efficient version reading the decimated window through h5py - never loads full DEM.
+        Supports 200GB+ global DEMs referenced for all scenes/bursts, merged or as a VRT of tiles.
 
         Parameters
         ----------
@@ -521,7 +516,6 @@ class Satellite(progressbar_joblib, datagrid):
             Array containing the topography coordinates (lon, lat, z), NaN filtered.
         """
         import numpy as np
-        import os
 
         record = self.get_record(record_id)
         geometry = record.geometry
@@ -535,63 +529,29 @@ class Satellite(progressbar_joblib, datagrid):
             bounds = geometry.buffer(buffer_degrees).total_bounds  # [minx, miny, maxx, maxy]
         lon_min, lat_min, lon_max, lat_max = bounds
 
-        # Open DEM file directly (never loads full array!)
+        # Open DEM file directly (never loads full array!); a missing file is reported by the reader
         dem_path = self.DEM
-        if not isinstance(dem_path, str) or not os.path.exists(dem_path):
-            raise ValueError(f'DEM path must be a valid file: {dem_path}')
+        if not isinstance(dem_path, str):
+            raise ValueError(f'DEM path must be a file name: {dem_path}')
+        from insardev_toolkit import utils_tiles
 
-        # Use configured netcdf engine for optimized strided access
-        if self.netcdf_engine_read == 'h5netcdf':
-            import h5netcdf
-            nc = h5netcdf.File(dem_path, 'r')
-        else:
-            from netCDF4 import Dataset
-            nc = Dataset(dem_path, 'r')
+        # Compute decimation factor
+        dem_res = utils_tiles.dem_step(dem_path)[0]
+        dec_factor = max(1, int(np.round(degrees / dem_res)))
 
-        try:
-            # Get coordinate arrays (these are small - just 1D indices)
-            lat_var = nc.variables.get('lat') or nc.variables.get('y')
-            lon_var = nc.variables.get('lon') or nc.variables.get('x')
-            lat_arr = lat_var[:]
-            lon_arr = lon_var[:]
+        # Strided read: only keeps every dec_factor-th point (decimated read - memory efficient!)
+        window = utils_tiles.read_dem(dem_path, (lon_min, lat_min, lon_max, lat_max), stride=dec_factor)
+        if window is None:
+            raise ValueError(f'DEM does not cover bounds: {bounds}')
+        z_vals, lat_vals, lon_vals = window
 
-            # Find indices for the required region
-            lat_idx = np.where((lat_arr >= lat_min) & (lat_arr <= lat_max))[0]
-            lon_idx = np.where((lon_arr >= lon_min) & (lon_arr <= lon_max))[0]
-
-            if len(lat_idx) == 0 or len(lon_idx) == 0:
-                raise ValueError(f'DEM does not cover bounds: {bounds}')
-
-            lat_start, lat_end = lat_idx[0], lat_idx[-1] + 1
-            lon_start, lon_end = lon_idx[0], lon_idx[-1] + 1
-
-            # Compute decimation factor
-            dem_res = abs(lat_arr[1] - lat_arr[0])
-            dec_factor = max(1, int(np.round(degrees / dem_res)))
-
-            if debug:
-                print(f'DEBUG: DEM decimation factor={dec_factor}, region={lat_end-lat_start}x{lon_end-lon_start}')
-
-            # Read DEM data with striding (decimated read - memory efficient!)
-            dem_var = nc.variables.get('z') or nc.variables.get('elevation') or nc.variables.get('dem')
-            if dem_var is None:
-                # Try first 2D variable
-                for name, var in nc.variables.items():
-                    if len(var.dimensions) == 2:
-                        dem_var = var
-                        break
-
-            # Strided read: only loads every dec_factor-th point
-            z_vals = dem_var[lat_start:lat_end:dec_factor, lon_start:lon_end:dec_factor].astype(np.float32)
-            lat_vals = lat_arr[lat_start:lat_end:dec_factor]
-            lon_vals = lon_arr[lon_start:lon_end:dec_factor]
-        finally:
-            nc.close()
+        if debug:
+            print(f'DEBUG: DEM decimation factor={dec_factor}, decimated region={z_vals.shape[0]}x{z_vals.shape[1]}')
 
         # Apply geoid correction (EGM96 -> WGS84 ellipsoid)
         from .utils_satellite import get_geoid_correction
         lon_grid, lat_grid = np.meshgrid(lon_vals, lat_vals)
-        geoid = get_geoid_correction(lat_grid.ravel(), lon_grid.ravel(), netcdf_engine=self.netcdf_engine_read)
+        geoid = get_geoid_correction(lat_grid.ravel(), lon_grid.ravel())
         z_wgs84 = z_vals.ravel() + geoid.astype(np.float32)
         del geoid
 

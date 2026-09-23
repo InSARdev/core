@@ -905,7 +905,7 @@ class Nisar_transform(Nisar_align):
                 scale_factor=1 / dem_vertical_accuracy,
                 epsg=epsg, resolution=resolution, bbox=bbox,
                 chunk=chunk, compute_topo=remove_topo_phase,
-                n_jobs=n_jobs, netcdf_engine=self.netcdf_engine_read, debug=debug
+                n_jobs=n_jobs, debug=debug
             )
             conversion_dir = os.path.join(outdir, 'conversion')
 

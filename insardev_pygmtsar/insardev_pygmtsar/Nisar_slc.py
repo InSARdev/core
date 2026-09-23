@@ -44,6 +44,11 @@ class Nisar_slc(Satellite):
         from .utils_nisar import nisar_get_frequencies, nisar_get_polarizations
 
         self.datadir = datadir
+        # a DEM file name is resolved here once: a dem.nc that the downloader replaced by dem.vrt is read from
+        # the VRT, and the note about it prints in this process, not in every worker
+        if isinstance(DEM, str):
+            from insardev_toolkit import utils_tiles
+            DEM = utils_tiles.resolve(DEM)
         self.DEM = DEM
         self.frequency = frequency
 

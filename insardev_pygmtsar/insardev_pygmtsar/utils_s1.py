@@ -600,12 +600,12 @@ def reference_burst(xml_path: str, tiff_path: str, eof_path: str) -> tuple:
 
 def satellite_slc(tiff_path: str) -> "xr.DataArray":
     """
-    Read Sentinel-1 burst SLC data from GeoTIFF as xarray DataArray.
+    Read Sentinel-1 burst SLC data as xarray DataArray.
 
     Parameters
     ----------
     tiff_path : str
-        Path to burst GeoTIFF file
+        Path to the burst measurement file: `<burst>.nc`, or the legacy `<burst>.tiff`.
 
     Returns
     -------
@@ -615,19 +615,19 @@ def satellite_slc(tiff_path: str) -> "xr.DataArray":
 
     Notes
     -----
-    Sentinel-1 burst GeoTIFFs are stored as complex_int16 format.
+    Sentinel-1 bursts are complex int16, stored as compressed NetCDF4 (or GeoTIFF when downloaded before).
     This function reads the data as complex64 for processing.
 
     Examples
     --------
-    >>> slc = satellite_slc('burst.tiff')
+    >>> slc = satellite_slc('burst.nc')
     >>> print(slc.shape)  # (lines, samples)
     >>> print(slc.dtype)  # complex64
     """
     import xarray as xr
-    from tifffile import imread
+    from insardev_toolkit.utils_S1 import read_slc
 
-    data = imread(tiff_path).astype('complex64')
+    data = read_slc(tiff_path)
     n_lines, n_samples = data.shape
 
     return xr.DataArray(

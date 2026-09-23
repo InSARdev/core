@@ -669,6 +669,7 @@ class CDSE(progressbar_joblib):
             from tifffile import TiffFile
             import rasterio
             from rasterio.io import MemoryFile
+            from .utils_S1 import measurement_path, slc_shape, write_slc
 
             def filter_azimuth_time(items, start_utc_dt, stop_utc_dt, delta=3):
                 if not isinstance(items, list):
@@ -693,7 +694,9 @@ class CDSE(progressbar_joblib):
             xml_file = os.path.join(xml_annot_dir, f'{burst}.xml')
             xml_noise_file = os.path.join(xml_noise_dir, f'{burst}.xml')
             xml_calib_file = os.path.join(xml_calib_dir, f'{burst}.xml')
-            tif_file = os.path.join(tif_dir, f'{burst}.tiff')
+            # the burst is stored as <burst>.nc; bursts downloaded before keep their <burst>.tiff
+            nc_file = os.path.join(tif_dir, f'{burst}.nc')
+            tif_file = measurement_path(tif_dir, burst)
 
             for dirname in [burst_dir, tif_dir, xml_annot_dir, xml_noise_dir, xml_calib_dir]:
                 os.makedirs(dirname, exist_ok=True)
@@ -709,11 +712,9 @@ class CDSE(progressbar_joblib):
                     local_annotation = xmltodict.parse(f.read())['product']
                 lines_per_burst = int(local_annotation['swathTiming']['linesPerBurst'])
                 samples_per_burst = int(local_annotation['imageAnnotation']['imageInformation']['numberOfSamples'])
-                with TiffFile(tif_file) as tif:
-                    page = tif.pages[0]
-                    actual_lines, actual_samples = page.shape
+                actual_lines, actual_samples = slc_shape(tif_file)
                 if actual_lines != lines_per_burst or actual_samples != samples_per_burst:
-                    raise Exception(f'ERROR: Existing TIFF dimensions mismatch for {burst}: '
+                    raise Exception(f'ERROR: Existing measurement dimensions mismatch for {burst}: '
                                   f'got {actual_lines}x{actual_samples}, expected {lines_per_burst}x{samples_per_burst}. '
                                   f'Delete the corrupted file and re-download.')
                 return True
@@ -808,6 +809,9 @@ class CDSE(progressbar_joblib):
                     elif filename.startswith('calibration-') and filename.endswith('.xml'):
                         with zf.open(member) as src:
                             calibration_xml = src.read().decode('utf-8')
+
+            # the archive is not needed anymore, and the conversion below must not hold it in memory
+            del zip_bytes, archive
 
             if not tiff_bytes:
                 raise Exception(f'ERROR: No TIFF found in ZIP for {burst}')
@@ -1042,10 +1046,9 @@ class CDSE(progressbar_joblib):
 
             # All validations passed - write to temp files then atomic rename.
             # This guarantees no partial files on disk if interrupted mid-write.
-            tmp = tif_file + '.tmp'
-            with open(tmp, 'wb') as f:
-                f.write(tiff_bytes)
-            os.rename(tmp, tif_file)
+            # The burst is stored as compressed NetCDF4, converted and verified in memory, the same
+            # file the ASF download writes.
+            write_slc(tiff_bytes, nc_file)
 
             for filepath, content in xml_contents.items():
                 tmp = filepath + '.tmp'
@@ -1125,8 +1128,9 @@ class CDSE(progressbar_joblib):
             subdir_path = os.path.join(burst_dir, subdir)
             if not os.path.isdir(subdir_path):
                 return False
-            ext = '.tiff' if subdir == 'measurement' else '.xml'
-            matches = glob(file_pattern + ext, root_dir=subdir_path)
+            # the measurement is <burst>.nc, or the legacy <burst>.tiff
+            exts = ('.nc', '.tiff') if subdir == 'measurement' else ('.xml',)
+            matches = [m for ext in exts for m in glob(file_pattern + ext, root_dir=subdir_path)]
             if not matches:
                 return False
             filepath = os.path.join(subdir_path, matches[0])

@@ -56,11 +56,11 @@ setup(
                       'shapely>=2.0.2',
                       'xmltodict',
                       'rioxarray',
+                      'rasterio',
                       'statsmodels>=0.14.0',
                       'h5netcdf',
                       'h5py',
-                      'tifffile',
-                      'netCDF4',
+                      'hdf5plugin>=4.1.0',
                       'pyproj',
                       'joblib',
                       'tqdm',
@@ -76,10 +76,9 @@ setup(
         'Operating System :: POSIX :: Linux',
         'Operating System :: MacOS',
         'Programming Language :: Python',
-        'Programming Language :: Python :: 3.11',
         'Programming Language :: Python :: 3.12',
         'Programming Language :: Python :: 3.13'
     ],
-    python_requires='>=3.11',
+    python_requires='>=3.12',
     keywords='satellite interferometry, InSAR, remote sensing, Sentinel-1'
 )

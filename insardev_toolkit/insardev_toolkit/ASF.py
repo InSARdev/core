@@ -384,9 +384,10 @@ class ASF(progressbar_joblib):
 
         burst_dir = os.path.join(basedir, matching_dirs[0])
 
-        # Define expected file paths
+        # Define expected file paths: the measurement is <burst>.nc, or the legacy <burst>.tiff
+        from .utils_S1 import measurement_path
         files = [
-            os.path.join(burst_dir, 'measurement', f'{burst}.tiff'),
+            measurement_path(os.path.join(burst_dir, 'measurement'), burst),
             os.path.join(burst_dir, 'annotation', f'{burst}.xml'),
             os.path.join(burst_dir, 'calibration', f'{burst}.xml'),
             os.path.join(burst_dir, 'noise', f'{burst}.xml'),
@@ -624,6 +625,7 @@ class ASF(progressbar_joblib):
 
         import rioxarray as rio
         from tifffile import TiffFile
+        from .utils_S1 import measurement_path, slc_shape, tiff_data_offset, write_slc
         import xmltodict
         from xml.etree import ElementTree
         import pandas as pd
@@ -692,28 +694,35 @@ class ASF(progressbar_joblib):
             xml_noise_file = os.path.join(xml_noise_dir, f'{burst}.xml')
             xml_calib_file = os.path.join(xml_calib_dir, f'{burst}.xml')
             #rint ('xml_file', xml_file)
-            tif_file = os.path.join(tif_dir, f'{burst}.tiff')
+            # the burst is stored as <burst>.nc; bursts downloaded before keep their <burst>.tiff
+            nc_file = os.path.join(tif_dir, f'{burst}.nc')
+            tif_file = measurement_path(tif_dir, burst)
             #print ('tif_file', tif_file)
             for dirname in [burst_dir, tif_dir, xml_annot_dir, xml_noise_dir, xml_calib_dir]:
                 os.makedirs(dirname, exist_ok=True)
 
+            def measurement_exists():
+                if not os.path.exists(tif_file):
+                    return False
+                if tif_file.endswith('.tiff'):
+                    return os.path.getsize(tif_file) >= int(properties['bytes'])
+                return os.path.getsize(tif_file) > 0
+
             # check if all files already exist
-            all_exist = (os.path.exists(tif_file) and os.path.getsize(tif_file) >= int(properties['bytes'])
+            all_exist = (measurement_exists()
                         and os.path.exists(xml_file) and os.path.getsize(xml_file) > 0
                         and os.path.exists(xml_noise_file) and os.path.getsize(xml_noise_file) > 0
                         and os.path.exists(xml_calib_file) and os.path.getsize(xml_calib_file) > 0)
 
             if all_exist:
-                # validate existing TIFF dimensions using local annotation XML
+                # validate existing measurement dimensions using local annotation XML
                 with open(xml_file, 'r') as f:
                     local_annotation = xmltodict.parse(f.read())['product']
                 lines_per_burst = int(local_annotation['swathTiming']['linesPerBurst'])
                 samples_per_burst = int(local_annotation['imageAnnotation']['imageInformation']['numberOfSamples'])
-                with TiffFile(tif_file) as tif:
-                    page = tif.pages[0]
-                    actual_lines, actual_samples = page.shape
+                actual_lines, actual_samples = slc_shape(tif_file)
                 if actual_lines != lines_per_burst or actual_samples != samples_per_burst:
-                    raise Exception(f'ERROR: Existing TIFF dimensions mismatch for {burst}: '
+                    raise Exception(f'ERROR: Existing measurement dimensions mismatch for {burst}: '
                                   f'got {actual_lines}x{actual_samples}, expected {lines_per_burst}x{samples_per_burst}. '
                                   f'Delete the corrupted file and re-download.')
                 # all files valid, skip download
@@ -768,13 +777,11 @@ class ASF(progressbar_joblib):
                               f'This indicates corrupted manifest data.')
 
             # download tif if needed
-            if os.path.exists(tif_file) and os.path.getsize(tif_file) >= int(properties['bytes']):
+            if measurement_exists():
                 # validate existing file dimensions
-                with TiffFile(tif_file) as tif:
-                    page = tif.pages[0]
-                    actual_lines, actual_samples = page.shape
+                actual_lines, actual_samples = slc_shape(tif_file)
                 if actual_lines != lines_per_burst or actual_samples != samples_per_burst:
-                    raise Exception(f'ERROR: Existing TIFF dimensions mismatch for {burst}: '
+                    raise Exception(f'ERROR: Existing measurement dimensions mismatch for {burst}: '
                                   f'got {actual_lines}x{actual_samples}, expected {lines_per_burst}x{samples_per_burst}. '
                                   f'Delete the corrupted file and re-download.')
             else:
@@ -841,11 +848,10 @@ class ASF(progressbar_joblib):
                            and os.path.exists(xml_calib_file) and os.path.getsize(xml_calib_file) > 0)
 
             if need_xml:
-                # Get TIFF offset (already have it if we downloaded, otherwise read from existing file)
+                # Get TIFF offset (already have it if we downloaded, otherwise read from the existing
+                # measurement: a .nc burst keeps the offset of the TIFF it was converted from)
                 if 'tiff_offset' not in dir():
-                    with TiffFile(tif_file) as tif:
-                        page = tif.pages[0]
-                        tiff_offset = page.dataoffsets[0]
+                    tiff_offset = tiff_data_offset(tif_file)
                 offset = tiff_offset
 
                 azimuth_time_interval = annotation['imageAnnotation']['imageInformation']['azimuthTimeInterval']
@@ -985,10 +991,8 @@ class ASF(progressbar_joblib):
             # All validations passed - write to temp files then atomic rename.
             # This guarantees no partial files on disk if interrupted mid-write.
             if 'tiff_bytes' in dir():
-                tmp = tif_file + '.tmp'
-                with open(tmp, 'wb') as f:
-                    f.write(tiff_bytes)
-                os.rename(tmp, tif_file)
+                # the burst is stored as compressed NetCDF4, converted and verified in memory
+                write_slc(tiff_bytes, nc_file)
 
             for filepath, content in xml_contents.items():
                 tmp = filepath + '.tmp'
@@ -1033,6 +1037,7 @@ class ASF(progressbar_joblib):
             polarization = burst.split('_')[4]
             properties['fileID'] = burst
             properties['sceneName'] = burst
+            # the catalog names the served TIFF; the measurement is stored as <burst>.nc (or the legacy <burst>.tiff)
             properties['fileName'] = f'{burst}.tiff'
             properties['polarization'] = polarization
             properties['url'] = replace_polarization(properties['url'], polarization)

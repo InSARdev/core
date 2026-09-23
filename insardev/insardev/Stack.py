@@ -1704,10 +1704,6 @@ DEFOMAX_CYCLE  {defomax}
 
         assert data.dims[0] == 'date', 'The first data dimension should be date'
 
-        # Default chunk sizes if not set on Stack
-        netcdf_chunksize = getattr(self, 'netcdf_chunksize', 512)
-        chunksize1d = getattr(self, 'chunksize1d', 10000)
-
         if not isinstance(data, xr.DataArray):
             raise Exception('Invalid input: The "data" parameter should be of type xarray.DataArray.')
 

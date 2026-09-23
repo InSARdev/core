@@ -21,7 +21,7 @@ class Nisar(Nisar_transform):
     Usage
     -----
     >>> from insardev_pygmtsar import Nisar
-    >>> nisar = Nisar('/path/to/nisar/data', DEM='/path/to/dem.tif')
+    >>> nisar = Nisar('/path/to/nisar/data', DEM='/path/to/dem.vrt')
     >>> nisar.to_dataframe()
     >>> nisar.plot()
     >>> nisar.transform('/output/stack.zarr', ref='2025-11-22')

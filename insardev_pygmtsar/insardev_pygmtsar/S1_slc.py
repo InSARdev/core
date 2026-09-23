@@ -36,7 +36,7 @@ class S1_slc(Satellite):
         Raises
         ------
         ValueError
-            If the bursts contain inconsistencies, such as mismatched .tiff and .xml files, or if invalid filter parameters are provided.
+            If the bursts contain inconsistencies, such as mismatched measurement (.nc or .tiff) and .xml files, or if invalid filter parameters are provided.
         """
         import os
         from glob import glob
@@ -48,6 +48,11 @@ class S1_slc(Satellite):
         oneday = relativedelta(days=1)
         
         self.datadir = datadir
+        # a DEM file name is resolved here once: a dem.nc that the downloader replaced by dem.vrt is read from
+        # the VRT, and the note about it prints in this process, not in every worker
+        if isinstance(DEM, str):
+            from insardev_toolkit import utils_tiles
+            DEM = utils_tiles.resolve(DEM)
         self.DEM = DEM
 
         orbits = glob(self.pattern_orbit, root_dir=self.datadir)

@@ -497,7 +497,8 @@ class PRM(datagrid, PRM_gmtsar):
         closest to the burst center time, following the same approach as GMTSAR's
         make_s1a_tops.c dramp_dmod() function.
 
-        The XML annotation file is derived from the input_file path by replacing .tiff with .xml.
+        The XML annotation file is derived from the input_file path by replacing the measurement file
+        extension (.nc, or the legacy .tiff) with .xml.
 
         References
         ----------
@@ -505,11 +506,12 @@ class PRM(datagrid, PRM_gmtsar):
         ESA Sentinel-1 TOPS SLC Deramping: https://sentinels.copernicus.eu/documents/247904/1653442/Sentinel-1-TOPS-SLC_Deramping
         """
         from datetime import datetime
+        import os
         import xmltodict
 
-        # Derive XML path from input_file (replace .tiff with .xml)
+        # Derive XML path from input_file (replace the .nc or .tiff extension with .xml)
         input_file = self.get('input_file')
-        xml_file = input_file.replace('measurement','annotation').replace('.tiff', '.xml')
+        xml_file = os.path.splitext(input_file.replace('measurement','annotation'))[0] + '.xml'
 
         # Read annotation XML
         with open(xml_file) as fd:

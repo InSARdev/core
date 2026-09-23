@@ -28,7 +28,7 @@ InSARdev expects native ASF burst delivery layout:
 
     DATADIR/
     └── {path:03d}_{burstId}_{IW}/
-        ├── measurement/  S1_{burstId}_{IW}_{datetime}_{pol}_{hash}-BURST.tiff
+        ├── measurement/  S1_{burstId}_{IW}_{datetime}_{pol}_{hash}-BURST.nc
         ├── annotation/   S1_..._BURST.xml
         ├── calibration/  S1_..._BURST.xml
         └── noise/        S1_..._BURST.xml
@@ -59,9 +59,11 @@ class PyGMTSAR:
     single burst's entries with line numbers re-zeroed.
     """
 
-    def safeload(self, safedir, datadir, bursts, link=False, skip_errors=False,
-                 skip_exist=True, debug=False):
+    def safeload(self, safedir, datadir, bursts, skip_errors=False, skip_exist=True, debug=False):
         """Translate SAFE-format bursts in ``safedir`` into InSARdev layout under ``datadir``.
+
+        A one-time translation: the measurement is converted into the burst's compressed NetCDF4 file, and the
+        XMLs and orbits, small next to it, are copied.
 
         Parameters
         ----------
@@ -75,12 +77,6 @@ class PyGMTSAR:
             ``'S1_262885_IW2_20190702T032452_VV_69C5-BURST'``. Accepts a single
             string, newline-separated string, list of strings, or a GeoDataFrame
             with a ``sceneName`` column (as ``asf_search`` returns).
-        link : bool, optional
-            If True, symlink files instead of copying. Default False (copy).
-            Symlinks are faster and free, but break if ``safedir`` is later
-            moved/removed. Note: for multi-burst SAFEs the TIFF must always be
-            rewritten (the source is one big multi-burst file), so ``link``
-            only affects XMLs and orbits in that case.
         skip_errors : bool, optional
             If False (default), raise on missing/ambiguous source files.
             If True, log a warning and continue with the next burst.
@@ -127,8 +123,7 @@ class PyGMTSAR:
         records = []
         for burst in bursts:
             try:
-                rec = self._process_burst(burst, datadir, safe_index,
-                                          link=link, skip_exist=skip_exist, debug=debug)
+                rec = self._process_burst(burst, datadir, safe_index, skip_exist=skip_exist, debug=debug)
             except Exception as e:
                 if not skip_errors:
                     raise
@@ -137,7 +132,7 @@ class PyGMTSAR:
                 print(f'WARNING: {burst}: {e}')
             records.append(rec)
 
-        self._transfer_orbits(safedir, datadir, link=link, debug=debug)
+        self._transfer_orbits(safedir, datadir, debug=debug)
 
         return pd.DataFrame.from_records(records)
 
@@ -162,8 +157,7 @@ class PyGMTSAR:
     # ---- main per-burst worker ----
 
     @classmethod
-    def _process_burst(cls, burst, datadir, safe_index,
-                       link, skip_exist, debug):
+    def _process_burst(cls, burst, datadir, safe_index, skip_exist, debug):
         import xmltodict
 
         burst_id_num, subswath, datetime_str, pol, scene_hash = cls._parse_burst_id(burst)
@@ -218,14 +212,16 @@ class PyGMTSAR:
             raise ValueError(f"unknown platform {platform!r} in {burst}: cannot compute pathNumber")
         path = ((abs_orbit - offset) % 175) + 1
 
-        # Plan target paths.
+        # Plan target paths. The burst is stored as <burst>.nc; bursts translated before keep their <burst>.tiff.
+        from .utils_S1 import measurement_path
         target_dir = os.path.join(datadir, f'{path:03d}_{burst_id_num}_{subswath}')
-        tgt_meas  = os.path.join(target_dir, 'measurement', f'{burst}.tiff')
+        tgt_meas  = os.path.join(target_dir, 'measurement', f'{burst}.nc')
         tgt_ann   = os.path.join(target_dir, 'annotation',  f'{burst}.xml')
         tgt_cal   = os.path.join(target_dir, 'calibration', f'{burst}.xml')
         tgt_noise = os.path.join(target_dir, 'noise',       f'{burst}.xml')
+        present_meas = measurement_path(os.path.join(target_dir, 'measurement'), burst)
 
-        if skip_exist and all(cls._is_present(p) for p in (tgt_meas, tgt_ann, tgt_cal, tgt_noise)):
+        if skip_exist and all(cls._is_present(p) for p in (present_meas, tgt_ann, tgt_cal, tgt_noise)):
             if debug:
                 print(f'  skip {burst} (already present)')
             return {'burst': burst, 'status': 'skipped', 'path': path,
@@ -244,9 +240,8 @@ class PyGMTSAR:
 
         if n_bursts_in_safe == 1:
             cls._transfer_singleburst(src_meas, src_ann, src_cal, src_noise,
-                                      tgt_meas, tgt_ann, tgt_cal, tgt_noise,
-                                      link=link)
-            mode = 'linked' if link else 'copied'
+                                      tgt_meas, tgt_ann, tgt_cal, tgt_noise)
+            mode = 'converted'
         else:
             cls._extract_multiburst(
                 src_meas, src_cal, src_noise,
@@ -261,18 +256,20 @@ class PyGMTSAR:
                 'burstId': int(burst_id_num), 'subswath': subswath,
                 'target_dir': target_dir}
 
-    # ---- single-burst SAFE: just rename/copy ----
+    # ---- single-burst SAFE: convert the measurement, copy the XMLs ----
 
     @classmethod
     def _transfer_singleburst(cls, src_meas, src_ann, src_cal, src_noise,
-                              tgt_meas, tgt_ann, tgt_cal, tgt_noise, link):
+                              tgt_meas, tgt_ann, tgt_cal, tgt_noise):
+        from .utils_S1 import write_slc
+        with open(src_meas, 'rb') as f:
+            write_slc(f.read(), tgt_meas)
         for src, tgt in (
-            (src_meas, tgt_meas),
             (src_ann, tgt_ann),
             (src_cal, tgt_cal),
             (src_noise, tgt_noise),
         ):
-            cls._transfer(src, tgt, link=link)
+            cls._transfer(src, tgt)
 
     # ---- multi-burst SAFE: extract TIFF strip + filter XMLs ----
 
@@ -283,12 +280,14 @@ class PyGMTSAR:
         import xmltodict
 
         # 1. Read the requested burst's pixel strip from the multi-burst TIFF
-        #    and write it as a standalone single-burst TIFF.
-        cls._write_burst_tiff(src_meas, tgt_meas, burst_index, lines_per_burst)
+        #    as a standalone single-burst TIFF, in memory.
+        import io
+        from .utils_S1 import write_slc
+        tiff_bytes = cls._burst_tiff_bytes(src_meas, burst_index, lines_per_burst)
 
-        # 2. Read back the new TIFF's first-strip byte offset for the annotation XML.
+        # 2. The new TIFF's first-strip byte offset for the annotation XML.
         from tifffile import TiffFile
-        with TiffFile(tgt_meas) as tif:
+        with TiffFile(io.BytesIO(tiff_bytes)) as tif:
             page = tif.pages[0]
             actual_lines, actual_samples = page.shape
             tiff_offset = int(page.dataoffsets[0])
@@ -298,6 +297,8 @@ class PyGMTSAR:
                 f'{actual_lines}x{actual_samples}, expected '
                 f'{lines_per_burst}x{samples_per_burst}'
             )
+        # the burst is stored as NetCDF4, which keeps that offset too
+        write_slc(tiff_bytes, tgt_meas)
 
         # 3. Filter annotation/noise/calibration XMLs to the single requested burst.
         ann_xml_out = cls._build_product_xml(annotation, burst_index, tiff_offset)
@@ -535,32 +536,38 @@ class PyGMTSAR:
         return xmltodict.unparse({'calibration': calibration}, pretty=True, indent='  ')
 
     @staticmethod
-    def _write_burst_tiff(src_tiff, tgt_tiff, burst_index, lines_per_burst):
-        """Extract one burst's strip from a multi-burst Sentinel-1 SLC TIFF and
-        write it as a standalone single-burst TIFF."""
-        from tifffile import TiffFile, TiffWriter
+    def _burst_tiff_bytes(src_tiff, burst_index, lines_per_burst):
+        """Extract one burst's rows from a multi-burst Sentinel-1 SLC TIFF as a standalone single-burst
+        complex int16 TIFF held in memory.
 
+        A Sentinel-1 SLC TIFF is uncompressed with contiguous strips, so the burst's rows are read straight from
+        the file, without decoding the whole subswath; any other layout is decoded by tifffile."""
+        import numpy as np
+        from tifffile import TiffFile
+        from .utils_S1 import pairs_tiff
+
+        first, last = burst_index * lines_per_burst, (burst_index + 1) * lines_per_burst
         with TiffFile(src_tiff) as tif:
             page = tif.pages[0]
-            if page.shape[0] < (burst_index + 1) * lines_per_burst:
+            if page.shape[0] < last:
                 raise ValueError(
                     f'TIFF too short for burst_index={burst_index}: '
-                    f'page has {page.shape[0]} rows, need at least '
-                    f'{(burst_index + 1) * lines_per_burst}'
+                    f'page has {page.shape[0]} rows, need at least {last}'
                 )
-            data = page.asarray()[
-                burst_index * lines_per_burst:(burst_index + 1) * lines_per_burst, :
-            ]
-
-        tmp = tgt_tiff + '.tmp'
-        with TiffWriter(tmp) as tw:
-            tw.write(
-                data,
-                photometric='minisblack',
-                rowsperstrip=lines_per_burst,
-                compression=None,
-            )
-        os.replace(tmp, tgt_tiff)
+            lines, samples = (int(n) for n in page.shape)
+            offsets, counts = page.dataoffsets, page.databytecounts
+            contiguous = (page.dtype == np.complex64 and int(page.compression) == 1 and len(offsets) == lines
+                          and sum(counts) == lines * samples * 4
+                          and all(offsets[i] + counts[i] == offsets[i + 1] for i in range(len(offsets) - 1)))
+            if contiguous:
+                with open(src_tiff, 'rb') as f:
+                    f.seek(int(offsets[first]))
+                    raw = f.read(lines_per_burst * samples * 4)
+                iq = np.frombuffer(raw, dtype=tif.byteorder + 'i2').reshape(lines_per_burst, samples, 2)
+            else:
+                c = page.asarray()[first:last]
+                iq = c.view(np.float32).reshape(c.shape + (2,)).astype(np.int16)
+        return pairs_tiff(iq)
 
     # ---- helpers ----
 
@@ -661,13 +668,10 @@ class PyGMTSAR:
         return os.path.isfile(path) and os.path.getsize(path) > 0
 
     @staticmethod
-    def _transfer(src, tgt, link):
+    def _transfer(src, tgt):
         if os.path.lexists(tgt):
             os.remove(tgt)
-        if link:
-            os.symlink(os.path.abspath(src), tgt)
-        else:
-            shutil.copy2(src, tgt)
+        shutil.copy2(src, tgt)
 
     @staticmethod
     def _atomic_write_text(tgt, content):
@@ -677,11 +681,11 @@ class PyGMTSAR:
         os.replace(tmp, tgt)
 
     @classmethod
-    def _transfer_orbits(cls, safedir, datadir, link, debug):
+    def _transfer_orbits(cls, safedir, datadir, debug):
         for eof in glob(os.path.join(safedir, '*.EOF')):
             tgt = os.path.join(datadir, os.path.basename(eof))
             if cls._is_present(tgt):
                 continue
-            cls._transfer(eof, tgt, link=link)
+            cls._transfer(eof, tgt)
             if debug:
-                print(f'  orbit {"linked" if link else "copied"}: {os.path.basename(eof)}')
+                print(f'  orbit copied: {os.path.basename(eof)}')

@@ -9,50 +9,7 @@
 # ----------------------------------------------------------------------------
 from .S1_align import S1_align
 from .utils_satellite import remap_radar_to_geo
-
-
-def _compute_transform_inverse_worker(prm_ref_df, prm_ref_orbit_df, dem_path, geometry_wkt, outdir,
-                               scale_factor, epsg, resolution, bbox, n_chunks, debug, netcdf_engine, result_queue):
-    """Worker function for compute_transform_inverse in spawned subprocess.
-
-    Must be at module level for multiprocessing spawn to pickle it.
-    Computes transform, saves to zarr, sends topo through queue.
-
-    Takes serialized prm_ref from main process - does NOT create S1 instance.
-    """
-    from insardev_pygmtsar.PRM import PRM
-    from insardev_pygmtsar.utils_satellite import compute_transform_inverse, get_dem_wgs84ellipsoid, save_transform
-    from shapely import wkt
-
-    # Reconstruct prm_ref from serialized dataframe
-    prm_ref = PRM()
-    for name, row in prm_ref_df.iterrows():
-        prm_ref.set(**{name: row['value']})
-    prm_ref.orbit_df = prm_ref_orbit_df
-
-    # Parse geometry and load DEM
-    geometry = wkt.loads(geometry_wkt)
-    dem = get_dem_wgs84ellipsoid(dem_path, geometry, netcdf_engine=netcdf_engine)
-
-    # Compute and save transform
-    topo, transform = compute_transform_inverse(
-        prm_ref, dem,
-        scale_factor=scale_factor, epsg=epsg,
-        resolution=resolution, bbox=bbox, n_chunks=n_chunks, debug=debug
-    )
-    save_transform(transform, outdir, scale_factor=scale_factor)
-
-    # Send topo and transform (without ele) through queue
-    result_queue.put({
-        'topo_values': topo.values,
-        'topo_a_coords': topo.coords['a'].values,
-        'topo_r_coords': topo.coords['r'].values,
-        'transform_azi': transform.azi.values,
-        'transform_rng': transform.rng.values,
-        'transform_y': transform.y.values,
-        'transform_x': transform.x.values,
-        'transform_attrs': dict(transform.attrs),
-    })
+from insardev_toolkit.utils_S1 import measurement_path
 
 
 def _process_date_worker(args):
@@ -761,7 +718,7 @@ class S1_transform(S1_align):
             # Load DEM and compute transform
             from .utils_satellite import compute_transform_inverse, get_dem_wgs84ellipsoid, save_transform
             record = self.get_record(ref_burst_name)
-            dem = get_dem_wgs84ellipsoid(self.DEM, record.geometry.iloc[0], netcdf_engine=self.netcdf_engine_read)
+            dem = get_dem_wgs84ellipsoid(self.DEM, record.geometry.iloc[0])
             topo, transform = compute_transform_inverse(prm_ref_main, dem, scale_factor=1/dem_vertical_accuracy, epsg=epsg, resolution=resolution, bbox=bbox, debug=debug)
             del dem
 
@@ -878,7 +835,7 @@ class S1_transform(S1_align):
 
             from .utils_satellite import compute_transform_inverse, get_dem_wgs84ellipsoid, save_transform
             record = self.get_record(ref_burst_name)
-            dem = get_dem_wgs84ellipsoid(self.DEM, record.geometry.iloc[0], netcdf_engine=self.netcdf_engine_read)
+            dem = get_dem_wgs84ellipsoid(self.DEM, record.geometry.iloc[0])
             topo, transform = compute_transform_inverse(prm_ref_main, dem, scale_factor=1/dem_vertical_accuracy, epsg=epsg, resolution=resolution, bbox=bbox, debug=debug)
             del dem
 
@@ -923,7 +880,7 @@ class S1_transform(S1_align):
                 prefix = self.fullBurstId(burst_name)
                 record = self.get_record(burst_name)
                 xml_file = os.path.join(self.datadir, prefix, 'annotation', f'{burst_name}.xml')
-                tiff_file = os.path.join(self.datadir, prefix, 'measurement', f'{burst_name}.tiff')
+                tiff_file = measurement_path(os.path.join(self.datadir, prefix, 'measurement'), burst_name)
                 orbit_file = os.path.join(self.datadir, record['orbit'].iloc[0])
                 calibration_xml = os.path.join(self.datadir, prefix, 'calibration', f'{burst_name}.xml')
                 noise_xml = os.path.join(self.datadir, prefix, 'noise', f'{burst_name}.xml')

@@ -1340,8 +1340,9 @@ class BatchCore(dict):
 
         Examples
         --------
-        # Apply binary landmask
-        land = np.isfinite(xr.open_dataarray('land.nc').rio.reproject(intf.crs))
+        # Apply binary land mask, downloaded as tiles with a VRT index by Tiles().download_landmask(AOI, 'land.vrt')
+        from insardev_toolkit import Tiles
+        land = np.isfinite(Tiles().open('land.vrt').rio.reproject(intf.crs))
         masked_intf = intf.mask(land)
 
         # Mask by AOI polygon

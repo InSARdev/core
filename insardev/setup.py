@@ -83,10 +83,9 @@ setup(
         'Operating System :: POSIX :: Linux',
         'Operating System :: MacOS',
         'Programming Language :: Python',
-        'Programming Language :: Python :: 3.11',
         'Programming Language :: Python :: 3.12',
         'Programming Language :: Python :: 3.13'
     ],
-    python_requires='>=3.11',
+    python_requires='>=3.12',
     keywords='satellite interferometry, InSAR, remote sensing, geospatial analysis, elevation, Sentinel-1, SBAS, PSI'
 )
