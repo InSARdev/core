@@ -6979,10 +6979,10 @@ class Batches(tuple):
 
         Examples
         --------
-        >>> phase, corr = stack.pairs(pairs).interferogram(30).goldstein(200)
+        >>> intf, corr = stack.pairs(pairs).interferogram(30).goldstein(200)
         """
         if len(self) < 2:
-            raise ValueError("goldstein() requires Batches with at least 2 elements: [phase, correlation]")
+            raise ValueError("goldstein() requires Batches with at least 2 elements: [interferogram, correlation]")
 
         phase, corr = self[0], self[1]
 
@@ -7030,11 +7030,13 @@ class Batches(tuple):
         Returns
         -------
         Batches
-            Batches with [phase, correlation].
+            Batches with [interferogram, correlation]: the interferogram COMPLEX
+            (BatchComplex) until angle() is called -- unwrap2d() and
+            unwrap2d_irls() call it themselves -- and the correlation a BatchUnit.
 
         Examples
         --------
-        >>> phase, corr = stack.pairs(baseline.tolist()).interferogram(30)
+        >>> intf, corr = stack.pairs(baseline.tolist()).interferogram(30)
         >>> # single-look, ONE element back -- no correlation without a filter
         >>> intf, = stack.pairs(baseline.tolist()).interferogram()
         """

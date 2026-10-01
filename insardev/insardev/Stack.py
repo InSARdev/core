@@ -2683,7 +2683,7 @@ DEFOMAX_CYCLE  {defomax}
                 raise ValueError("transform is required when data=None")
 
             # Get topography at native resolution
-            topo_merged = tfm[['ele']]._start_from(tfm).to_dataset()
+            topo_merged = tfm[['ele']].to_dataset()
             topo_da = topo_merged['ele'] if 'ele' in topo_merged else None
             if topo_da is None:
                 raise ValueError("transform must contain 'ele' variable")
@@ -2783,7 +2783,7 @@ DEFOMAX_CYCLE  {defomax}
                 for k in target.keys():
                     if k not in tfm:
                         continue
-                    tfm_ds = tfm[k][['ele'] + (['startTime'] if 'startTime' in tfm[k].data_vars else [])]
+                    tfm_ds = tfm[k][['ele']]
                     tgt_ds = target[k]
                     # Find nearest indices for y and x coordinates
                     y_idx = _nearest_indices(tfm_ds.y.values, tgt_ds.y.values)
@@ -2799,7 +2799,7 @@ DEFOMAX_CYCLE  {defomax}
                 topo_merged = Batch(decimated).to_dataset()
             else:
                 # User-provided transform: use as-is
-                topo_merged = tfm[['ele']]._start_from(tfm).to_dataset()
+                topo_merged = tfm[['ele']].to_dataset()
 
         # Group by data variable (polarization)
         data_vars = list(merged.data_vars)
@@ -4279,7 +4279,7 @@ DEFOMAX_CYCLE  {defomax}
         --------
         >>> # Align burst phases before interferogram formation
         >>> stack_aligned = stack.align()
-        >>> phase, corr = stack_aligned.pairs(baseline).interferogram(wavelength=30)
+        >>> intf, corr = stack_aligned.pairs(baseline).interferogram(wavelength=30)
         """
         import numpy as np
         import xarray as xr

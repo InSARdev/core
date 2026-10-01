@@ -1113,10 +1113,12 @@ class BatchCore(dict):
         return by_name
 
     def _start_from(self, source):
-        """THIS BATCH WITH EACH BURST'S startTime FROM `source`: the library's own selections
-        of grids ahead of a merge (plot, to_vtk) drop it, and it is the burst order of the
-        merge (_acquisition_order). The class and the grids stay as they are; a burst or a
-        source without startTime is left as it is."""
+        """THIS BATCH WITH EACH BURST'S startTime FROM `source`: plot()'s own selection of the
+        grids it draws drops it, and it is the burst order of the merge (_acquisition_order).
+        The class and the grids stay as they are; a burst or a source without startTime is
+        left as it is. Not for a transform's grids: they carry no time by design and merge
+        in the fullBurstID order, and a startTime there collides with a scalar date
+        coordinate of the data (a fit3d model's)."""
         out = {}
         for k, v in dict.items(self):
             s = dict.get(source, k)
@@ -5147,7 +5149,7 @@ class BatchCore(dict):
         # Handle overlay-only case (export just overlay on topography)
         if not self and overlay is not None and transform is not None:
             tfm = transform if isinstance(transform, BatchCore) else Batch(transform)
-            topo_merged = tfm[['ele']]._start_from(tfm).to_dataset()
+            topo_merged = tfm[['ele']].to_dataset()
             topo_da = topo_merged['ele'] if 'ele' in topo_merged else None
             if topo_da is None:
                 raise ValueError("transform must contain 'ele' variable")
@@ -5229,7 +5231,7 @@ class BatchCore(dict):
             for k in self.keys():
                 if k not in tfm:
                     continue
-                tfm_ds = tfm[k][['ele'] + (['startTime'] if 'startTime' in tfm[k].data_vars else [])]
+                tfm_ds = tfm[k][['ele']]
                 tgt_ds = self[k]
                 y_idx = _nearest_indices(tfm_ds.y.values, tgt_ds.y.values)
                 x_idx = _nearest_indices(tfm_ds.x.values, tgt_ds.x.values)
