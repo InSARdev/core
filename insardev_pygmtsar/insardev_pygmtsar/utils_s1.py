@@ -26,18 +26,50 @@ def _ydf_to_iso(ydf: float) -> str:
 
     Only used to bracket a text search, so the seconds are truncated rather than
     rounded -- widening the window by under a second either way is harmless when
-    an exact numeric test follows.
+    an exact numeric test follows. A window across Jan 1 runs below day 0 of the
+    scene year (or past Dec 31), so the year is the nearest thousand.
     """
+    import math
     from datetime import datetime, timedelta
-    year = int(ydf // 1000)
+    year = int(math.floor(ydf / 1000.0 + 0.5))
     rest = ydf - year * 1000
-    jd = int(rest)
+    jd = math.floor(rest)
     sec = (rest - jd) * 86400.0
     dt = datetime(year, 1, 1) + timedelta(days=jd, seconds=sec)
     return dt.strftime('%Y-%m-%dT%H:%M:%S.%f')
 
 
-def satellite_orbit(xml_path: str, t1: float, t2: float) -> pd.DataFrame:
+def _jan1_days(year0: int, year: int) -> int:
+    """Days from Jan 1 of year0 to Jan 1 of year: the day count of year0 carried into a neighbouring year."""
+    return (datetime(int(year), 1, 1) - datetime(int(year0), 1, 1)).days
+
+
+def _aztime_seconds(dt, day0) -> float:
+    """Seconds of a datetime from 00:00 UTC of the date day0; on day0 itself exactly the seconds of the day.
+
+    GMTSAR compares annotation times with the day kept (yyyyddd.fraction), so a time just past midnight stays
+    seconds, not a day, from a burst before it.
+    """
+    return (86400 * (dt.date() - day0).days
+            + dt.hour * 3600 + dt.minute * 60 + dt.second + dt.microsecond / 1e6)
+
+
+def orbit_window(start: float, stop: float) -> tuple:
+    """
+    The time the orbit of a burst is read for, (t1, t2): its first to last line, start and stop as
+    year.day_fraction (SC_clock_start, SC_clock_stop), extended by 1400 s (about 23 minutes) on each side.
+    """
+    return start - 1400.0 / 86400.0, stop + 1400.0 / 86400.0
+
+
+def _orbit_for(burst: tuple, t1: float, t2: float) -> str:
+    """What an orbit file error names: the burst (name, start, stop) and its date, or the time t1 to t2."""
+    if burst is not None:
+        return f'burst {burst[0]} ({_ydf_to_iso(burst[1])[:10]})'
+    return f'{_ydf_to_iso(t1)[:19]} to {_ydf_to_iso(t2)[:19]}'
+
+
+def satellite_orbit(xml_path: str, t1: float, t2: float, burst: tuple = None) -> pd.DataFrame:
     """
     Extract orbit state vectors from Sentinel-1 EOF XML file.
 
@@ -53,6 +85,17 @@ def satellite_orbit(xml_path: str, t1: float, t2: float) -> pd.DataFrame:
     t2 : float
         End time as year.day_fraction
         This is GMTSAR's SC_clock_stop format
+    burst : tuple, optional
+        (name, start, stop) of the burst the orbit is read for, start and stop as year.day_fraction:
+        the state vectors must cover this time, and the error names the burst and its date.
+
+    Raises
+    ------
+    FileNotFoundError
+        There is no orbit file at xml_path.
+    ValueError
+        The orbit file cannot be used: it has no state vectors over the time (the burst when given),
+        a gap between them, or a state vector that is not finite (utils_satellite.orbit_defect).
 
     Returns
     -------
@@ -63,7 +106,9 @@ def satellite_orbit(xml_path: str, t1: float, t2: float) -> pd.DataFrame:
         - isec: seconds of day
         - px, py, pz: ECEF position (meters)
         - vx, vy, vz: ECEF velocity (m/s)
-        - clock: seconds from Jan 1 of the year (for interpolation)
+        - clock: seconds from Jan 1 of the scene year (for interpolation), continuous through
+          midnight and Jan 1 (a vector of the next year counts on from day 365/366, one of the
+          previous year from day -1), like t1/t2 and PRM clock_start
 
         DataFrame.attrs contains metadata:
         - nd: number of records
@@ -72,11 +117,100 @@ def satellite_orbit(xml_path: str, t1: float, t2: float) -> pd.DataFrame:
     Examples
     --------
     >>> # Get orbit for a burst (extend time range by ~23 minutes on each side)
-    >>> t1 = prm.get('SC_clock_start') - 1400.0/86400.0
-    >>> t2 = prm.get('SC_clock_stop') + 1400.0/86400.0
+    >>> t1, t2 = orbit_window(prm.get('SC_clock_start'), prm.get('SC_clock_stop'))
     >>> orbit_df = satellite_orbit(eof_path, t1, t2)
     """
+    df, _ = _eof_state_vectors(xml_path, t1, t2, burst)
+    # an orbit file that cannot be used raises: the state vectors must cover the burst, without a gap, and be finite
+    error = _eof_error(xml_path, df, t1, t2, burst)
+    if error is not None:
+        raise error
+
+    # Store metadata
+    if len(df) > 1:
+        dt = df['isec'].iloc[1] - df['isec'].iloc[0]
+        if dt < 0:  # day boundary crossing
+            dt = (df['clock'].iloc[1] - df['clock'].iloc[0])
+    else:
+        dt = 10.0  # default 10s for single record
+
+    df.attrs = {
+        'nd': len(df),
+        'iy': int(df['iy'].iloc[0]),
+        'id': int(df['id'].iloc[0]),
+        'isec': float(df['isec'].iloc[0]),
+        'idsec': dt
+    }
+
+    return df
+
+
+def check_orbit_file(xml_path: str, bursts: list) -> None:
+    """
+    Check an EOF file for every burst that uses it with one read of the file: the state vectors of each burst
+    (those satellite_orbit reads for it, over orbit_window) are checked as satellite_orbit checks them.
+
+    Parameters
+    ----------
+    xml_path : str
+        Path to orbit EOF XML file.
+    bursts : list
+        (name, start, stop) of each burst, start and stop as year.day_fraction (SC_clock_start, SC_clock_stop).
+
+    Raises
+    ------
+    FileNotFoundError, ValueError
+        The error of satellite_orbit for a burst whose orbit cannot be used.
+    """
+    windows = [orbit_window(start, stop) for _, start, stop in bursts]
+    # one read per day count (year * 1000 + day, the year of t1): the bursts of a date across Jan 1 have two
+    years = [int(np.floor(t1 / 1000.0 + 0.5)) for t1, _ in windows]
+    for year in dict.fromkeys(years):
+        group = [i for i, y in enumerate(years) if y == year]
+        df, ydf = _eof_state_vectors(xml_path, min(windows[i][0] for i in group),
+                                     max(windows[i][1] for i in group), bursts[group[0]])
+        for i in group:
+            t1, t2 = windows[i]
+            error = _eof_error(xml_path, df[(ydf >= t1) & (ydf <= t2)], t1, t2, bursts[i])
+            if error is not None:
+                raise error
+
+
+def _eof_error(xml_path: str, df: pd.DataFrame, t1: float, t2: float, burst: tuple):
+    """The error of the state vectors df of an EOF file read from t1 to t2 for the burst (name, start, stop) when
+    they cannot be used (utils_satellite.orbit_defect), None when they can."""
+    from .utils_satellite import orbit_defect
+    year0 = int(np.floor(t1 / 1000.0 + 0.5))
+    span = ((burst[1] - year0 * 1000) * 86400.0, (burst[2] - year0 * 1000) * 86400.0) if burst is not None else ()
+    defect = orbit_defect(df, *span)
+    if defect is None:
+        return None
+    return ValueError(f'ERROR: Orbit file {xml_path} {defect} {_orbit_for(burst, t1, t2)}. '
+                      f'Delete it and download the orbits again.')
+
+
+def _eof_state_vectors(xml_path: str, t1: float, t2: float, burst: tuple = None) -> tuple:
+    """
+    The state vectors of an EOF file from t1 to t2 (year.day_fraction), in file order, without a check.
+
+    Returns
+    -------
+    tuple
+        (pd.DataFrame with the columns of satellite_orbit and no attrs, np.ndarray of each state vector's
+        year.day_fraction on the day count of t1); the DataFrame holds only 'clock' when no state vector is in
+        the time.
+
+    Raises
+    ------
+    FileNotFoundError
+        There is no file at xml_path; the error names the burst (name, start, stop) when given.
+    """
     import xml.etree.ElementTree as ET
+    from insardev_toolkit.utils_files import exists
+
+    if not exists(xml_path):
+        raise FileNotFoundError(f'ERROR: Orbit file {xml_path} not found for {_orbit_for(burst, t1, t2)}. '
+                                f'Download the orbits again.')
 
     # ONLY THE WINDOW IS PARSED. A precise-orbit file covers 26 hours at 10 s --
     # 9,361 state vectors -- and a burst asks for about 47 minutes of it, so
@@ -116,7 +250,12 @@ def satellite_orbit(xml_path: str, t1: float, t2: float) -> pd.DataFrame:
     # Find all OSV (Orbit State Vector) elements
     osvs = root.findall('.//OSV')
 
+    # t1/t2 count the days of the scene year (year * 1000 + day), running below day 0 or past Dec 31 when the
+    # window crosses Jan 1: the vectors of the other year are put on that count too, and so is 'clock'
+    year0 = int(np.floor(t1 / 1000.0 + 0.5))
+
     records = []
+    ydfs = []
     for osv in osvs:
         # Parse UTC timestamp: "UTC=2015-01-20T22:59:44.000000". Fixed width, so
         # it is sliced rather than passed to strptime, which dominated this
@@ -134,8 +273,11 @@ def satellite_orbit(xml_path: str, t1: float, t2: float) -> pd.DataFrame:
         sec = (int(utc_str[11:13]) * 3600 + int(utc_str[14:16]) * 60
                + int(utc_str[17:19]) + float(utc_str[19:]))
 
-        # Compute year.day_fraction for filtering (GMTSAR format)
-        ydf = year * 1000 + jd + sec / 86400.0
+        # Compute year.day_fraction for filtering (GMTSAR format), on the day count of t1/t2
+        if year == year0:
+            ydf = year * 1000 + jd + sec / 86400.0
+        else:
+            ydf = year0 * 1000 + (jd + _jan1_days(year0, year)) + sec / 86400.0
 
         # Filter by time range
         if ydf < t1 or ydf > t2:
@@ -160,32 +302,20 @@ def satellite_orbit(xml_path: str, t1: float, t2: float) -> pd.DataFrame:
             'vy': vy,
             'vz': vz
         })
+        ydfs.append(ydf)
 
     if len(records) == 0:
-        raise ValueError(f'No orbit data found in time range {t1} to {t2}')
+        return pd.DataFrame({'clock': np.empty(0)}), np.empty(0)
 
     df = pd.DataFrame(records)
 
-    # Compute clock (seconds from Jan 1) for interpolation
-    df['clock'] = (24 * 60 * 60) * df['id'] + df['isec']
+    # Compute clock (seconds from Jan 1 of the scene year, continuous through Jan 1) for interpolation
+    day = df['id']
+    if (df['iy'] != year0).any():
+        day = day + [_jan1_days(year0, y) for y in df['iy']]
+    df['clock'] = (24 * 60 * 60) * day + df['isec']
 
-    # Store metadata
-    if len(df) > 1:
-        dt = df['isec'].iloc[1] - df['isec'].iloc[0]
-        if dt < 0:  # day boundary crossing
-            dt = (df['clock'].iloc[1] - df['clock'].iloc[0])
-    else:
-        dt = 10.0  # default 10s for single record
-
-    df.attrs = {
-        'nd': len(df),
-        'iy': int(df['iy'].iloc[0]),
-        'id': int(df['id'].iloc[0]),
-        'isec': float(df['isec'].iloc[0]),
-        'idsec': dt
-    }
-
-    return df
+    return df, np.array(ydfs, dtype=np.float64)
 
 
 def doppler_centroid(orbit_df: pd.DataFrame,
@@ -585,15 +715,17 @@ def reference_burst(xml_path: str, tiff_path: str, eof_path: str) -> tuple:
     are returned. This is typically used for computing geometry and preparing
     for burst alignment.
     """
+    import os
+
     # Extract PRM parameters from XML
     prm_dict = satellite_prm(xml_path, tiff_path)
 
     # Compute time range for orbit extraction (extend by ~23 minutes on each side)
-    t1 = prm_dict['SC_clock_start'] - 1400.0 / 86400.0
-    t2 = prm_dict['SC_clock_stop'] + 1400.0 / 86400.0
+    t1, t2 = orbit_window(prm_dict['SC_clock_start'], prm_dict['SC_clock_stop'])
 
-    # Extract orbit from EOF file
-    orbit_df = satellite_orbit(eof_path, t1, t2)
+    # Extract orbit from EOF file; it must cover the burst (named after its annotation file)
+    burst = (os.path.splitext(os.path.basename(xml_path))[0], prm_dict['SC_clock_start'], prm_dict['SC_clock_stop'])
+    orbit_df = satellite_orbit(eof_path, t1, t2, burst=burst)
 
     return prm_dict, orbit_df
 
@@ -642,6 +774,39 @@ def satellite_slc(tiff_path: str) -> "xr.DataArray":
     )
 
 
+def dc_polynomial(dc_estimate, xml_path: str) -> tuple:
+    """
+    The Doppler centroid polynomial of a dcEstimate record as the S-1 IPF used it: the geometryDcPolynomial when the
+    record is flagged dataDcRmsErrorAboveThreshold (the IPF falls back to the Doppler centroid from geometry, S-1 L1
+    Detailed Algorithm Definition, section 5), the dataDcPolynomial otherwise.
+
+    Parameters
+    ----------
+    dc_estimate : element or dict
+        The dcEstimate record: an ElementTree / lxml element, or the dict of xmltodict.
+    xml_path : str
+        The burst annotation XML file (for the error message).
+
+    Returns
+    -------
+    tuple
+        ([c0, c1, c2], t0): the polynomial coefficients about its slant range time t0.
+    """
+    def text(name):
+        if isinstance(dc_estimate, dict):
+            value = dc_estimate.get(name)
+            value = value.get('#text') if isinstance(value, dict) else value
+        else:
+            element = dc_estimate.find(name)
+            value = element.text if element is not None else None
+        if value is None:
+            raise ValueError(f'ERROR: {xml_path}: a dcEstimate record has no {name}. Download the burst again.')
+        return value
+
+    name = 'geometryDcPolynomial' if text('dataDcRmsErrorAboveThreshold').strip() == 'true' else 'dataDcPolynomial'
+    return [float(x) for x in text(name).split()[:3]], float(text('t0'))
+
+
 def deramped_burst(xml_path: str, tiff_path: str, eof_path: str) -> tuple:
     """
     Extract deramped burst SLC data without alignment shift or reramp.
@@ -670,7 +835,8 @@ def deramped_burst(xml_path: str, tiff_path: str, eof_path: str) -> tuple:
         Values are raw DN (digital numbers) without any scaling.
     reramp_params : dict
         Parameters for analytical reramp phase computation:
-        fka, fnc, ks, dta, dts, ts0, tau0, lpb, k_start, n_valid
+        fka, fnc, ks, dta, dts, ts0, tau0, lpb, k_start, n_valid; fka is the FM rate polynomial about its t0
+        (tau0), fnc the Doppler centroid polynomial the IPF used (dc_polynomial()) re-expanded about tau0.
     """
     import numpy as np
     from scipy import constants
@@ -723,7 +889,6 @@ def deramped_burst(xml_path: str, tiff_path: str, eof_path: str) -> tuple:
     dta = 1.0 / prf
     dts = 1.0 / prm_dict['rng_samp_rate']
     ts0 = prm_dict['near_range'] * 2.0 / SOL + 1.0 / prm_dict['rng_samp_rate']
-    tau0 = float(root.find('.//azimuthFmRateList/azimuthFmRate/t0').text)
 
     # Compute burst center time for finding nearest Doppler/FM rate estimates
     t_brst_str = root.find('.//swathTiming/burstList/burst/azimuthTime').text
@@ -732,8 +897,8 @@ def deramped_burst(xml_path: str, tiff_path: str, eof_path: str) -> tuple:
     t_brst = sec_brst + dta * lpb / 2.0
 
     def parse_aztime(aztime_str):
-        dt = datetime.strptime(aztime_str, '%Y-%m-%dT%H:%M:%S.%f')
-        return dt.hour * 3600 + dt.minute * 60 + dt.second + dt.microsecond / 1e6
+        # seconds from 00:00 UTC of the burst day, the clock of t_brst
+        return _aztime_seconds(datetime.strptime(aztime_str, '%Y-%m-%dT%H:%M:%S.%f'), dt_brst.date())
 
     # Get Doppler centroid polynomial
     dc_estimates = root.findall('.//dopplerCentroid/dcEstimateList/dcEstimate')
@@ -745,7 +910,8 @@ def deramped_burst(xml_path: str, tiff_path: str, eof_path: str) -> tuple:
         if dist < best_dc_dist:
             best_dc_dist = dist
             best_dc = dc
-    fnc = [float(x) for x in best_dc.find('dataDcPolynomial').text.split()[:3]]
+    # the Doppler centroid the IPF used
+    fnc, dc_t0 = dc_polynomial(best_dc, xml_path)
 
     # Get FM rate polynomial
     fm_rates = root.findall('.//generalAnnotation/azimuthFmRateList/azimuthFmRate')
@@ -757,6 +923,7 @@ def deramped_burst(xml_path: str, tiff_path: str, eof_path: str) -> tuple:
         if dist < best_fm_dist:
             best_fm_dist = dist
             best_fm = fm
+    tau0 = float(best_fm.find('t0').text)
     if best_fm.find('azimuthFmRatePolynomial') is not None:
         fka = [float(x) for x in best_fm.find('azimuthFmRatePolynomial').text.split()[:3]]
     else:
@@ -764,13 +931,18 @@ def deramped_burst(xml_path: str, tiff_path: str, eof_path: str) -> tuple:
                float(best_fm.find('c1').text),
                float(best_fm.find('c2').text)]
 
-    # Find velocity at burst center
-    orbit_time = orbit_df['clock'].values
-    assert orbit_time[-1] % 86400 >= orbit_time[0] % 86400, \
-        f'Orbit spans midnight ({orbit_time[0] % 86400:.0f}s to {orbit_time[-1] % 86400:.0f}s), not supported'
-    vx = np.interp(t_brst, orbit_time % 86400, orbit_df['vx'].values)
-    vy = np.interp(t_brst, orbit_time % 86400, orbit_df['vy'].values)
-    vz = np.interp(t_brst, orbit_time % 86400, orbit_df['vz'].values)
+    # Each polynomial is given about its own t0: the FM rate about its record's t0 (tau0), the Doppler centroid
+    # about the dcEstimate t0. The deramp / reramp evaluate both at tau - tau0, so the Doppler polynomial is
+    # re-expanded exactly about tau0: fnc(tau - dc_t0) = fnc'(tau - tau0)
+    d = tau0 - dc_t0
+    fnc = [fnc[0] + fnc[1] * d + fnc[2] * d * d, fnc[1] + 2.0 * fnc[2] * d, fnc[2]]
+
+    # Find velocity at burst center (orbit times from 00:00 UTC of the burst day, the clock of t_brst)
+    from .utils_satellite import orbit_seconds
+    orbit_time = orbit_seconds(orbit_df, dt_brst.timetuple().tm_yday - 1)
+    vx = np.interp(t_brst, orbit_time, orbit_df['vx'].values)
+    vy = np.interp(t_brst, orbit_time, orbit_df['vy'].values)
+    vz = np.interp(t_brst, orbit_time, orbit_df['vz'].values)
     vtot = np.sqrt(vx**2 + vy**2 + vz**2)
     ks = 2.0 * vtot * radar_freq * kpsi / SOL
 
@@ -786,13 +958,21 @@ def deramped_burst(xml_path: str, tiff_path: str, eof_path: str) -> tuple:
 
     n_chunks = 8
     chunk_size = (lpb + n_chunks - 1) // n_chunks
-    slc_deramped = np.empty((lpb, width), dtype=np.complex64)
+    # Only the valid region is returned - as complex64 (raw DN values, no scaling). Each chunk is deramped as a
+    # whole, as before, and its valid lines go straight into the output: no full-burst deramped array and no copy
+    # of its valid region
+    slc_valid = np.empty((n_valid, width), dtype=np.complex64)
 
     for chunk_idx in range(n_chunks):
         azi_start = chunk_idx * chunk_size
         azi_end = min((chunk_idx + 1) * chunk_size, lpb)
         if azi_start >= lpb:
             break
+        # the chunk's lines inside the valid region
+        v0 = max(azi_start, k_start)
+        v1 = min(azi_end, k_start + n_valid)
+        if v0 >= v1:
+            continue
         eta_chunk = eta[azi_start:azi_end, np.newaxis]
         pramp = -np.pi * kt * (eta_chunk - etaref)**2
         pmod = -2.0 * np.pi * fnct_arr * eta_chunk
@@ -800,14 +980,13 @@ def deramped_burst(xml_path: str, tiff_path: str, eof_path: str) -> tuple:
         del pramp, pmod
         deramp = np.exp(1j * phase_chunk)
         del phase_chunk
-        slc_deramped[azi_start:azi_end] = (data_complex[azi_start:azi_end, :width] * deramp).astype(np.complex64)
+        deramped = (data_complex[azi_start:azi_end, :width] * deramp).astype(np.complex64)
         del deramp
+        slc_valid[v0 - k_start:v1 - k_start] = deramped[v0 - azi_start:v1 - azi_start]
+        del deramped
 
-    del data_complex, eta, jj, taus, ka, kt, fnct_arr, etaref
-
-    # Extract valid region - return as complex64 (raw DN values, no scaling)
-    slc_valid = slc_deramped[k_start:k_start + n_valid, :width].copy()
-    del slc_deramped
+    # slc_da too: it held the raw SLC alive until return
+    del data_complex, slc_da, eta, jj, taus, ka, kt, fnct_arr, etaref
 
     reramp_params = {
         'fka': fka,
@@ -825,322 +1004,17 @@ def deramped_burst(xml_path: str, tiff_path: str, eof_path: str) -> tuple:
     return prm_dict, orbit_df, slc_valid, reramp_params
 
 
-def repeat_burst(xml_path: str, tiff_path: str, eof_path: str,
-                 rshift_grid: "np.ndarray | None" = None,
-                 ashift_grid: "np.ndarray | None" = None,
-                 grid_step: int = 16) -> tuple:
-    """
-    Extract repeat burst SLC data with alignment (mode=1).
-
-    Replaces GMTSAR make_s1a_tops for mode=1 with OpenCV Lanczos interpolation.
-
-    Parameters
-    ----------
-    xml_path : str
-        Path to burst annotation XML file
-    tiff_path : str
-        Path to burst GeoTIFF file
-    eof_path : str
-        Path to precise orbit EOF file
-    rshift_grid : np.ndarray, optional
-        Range shift grid for alignment (shape matches output SLC).
-        If None, no alignment is applied.
-    ashift_grid : np.ndarray, optional
-        Azimuth shift grid for alignment (shape matches output SLC).
-        If None, no alignment is applied.
-    grid_step : int
-        Step size of shift grids relative to full resolution SLC.
-        Default is 16 (matching GMTSAR convention).
-
-    Returns
-    -------
-    prm_dict : dict
-        Dictionary of PRM parameters
-    orbit_df : pd.DataFrame
-        Orbit state vectors from EOF file
-    slc_data : np.ndarray
-        Complex SLC data as int16 array with shape (num_lines, num_rng_bins*2).
-        Format: [re0, im0, re1, im1, ...] matching GMTSAR SLC format.
-
-    Notes
-    -----
-    This implements the TOPS deramp-shift-reramp procedure:
-    1. Read raw burst data from GeoTIFF
-    2. Apply deramp (remove azimuth phase ramp)
-    3. Shift using OpenCV Lanczos interpolation (better than GMTSAR's sinc)
-    4. Apply reramp (restore azimuth phase ramp with shifted parameters)
-
-    OpenCV Lanczos interpolation is used instead of GMTSAR's 8-point sinc
-    interpolation for better quality and faster processing.
-
-    Theory: TOPS mode introduces an azimuth phase ramp due to antenna steering.
-    The phase must be removed before resampling (deramp) and restored after
-    (reramp) to maintain phase coherence between bursts.
-    """
-    import numpy as np
-    import cv2
-    from scipy import constants
-
-    SOL = constants.speed_of_light
-
-    # Get PRM parameters and orbit
-    prm_dict, orbit_df = reference_burst(xml_path, tiff_path, eof_path)
-
-    # Read SLC data
-    slc_da = satellite_slc(tiff_path)
-    data_complex = slc_da.values
-
-    # Get valid line range
-    n_lines, n_cols = data_complex.shape
-    lpb = n_lines
-    width = prm_dict['num_rng_bins']
-
-    # Parse firstValidSample from XML for valid region
-    import xml.etree.ElementTree as ET
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
-    burst = root.find('.//swathTiming/burstList/burst')
-    fvs_text = burst.find('firstValidSample').text
-    fvs = [int(x) for x in fvs_text.split()]
-
-    # Find valid line range
-    k_start = None
-    k_end = None
-    for j, flag in enumerate(fvs):
-        if flag >= 0:
-            if k_start is None:
-                k_start = j
-            k_end = j
-
-    if k_start is None:
-        k_start = 0
-        k_end = lpb - 1
-
-    # Extract valid region (GMTSAR uses line span, not count)
-    n_valid = k_end - k_start
-    n_valid = n_valid - (n_valid % 4)  # Make divisible by 4
-
-    # If no shift grids provided, just extract without alignment
-    if rshift_grid is None or ashift_grid is None:
-        # Extract valid region and crop to width
-        slc = data_complex[k_start:k_start + n_valid, :width].copy()
-
-        # Convert to int16 format (real, imag interleaved)
-        slc_out = np.zeros((n_valid, width * 2), dtype=np.int16)
-        slc_out[:, 0::2] = np.clip(slc.real * 2, -32768, 32767).astype(np.int16)
-        slc_out[:, 1::2] = np.clip(slc.imag * 2, -32768, 32767).astype(np.int16)
-
-        return prm_dict, orbit_df, slc_out
-
-    # ======================================================================
-    # TOPS Deramp-Shift-Reramp procedure
-    # ======================================================================
-
-    # Get parameters for deramp computation
-    prf = prm_dict['PRF']
-    radar_freq = SOL / prm_dict['radar_wavelength']
-    azi_steering_rate = float(root.find('.//productInformation/azimuthSteeringRate').text)
-    kpsi = np.pi * azi_steering_rate / 180.0
-
-    dta = 1.0 / prf  # azimuth time interval
-    dts = 1.0 / prm_dict['rng_samp_rate']  # range time interval
-    ts0 = prm_dict['near_range'] * 2.0 / SOL + 1.0 / prm_dict['rng_samp_rate']  # slant range time at near range
-    tau0 = float(root.find('.//azimuthFmRateList/azimuthFmRate/t0').text)
-
-    # Compute burst center time for finding nearest Doppler/FM rate estimates
-    t_brst_str = root.find('.//swathTiming/burstList/burst/azimuthTime').text
-    from datetime import datetime
-    dt_brst = datetime.strptime(t_brst_str, '%Y-%m-%dT%H:%M:%S.%f')
-    sec_brst = dt_brst.hour * 3600 + dt_brst.minute * 60 + dt_brst.second + dt_brst.microsecond / 1e6
-    t_brst = sec_brst + dta * lpb / 2.0  # burst center time (seconds of day)
-
-    # Helper to parse azimuth time string to seconds of day
-    def parse_aztime(aztime_str):
-        dt = datetime.strptime(aztime_str, '%Y-%m-%dT%H:%M:%S.%f')
-        return dt.hour * 3600 + dt.minute * 60 + dt.second + dt.microsecond / 1e6
-
-    # Get Doppler centroid polynomial - find NEAREST to burst center time (like GMTSAR)
-    dc_estimates = root.findall('.//dopplerCentroid/dcEstimateList/dcEstimate')
-    best_dc = None
-    best_dc_dist = float('inf')
-    for dc in dc_estimates:
-        dc_time = parse_aztime(dc.find('azimuthTime').text)
-        dist = abs(dc_time - t_brst)
-        if dist < best_dc_dist:
-            best_dc_dist = dist
-            best_dc = dc
-    fnc = [float(x) for x in best_dc.find('dataDcPolynomial').text.split()[:3]]
-
-    # Get FM rate polynomial - find NEAREST to burst center time (like GMTSAR)
-    fm_rates = root.findall('.//generalAnnotation/azimuthFmRateList/azimuthFmRate')
-    best_fm = None
-    best_fm_dist = float('inf')
-    for fm in fm_rates:
-        fm_time = parse_aztime(fm.find('azimuthTime').text)
-        dist = abs(fm_time - t_brst)
-        if dist < best_fm_dist:
-            best_fm_dist = dist
-            best_fm = fm
-    if best_fm.find('azimuthFmRatePolynomial') is not None:
-        fka = [float(x) for x in best_fm.find('azimuthFmRatePolynomial').text.split()[:3]]
-    else:
-        fka = [float(best_fm.find('c0').text),
-               float(best_fm.find('c1').text),
-               float(best_fm.find('c2').text)]
-
-    # Find velocity at burst center by interpolating orbit
-    orbit_time = orbit_df['clock'].values
-    assert orbit_time[-1] % 86400 >= orbit_time[0] % 86400, \
-        f'Orbit spans midnight ({orbit_time[0] % 86400:.0f}s to {orbit_time[-1] % 86400:.0f}s), not supported'
-    vx = np.interp(t_brst, orbit_time % 86400, orbit_df['vx'].values)
-    vy = np.interp(t_brst, orbit_time % 86400, orbit_df['vy'].values)
-    vz = np.interp(t_brst, orbit_time % 86400, orbit_df['vz'].values)
-    vtot = np.sqrt(vx**2 + vy**2 + vz**2)
-
-    # Steering rate contribution to Doppler rate
-    ks = 2.0 * vtot * radar_freq * kpsi / SOL
-
-    # ======================================================================
-    # Compute deramp phase in chunks along azimuth (memory-efficient)
-    # Keep float64 for phase precision (TOPS phases can be thousands of radians)
-    # ======================================================================
-    eta = (np.arange(lpb) - lpb / 2.0 + 0.5) * dta  # azimuth time relative to center
-    jj = np.arange(width)
-    taus = ts0 + jj * dts - tau0  # slant range time relative to tau0
-
-    # FM rate at each range (1D arrays, reused for all chunks)
-    ka = fka[0] + fka[1] * taus + fka[2] * taus**2
-    kt = ka * ks / (ka - ks)
-    fnct = fnc[0] + fnc[1] * taus + fnc[2] * taus**2
-    etaref = -fnct / ka + fnc[0] / fka[0]
-
-    # Process deramp in chunks along azimuth
-    n_chunks = 8
-    chunk_size = (lpb + n_chunks - 1) // n_chunks
-    slc_deramped = np.empty((lpb, width), dtype=np.complex64)
-
-    for chunk_idx in range(n_chunks):
-        azi_start = chunk_idx * chunk_size
-        azi_end = min((chunk_idx + 1) * chunk_size, lpb)
-        if azi_start >= lpb:
-            break
-
-        # Compute phase for this chunk (float64 precision)
-        eta_chunk = eta[azi_start:azi_end, np.newaxis]
-        pramp = -np.pi * kt * (eta_chunk - etaref)**2
-        pmod = -2.0 * np.pi * fnct * eta_chunk
-        phase_chunk = pramp + pmod
-        del pramp, pmod
-
-        # Apply deramp and store as complex64
-        deramp = np.exp(1j * phase_chunk)
-        del phase_chunk
-        slc_deramped[azi_start:azi_end] = (data_complex[azi_start:azi_end, :width] * deramp).astype(np.complex64)
-        del deramp
-
-    del data_complex
-
-    # ======================================================================
-    # Apply shift using OpenCV Lanczos interpolation
-    # ======================================================================
-    # Upsample shift grids to full resolution if needed
-    if rshift_grid.shape != (lpb, width):
-        rshift_full = cv2.resize(rshift_grid.astype(np.float32),
-                                  (width, lpb),
-                                  interpolation=cv2.INTER_LINEAR)
-        ashift_full = cv2.resize(ashift_grid.astype(np.float32),
-                                  (width, lpb),
-                                  interpolation=cv2.INTER_LINEAR)
-    else:
-        rshift_full = rshift_grid.astype(np.float32)
-        ashift_full = ashift_grid.astype(np.float32)
-
-    # Create coordinate maps for remap (reuse arrays)
-    col_idx = np.arange(width, dtype=np.float32)[np.newaxis, :] + np.zeros((lpb, 1), dtype=np.float32)
-    row_idx = np.arange(lpb, dtype=np.float32)[:, np.newaxis] + np.zeros((1, width), dtype=np.float32)
-    map_x = col_idx + rshift_full
-    map_y = row_idx + ashift_full
-    del col_idx, row_idx
-
-    # Apply shift using OpenCV remap with Lanczos interpolation
-    slc_real_shifted = cv2.remap(slc_deramped.real,
-                                  map_x, map_y,
-                                  interpolation=cv2.INTER_LANCZOS4,
-                                  borderMode=cv2.BORDER_CONSTANT,
-                                  borderValue=0)
-    slc_imag_shifted = cv2.remap(slc_deramped.imag,
-                                  map_x, map_y,
-                                  interpolation=cv2.INTER_LANCZOS4,
-                                  borderMode=cv2.BORDER_CONSTANT,
-                                  borderValue=0)
-    del slc_deramped, map_x, map_y
-
-    # Combine into complex (reuse one of the arrays)
-    slc_shifted = (slc_real_shifted + 1j * slc_imag_shifted).astype(np.complex64)
-    del slc_real_shifted, slc_imag_shifted
-
-    # ======================================================================
-    # Compute reramp phase in chunks along azimuth (memory-efficient)
-    # Keep float64 for phase precision
-    # ======================================================================
-    slc_final = np.empty((lpb, width), dtype=np.complex64)
-
-    for chunk_idx in range(n_chunks):
-        azi_start = chunk_idx * chunk_size
-        azi_end = min((chunk_idx + 1) * chunk_size, lpb)
-        if azi_start >= lpb:
-            break
-
-        # Shifted coordinates for this chunk (float64 precision)
-        eta_chunk = eta[azi_start:azi_end, np.newaxis]
-        eta_shifted = eta_chunk + ashift_full[azi_start:azi_end] * dta
-        taus_shifted = ts0 + (jj[np.newaxis, :] + rshift_full[azi_start:azi_end]) * dts - tau0
-
-        # FM rate at shifted range
-        ka_shifted = fka[0] + fka[1] * taus_shifted + fka[2] * taus_shifted**2
-        kt_shifted = ka_shifted * ks / (ka_shifted - ks)
-
-        # Doppler centroid at shifted range
-        fnct_shifted = fnc[0] + fnc[1] * taus_shifted + fnc[2] * taus_shifted**2
-
-        # Reference time at shifted range
-        etaref_shifted = -fnct_shifted / ka_shifted + fnc[0] / fka[0]
-
-        # Reramp phase (negative of deramp)
-        pramp_reramp = -np.pi * kt_shifted * (eta_shifted - etaref_shifted)**2
-        pmod_reramp = -2.0 * np.pi * fnct_shifted * eta_shifted
-        phase_chunk = pramp_reramp + pmod_reramp
-        del pramp_reramp, pmod_reramp, eta_shifted, taus_shifted, ka_shifted, kt_shifted, fnct_shifted, etaref_shifted
-
-        # Apply reramp (conjugate = negative phase)
-        reramp = np.exp(-1j * phase_chunk)
-        del phase_chunk
-        slc_final[azi_start:azi_end] = (slc_shifted[azi_start:azi_end] * reramp).astype(np.complex64)
-        del reramp
-
-    del slc_shifted, ashift_full, rshift_full, eta, jj, taus, ka, kt, fnct, etaref
-
-    # Extract valid region and return as complex64 (raw DN values)
-    slc_valid = slc_final[k_start:k_start + n_valid, :width].astype(np.complex64)
-    del slc_final
-
-    return prm_dict, orbit_df, slc_valid
-
-
 # Re-export satellite_llt2rat from utils_satellite for backwards compatibility
 from .utils_satellite import satellite_llt2rat
 
 
 def make_burst(xml_file: str, tiff_file: str, orbit_file: str,
-               mode: int = 0,
-               rshift_grid: "np.ndarray | None" = None,
-               ashift_grid: "np.ndarray | None" = None,
                debug: bool = False) -> tuple:
     """
-    Pure Python replacement for GMTSAR make_s1a_tops + ext_orb_s1a.
+    Pure Python replacement for GMTSAR make_s1a_tops + ext_orb_s1a (mode=0: PRM and orbit, no SLC).
 
-    Returns PRM object with attached orbit data and optionally SLC data,
-    without writing any files to disk.
+    Returns PRM object with attached orbit data, without writing any files to disk.
+    The SLC is read by deramped_burst().
 
     Parameters
     ----------
@@ -1150,22 +1024,13 @@ def make_burst(xml_file: str, tiff_file: str, orbit_file: str,
         Path to burst GeoTIFF file
     orbit_file : str
         Path to precise orbit EOF file
-    mode : int, optional
-        0 - PRM and orbit only (no SLC)
-        1 - PRM, orbit, and SLC data
-        Defaults to 0.
-    rshift_grid : np.ndarray, optional
-        Range shift grid for alignment (mode=1 only)
-    ashift_grid : np.ndarray, optional
-        Azimuth shift grid for alignment (mode=1 only)
     debug : bool, optional
         Enable debug output. Defaults to False.
 
     Returns
     -------
     tuple
-        (prm, orbit_df) for mode=0 where prm is a PRM object
-        (prm, orbit_df, slc_data) for mode=1
+        (prm, orbit_df) where prm is a PRM object
 
     Notes
     -----
@@ -1181,20 +1046,12 @@ def make_burst(xml_file: str, tiff_file: str, orbit_file: str,
 
     start_time = time.perf_counter()
 
-    if mode == 0:
-        # Mode 0: PRM and orbit only
-        prm_dict, orbit_df = reference_burst(xml_file, tiff_file, orbit_file)
-    else:
-        # Mode 1: PRM, orbit, and SLC
-        prm_dict, orbit_df, slc_data = repeat_burst(
-            xml_file, tiff_file, orbit_file,
-            rshift_grid=rshift_grid,
-            ashift_grid=ashift_grid
-        )
+    # PRM and orbit only
+    prm_dict, orbit_df = reference_burst(xml_file, tiff_file, orbit_file)
 
     elapsed = time.perf_counter() - start_time
     if debug:
-        print(f'PROFILE: make_burst mode={mode} {elapsed:.3f}s')
+        print(f'PROFILE: make_burst {elapsed:.3f}s')
 
     # Create PRM object from dict
     from .PRM import PRM
@@ -1203,7 +1060,4 @@ def make_burst(xml_file: str, tiff_file: str, orbit_file: str,
     # Attach orbit data to PRM object for in-memory processing
     prm.orbit_df = orbit_df
 
-    if mode == 0:
-        return prm, orbit_df
-    else:
-        return prm, orbit_df, slc_data
+    return prm, orbit_df

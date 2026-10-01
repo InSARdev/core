@@ -1,3 +1,2 @@
 include LICENSE
-include insardev_pygmtsar/data/geoid_egm96_icgem.grd
 include insardev_pygmtsar/data/google_colab.sh

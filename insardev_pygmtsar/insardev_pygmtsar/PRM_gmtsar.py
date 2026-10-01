@@ -98,7 +98,7 @@ class PRM_gmtsar:
             return prm
 
     def SAT_llt2rat(self, coords: np.ndarray, precise: int = 1,
-                    debug: bool = False) -> np.ndarray:
+                    n_jobs: int | None = None, debug: bool = False) -> np.ndarray:
         """
         Convert geographic coordinates (LLT) to radar coordinates (RAT).
 
@@ -110,6 +110,8 @@ class PRM_gmtsar:
             LLT coordinates with shape (N, 3): [longitude, latitude, elevation].
         precise : int, optional
             Precision level (0=standard, 1=polynomial refinement). Default is 1.
+        n_jobs : int or None, optional
+            Number of parallel workers of satellite_llt2rat. None or -1 (default): all cores.
         debug : bool, optional
             If True, print debug information. Default is False.
 
@@ -161,7 +163,8 @@ class PRM_gmtsar:
             ashift=int(self.get('ashift')),
             sub_int_r=self.get('sub_int_r'),
             sub_int_a=self.get('sub_int_a'),
-            chirp_ext=int(self.get('chirp_ext'))
+            chirp_ext=int(self.get('chirp_ext')),
+            n_jobs=n_jobs
         )
 
         elapsed = time.perf_counter() - start_time
@@ -227,7 +230,9 @@ class PRM_gmtsar:
             num_valid_az_rep=int(other.get('num_valid_az')) if 'num_valid_az' in other.df.index else None,
             num_patches_rep=int(other.get('num_patches')) if 'num_patches' in other.df.index else None,
             nrows_rep=int(other.get('nrows')) if 'nrows' in other.df.index else None,
-            prf_rep=other.get('PRF') if 'PRF' in other.df.index else None
+            prf_rep=other.get('PRF') if 'PRF' in other.df.index else None,
+            # required, never defaulted: a missing look side would silently mirror a left-looking baseline
+            lookdir=self.get('lookdir')
         )
 
         elapsed = time.perf_counter() - start_time

@@ -38,8 +38,13 @@ setup(
     author='Alexey Pechnikov',
     author_email='alexey@pechnikov.dev',
     license='BSD-3-Clause',
-    packages=['insardev_toolkit'],
+    # the data folder of the EGM2008 and EGM96 geoid grids, with their README, LICENSE and the programs that wrote
+    # the two grids (documentation, not imported), is listed as a (namespace) package so setuptools ships it without
+    # ambiguity (see insardev_toolkit/data/geoid/README.md)
+    packages=['insardev_toolkit', 'insardev_toolkit.data.geoid'],
     include_package_data=True,
+    package_data={'insardev_toolkit.data.geoid': ['*.nc', 'README.md', 'LICENSE', 'egm2008_2.5min.py',
+                                                  'egm96_7.5min.py']},
     install_requires=['xarray>=2024.1.0',
                       'numpy',
                       'pandas>=2.2',

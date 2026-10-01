@@ -8,6 +8,9 @@
 # See the LICENSE file in the insardev_pygmtsar directory for license terms.
 # ----------------------------------------------------------------------------
 from .Satellite import Satellite
+from insardev_toolkit.utils_S1 import path_number, measurement_path
+from insardev_toolkit.utils_files import exists
+from insardev_toolkit import utils_eof
 
 
 class S1_slc(Satellite):
@@ -40,13 +43,10 @@ class S1_slc(Satellite):
         """
         import os
         from glob import glob
-        import re
         import pandas as pd
         import geopandas as gpd
         from datetime import datetime
-        from dateutil.relativedelta import relativedelta
-        oneday = relativedelta(days=1)
-        
+
         self.datadir = datadir
         # a DEM file name is resolved here once: a dem.nc that the downloader replaced by dem.vrt is read from
         # the VRT, and the note about it prints in this process, not in every worker
@@ -54,21 +54,14 @@ class S1_slc(Satellite):
             from insardev_toolkit import utils_tiles
             DEM = utils_tiles.resolve(DEM)
         self.DEM = DEM
+        # its vertical datum as well (dem_datum()): a DEM without one warns here, and a DEM of a vertical datum that
+        # is not supported, or mixing providers, raises before any processing
+        if DEM is not None:
+            self.dem_datum()
 
-        orbits = glob(self.pattern_orbit, root_dir=self.datadir)
-        #print ('orbits', orbits)
-        orbits_dict = {}
-        # Extract validity dates from filename (no file I/O needed)
-        # Pattern: S1A_OPER_AUX_POEORB_OPOD_20210207T122351_V20210117T225942_20210119T005942.EOF
-        filename_pattern = re.compile(r'_V(\d{8})T\d{6}_(\d{8})T\d{6}\.EOF$')
-        for orbit in orbits:
-            match = filename_pattern.search(orbit)
-            if match:
-                validity_start = datetime.strptime(match.group(1), '%Y%m%d').date()
-                validity_stop = datetime.strptime(match.group(2), '%Y%m%d').date()
-                orbits_dict[(validity_start, validity_stop)] = orbit
-        #print('orbits_dict', orbits_dict)
-        
+        # mission, product, production and validity of the orbit files from their names; an empty file raises
+        orbits = utils_eof.parse_files(glob(self.pattern_orbit, root_dir=self.datadir), root_dir=self.datadir)
+
         # scan directories with patterns
         prefixes = glob(self.pattern_prefix, root_dir=self.datadir)
         records = []
@@ -79,6 +72,11 @@ class S1_slc(Satellite):
             #print('metas', metas)
             for meta in metas:
                 #print('meta', meta)
+                # the files of the burst that the processing reads; an empty one raises
+                exists(os.path.join(meta_dir, meta))
+                measurement_path(os.path.join(self.datadir, prefix, 'measurement'), os.path.splitext(meta)[0])
+                for sub in ('calibration', 'noise'):
+                    exists(os.path.join(self.datadir, prefix, sub, meta))
                 ann = self.parse_annotation(os.path.join(meta_dir, meta))
                 start_time = datetime.strptime(ann['startTime'], '%Y-%m-%dT%H:%M:%S.%f')
                 # validate startTime matches burst name date (detect corrupted XML from parallel download race condition)
@@ -90,12 +88,9 @@ class S1_slc(Satellite):
                                    f'startTime {start_time.date()} does not match expected date {expected_date}. '
                                    f'This is likely caused by a race condition during parallel download. '
                                    f'Delete the corrupted files and re-download with n_jobs=1 or re-run the download.')
-                # match orbit file
-                date = start_time.date()
-                orbit= (orbits_dict.get((date-oneday, date+oneday)) or
-                                     orbits_dict.get((date-oneday, date)) or
-                                     orbits_dict.get((date, date+oneday)) or
-                                     orbits_dict.get((date, date)))
+                # the orbit file of the burst's own mission that covers the burst time, a precise orbit first,
+                # then the newest production, as EOF.download selects it; None when no file covers the burst
+                orbit = utils_eof.select(orbits, ann['missionId'], start_time)
                 # Build record from parsed annotation
                 record = {
                     'fullBurstID': prefix,
@@ -103,9 +98,13 @@ class S1_slc(Satellite):
                     'startTime': start_time,
                     'polarization': ann['polarisation'],
                     'flightDirection': ann['flightDirection'],
-                    'pathNumber': ((int(ann['absoluteOrbitNumber']) - 73) % 175) + 1,
+                    # the path of the burst ID, the same for the burst on every date and satellite
+                    'pathNumber': path_number(burst_name.split('_')[1]),
                     'subswath': ann['swath'],
                     'mission': ann['missionId'],
+                    # the radar band, C on every Sentinel-1 satellite (the NISAR records say L); the transform
+                    # stores it with the other record attributes
+                    'band': 'C',
                     'beamModeType': ann['mode'],
                     'orbit': orbit,
                     'geometry': ann['geometry']

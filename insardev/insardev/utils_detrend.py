@@ -1485,14 +1485,31 @@ def trend2d_accumulate(data_blk, transform_blk, stats, cells, dims=None,
 # A DIFFERENT ESTIMATOR FROM trend2d_* above: those solve one gradient per
 # variable on the phasors, this fits a least-squares polynomial surface per
 # pair. BatchCore.trend2d() drives these; BatchComplex.trend2d() drives the
-# gradient solve. Restored from 14180b7 (2026-08-29) unchanged.
+# gradient solve. Restored from 14180b7 (2026-08-29); since then the
+# variables are centred and scaled BEFORE the terms are built (N40).
 # ---------------------------------------------------------------------------
 
-def _build_poly_features(var_flat_list, n_pixels, degree):
+def _n_poly_features(n_vars, degree):
+    """Number of polynomial terms of total degree 1..degree in n_vars variables
+    (no bias): the column count _build_poly_features() returns."""
+    from math import comb
+    return comb(n_vars + degree, degree) - 1
+
+def _build_poly_features(var_flat_list, n_pixels, degree, feature_mean, feature_std):
     """Build polynomial feature matrix from flattened variable arrays.
 
     Features are ordered: degree 1 first, then degree 2, etc.
     Same order as sklearn PolynomialFeatures(include_bias=False).
+
+    EVERY VARIABLE IS CENTRED AND SCALED FIRST, (v - mean) / std, and only then
+    multiplied into terms. A polynomial of total degree `degree` spans the same
+    functions in v and in (v - mean) / std, so the fitted surface is the same;
+    but raw map coordinates (northing ~4.4e6 m) make y, y^2, y^3 nearly
+    collinear: at degree 3 the Tuerkiye bursts accumulated cond(A^T W A)
+    3.6e13-1.5e15 and the solve left the least-squares fit by up to 15.5 rad
+    (N40); centred, 1.0e3-2.0e3 and the fit is the least-squares one
+    (tests/test_n40_trend2d_centre). At degree 1 the columns are the same
+    numbers as before.
 
     Parameters
     ----------
@@ -1502,6 +1519,8 @@ def _build_poly_features(var_flat_list, n_pixels, degree):
         Number of pixels.
     degree : int
         Polynomial degree.
+    feature_mean, feature_std : ndarray (n_vars,)
+        Per-variable centre and scale from _compute_feature_stats().
 
     Returns
     -------
@@ -1511,23 +1530,29 @@ def _build_poly_features(var_flat_list, n_pixels, degree):
     from itertools import combinations_with_replacement
 
     n_vars = len(var_flat_list)
+    if degree < 1 or n_vars == 0:
+        return np.empty((n_pixels, 0), dtype=np.float64)
+    var_std_list = [(var_flat_list[i] - feature_mean[i]) / feature_std[i]
+                    for i in range(n_vars)]
+    # a term starts from its first factor, not from ones: the same numbers
+    # (1 * u is u exactly) without a ones array and a copy per term
     features = []
     for d in range(1, degree + 1):
         for combo in combinations_with_replacement(range(n_vars), d):
-            term = np.ones(n_pixels, dtype=np.float64)
-            for idx in combo:
-                term = term * var_flat_list[idx]
+            term = var_std_list[combo[0]]
+            for idx in combo[1:]:
+                term = term * var_std_list[idx]
             features.append(term)
-
-    if len(features) == 0:
-        return np.empty((n_pixels, 0), dtype=np.float64)
     return np.column_stack(features)
 
 def _compute_feature_stats(var_dask_list, degree):
-    """Phase 0: Compute global feature_mean and feature_std for standardization.
+    """Phase 0: Compute the global per-VARIABLE mean and std that
+    _build_poly_features() centres and scales every variable by before it
+    builds the polynomial terms.
 
     Computes statistics from transform (pair-independent) using dask tree
-    reductions.  Single .compute() call for efficiency.
+    reductions, over the pixels where every variable is finite.  Single
+    .compute() call for efficiency; nothing is computed at degree 0.
 
     Parameters
     ----------
@@ -1538,14 +1563,16 @@ def _compute_feature_stats(var_dask_list, degree):
 
     Returns
     -------
-    feature_mean : ndarray (n_poly_features,)
-    feature_std : ndarray (n_poly_features,)
+    feature_mean : ndarray (n_vars,)
+    feature_std : ndarray (n_vars,)
+        Empty at degree 0 (no terms to build).
     """
     import dask
     import dask.array as da
-    from itertools import combinations_with_replacement
 
     n_vars = len(var_dask_list)
+    if degree < 1 or n_vars == 0:
+        return np.empty(0, dtype=np.float64), np.ones(0, dtype=np.float64)
 
     # Valid mask: all variables finite
     valid_mask = da.ones(var_dask_list[0].shape, dtype=bool,
@@ -1553,27 +1580,16 @@ def _compute_feature_stats(var_dask_list, degree):
     for v in var_dask_list:
         valid_mask = valid_mask & da.isfinite(v)
 
-    # Build polynomial features lazily and schedule reductions
     to_compute = []
-    n_features = 0
-    for d in range(1, degree + 1):
-        for combo in combinations_with_replacement(range(n_vars), d):
-            term = da.ones_like(var_dask_list[0], dtype=np.float64)
-            for idx in combo:
-                v64 = var_dask_list[idx].astype(np.float64)
-                term = term * da.where(da.isfinite(v64), v64, 0.0)
-            masked = da.where(valid_mask, term, np.nan)
-            to_compute.append(da.nanmean(masked))
-            to_compute.append(da.nanstd(masked))
-            n_features += 1
-
-    if n_features == 0:
-        return np.empty(0, dtype=np.float64), np.ones(0, dtype=np.float64)
+    for v in var_dask_list:
+        masked = da.where(valid_mask, v.astype(np.float64), np.nan)
+        to_compute.append(da.nanmean(masked))
+        to_compute.append(da.nanstd(masked))
 
     results = dask.compute(*to_compute)
-    feature_mean = np.array([float(results[2 * i]) for i in range(n_features)],
+    feature_mean = np.array([float(results[2 * i]) for i in range(n_vars)],
                             dtype=np.float64)
-    feature_std = np.array([float(results[2 * i + 1]) for i in range(n_features)],
+    feature_std = np.array([float(results[2 * i + 1]) for i in range(n_vars)],
                            dtype=np.float64) + 1e-10
 
     return feature_mean, feature_std
@@ -1594,8 +1610,9 @@ def _accumulate_chunk(phase_chunk, weight_chunk, var_chunks,
         Weight data, same shape as phase_chunk.
     var_chunks : tuple/list of ndarray (cy, cx)
         Transform variable arrays.
-    feature_mean : ndarray (n_poly_features,)
-    feature_std : ndarray (n_poly_features,)
+    feature_mean : ndarray (n_vars,)
+    feature_std : ndarray (n_vars,)
+        Per-variable centre and scale (_compute_feature_stats()).
     degree : int
     is_complex : bool
 
@@ -1616,7 +1633,7 @@ def _accumulate_chunk(phase_chunk, weight_chunk, var_chunks,
         fit_mask &= np.isfinite(v_flat)
         var_flat_list.append(np.nan_to_num(v_flat, nan=0.0))
 
-    n_poly = len(feature_mean)
+    n_poly = _n_poly_features(len(var_chunks), degree)
     n_feat = n_poly + 1  # +1 for bias
     n_feat_b = 2 * n_feat if is_complex else n_feat
     n_accum = n_feat * n_feat + n_feat_b + 1
@@ -1661,9 +1678,10 @@ def _accumulate_chunk(phase_chunk, weight_chunk, var_chunks,
 
             # Build A_std for this batch (bounded memory)
             var_batch_list = [v[s:e] for v in var_flat_list]
-            X_poly_b = _build_poly_features(var_batch_list, batch_len, degree)
+            X_poly_b = _build_poly_features(var_batch_list, batch_len, degree,
+                                            feature_mean, feature_std)
             A_std_b = np.concatenate([
-                (X_poly_b - feature_mean) / feature_std,
+                X_poly_b,
                 np.ones((batch_len, 1), dtype=np.float64)
             ], axis=1)
 
@@ -1773,7 +1791,8 @@ def _apply_chunk(phase_chunk, coeffs_packed, var_chunks,
         Packed coefficients (float64).
     var_chunks : tuple/list of ndarray (cy, cx)
         Transform variable arrays.
-    feature_mean, feature_std : ndarray (n_poly_features,)
+    feature_mean, feature_std : ndarray (n_vars,)
+        Per-variable centre and scale (_compute_feature_stats()).
     degree : int
     is_complex : bool
     detrend_mode : bool
@@ -1789,7 +1808,7 @@ def _apply_chunk(phase_chunk, coeffs_packed, var_chunks,
     cy, cx = phase_chunk.shape[1], phase_chunk.shape[2]
     n_pixels = cy * cx
 
-    n_poly = len(feature_mean)
+    n_poly = _n_poly_features(len(var_chunks), degree)
     n_feat = n_poly + 1
 
     # Flatten variables
@@ -1828,9 +1847,9 @@ def _apply_chunk(phase_chunk, coeffs_packed, var_chunks,
 
             var_batch_list = [v[s:e] for v in var_flat_list]
             X_poly_b = _build_poly_features(var_batch_list, batch_len,
-                                            degree)
+                                            degree, feature_mean, feature_std)
             A_std_b = np.concatenate([
-                (X_poly_b - feature_mean) / feature_std,
+                X_poly_b,
                 np.ones((batch_len, 1), dtype=np.float64)
             ], axis=1)
 

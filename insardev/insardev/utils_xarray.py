@@ -188,7 +188,6 @@ def apply(*args, **kwarg):
     >>> sbas.apply(intfs['106_226497_IW1'], corrs['106_226497_IW1'], func=lambda a, b, **kwargs: (a,b))
     >>> sbas.apply(intfs['106_226497_IW1'], corrs['106_226497_IW1'], func=lambda a, b, **kwargs: a)
     """
-    from insardev_toolkit import progressbar
     import dask
 
     func = kwarg.pop('func', None)
@@ -206,7 +205,8 @@ def apply(*args, **kwarg):
     else:
         dss = {key: func(*(d[key] if d is not None else None for d in datas), **kwarg) for key in keys}
     if compute:
-        progressbar(dss := dask.persist(dss)[0], desc=f'Computing...'.ljust(25))
+        from .utils_dask import progress_persisted
+        progress_persisted(dss := dask.persist(dss)[0], desc=f'Computing...'.ljust(25))
     # detect output type
     sample = next(iter(dss.values()))
     # multiple datasets or dictionaries

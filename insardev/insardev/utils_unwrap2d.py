@@ -803,27 +803,6 @@ def connect_components_ilp_fast(unwrapped, labeled_array, components, connection
     return result
 
 
-def conncomp_2d(phase):
-    """
-    Compute connected components for a 2D phase array.
-
-    Parameters
-    ----------
-    phase : np.ndarray
-        2D array of phase values (NaN indicates invalid pixels).
-
-    Returns
-    -------
-    np.ndarray
-        2D array of connected component labels (0 for invalid pixels).
-    """
-    from scipy.ndimage import label
-
-    valid_mask = ~np.isnan(phase)
-    labeled_array, num_features = label(valid_mask)
-    return labeled_array.astype(np.int32)
-
-
 def wrap(phase):
     """Wrap phase to [-π, π]."""
     return np.arctan2(np.sin(phase), np.cos(phase))
@@ -843,7 +822,7 @@ def wrapped_gradient(phase):
 
 
 @serialize_gpu
-def irls_unwrap_2d(phase, weight=None, device='auto', max_iter=50, tol=1e-3,
+def irls_unwrap_2d(phase, weight=None, device='auto', max_iter=200, tol=1e-3,
                    cg_max_iter=20, cg_tol=1e-4, epsilon=1e-2, conncomp_size=30, debug=False):
     """
     Unwrap 2D phase using GPU/TPU-accelerated Iteratively Reweighted Least Squares (L¹ norm).
@@ -866,7 +845,7 @@ def irls_unwrap_2d(phase, weight=None, device='auto', max_iter=50, tol=1e-3,
         PyTorch device: 'auto' (default), 'cuda', 'mps', 'cpu', or 'tpu'.
         'auto' uses GPU if Dask client has resources={'gpu': 1}.
     max_iter : int, optional
-        Maximum IRLS iterations. Default is 50.
+        Maximum IRLS iterations. Default is 200.
     tol : float, optional
         Convergence tolerance for relative change in solution. Default is 1e-3.
     cg_max_iter : int, optional
@@ -915,14 +894,16 @@ def irls_unwrap_2d(phase, weight=None, device='auto', max_iter=50, tol=1e-3,
     -----------
     Achieves 10-20x speedup over SNAPHU on GPU/TPU.
 
-    Default parameters ensure robust convergence for InSAR processing:
-    - max_iter=50, cg_max_iter=20: Ensures full convergence, avoiding
-      phase discontinuities from early termination.
-    - tol=1e-3, cg_tol=1e-4: Tight tolerances for accurate results.
+    The defaults are the strong set (see irls_strong()):
+    - max_iter=200, cg_max_iter=20: iteration budgets.
+    - tol=1e-3, cg_tol=1e-4: tight tolerances.
     - epsilon=1e-2: Balances L¹ approximation quality with stability.
 
-    For faster processing on clean data (may have artifacts on noisy data):
-    >>> irls_unwrap_2d(phase, weight, max_iter=20, tol=1e-2)
+    The Stack and Batch unwrap2d() and unwrap2d_irls() methods default to the
+    relaxed, faster set max_iter=50, tol=1e-2, cg_max_iter=10, cg_tol=1e-3
+    (epsilon=1e-2) and print one WARNING per call when any parameter is looser
+    than the strong set (see irls_relaxed_warning()). The relaxed set here:
+    >>> irls_unwrap_2d(phase, weight, max_iter=50, tol=1e-2, cg_max_iter=10, cg_tol=1e-3)
     """
     import torch
     import time
@@ -1294,6 +1275,8 @@ def irls_unwrap_2d(phase, weight=None, device='auto', max_iter=50, tol=1e-3,
     u_best = u.clone()
     best_residual = float('inf')
 
+    # the debug TIMING line counts iteration + 1, also for max_iter=0 (no iteration)
+    iteration = -1
     for iteration in range(max_iter):
         u_prev.copy_(u)
 
@@ -1388,6 +1371,10 @@ def irls_unwrap_2d(phase, weight=None, device='auto', max_iter=50, tol=1e-3,
             if debug:
                 print(f'  IRLS converged at iteration {iteration}')
             break
+    else:
+        # no break: all max_iter iterations ran without meeting tol
+        if debug and max_iter > 0:
+            print(f'  IRLS not converged: {max_iter} iterations, last rel_change = {rel_change:.2e} >= tol = {tol:g}')
 
     # Use best solution found during iterations if current is invalid
     if not torch.isfinite(u).all():
@@ -1528,6 +1515,48 @@ def irls_unwrap_2d(phase, weight=None, device='auto', max_iter=50, tol=1e-3,
         print(f'  TOTAL:        {(_t_align_end - _t_start)*1000:.1f} ms')
 
     return unwrapped, conncomp
+
+
+# The IRLS parameters of the strong set and the direction that is looser:
+# -1 for fewer iterations, +1 for a larger tolerance or smoothing.
+_IRLS_LOOSER = {'max_iter': -1, 'tol': +1, 'cg_max_iter': -1, 'cg_tol': +1, 'epsilon': +1}
+
+
+def irls_strong():
+    """The strong IRLS set: the defaults of irls_unwrap_2d(), as a dict."""
+    import inspect
+    params = inspect.signature(irls_unwrap_2d).parameters
+    return {name: params[name].default for name in _IRLS_LOOSER}
+
+
+def _format_param(value):
+    """1e-3 for 0.001, 20 for 20."""
+    if isinstance(value, float) and 0 < abs(value) < 0.1:
+        mantissa, exponent = f'{value:.12e}'.split('e')
+        return f'{mantissa.rstrip("0").rstrip(".")}e{int(exponent)}'
+    return repr(value)
+
+
+def irls_relaxed_warning(max_iter, tol, cg_max_iter, cg_tol, epsilon):
+    """Print ONE warning when an IRLS parameter is looser than the strong set.
+
+    Looser is fewer iterations (max_iter, cg_max_iter) or a larger tolerance or
+    smoothing (tol, cg_tol, epsilon) than the defaults of irls_unwrap_2d().
+    The warning names only those parameters, with their strong values. Call it
+    once per unwrapping call in the calling process, never per burst or pair.
+
+    Returns
+    -------
+    list of str
+        The looser parameter names; empty for the strong set or a stricter one.
+    """
+    given = dict(max_iter=max_iter, tol=tol, cg_max_iter=cg_max_iter, cg_tol=cg_tol, epsilon=epsilon)
+    strong = irls_strong()
+    looser = [name for name, sign in _IRLS_LOOSER.items() if sign * (given[name] - strong[name]) > 0]
+    if looser:
+        text = ', '.join(f'{name}={_format_param(strong[name])}' for name in looser)
+        print(f'WARNING: relaxed unwrapping may not converge. Strong parameters: {text}.', flush=True)
+    return looser
 
 
 def detect_discontinuity_hough_focal(phase, grad_threshold=2.0, mask_width=3, debug=False):

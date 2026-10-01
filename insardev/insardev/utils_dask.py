@@ -24,6 +24,7 @@ Chunk size is controlled via Dask configuration:
 """
 
 import dask.config
+from dask._task_spec import Task as _Task
 
 
 def get_dask_chunk_size_mb() -> int:
@@ -877,3 +878,203 @@ def restore_chunks(data, original_chunks, debug: bool = False):
         if debug:
             print(f"restore_chunks: restoring to {original_chunks}")
         return data.rechunk(original_chunks)
+
+
+def _held_chunk(block):
+    """Identity task that reads one persisted chunk (see hold_persisted)."""
+    return block
+
+
+class _HeldTask(_Task):
+    """The task of one held chunk (hold_persisted). It is NEVER FUSED into the chain that
+    reads it: fused, it went into a different chain in each graph (one reader in an angle,
+    two in an align), so the same downstream key -- the key of data another compute still
+    holds -- became an alias of a different fused task in the next graph. The scheduler
+    keeps the known key's old dependencies (dask issue 9888), and the compute failed with
+    KeyError ('held-sub-sub-...'), an AssertionError on a TaskState, or hung. Unfused, a
+    chain built on computed data starts above this task in every graph, as it did on the
+    Futures before the hold."""
+    __slots__ = ()
+
+    @property
+    def block_fusion(self) -> bool:
+        return True
+
+
+class _UnfusedTask(_Task):
+    """A task that dask never fuses with its neighbours, so its key names the same task in every graph
+    (Stack._zarr_dask: the zarr readers of Stack.load(); see _HeldTask for the same failure)."""
+    __slots__ = ()
+
+    @property
+    def block_fusion(self) -> bool:
+        return True
+
+
+def _unfused_block(block):
+    """Identity task that reads one block of a shared array (see unfused)."""
+    return block
+
+
+def unfused(arr):
+    """
+    The same dask array, each block read by a task dask never fuses (_UnfusedTask).
+
+    FOR AN ARRAY TWO RESULTS SHARE: the Gaussian-filtered interferogram, which both the
+    phase and the correlation of interferogram() read. In a graph of the phase alone,
+    the filter was fused into the phase's chain and the phase's key became an alias of
+    that fused task; in a graph of both, the filter stayed apart and the same key was
+    one task over it. The scheduler, still holding the key from one computation (the
+    unwrapped phase), kept its old definition for the next (dask issue 9888, 'different
+    run_spec' on 'sub-...'). The same for the interferogram product under the filter:
+    one block spans every pair, and a graph of one pair fused it into that pair's chain.
+    Read through here, the consumers build on the same unfused keys in every graph, so
+    every graph defines them the same way.
+
+    Parameters
+    ----------
+    arr : dask.array.Array
+        Any dask array; anything else is returned as is.
+
+    Returns
+    -------
+    dask.array.Array
+        Same chunks, dtype and data.
+    """
+    import dask.array as da
+    from dask.base import tokenize
+    from dask.core import flatten
+    from dask._task_spec import TaskRef
+    from dask.highlevelgraph import HighLevelGraph
+    if not isinstance(arr, da.Array):
+        return arr
+    name = f'unfused-{tokenize(arr.name)}'
+    layer = {}
+    for key in flatten(arr.__dask_keys__()):
+        out = (name,) + tuple(key[1:])
+        layer[out] = _UnfusedTask(out, _unfused_block, TaskRef(key))
+    graph = HighLevelGraph.from_collections(name, layer, dependencies=[arr])
+    return da.Array(graph, name, chunks=arr.chunks, dtype=arr.dtype, meta=arr._meta)
+
+
+def hold_persisted(arr):
+    """
+    Keep the cluster data of a persisted dask array alive in every graph built from it.
+
+    After a distributed persist the array graph is {key: Future}. Dask drops these
+    entries when it converts a graph to tasks (dask.delayed of the array, to_delayed(),
+    optimize), so a product built that way names the chunks by key only and holds no
+    Future. Once the persisted array is freed, the scheduler releases the chunks and
+    refuses the product ("lost dependencies"). Here each chunk is read by a one-line task
+    that takes its Future as an argument; the argument survives any conversion, so the
+    chunk stays on the cluster while any product still needs it. The {key: Future} layer
+    is kept below it for futures_of() and for checks that look for Futures in the graph.
+    The reading task is never fused (_HeldTask), so every graph gives the keys built on it
+    the same task.
+
+    Parameters
+    ----------
+    arr : dask.array.Array
+        Result of a persist.
+
+    Returns
+    -------
+    dask.array.Array
+        Same chunks and data. An array without Futures (local scheduler) is returned as is.
+    """
+    import dask.array as da
+    from dask.base import tokenize
+    from dask.core import flatten
+    from dask.highlevelgraph import HighLevelGraph
+    from distributed import Future
+
+    graph = arr.__dask_graph__()
+    futures = {k: graph[k] for k in flatten(arr.__dask_keys__())}
+    if not all(isinstance(f, Future) for f in futures.values()):
+        return arr
+    name = 'held-' + tokenize(arr.name)
+    layer = {}
+    for k, f in futures.items():
+        k2 = (name,) + tuple(k[1:])
+        layer[k2] = _HeldTask(k2, _held_chunk, f)
+    hlg = HighLevelGraph({arr.name: futures, name: layer}, {arr.name: set(), name: {arr.name}})
+    return da.Array(hlg, name, chunks=arr.chunks, dtype=arr.dtype, meta=arr._meta)
+
+
+def _scheduler_knows(keys, dask_scheduler=None):
+    return all(k in dask_scheduler.tasks for k in keys)
+
+
+def _drop_refused(client, futures):
+    """
+    Detach the futures of a graph the scheduler refused from the client, before raising.
+
+    The raised error holds these futures through its traceback (and a cancelled future's
+    own CancelledError, which the client keeps, holds them through the traceback raising it
+    gave it). A future state left in client.futures is shared by the next persist of the
+    same keys -- the recompute from the source the error asks for -- which then starts as
+    'cancelled' and was refused falsely before the scheduler had even seen the new graph.
+    The scheduler has already released the refused keys, so nothing is sent to it; the
+    futures are released, so a kept traceback holds no cluster data either.
+    """
+    for f in futures:
+        client.futures.pop(f.key, None)
+        f.release()
+
+
+def _refusal_reason(future):
+    """The text of a cancelled future's CancelledError, raised and dropped here so that
+    it keeps no traceback (and so no frame or future) alive."""
+    reason = 'cancelled'
+    try:
+        future.result()
+    except Exception as e:
+        reason = str(e)
+        e.__traceback__ = None
+    return reason
+
+
+def progress_persisted(persisted, desc):
+    """
+    Progress bar for a distributed persist; raise when the scheduler refuses the graph.
+
+    The progress bar waits until the scheduler has the keys it tracks. A graph that needs
+    data the cluster no longer holds is refused ("lost dependencies"), its keys never
+    appear, and the bar waited forever. So first wait until the scheduler has all the
+    keys or the futures report the refusal. The refused futures are detached from the
+    client before the error is raised (_drop_refused), so the recompute from the source
+    works on the first attempt.
+
+    Parameters
+    ----------
+    persisted : object
+        Result of dask.persist() (collections or containers of them).
+    desc : str
+        Progress bar label.
+
+    Raises
+    ------
+    RuntimeError
+        The graph needs data the cluster no longer holds.
+    """
+    import time
+    from distributed.client import futures_of
+    from insardev_toolkit.progressbar import progressbar
+
+    futures = futures_of(persisted)
+    if futures:
+        client = futures[0].client
+        keys = [f.key for f in futures]
+        delay = 0.05
+        while not client.run_on_scheduler(_scheduler_knows, keys):
+            refused = next((f for f in futures if f.status in ('error', 'cancelled')), None)
+            if refused is not None:
+                _drop_refused(client, futures)
+                if refused.status == 'error':
+                    refused.result()
+                reason = _refusal_reason(refused)
+                raise RuntimeError(f'Input data is no longer on the cluster ({reason}). '
+                                   'Recompute it from its source.')
+            time.sleep(delay)
+            delay = min(2 * delay, 1.0)
+    progressbar(persisted, desc=desc)

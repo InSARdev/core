@@ -278,6 +278,10 @@ def gaussian_numpy(data_np, weight_np=None, sigma=None, truncate=4.0, threshold=
     if data_np.ndim == 3 and data_np.shape[0] == 1:
         data_np = data_np[0]
         squeeze = True
+    # its (1, y, x) weight block too: left 3-D, it failed against the 2-D data
+    # (a per-pair weight on per-pair data, N81)
+    if weight_np is not None and weight_np.ndim == 3 and weight_np.shape[0] == 1:
+        weight_np = weight_np[0]
 
     # Ensure correct dtypes (nanconvolve2d requires float32/complex64)
     is_complex = np.issubdtype(data_np.dtype, np.complexfloating)

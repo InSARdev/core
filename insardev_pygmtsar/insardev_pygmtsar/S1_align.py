@@ -9,8 +9,6 @@
 # ----------------------------------------------------------------------------
 from .S1_gmtsar import S1_gmtsar
 from .PRM import PRM
-from .utils_satellite import _xcorr_refine_slc
-from insardev_toolkit.utils_S1 import measurement_path
 import numpy as np
 
 
@@ -18,40 +16,6 @@ class S1_align(S1_gmtsar):
     import numpy as np
     import xarray as xr
     import pandas as pd
-
-    @staticmethod
-    def _get_k_start(xml_path: str) -> int:
-        """
-        Get k_start (first valid line in TIFF) from burst XML annotation.
-
-        k_start is the offset between TIFF row 0 and PRM azimuth 0.
-        This is needed to convert geometry offsets (computed in PRM space)
-        to TIFF offsets (for xcorr which reads from TIFF).
-
-        Parameters
-        ----------
-        xml_path : str
-            Path to burst XML annotation file.
-
-        Returns
-        -------
-        int
-            First valid line index in the TIFF (k_start).
-        """
-        import xml.etree.ElementTree as ET
-
-        tree = ET.parse(xml_path)
-        root = tree.getroot()
-
-        first_valid = root.find('.//burstList/burst/firstValidSample')
-        if first_valid is None:
-            return 0
-
-        samples = [int(x) for x in first_valid.text.split()]
-        for i, s in enumerate(samples):
-            if s >= 0:
-                return i
-        return 0
 
     @staticmethod
     def _offset2shift(offset_dat: np.ndarray, rmax: int, amax: int) -> tuple:
@@ -140,8 +104,8 @@ class S1_align(S1_gmtsar):
 
     def align_rep(self, burst_rep: str, burst_ref: str, prm_ref: "PRM",
                   degrees: float = 12.0/3600, debug: bool = False,
-                  xcorr: tuple = None, xcorr_min_response: float = 0.2,
-                  topo_llt: "np.ndarray | None" = None) -> tuple:
+                  topo_llt: "np.ndarray | None" = None,
+                  n_jobs: int | None = None) -> tuple:
         """
         Process and align secondary burst to reference.
 
@@ -164,12 +128,8 @@ class S1_align(S1_gmtsar):
             Degrees per pixel resolution for the coarse DEM. Default is 12.0/3600.
         debug : bool, optional
             Enable debug mode. Default is False.
-        xcorr : tuple or None, optional
-            Xcorr patch size as (height, width). Default (256, 256) for S1.
-            Set to None to disable xcorr refinement. Grid is auto-computed
-            to cover the image with ~2x patch spacing.
-        xcorr_min_response : float, optional
-            Minimum correlation response. Default 0.2 matches GMTSAR's SNR=20.
+        n_jobs : int or None, optional
+            Number of parallel workers of the geometry offsets (SAT_llt2rat). None or -1 (default): all cores.
 
         Returns
         -------
@@ -215,10 +175,10 @@ class S1_align(S1_gmtsar):
         prm_ref_shifted.calc_dop_orb(earth_radius, inplace=True, debug=debug)
 
         # Compute offset from reference to secondary
-        tmpm_dat = prm_ref_shifted.SAT_llt2rat(coords=topo_llt, precise=1, debug=debug)
+        tmpm_dat = prm_ref_shifted.SAT_llt2rat(coords=topo_llt, precise=1, n_jobs=n_jobs, debug=debug)
 
         prm_rep.calc_dop_orb(earth_radius, inplace=True, debug=debug)
-        tmp1_dat = prm_rep.SAT_llt2rat(coords=topo_llt, precise=1, debug=debug)
+        tmp1_dat = prm_rep.SAT_llt2rat(coords=topo_llt, precise=1, n_jobs=n_jobs, debug=debug)
 
         # Compute r, dr, a, da, SNR table for fitoffset (vectorized)
         offset_dat0 = np.hstack([tmpm_dat, tmp1_dat])
@@ -234,11 +194,9 @@ class S1_align(S1_gmtsar):
         rmax = prm_rep.get('num_rng_bins')
         amax = prm_rep.get('num_lines')
 
-        # Filter to points inside valid radar extent
-        valid_mask = (
-            (offset_dat[:, 0] > 0) & (offset_dat[:, 0] < rmax) &
-            (offset_dat[:, 2] > 0) & (offset_dat[:, 2] < amax)
-        )
+        # Filter to points inside valid radar extent, with a finite offset
+        from .utils_satellite import offset_valid_mask
+        valid_mask = offset_valid_mask(offset_dat, rmax, amax)
         offset_dat_valid = offset_dat[valid_mask]
 
         # Prepare offset parameters for fitoffset
@@ -247,92 +205,6 @@ class S1_align(S1_gmtsar):
 
         # Apply fitoffset parameters (bilinear offset model stored in PRM)
         prm_rep.set(PRM.fitoffset(3, 3, par_tmp))
-
-        # Xcorr refinement: measure actual offsets and correct geometry alignment
-        if xcorr is not None:
-            import os
-            import math
-
-            # Extract patch size from tuple
-            xcorr_patch_size = xcorr[0] if isinstance(xcorr, tuple) else int(xcorr)
-
-            if debug:
-                print(f"Running xcorr refinement (patch_size={xcorr_patch_size})...")
-
-            # Get burst measurement paths, .nc or legacy .tiff (read patches directly, don't load full images)
-            prefix_ref = self.fullBurstId(burst_ref)
-            prefix_rep = self.fullBurstId(burst_rep)
-            ref_tiff = measurement_path(os.path.join(self.datadir, prefix_ref, 'measurement'), burst_ref)
-            rep_tiff = measurement_path(os.path.join(self.datadir, prefix_rep, 'measurement'), burst_rep)
-
-            # Check files exist
-            if not os.path.exists(ref_tiff) or not os.path.exists(rep_tiff):
-                if debug:
-                    print(f"  WARNING: Xcorr skipped - files not found:")
-                    print(f"    ref: {ref_tiff} (exists: {os.path.exists(ref_tiff)})")
-                    print(f"    rep: {rep_tiff} (exists: {os.path.exists(rep_tiff)})")
-            else:
-                # Compute median integer shifts from raw geometry offsets
-                # par_tmp columns: [r, dr, a, da, SNR]
-                median_da = np.median(par_tmp[:, 3])
-                median_dr = np.median(par_tmp[:, 1])
-
-                # Convert azimuth offset from PRM to TIFF space
-                ref_xml = os.path.join(self.datadir, prefix_ref, 'annotation', f'{burst_ref}.xml')
-                rep_xml = os.path.join(self.datadir, prefix_rep, 'annotation', f'{burst_rep}.xml')
-                k_start_ref = self._get_k_start(ref_xml)
-                k_start_rep = self._get_k_start(rep_xml)
-                k_start_correction = k_start_rep - k_start_ref
-
-                int_ashift_tiff = int(np.round(median_da + k_start_correction))
-                int_rshift = int(np.round(median_dr))
-
-                if debug:
-                    print(f"  Median geometry: da={median_da:.2f}, dr={median_dr:.2f}, "
-                          f"k_start_corr={k_start_correction}")
-                    print(f"  Integer shifts (TIFF): ashift={int_ashift_tiff}, rshift={int_rshift}")
-
-                # xcorr measures total offsets (int_shift + sub-pixel) at each patch
-                # then fits bilinear model to get final parameters (in TIFF space)
-                try:
-                    xcorr_params = _xcorr_refine_slc(
-                        ref_tiff, rep_tiff,
-                        int_ashift=int_ashift_tiff, int_rshift=int_rshift,
-                        patch_size=xcorr_patch_size,
-                        min_response=xcorr_min_response, debug=debug
-                    )
-                except RuntimeError as e:
-                    if debug:
-                        print(f"  WARNING: {e}")
-                    xcorr_params = None
-
-                if xcorr_params is None:
-                    # Xcorr failed - keep geometry alignment from fitoffset(3,3) above
-                    print(f"WARNING: Xcorr FAILED for {burst_rep} - using geometry")
-                else:
-                    # Range-only xcorr: orbit geometry for azimuth, xcorr for range.
-                    # TOPS reramp phase has range-dependent Doppler centroid; per-burst
-                    # ashift noise × fnct(range) creates inter-burst range ramps.
-                    # Orbit-based azimuth is smooth across burst boundaries.
-                    geom_ashift = prm_rep.get('ashift') + prm_rep.get('sub_int_a')
-                    rshift_new = xcorr_params['rshift']
-
-                    prm_rep.set(
-                        # Azimuth: orbit geometry (smooth across burst boundaries)
-                        ashift=int(geom_ashift) if geom_ashift >= 0 else int(geom_ashift) - 1,
-                        sub_int_a=math.fmod(geom_ashift, 1) if geom_ashift >= 0 else math.fmod(geom_ashift, 1) + 1,
-                        stretch_a=prm_rep.get('stretch_a'),
-                        a_stretch_a=prm_rep.get('a_stretch_a'),
-                        # Range: xcorr total offsets (improves coherence, no inter-burst ramp)
-                        rshift=int(rshift_new) if rshift_new >= 0 else int(rshift_new) - 1,
-                        sub_int_r=math.fmod(rshift_new, 1) if rshift_new >= 0 else math.fmod(rshift_new, 1) + 1,
-                        stretch_r=xcorr_params['stretch_r'],
-                        a_stretch_r=xcorr_params['a_stretch_r'],
-                    )
-
-                    if debug:
-                        print(f"  Range-only xcorr:")
-                        print(f"    ashift={geom_ashift:.4f} (geometry), rshift={rshift_new:.4f} (xcorr)")
 
         # Recompute Doppler with earth_radius
         prm_rep.calc_dop_orb(earth_radius, inplace=True, debug=debug)

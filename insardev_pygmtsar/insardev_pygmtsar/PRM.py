@@ -487,7 +487,9 @@ class PRM(datagrid, PRM_gmtsar):
             - azimuthFmRatePolynomial: FM rate coefficients [c0, c1, c2] at burst center time
             - azimuthFmRateT0: Reference slant range time for FM rate polynomial
             - azimuthFmRateAzimuthTime: Azimuth time for FM rate record
-            - dcPolynomial: Doppler centroid coefficients [c0, c1, c2] at burst center time
+            - dcPolynomial: Doppler centroid coefficients [c0, c1, c2] at burst center time, the ones the IPF
+              used (utils_s1.dc_polynomial()): geometryDcPolynomial for a record flagged
+              dataDcRmsErrorAboveThreshold, dataDcPolynomial otherwise
             - dcT0: Reference slant range time for DC polynomial
             - dcAzimuthTime: Azimuth time for DC estimate record
 
@@ -508,6 +510,7 @@ class PRM(datagrid, PRM_gmtsar):
         from datetime import datetime
         import os
         import xmltodict
+        from .utils_s1 import _aztime_seconds, dc_polynomial
 
         # Derive XML path from input_file (replace the .nc or .tiff extension with .xml)
         input_file = self.get('input_file')
@@ -551,7 +554,8 @@ class PRM(datagrid, PRM_gmtsar):
         for i, fm_rate in enumerate(fm_rate_list):
             fm_time_str = fm_rate['azimuthTime']
             fm_time = datetime.strptime(fm_time_str, '%Y-%m-%dT%H:%M:%S.%f')
-            fm_t = fm_time.hour * 3600 + fm_time.minute * 60 + fm_time.second + fm_time.microsecond / 1e6
+            # seconds from 00:00 UTC of the burst day, the clock of t_brst
+            fm_t = _aztime_seconds(fm_time, burst_azimuth_time.date())
             diff = abs(fm_t - t_brst)
             if diff < best_fm_diff:
                 best_fm_diff = diff
@@ -579,19 +583,18 @@ class PRM(datagrid, PRM_gmtsar):
         for i, dc_est in enumerate(dc_list):
             dc_time_str = dc_est['azimuthTime']
             dc_time = datetime.strptime(dc_time_str, '%Y-%m-%dT%H:%M:%S.%f')
-            dc_t = dc_time.hour * 3600 + dc_time.minute * 60 + dc_time.second + dc_time.microsecond / 1e6
+            # seconds from 00:00 UTC of the burst day, the clock of t_brst
+            dc_t = _aztime_seconds(dc_time, burst_azimuth_time.date())
             diff = abs(dc_t - t_brst)
             if diff < best_dc_diff:
                 best_dc_diff = diff
                 best_dc_idx = i
 
         dc_record = dc_list[best_dc_idx]
-        dc_t0 = float(dc_record['t0'])
         dc_azimuth_time = dc_record['azimuthTime']
 
-        # Parse DC polynomial
-        dc_poly_str = dc_record['dataDcPolynomial']['#text'] if isinstance(dc_record['dataDcPolynomial'], dict) else dc_record['dataDcPolynomial']
-        dc_poly = [float(x) for x in dc_poly_str.split()]
+        # the DC polynomial the IPF used
+        dc_poly, dc_t0 = dc_polynomial(dc_record, xml_file)
 
         return {
             'azimuthSteeringRate': azimuth_steering_rate,
@@ -736,9 +739,10 @@ class PRM(datagrid, PRM_gmtsar):
         Parameters
         ----------
         rank_rng : int
-            Number of parameters to fit in the range direction.
+            Number of parameters to fit in the range direction: 1 (a constant shift), 2 (plus the stretch in
+            range) or 3 (plus the stretch in azimuth, bilinear). The terms a lower rank does not fit are 0.
         rank_azi : int
-            Number of parameters to fit in the azimuth direction.
+            Number of parameters to fit in the azimuth direction, as rank_rng.
         matrix : numpy.ndarray, optional
             Array of range and azimuth offset estimates. Default is None.
         matrix_fromfile : str, optional
@@ -799,24 +803,35 @@ class PRM(datagrid, PRM_gmtsar):
         #print ('rng_coef', rng_coef)
         #print ('azi_coef', azi_coef)
 
-        # now convert to range coefficients
-        rshift = rng_coef[0] - rng_coef[1]*(scale_coef[1]+scale_coef[0])/(scale_coef[1]-scale_coef[0]) \
-            - rng_coef[2]*(scale_coef[3]+scale_coef[2])/(scale_coef[3]-scale_coef[2])
-        # now convert to azimuth coefficients
-        ashift = azi_coef[0] - azi_coef[1]*(scale_coef[1]+scale_coef[0])/(scale_coef[1]-scale_coef[0]) \
-            - azi_coef[2]*(scale_coef[3]+scale_coef[2])/(scale_coef[3]-scale_coef[2])
+        # now convert to shift and stretch coefficients; a term the rank does not fit is 0 (skipped, so a
+        # constant range or azimuth of the points cannot turn it into 0 * inf)
+        def shift_of(coef):
+            shift = coef[0]
+            if len(coef) > 1:
+                shift -= coef[1]*(scale_coef[1]+scale_coef[0])/(scale_coef[1]-scale_coef[0])
+            if len(coef) > 2:
+                shift -= coef[2]*(scale_coef[3]+scale_coef[2])/(scale_coef[3]-scale_coef[2])
+            return shift
+        def stretch_of(coef):
+            return coef[1]*2/(scale_coef[1]-scale_coef[0]) if len(coef) > 1 else 0.0
+        def a_stretch_of(coef):
+            return coef[2]*2/(scale_coef[3]-scale_coef[2]) if len(coef) > 2 else 0.0
+        # range coefficients
+        rshift = shift_of(rng_coef)
+        # azimuth coefficients
+        ashift = shift_of(azi_coef)
         #print ('rshift', rshift, 'ashift', ashift)
 
         # note: Python x % y expression and nympy results are different to C, use math function
         # use 'g' format for float values as in original GMTSAR codes to easy compare results
         prm = PRM().set(rshift     =int(rshift) if rshift>=0 else int(rshift)-1,
                         sub_int_r  =math.fmod(rshift, 1)  if rshift>=0 else math.fmod(rshift, 1) + 1,
-                        stretch_r  =rng_coef[1]*2/(scale_coef[1]-scale_coef[0]),
-                        a_stretch_r=rng_coef[2]*2/(scale_coef[3]-scale_coef[2]),
+                        stretch_r  =stretch_of(rng_coef),
+                        a_stretch_r=a_stretch_of(rng_coef),
                         ashift     =int(ashift) if ashift>=0 else int(ashift)-1,
                         sub_int_a  =math.fmod(ashift, 1)  if ashift>=0 else math.fmod(ashift, 1) + 1,
-                        stretch_a  =azi_coef[1]*2/(scale_coef[1]-scale_coef[0]),
-                        a_stretch_a=azi_coef[2]*2/(scale_coef[3]-scale_coef[2]),
+                        stretch_a  =stretch_of(azi_coef),
+                        a_stretch_a=a_stretch_of(azi_coef),
                        )
 
         return prm

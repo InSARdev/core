@@ -25,7 +25,6 @@ import rioxarray
 import threading
 from contextlib import nullcontext
 from . import utils_stl
-from insardev_toolkit import progressbar
 from .utils_vtk import as_vtk as _as_vtk
 from .Batch import Batch, BatchWrap, BatchUnit, BatchComplex, Batches
 from . import utils_io
@@ -107,6 +106,14 @@ def _irls_process_with_weight_conncomp(phase_chunk, weight_chunk, params_tuple):
     # Stack: (1, y, x) + (1, y, x) -> (1, 2, y, x) for blockwise with 'pcyx' output
     stacked = np.stack([unwrapped[0].astype(np.float32), conncomp[0].astype(np.float32)], axis=0)
     return stacked[np.newaxis, ...]  # (1, 2, y, x)
+
+def _zarr_block(layout, *parts):
+    """One block of Stack._zarr_dask(): cut from the disk chunks it overlaps (parts, row by row), joined.
+    layout: (rows, columns, ((start, stop) in each row's chunk), ((start, stop) in each column's chunk), lead)."""
+    ny, nx, ys, xs, lead = layout
+    cut = [[parts[i * nx + j][ys[i][0]:ys[i][1], xs[j][0]:xs[j][1]] for j in range(nx)] for i in range(ny)]
+    block = cut[0][0] if ny == 1 and nx == 1 else np.block(cut)
+    return block[np.newaxis] if lead else block
 
 @_numba.njit(nogil=True, cache=True, inline='always')
 def _median_select(buf, k, n):
@@ -238,9 +245,189 @@ def _warmup_numba_cache():
 _warmup_numba_cache()
 
 
+def _on_data(name):
+    """Stack.`name` is BatchComplex.`name` run on the stack's DATA, BatchComplex(stack)
+    (N81): the transform grids are never an operand, and a result on the stack's own
+    grid gets them back untouched (Stack._restack). A Stack argument is its data too."""
+    def method(self, *args, **kwargs):
+        data = BatchComplex(self)
+
+        def arg(a):
+            return data if a is self else (BatchComplex(a) if isinstance(a, Stack) else a)
+        out = getattr(data, name)(*[arg(a) for a in args], **{k: arg(v) for k, v in kwargs.items()})
+        return self._restack(data, out)
+    method.__name__ = name
+    method.__qualname__ = f'Stack.{name}'
+    method.__doc__ = getattr(BatchComplex, name).__doc__
+    return method
+
+
+def _on_data_reflected(name):
+    """A reflected operator of the stack's data: 2 * stack is stack * 2. Python asks a
+    SUBCLASS's reflected operator first, so batch * stack would reach stack.__rmul__(batch):
+    a batch on the left answers for itself instead, as it did before."""
+    def method(self, other):
+        if isinstance(other, BatchCore):
+            return NotImplemented
+        data = BatchComplex(self)
+        return self._restack(data, getattr(data, name)(other))
+    method.__name__ = name
+    method.__qualname__ = f'Stack.{name}'
+    method.__doc__ = getattr(BatchComplex, name).__doc__
+    return method
+
+
 class Stack(BatchComplex):
+    """The per-burst SLC stack: the complex data (VV, ...), its 1-D radar metadata and
+    the TRANSFORM, the geometry grids (azi, ele, rng, look_E/N/U) and the per-date
+    geometry polynomials, which stack.transform() gives.
+
+    THE TRANSFORM IS NOT DATA (N81). Every data operation of a Stack -- the operators,
+    comparisons and numpy ufuncs, where(), mask(), the map helpers, the reductions,
+    gaussian(), multilook(), goldstein(), fit1d(), fit3d(), trend2d(), predict(), ...
+    -- runs on BatchComplex(stack), so the transform grids are never masked,
+    weighted, filtered, smoothed or reduced as data were. A result on the stack's own
+    grid that stays complex data comes back as a Stack with the transform untouched
+    (stack.where(mask).transform() is the stack's transform, unmasked); any other
+    result is what the operation gives: a mask is a plain Batch, angle() a BatchWrap,
+    downsample() a BatchComplex on its new grid. A mask or a weight matches the data
+    grids by name (a DataArray one applies to every data grid).
+
+    Selection and structure -- sel(), isel(), crop(), chunk*(), compute(), assign(),
+    load(), snapshot() -- take the transform along. The methods that need the
+    geometry read it from the stack: trend2d() and predict() from stack.transform(),
+    detrend() from the stack's own covariates, elevation() and displacement_*()
+    from stack.transform().
+    """
 
     _STRUCTURE_4CONN = utils_unwrap2d.STRUCTURE_4CONN
+
+    # THE DATA OPERATIONS RUN ON BatchComplex(self) (N81, see the class docstring)
+    __add__ = _on_data('__add__')
+    __sub__ = _on_data('__sub__')
+    __mul__ = _on_data('__mul__')
+    __truediv__ = _on_data('__truediv__')
+    __pow__ = _on_data('__pow__')
+    __neg__ = _on_data('__neg__')
+    __abs__ = _on_data('__abs__')
+    __invert__ = _on_data('__invert__')
+    __gt__ = _on_data('__gt__')
+    __lt__ = _on_data('__lt__')
+    __ge__ = _on_data('__ge__')
+    __le__ = _on_data('__le__')
+    __eq__ = _on_data('__eq__')
+    __ne__ = _on_data('__ne__')
+    __and__ = _on_data('__and__')
+    __or__ = _on_data('__or__')
+    __array_ufunc__ = _on_data('__array_ufunc__')
+    __radd__ = _on_data_reflected('__radd__')
+    __rsub__ = _on_data_reflected('__rsub__')
+    __rmul__ = _on_data_reflected('__rmul__')
+    __rtruediv__ = _on_data_reflected('__rtruediv__')
+    __rand__ = _on_data_reflected('__rand__')
+    __ror__ = _on_data_reflected('__ror__')
+    __rgt__ = _on_data_reflected('__rgt__')
+    __rlt__ = _on_data_reflected('__rlt__')
+    __hash__ = None
+    map_da = _on_data('map_da')
+    astype = _on_data('astype')
+    abs = _on_data('abs')
+    square = _on_data('square')
+    sqrt = _on_data('sqrt')
+    log10 = _on_data('log10')
+    multiply = _on_data('multiply')
+    divide = _on_data('divide')
+    clip = _on_data('clip')
+    isfinite = _on_data('isfinite')
+    fillna = _on_data('fillna')
+    power = _on_data('power')
+    real = _on_data('real')
+    imag = _on_data('imag')
+    conj = _on_data('conj')
+    angle = _on_data('angle')
+    where = _on_data('where')
+    mask = _on_data('mask')
+    combine_first = _on_data('combine_first')
+    mean = _on_data('mean')
+    sum = _on_data('sum')
+    min = _on_data('min')
+    max = _on_data('max')
+    std = _on_data('std')
+    var = _on_data('var')
+    gaussian = _on_data('gaussian')
+    singlelook = _on_data('singlelook')
+    multilook = _on_data('multilook')
+    goldstein = _on_data('goldstein')
+    threshold = _on_data('threshold')
+    dissolve = _on_data('dissolve')
+    polyval = _on_data('polyval')
+    residuals = _on_data('residuals')
+    rmse = _on_data('rmse')
+    coarsen = _on_data('coarsen')
+    downsample = _on_data('downsample')
+    interp = _on_data('interp')
+    interp_like = _on_data('interp_like')
+    unwrap3d = _on_data('unwrap3d')
+    fit1d = _on_data('fit1d')
+    fit3d = _on_data('fit3d')
+    mix = _on_data('mix')
+
+    def _restack(self, data, out):
+        """The result of a data operation (`out`, computed on `data` =
+        BatchComplex(self)) as the caller gets it (N81).
+
+        A BatchComplex on the stack's own grid -- the same bursts, y and x --
+        is a stack again: every variable BatchComplex(self) left out (the
+        transform grids, the per-date geometry polynomials) rides along
+        untouched, the same objects, where its dimensions still describe the
+        result (a polynomial over dates does not ride once the dates are
+        reduced). Anything else -- a mask, a real Batch, a BatchWrap, a model, a
+        new grid -- is returned as the operation gave it.
+        """
+        import numpy as np
+        import xarray as xr
+        if type(out) is not BatchComplex or not out:
+            return out
+        res = {}
+        for key, ods in dict.items(out):
+            ds = dict.get(self, key)
+            dds = dict.get(data, key)
+            if ds is None or dds is None or not isinstance(ods, xr.Dataset):
+                return out
+
+            def same(d):
+                # the dimension as the stack has it: the same labels, or the same size unlabelled
+                if d not in ods.dims or d not in ds.dims or (d in ds.indexes) != (d in ods.indexes):
+                    return False
+                if d in ds.indexes:
+                    return np.array_equal(np.asarray(ds.indexes[d]), np.asarray(ods.indexes[d]))
+                return ds.sizes[d] == ods.sizes[d]
+            if not (same('y') and same('x')):
+                return out
+            ride = {v: ds[v] for v in ds.data_vars
+                    if v not in dds.data_vars and v not in ods.variables
+                    and all(same(d) if d in dds.dims else d not in ods.dims for d in ds[v].dims)}
+            if ride:
+                ods = ods.assign(ride)
+                order = [v for v in ds.data_vars if v in ods.data_vars]
+                ods = ods[order + [v for v in ods.data_vars if v not in order]]
+            res[key] = ods
+        return type(self)(res)
+
+    def trend2d(self, *vars, transform=None, **kwargs):
+        # the data is BatchComplex(self); the covariates named are read from stack.transform()
+        data = BatchComplex(self)
+        return self._restack(data, data.trend2d(
+            *vars, transform=self.transform() if transform is None else transform, **kwargs))
+    trend2d.__doc__ = BatchComplex.trend2d.__doc__
+
+    def predict(self, model, baseline: 'str | None' = 'BPR', ref=None, vars=None) -> 'Batch':
+        # the data is BatchComplex(self); a trend2d() model's covariates come from stack.transform()
+        data = BatchComplex(self)
+        if vars is None and all('trend2d_vars' in model[k].attrs for k in model):
+            vars = self.transform()
+        return self._restack(data, data.predict(model, baseline=baseline, ref=ref, vars=vars))
+    predict.__doc__ = BatchComplex.predict.__doc__
 
     @staticmethod
     def _carry_meta(src_ds, out_vars):
@@ -260,162 +447,6 @@ class Stack(BatchComplex):
                    if v not in out_vars and src_ds[v].ndim <= 1},
                 **out_vars}
 
-    def _reorder_conncomp_by_size(self, conncomp_labels):
-        """
-        Reorder connected component labels by size (largest=1, smallest=max).
-
-        Parameters
-        ----------
-        conncomp_labels : BatchUnit
-            Batch of connected component labels.
-
-        Returns
-        -------
-        BatchUnit
-            Batch with reordered labels (1=largest, 2=second largest, etc.).
-        """
-        import xarray as xr
-        import dask.array
-        from .Batch import BatchUnit
-
-        def _reorder_2d(labels_2d):
-            """Reorder labels in a single 2D array."""
-            # Handle (1, y, x) arrays from blockwise
-            squeeze = False
-            if labels_2d.ndim == 3 and labels_2d.shape[0] == 1:
-                labels_2d = labels_2d[0]
-                squeeze = True
-
-            # Get unique labels (excluding 0 and NaN)
-            valid_mask = ~np.isnan(labels_2d) & (labels_2d > 0)
-            if not np.any(valid_mask):
-                result = labels_2d.astype(np.float32)
-                return result[np.newaxis, ...] if squeeze else result
-
-            unique_labels = np.unique(labels_2d[valid_mask])
-            if len(unique_labels) == 0:
-                result = labels_2d.astype(np.float32)
-                return result[np.newaxis, ...] if squeeze else result
-
-            # Count pixels per label
-            sizes = []
-            for label in unique_labels:
-                sizes.append(np.sum(labels_2d == label))
-
-            # Sort by size (descending) and create mapping
-            sorted_indices = np.argsort(sizes)[::-1]
-            label_mapping = {}
-            for new_label, idx in enumerate(sorted_indices, start=1):
-                old_label = unique_labels[idx]
-                label_mapping[old_label] = new_label
-
-            # Apply mapping
-            result = np.zeros_like(labels_2d)
-            result[~valid_mask] = np.nan
-            for old_label, new_label in label_mapping.items():
-                result[labels_2d == old_label] = new_label
-
-            result = result.astype(np.float32)
-            return result[np.newaxis, ...] if squeeze else result
-
-        # Process each dataset in the batch
-        result = {}
-        for key in conncomp_labels.keys():
-            ds = conncomp_labels[key]
-            data_vars = list(ds.data_vars)
-
-            reordered_vars = {}
-            for var in data_vars:
-                data_arr = ds[var]
-
-                # Use da.blockwise for efficient dask integration
-                dask_data = data_arr.data
-                dim_str = ''.join(chr(ord('a') + i) for i in range(dask_data.ndim))
-
-                # Provide meta to avoid calling _reorder_2d during graph construction
-                meta = np.empty((0,) * dask_data.ndim, dtype=np.float32)
-                result_dask = dask.array.blockwise(
-                    _reorder_2d, dim_str,
-                    dask_data, dim_str,
-                    dtype=np.float32,
-                    meta=meta,
-                )
-
-                reordered_da = xr.DataArray(
-                    result_dask,
-                    dims=data_arr.dims,
-                    coords=data_arr.coords
-                )
-                reordered_vars[var] = reordered_da
-
-            result[key] = xr.Dataset(Stack._carry_meta(ds, reordered_vars),
-                                     coords=ds.coords, attrs=ds.attrs)
-
-        return BatchUnit(result)
-
-    def _compute_conncomp_labels(self, phase):
-        """
-        Compute connected component labels from phase data.
-
-        Parameters
-        ----------
-        phase : BatchWrap
-            Batch of wrapped phase datasets.
-
-        Returns
-        -------
-        BatchUnit
-            Batch of connected component labels (int32).
-        """
-        import dask
-        import dask.array as da
-        import xarray as xr
-        from .Batch import BatchUnit
-
-        result = {}
-        for key in phase.keys():
-            phase_ds = phase[key]
-            data_vars = [v for v in phase_ds.data_vars
-                        if 'y' in phase_ds[v].dims and 'x' in phase_ds[v].dims]
-
-            label_vars = {}
-            for var in data_vars:
-                phase_da = phase_ds[var]
-
-                def compute_labels(phase_chunk):
-                    """Compute connected components for a chunk."""
-                    if phase_chunk.ndim == 3:
-                        # (pair, y, x) -> process each pair
-                        result = np.zeros_like(phase_chunk, dtype=np.int32)
-                        for i in range(phase_chunk.shape[0]):
-                            result[i] = utils_unwrap2d.conncomp_2d(phase_chunk[i])
-                        return result
-                    else:
-                        return utils_unwrap2d.conncomp_2d(phase_chunk).astype(np.int32)
-
-                dask_data = phase_da.data
-                dim_str = ''.join(chr(ord('a') + i) for i in range(dask_data.ndim))
-                meta = np.empty((0,) * dask_data.ndim, dtype=np.int32)
-
-                result_dask = da.blockwise(
-                    compute_labels, dim_str,
-                    dask_data, dim_str,
-                    dtype=np.int32,
-                    meta=meta,
-                )
-
-                label_da = xr.DataArray(
-                    result_dask,
-                    dims=phase_da.dims,
-                    coords=phase_da.coords
-                )
-                label_vars[var] = label_da
-
-            result[key] = xr.Dataset(Stack._carry_meta(phase_ds, label_vars),
-                                     coords=phase_ds.coords, attrs=phase_ds.attrs)
-
-        return BatchUnit(result)
-
     def _link_components(self, unwrapped, conncomp_labels=None, conncomp_size=100, conncomp_gap=None,
                          conncomp_linksize=5, conncomp_linkcount=30, debug=False):
         """
@@ -425,7 +456,7 @@ class Stack(BatchComplex):
         ----------
         unwrapped : Batch
             Batch of unwrapped phase datasets.
-        conncomp_labels : BatchUnit or None
+        conncomp_labels : Batch or None
             Optional pre-computed connected component labels from IRLS.
             Labels should be size-ordered (1=largest, 2=second, etc.).
         conncomp_size : int
@@ -536,12 +567,14 @@ class Stack(BatchComplex):
             ds = unwrapped[key]
             # Get corresponding conncomp dataset if available
             conncomp_ds = conncomp_labels[key] if conncomp_labels is not None and key in conncomp_labels else None
-            data_vars = list(ds.data_vars)
+            # THE GRIDS ONLY, as unwrap2d_irls() takes them; the metadata rides along through _carry_meta().
+            # Linked too, the metadata came back as float32 arrays: the strings ones that fail on compute,
+            # most numbers NaN. A DataArray burst is its own one grid (N81)
+            grids = BatchCore._grids_of(ds)
+            conncomp_grids = BatchCore._vars_of(conncomp_ds) if conncomp_ds is not None else {}
 
             linked_vars = {}
-            for var in data_vars:
-                data_arr = ds[var]
-
+            for var, data_arr in grids.items():
                 # Use da.blockwise for efficient dask integration
                 dask_data = data_arr.data
                 dim_str = ''.join(chr(ord('a') + i) for i in range(dask_data.ndim))
@@ -549,9 +582,9 @@ class Stack(BatchComplex):
                 # Provide meta to avoid calling _link_2d during graph construction
                 meta = np.empty((0,) * dask_data.ndim, dtype=np.float32)
 
-                if conncomp_ds is not None and var in conncomp_ds:
+                if var in conncomp_grids:
                     # Pass conncomp to _link_2d
-                    conncomp_dask = conncomp_ds[var].data
+                    conncomp_dask = conncomp_grids[var].data
                     result_dask = dask.array.blockwise(
                         _link_2d, dim_str,
                         dask_data, dim_str,
@@ -575,6 +608,10 @@ class Stack(BatchComplex):
                 )
                 linked_vars[var] = linked_da
 
+            if isinstance(ds, xr.DataArray):
+                # a DataArray in, a DataArray out (N81): no metadata to carry
+                result[key] = BatchCore._form(ds, linked_vars)
+                continue
             result[key] = xr.Dataset(Stack._carry_meta(ds, linked_vars),
                                      coords=ds.coords, attrs=ds.attrs)
 
@@ -712,13 +749,16 @@ class Stack(BatchComplex):
             If True, print diagnostic information. Default is False.
         **kwargs
             Additional arguments passed to unwrap2d_irls:
-            max_iter, tol, cg_max_iter, cg_tol, epsilon.
+            max_iter, tol, cg_max_iter, cg_tol, epsilon. Relaxed defaults:
+            max_iter=50, tol=1e-2, cg_max_iter=10, cg_tol=1e-3, epsilon=1e-2.
+            Strong set: max_iter=200, tol=1e-3, cg_max_iter=20, cg_tol=1e-4,
+            epsilon=1e-2. A looser setting prints one WARNING per call.
 
         Returns
         -------
         Batch or tuple
             If conncomp is False: Batch of unwrapped phase (components linked).
-            If conncomp is True: tuple of (Batch unwrapped phase, BatchUnit conncomp)
+            If conncomp is True: tuple of (Batch unwrapped phase, Batch conncomp)
             where conncomp labels are ordered by size (1=largest).
 
         Notes
@@ -756,6 +796,9 @@ class Stack(BatchComplex):
                 f'conncomp_linksize ({conncomp_linksize}) cannot be greater than conncomp_size ({conncomp_size}). '
                 f'Components must have at least conncomp_linksize pixels for reliable offset estimation.'
             )
+        # a BatchUnit (N81), whatever the phase: a DataArray one weights every grid, a
+        # Dataset one names every grid of a batch phase
+        weight = BatchCore._weight(weight, phase if isinstance(phase, BatchCore) else None)
 
         if union:
             return self._unwrap2d_union(
@@ -798,15 +841,49 @@ class Stack(BatchComplex):
         from .BatchCore import BatchCore
 
         _batch_in = isinstance(phase, BatchCore)
-        phase_ds = phase.to_dataset() if _batch_in else phase
-        weight_ds = (weight.to_dataset()
-                     if isinstance(weight, BatchCore) else weight)
-        if not isinstance(phase_ds, xr.Dataset):
+        # a BatchUnit (N81), the shared check: any other weight raised only at the solve, or not at all
+        weight = BatchCore._weight(weight, phase if _batch_in else None)
+        # A BATCH OF DATAARRAYS merges to one DataArray and splits back to DataArrays (N81),
+        # and a DataArray weight merges as one DataArray that weights every grid: the
+        # variable of the Dataset to_dataset() returns
+        _first = next(iter(dict.values(phase)), None) if _batch_in else None
+        _name = _first.name if isinstance(_first, xr.DataArray) else None
+        # an unnamed phase is named for the merge only, as an unnamed weight is: to_dataset()
+        # merges by name; the result is unnamed again, as unwrap2d() gives it per burst
+        _unnamed = isinstance(_first, xr.DataArray) and _name is None
+        if _unnamed:
+            _name = 'phase'
+            phase = phase._view({k: v.rename(_name) for k, v in dict.items(phase)})
+        _wfirst = next(iter(dict.values(weight)), None) if weight is not None else None
+        phase_ds = (phase.to_dataset(polarization=_name)[_name] if _name is not None
+                    else phase.to_dataset()) if _batch_in else phase
+        if weight is None:
+            weight_ds = None
+        elif isinstance(_wfirst, xr.DataArray):
+            # an unnamed weight is named for the merge only: to_dataset() merges by name
+            _wname = _wfirst.name if _wfirst.name is not None else 'weight'
+            if _wfirst.name is None:
+                weight = weight._view({k: v.rename(_wname) for k, v in dict.items(weight)})
+            weight_ds = weight.to_dataset(polarization=_wname)[_wname]
+        elif _unnamed:
+            # a Dataset weight weights an unnamed phase by its one grid (_weight_of)
+            weight_ds = BatchCore._weight_of(weight.to_dataset(), None)
+        else:
+            weight_ds = weight.to_dataset(polarization=_name)[_name] if _name is not None else weight.to_dataset()
+        if not (isinstance(phase_ds, xr.Dataset) or (_batch_in and isinstance(phase_ds, xr.DataArray))):
             raise TypeError(f"phase must be a Batch or xr.Dataset, got "
                             f"{type(phase).__name__}")
-        if weight_ds is not None and not isinstance(weight_ds, xr.Dataset):
-            raise TypeError(f"weight must be a Batch or xr.Dataset, got "
-                            f"{type(weight).__name__}")
+
+        if _batch_in:
+            # THE GRIDS ONLY into the solve: from_dataset() below gives each burst its own metadata back.
+            # The merged metadata went through the solve and came back in place of the burst's own
+            def _grids(ds_):
+                # a merged DataArray is its own one grid (N81)
+                if isinstance(ds_, xr.DataArray):
+                    return ds_
+                return ds_[[v for v in ds_.data_vars if 'y' in ds_[v].dims and 'x' in ds_[v].dims]]
+            phase_ds = _grids(phase_ds)
+            weight_ds = _grids(weight_ds) if weight_ds is not None else None
 
         # the solve is one raster; this bends the merged view, not the caller's
         _spatial = {d: -1 for d in ('y', 'x') if d in phase_ds.dims}
@@ -830,6 +907,8 @@ class Stack(BatchComplex):
         # keep only each burst's own pixels; overlaps were filled from neighbours
         valid = phase.map_da(lambda da: da.notnull())
         out = [phase.from_dataset(m).where(valid) for m in merged]
+        if _unnamed:
+            out = [o._view({k: v.rename(None) for k, v in dict.items(o)}) for o in out]
         return tuple(out) if conncomp else out[0]
 
     def unwrap2d_irls(self, phase, weight=None, device='auto',
@@ -862,16 +941,16 @@ class Stack(BatchComplex):
             PyTorch device: 'auto' (default), 'cuda', 'mps', 'cpu', or 'tpu'.
             'auto' uses GPU if Dask client has resources={'gpu': 1}.
         max_iter : int, optional
-            Maximum IRLS iterations. Default is 50.
+            Maximum IRLS iterations. Default is 50 (relaxed; strong: 200).
         tol : float, optional
-            Convergence tolerance for relative change. Default is 1e-2.
+            Convergence tolerance for relative change. Default is 1e-2 (relaxed; strong: 1e-3).
         cg_max_iter : int, optional
-            Maximum conjugate gradient iterations per IRLS step. Default is 10.
+            Maximum conjugate gradient iterations per IRLS step. Default is 10 (relaxed; strong: 20).
         cg_tol : float, optional
-            Conjugate gradient convergence tolerance. Default is 1e-3.
+            Conjugate gradient convergence tolerance. Default is 1e-3 (relaxed; strong: 1e-4).
         epsilon : float, optional
             Smoothing parameter for L¹ approximation. Larger values improve
-            numerical stability but reduce L¹ approximation quality. Default is 1e-2.
+            numerical stability but reduce L¹ approximation quality. Default is 1e-2 (strong: 1e-2).
         conncomp_size : int, optional
             Minimum connected component size in pixels. Components smaller than this
             are marked invalid (label 0). Default is 30.
@@ -885,9 +964,10 @@ class Stack(BatchComplex):
         Returns
         -------
         Batches
-            Tuple-like container with (Batch, BatchUnit):
+            Tuple-like container with (Batch, Batch):
             - unwrapped: Batch of unwrapped phase (float32)
-            - conncomp: BatchUnit of component labels (uint16, 0=invalid, 1=largest, 2=second, ...)
+            - conncomp: Batch of component labels (uint16, 0=invalid, 1=largest, 2=second, ...);
+              labels, not units (a BatchUnit holds float units only, N81)
 
         Notes
         -----
@@ -895,6 +975,11 @@ class Stack(BatchComplex):
         - L¹ norm preserves discontinuities better than L² (DCT alone)
         - Correlation weighting handles phase residues properly
         - Provides consistent results across multi-burst data
+        - The defaults are the relaxed, fast set: max_iter=50, tol=1e-2,
+          cg_max_iter=10, cg_tol=1e-3. The strong set is the defaults of
+          `utils_unwrap2d.irls_unwrap_2d`: max_iter=200, tol=1e-3, cg_max_iter=20,
+          cg_tol=1e-4, epsilon=1e-2. Any parameter looser than the strong set
+          prints one WARNING per call naming the strong values.
 
         **Algorithm**: Uses a novel DCT+IRLS combination. See
         `utils_unwrap2d.irls_unwrap_2d` for algorithm details and references.
@@ -906,11 +991,16 @@ class Stack(BatchComplex):
         from .Batch import Batch, BatchWrap, BatchUnit
 
         assert isinstance(phase, BatchWrap), 'ERROR: phase should be a BatchWrap object'
-        assert weight is None or isinstance(weight, BatchUnit), 'ERROR: weight should be a BatchUnit object'
+        from .BatchCore import BatchCore
+        # a BatchUnit (N81); a DataArray one weights every grid
+        weight = BatchCore._weight(weight, phase)
 
         # Validate lazy data
-        from .BatchCore import BatchCore
         BatchCore._require_lazy(phase, 'unwrap2d')
+
+        # every unwrapping path builds its graph here, so this prints once per call
+        utils_unwrap2d.irls_relaxed_warning(max_iter=max_iter, tol=tol, cg_max_iter=cg_max_iter,
+                                            cg_tol=cg_tol, epsilon=epsilon)
 
         # Resolve device using shared helper (handles Dask cluster resources)
         # Convert to string once to avoid serialization issues and repeated resolution
@@ -934,16 +1024,15 @@ class Stack(BatchComplex):
                 print(f'\nProcessing burst {burst_idx}: {key}')
             burst_idx += 1
 
-            # Get data variables (typically polarization like 'VV'), with y/x dims - excludes converted attributes
-            data_vars = [v for v in phase_ds.data_vars
-                        if 'y' in phase_ds[v].dims and 'x' in phase_ds[v].dims]
+            # Get data variables (typically polarization like 'VV'), with y/x dims - excludes converted attributes;
+            # a DataArray burst is its own one (N81)
+            grids = BatchCore._grids_of(phase_ds)
 
             unwrap_vars = {}
             conncomp_vars = {}
 
-            for var in data_vars:
-                phase_da = phase_ds[var]
-                weight_da = weight_ds[var] if weight_ds is not None else None
+            for var, phase_da in grids.items():
+                weight_da = BatchCore._weight_of(weight_ds, var)
 
                 # Save original spatial chunks to restore after unwrapping
                 orig_y_chunks = None
@@ -1060,18 +1149,24 @@ class Stack(BatchComplex):
                 unwrap_vars[var] = unwrap_da
                 conncomp_vars[var] = conncomp_da
 
-            # Preserve dataset attributes (subswath, pathNumber, etc.)
-            unwrap_result[key] = xr.Dataset(Stack._carry_meta(phase_ds, unwrap_vars),
-                                            attrs=phase_ds.attrs)
-            conncomp_result[key] = xr.Dataset(Stack._carry_meta(phase_ds, conncomp_vars),
-                                              attrs=phase_ds.attrs)
+            if isinstance(phase_ds, xr.DataArray):
+                # a DataArray in, a DataArray out (N81): no metadata to carry
+                unwrap_result[key] = BatchCore._form(phase_ds, unwrap_vars)
+                conncomp_result[key] = BatchCore._form(phase_ds, conncomp_vars)
+            else:
+                # Preserve dataset attributes (subswath, pathNumber, etc.)
+                unwrap_result[key] = xr.Dataset(Stack._carry_meta(phase_ds, unwrap_vars),
+                                                attrs=phase_ds.attrs)
+                conncomp_result[key] = xr.Dataset(Stack._carry_meta(phase_ds, conncomp_vars),
+                                                  attrs=phase_ds.attrs)
             # Preserve CRS from input dataset
             if phase_ds.rio.crs is not None:
                 unwrap_result[key].rio.write_crs(phase_ds.rio.crs, inplace=True)
                 conncomp_result[key].rio.write_crs(phase_ds.rio.crs, inplace=True)
 
-        from .Batch import BatchUnit, Batches
-        return Batches((Batch(unwrap_result), BatchUnit(conncomp_result)))
+        from .Batch import Batches
+        # the labels are integers, not units: a plain Batch (N81)
+        return Batches((Batch(unwrap_result), Batch(conncomp_result)))
 
     @staticmethod
     def _detect_discontinuity_hough(phase, grad_threshold=2.0, mask_width=3, debug=False):
@@ -1429,6 +1524,8 @@ DEFOMAX_CYCLE  {defomax}
         import dask.array
         import xarray as xr
         from .Batch import Batch
+        # a BatchUnit (N81); a DataArray one weights every grid
+        corr = BatchCore._weight(corr, phase, 'corr')
 
         results = {}
 
@@ -1442,7 +1539,11 @@ DEFOMAX_CYCLE  {defomax}
                     continue
 
                 phase_da = phase_ds[var]
-                corr_da = corr_ds[var] if corr_ds is not None and var in corr_ds else None
+                if isinstance(corr_ds, xr.DataArray):
+                    # a DataArray corr weights every grid as it is (N81)
+                    corr_da = corr_ds if BatchCore._is_grid(phase_da) else None
+                else:
+                    corr_da = corr_ds[var] if corr_ds is not None and var in corr_ds else None
 
                 # Ensure data is chunked for lazy processing (1 chunk per pair)
                 if 'pair' in phase_da.dims:
@@ -1586,6 +1687,10 @@ DEFOMAX_CYCLE  {defomax}
         Decomposes time series into trend, seasonal, and residual components.
         The input Batch must have a 'date' dimension.
 
+        ONE VARIABLE: a Batch of DataArrays, x['VV'], or of Datasets with one
+        (y, x) variable, x[['VV']]. The outputs are named by component alone,
+        so two variables would collide: several raise.
+
         Parameters
         ----------
         data : Batch
@@ -1601,14 +1706,14 @@ DEFOMAX_CYCLE  {defomax}
         Returns
         -------
         Batch
-            Batch containing 'trend', 'seasonal', and 'resid' variables for each polarization.
+            Batch of Datasets with the 'trend', 'seasonal' and 'residual' variables.
 
         Examples
         --------
         >>> model = (phase - phase.gaussian(wavelength=40000)).fit1d(weight=corr)
         >>> displacement = model.displacement_los(stack.transform())
-        >>> stl_result = stack.stl(displacement, freq='W', periods=52)
-        >>> stl_result.plot()  # Shows trend, seasonal, resid components
+        >>> stl_result = stack.stl(displacement['VV'], freq='W', periods=52)
+        >>> stl_result.plot()  # Shows trend, seasonal, residual components
 
         See Also
         --------
@@ -1628,25 +1733,28 @@ DEFOMAX_CYCLE  {defomax}
         if 'date' not in sample_ds.dims:
             raise ValueError("Input Batch must have 'date' dimension for STL decomposition")
 
-        # Get polarizations from the first dataset (spatial, with y/x dims) - excludes converted attributes
-        polarizations = [v for v in sample_ds.data_vars
-                        if 'y' in sample_ds[v].dims and 'x' in sample_ds[v].dims]
-
+        # ONE (y, x) VARIABLE per burst, a DataArray or a Dataset's one grid (N81): the
+        # outputs are named by component alone, so two variables would collide
         results = {}
         for key, ds in data.items():
-            result_vars = {}
-            for pol in polarizations:
-                if pol not in ds.data_vars:
-                    continue
-                da = ds[pol]
-                # Apply STL decomposition
-                stl_ds = self._stl(da, freq=freq, periods=periods, robust=robust)
-                # Rename variables to include polarization
-                for var in ['trend', 'seasonal', 'resid']:
-                    result_vars[f'{pol}_{var}'] = stl_ds[var]
+            grids = BatchCore._grids_of(ds)
+            if len(grids) != 1:
+                if isinstance(ds, xr.DataArray):
+                    raise TypeError(f"ERROR: stl(): x['{ds.name}'] has no (y, x) grid, dims {tuple(ds.dims)}.")
+                if not grids:
+                    BatchCore._grid_vars(ds)
+                names = list(grids)
+                raise ValueError(f"ERROR: stl() takes one variable; the batch has {', '.join(map(str, names))}. "
+                                 f"Select one: x[['{names[0]}']] or x['{names[0]}'].")
+            da = next(iter(grids.values()))
+            # Apply STL decomposition: 'trend', 'seasonal', 'residual'
+            stl_ds = self._stl(da, freq=freq, periods=periods, robust=robust)
 
-            result_ds = xr.Dataset(result_vars)
-            result_ds.attrs = ds.attrs
+            # THREE NAMED OUTPUTS, a Dataset whatever the input form; a DataArray's
+            # own attributes describe the input, not the result (N81)
+            result_ds = xr.Dataset({var: stl_ds[var] for var in ('trend', 'seasonal', 'residual')})
+            if isinstance(ds, xr.Dataset):
+                result_ds.attrs = ds.attrs
             # Preserve CRS if available
             if hasattr(ds, 'rio') and ds.rio.crs is not None:
                 import rioxarray
@@ -1755,8 +1863,8 @@ DEFOMAX_CYCLE  {defomax}
 
         coords = {'date': dt_periodic.astype('datetime64[ns]'), 'y': data.y, 'x': data.x}
 
-        # transform to separate variables
-        varnames = ['trend', 'seasonal', 'resid']
+        # transform to separate variables; 'residual', the word align() uses
+        varnames = ['trend', 'seasonal', 'residual']
         keys_vars = {}
         for varidx, varname in enumerate(varnames):
             var_data = models[varidx]
@@ -2058,13 +2166,15 @@ DEFOMAX_CYCLE  {defomax}
             None if variables have date/pair dimension but are not complex (should be Stack).
         """
         import numpy as np
+        import xarray as xr
         dtypes = set()
         has_temporal_dim = False
         for ds in subset.values():
-            for var in ds.data_vars:
-                dtypes.add(ds[var].dtype)
+            # a DataArray is its own one variable
+            for da_ in ([ds] if isinstance(ds, xr.DataArray) else [ds[v] for v in ds.data_vars]):
+                dtypes.add(da_.dtype)
                 # Check if variable has temporal dimension (date or pair)
-                if 'date' in ds[var].dims or 'pair' in ds[var].dims:
+                if 'date' in da_.dims or 'pair' in da_.dims:
                     has_temporal_dim = True
         # If all variables are complex with temporal dim, use BatchComplex
         if dtypes and all(np.issubdtype(dt, np.complexfloating) for dt in dtypes) and has_temporal_dim:
@@ -2166,34 +2276,48 @@ DEFOMAX_CYCLE  {defomax}
                 return batch_type(subset)
             # Has temporal dimension but not complex - return Stack
             return type(self)(subset)
+        if isinstance(key, str) and key not in self:
+            # not a burst: the variable or coordinate of that name (N81)
+            return self._select_var(key)
         return dict.__getitem__(self, key)
+
+    def _select_var(self, key):
+        """The variable or coordinate `key` of every burst that carries it, as a
+        Batch of DataArrays -- stack['residual'] is stack.residual, as in xarray
+        (N81): BatchComplex for a complex (y, x) stack variable over date or
+        pair, Batch otherwise. As for every batch class, a variable or
+        coordinate without (y, x) is a plain Batch whatever its dtype."""
+        subset = {k: ds[key] for k, ds in self.items() if key in ds.data_vars or key in ds.coords}
+        if not subset:
+            raise KeyError(key)
+        if not all(BatchCore._is_grid(v) for v in subset.values()):
+            return Batch(subset)
+        batch_type = self._batch_type_for_subset(subset)
+        # For single variable access, default to Batch if not BatchComplex
+        if batch_type is None:
+            batch_type = Batch
+        return batch_type(subset)
 
     def __getattr__(self, name: str):
         """
-        Access variables (e.g., 'ele') from the Stack as Batch.
-
-        This allows accessing variables stored in burst datasets:
-            sbas.ele  -> BatchVar containing elevation data
+        Access a variable (e.g., 'ele') of the Stack: `stack.ele` is
+        `stack['ele']`, a Batch of DataArrays, as xarray's ds.ele is ds['ele'].
         """
         if name.startswith('_') or name in ('keys', 'values', 'items', 'get'):
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
         if self:
-            sample = next(iter(self.values()), None)
-            if sample is not None and hasattr(sample, 'data_vars'):
-                if name in sample.data_vars or name in sample.coords:
-                    subset = {k: ds[[name]] for k, ds in self.items() if name in ds.data_vars or name in ds.coords}
-                    if subset:
-                        batch_type = self._batch_type_for_subset(subset)
-                        # For single attribute access, default to Batch if not BatchComplex
-                        if batch_type is None:
-                            batch_type = Batch
-                        return batch_type(subset)
+            try:
+                return self._select_var(name)
+            except KeyError:
+                pass
 
         raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
     def transform(self) -> Batch:
-        """Return a Batch view of this Stack (including 1D/2D non-complex vars).
+        """Return a Batch view of this Stack's transform: its non-complex (y, x) grids
+        (azi, rng, ele, ...) and every non-gridded variable, never the data
+        (BatchComplex(stack)).
 
         Also `northing` and `easting`, each burst's own y/x as a vector.
 
@@ -2203,7 +2327,8 @@ DEFOMAX_CYCLE  {defomax}
         """
         import numpy as np
         out = {}
-        for key, ds in self.items():
+        # Batch(stack) keeps the transform and leaves the data grids out
+        for key, ds in Batch(self).items():
             if 'y' not in ds.dims or 'x' not in ds.dims:
                 out[key] = ds
                 continue
@@ -2249,8 +2374,9 @@ DEFOMAX_CYCLE  {defomax}
         Returns
         -------
         Stack
-            The filtered stack, same grid, same chunking, same variables.
-            Non-gridded variables ride along untouched.
+            The filtered stack, same grid, same chunking, same variables. The
+            data grids are filtered (N81: BatchComplex(stack)); the transform
+            grids and the non-gridded variables ride along untouched.
 
         Examples
         --------
@@ -2262,10 +2388,12 @@ DEFOMAX_CYCLE  {defomax}
         import dask.array as da
         from . import utils_xarray
 
-        BatchCore._require_lazy(self, 'median')
+        # THE DATA, NOT THE TRANSFORM (N81): azi, ele and rng were median-filtered too
+        data = BatchComplex(self)
+        BatchCore._require_lazy(data, 'median')
 
         out = {}
-        for key, ds in self.items():
+        for key, ds in data.items():
             wy, wx = utils_xarray.meters_to_pixels(
                 window, utils_xarray.spacing_of(ds), minimum=3, odd=True,
                 name='median() window')
@@ -2291,7 +2419,7 @@ DEFOMAX_CYCLE  {defomax}
                                              coords=arr.coords, name=var)
             o = xr.Dataset(new_vars, attrs=ds.attrs)
             out[key] = o
-        return type(self)(out)
+        return self._restack(data, BatchComplex(out))
 
     def optimize2(self, angle_coarse: float = 15, angle_fine: float = 5,
                   window: 'float | tuple | None' = 40, device: str = 'auto') -> "Stack":
@@ -2555,7 +2683,7 @@ DEFOMAX_CYCLE  {defomax}
                 raise ValueError("transform is required when data=None")
 
             # Get topography at native resolution
-            topo_merged = tfm[['ele']].to_dataset()
+            topo_merged = tfm[['ele']]._start_from(tfm).to_dataset()
             topo_da = topo_merged['ele'] if 'ele' in topo_merged else None
             if topo_da is None:
                 raise ValueError("transform must contain 'ele' variable")
@@ -2622,9 +2750,9 @@ DEFOMAX_CYCLE  {defomax}
         os.makedirs(path, exist_ok=True)
 
         # Merge bursts into unified dataset(s) per variable
-        merged = target.to_dataset()
-        if isinstance(merged, xr.DataArray):
-            merged = merged.to_dataset()
+        # the (y, x) variables only, a Dataset for one burst or many (to_dataset(), N81)
+        from .BatchCore import _skip_nodata
+        merged = _skip_nodata(target.to_dataset())
 
         # Get transform elevation merged via to_dataset()
         # Decimate default transform to match input batch resolution for efficiency
@@ -2655,7 +2783,7 @@ DEFOMAX_CYCLE  {defomax}
                 for k in target.keys():
                     if k not in tfm:
                         continue
-                    tfm_ds = tfm[k][['ele']]
+                    tfm_ds = tfm[k][['ele'] + (['startTime'] if 'startTime' in tfm[k].data_vars else [])]
                     tgt_ds = target[k]
                     # Find nearest indices for y and x coordinates
                     y_idx = _nearest_indices(tfm_ds.y.values, tgt_ds.y.values)
@@ -2664,10 +2792,14 @@ DEFOMAX_CYCLE  {defomax}
                     selected = tfm_ds.isel(y=y_idx, x=x_idx)
                     selected = selected.assign_coords(y=tgt_ds.y, x=tgt_ds.x)
                     decimated[k] = selected
+                # a transform without any of the bursts RAISES: it gave no topography, silently
+                if not decimated:
+                    raise ValueError(f"ERROR: to_vtk(): the transform has none of the bursts "
+                                     f"({', '.join(list(target.keys())[:3])}). Pass their transform.")
                 topo_merged = Batch(decimated).to_dataset()
             else:
                 # User-provided transform: use as-is
-                topo_merged = tfm[['ele']].to_dataset()
+                topo_merged = tfm[['ele']]._start_from(tfm).to_dataset()
 
         # Group by data variable (polarization)
         data_vars = list(merged.data_vars)
@@ -2816,16 +2948,24 @@ DEFOMAX_CYCLE  {defomax}
 
         os.makedirs(path, exist_ok=True)
 
+        # the one exported grid of each burst: its integer nodata is not drawn, ONE WARNING
+        from .BatchCore import _skip_nodata, _warn_int_nodata
+        _first = BatchCore._grids_of(next(iter(target.values())))
+        if _first:
+            _warn_int_nodata('to_vtks', dict([next((n, a.dtype) for n, a in _first.items())]))
         with tqdm(total=len(target), desc='Exporting VTK') as pbar:
             for burst, ds in target.items():
                 if not ds.data_vars:
                     pbar.update(1)
                     continue
 
-                data_var = next(iter(ds.data_vars))
+                # THE GRID is exported, and its own dims say whether there are pairs:
+                # after mean('pair') the carried metadata still has its pairs, and
+                # reading them off the Dataset wrote <burst>_19700101.vtk once per pair
+                data_var = BatchCore._grid_vars(ds)[0]
                 base_da = ds[data_var]
 
-                if 'pair' in ds.dims:
+                if 'pair' in base_da.dims:
                     pair_coord = ds.coords.get('pair')
                     pair_values = pair_coord.values if pair_coord is not None else range(ds.sizes.get('pair', 0))
                     export_items = []
@@ -2840,7 +2980,8 @@ DEFOMAX_CYCLE  {defomax}
                     export_items = [(None, ds)]
 
                 for pair_val, ds_item in export_items:
-                    base_da_item = ds_item[data_var]
+                    # an integer grid's nodata is not drawn, as to_dataset() sets it (_skip_nodata)
+                    base_da_item = _skip_nodata(ds_item[data_var])
                     layers = [base_da_item.rename(data_var)]
 
                     if tfm is not None and burst in tfm:
@@ -3123,15 +3264,27 @@ DEFOMAX_CYCLE  {defomax}
         polarizations = [pol for pol in ['VV', 'VH', 'HH', 'HV'] if pol in next(iter(datas.values())).data_vars]
         #print ('polarizations', polarizations)
 
+        # the columns BY NAME, wherever the preprocessor stored them: the NISAR writers store lookdir and frequency
+        # before BPR, where a position rule never finds them, and older stores ref_height after it. The columns
+        # listed before keep their order, the stored one read backwards (S1 and NISAR stores differ there), and
+        # the added ones follow their neighbour: lookdir flightDirection, band mission, frequency band (or mission)
+        df_columns = {'fullBurstID', 'startTime', 'flightDirection', 'pathNumber', 'subswath', 'mission',
+                      'beamModeType', 'geometry', 'BPR', attr_start}
+        df_added = {'lookdir': ('flightDirection',), 'band': ('mission',), 'frequency': ('band', 'mission')}
+
         # make attributes dataframe from datas
         processed_attrs = []
         for ds in datas.values():
             #print (data.id)
-            attrs = [data_var for data_var in ds if ds[data_var].dims==('date',)][::-1]
-            attr_start_idx = attrs.index(attr_start)
+            per_date = [data_var for data_var in ds if ds[data_var].dims==('date',)]
+            attrs = [attr for attr in per_date[::-1] if attr in df_columns]
+            for attr, after in df_added.items():
+                if attr in per_date:
+                    anchor = next((a for a in after if a in attrs), None)
+                    attrs.insert(attrs.index(anchor) + 1 if anchor is not None else len(attrs), attr)
             for date_idx, date in enumerate(ds.date.values):
                 processed_attr = {}
-                for attr in attrs[:attr_start_idx+1]:
+                for attr in attrs:
                     # Use isel + values to handle both numpy and dask arrays
                     value = ds[attr].isel(date=date_idx).values
                     # Compute if dask array
@@ -3154,12 +3307,13 @@ DEFOMAX_CYCLE  {defomax}
         df = df.assign(polarization=','.join(map(str, polarizations)))
         # reorder columns to the same order as preprocessor uses
         pol = df.pop("polarization")
-        df.insert(3, "polarization", pol)
+        # after flightDirection, and after the lookdir beside it
+        df.insert(df.columns.get_loc('lookdir') + 1 if 'lookdir' in df.columns else 3, "polarization", pol)
         # round for human readability
         df['BPR'] = df['BPR'].round(1)
 
-        group_col = df.columns[0]
-        burst_col = df.columns[1]
+        group_col = 'fullBurstID'
+        burst_col = 'startTime'
         #print ('df.columns[0]', df.columns[0])
         #print ('df.columns[:2][::-1].tolist()', df.columns[:2][::-1].tolist())
         df['startTime'] = pd.to_datetime(df['startTime'])
@@ -3477,7 +3631,226 @@ DEFOMAX_CYCLE  {defomax}
 
         return shape, chunks, scale, fill_value, dtype
 
-    def load(self, urls:str | list | dict[str, str], storage_options:dict[str, str]|None=None,
+    @staticmethod
+    def _zarr_complex_source(zarr_path, group_path, storage_options=None):
+        """A burst's complex64 re/im for _zarr_dask(): (reader of disk chunk (iy, ix, chunk_shape), disk chunks)."""
+        import dask.array as da
+        shape, zarr_chunks, scale, fill_value, re_dtype = Stack._get_zarr_slc_meta(
+            zarr_path, group_path, storage_options
+        )
+        disk = da.core.normalize_chunks(zarr_chunks, shape)
+        if len(disk[0]) == 1 and len(disk[1]) == 1:
+            # Single chunk: one reader for entire array
+            return (lambda iy, ix, chunk_shape: (Stack._load_zarr_complex, (zarr_path, group_path, storage_options), {}),
+                    disk)
+        # Multi-chunk: one reader call per chunk
+        return (lambda iy, ix, chunk_shape: (Stack._load_zarr_complex_chunk,
+                                             (zarr_path, group_path, (iy, ix), chunk_shape, zarr_chunks,
+                                              scale, fill_value, storage_options), {'re_dtype': re_dtype}),
+                disk)
+
+    @staticmethod
+    def _zarr_array_source(zarr_path, group_path, name, storage_options=None):
+        """One float32 transform variable for _zarr_dask(): (reader of disk chunk (iy, ix, chunk_shape), disk chunks)."""
+        import dask.array as da
+        shape, zarr_chunks, scale_factor, fill_value, dtype = Stack._get_zarr_array_meta(
+            zarr_path, group_path, name, storage_options
+        )
+        disk = da.core.normalize_chunks(zarr_chunks, shape)
+        if len(disk[0]) == 1 and len(disk[1]) == 1:
+            # Single chunk: one reader for entire array
+            return (lambda iy, ix, chunk_shape: (Stack._load_zarr_array, (zarr_path, group_path, name,
+                                                                          storage_options), {}),
+                    disk)
+        # Multi-chunk: one reader per chunk
+        return (lambda iy, ix, chunk_shape: (Stack._load_zarr_array_chunk,
+                                             (zarr_path, group_path, name, (iy, ix), chunk_shape, zarr_chunks,
+                                              scale_factor, fill_value, dtype, storage_options), {}),
+                disk)
+
+    @staticmethod
+    def _load_chunks(disk_chunks, target_mb):
+        """The dask chunks ((y), (x)) of every grid of a loaded burst: the chunk2d logic on the disk chunks of its
+        data, which output chunks never cross."""
+        from .utils_dask import rechunk2d
+        shape = (sum(disk_chunks[0]), sum(disk_chunks[1]))
+        optimal = rechunk2d(shape, element_bytes=8, input_chunks=disk_chunks, merge=False, target_mb=target_mb)
+        return tuple(optimal['y']), tuple(optimal['x'])
+
+    @staticmethod
+    def _load_rechunk(ds, chunks):
+        """Every grid of a loaded burst in the dask chunks (1 date, chunks): _zarr_dask() gives them, so this only
+        rechunks a grid a merge of polarizations with different dates changed."""
+        rechunked = {}
+        for var in ds.data_vars:
+            arr = ds[var]
+            if not (arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x')):
+                continue
+            want = (((1,) * arr.shape[0],) if arr.ndim == 3 else ()) + tuple(chunks)
+            if arr.data.chunks != want:
+                rechunked[var] = arr.chunk(dict(zip(arr.dims, want)))
+        return ds.assign(rechunked) if rechunked else ds
+
+    @staticmethod
+    def _zarr_dask(label, sources, chunks, dtype, lead):
+        """
+        Lazy array of zarr arrays read by disk chunk, in the dask chunks `chunks` ((y), (x)): (y, x) of one source,
+        or (n, y, x) with one source per leading index (a date) when `lead`.
+
+        sources: [(read, disk chunks)] of _zarr_complex_source() / _zarr_array_source().
+
+        THE SAME KEYS IN EVERY GRAPH: one reader task per disk chunk, one task per output block that cuts it from the
+        disk chunks it overlaps, and dask fuses neither (_UnfusedTask). Built as readers, a concatenate and a rechunk,
+        dask fused them differently in each graph where a disk chunk feeds two blocks (a pygmtsar transform chunked
+        2402 x 8192 against 2402 x 6013 blocks): a graph reading one block made a key an alias of a fused task, while
+        the scheduler still held that key as a plain task among the inputs of a computed result, kept its old
+        dependencies (dask issue 9888), and failed with KeyError, an AssertionError on a TaskState, or hung.
+        """
+        import uuid
+        import numpy as np
+        import dask.array as da
+        from dask._task_spec import TaskRef
+        from dask.highlevelgraph import HighLevelGraph
+        from .utils_dask import _UnfusedTask
+
+        name = f'{label}-{uuid.uuid4().hex}'
+        oy, ox = (np.cumsum((0,) + tuple(c)).tolist() for c in chunks)
+        layer = {}
+        for d, (read, disk) in enumerate(sources):
+            rname = f'{label}-read-{uuid.uuid4().hex}'
+            dy, dx = (np.cumsum((0,) + tuple(c)).tolist() for c in disk)
+            assert dy[-1] == oy[-1] and dx[-1] == ox[-1], (label, disk, chunks)
+
+            def overlap(edges, lo, hi):
+                """[(disk chunk, start, stop within it)] of the disk chunks the range [lo, hi) overlaps."""
+                first = int(np.searchsorted(edges, lo, 'right')) - 1
+                last = int(np.searchsorted(edges, hi, 'left')) - 1
+                return [(i, max(lo, edges[i]) - edges[i], min(hi, edges[i + 1]) - edges[i])
+                        for i in range(first, last + 1)]
+            for by in range(len(oy) - 1):
+                ys = overlap(dy, oy[by], oy[by + 1])
+                for bx in range(len(ox) - 1):
+                    xs = overlap(dx, ox[bx], ox[bx + 1])
+                    parts = []
+                    for iy, _, _ in ys:
+                        for ix, _, _ in xs:
+                            key = (rname, iy, ix)
+                            if key not in layer:
+                                func, args, kwargs = read(iy, ix, (dy[iy + 1] - dy[iy], dx[ix + 1] - dx[ix]))
+                                layer[key] = _UnfusedTask(key, func, *args, **kwargs)
+                            parts.append(TaskRef(key))
+                    key = (name, d, by, bx) if lead else (name, by, bx)
+                    layout = (len(ys), len(xs), tuple((a, b) for _, a, b in ys), tuple((a, b) for _, a, b in xs),
+                              bool(lead))
+                    layer[key] = _UnfusedTask(key, _zarr_block, layout, *parts)
+        out_chunks = (((1,) * len(sources),) if lead else ()) + tuple(tuple(c) for c in chunks)
+        graph = HighLevelGraph.from_collections(name, layer, dependencies=())
+        return da.Array(graph, name, chunks=out_chunks, dtype=dtype,
+                        meta=np.empty((0,) * len(out_chunks), dtype=dtype))
+
+    @staticmethod
+    def _load_attrs(attrs: dict, where: str, notes: list, used: set) -> tuple[dict, dict]:
+        """One date group's stored attributes, split into the scalars and the lists load() makes variables of.
+
+        The scalars named in `used` (load()'s whitelist) and every list, except Conventions and spatial_ref,
+        which load() handles itself. Numbers become float, as they always did; a JSON null is no value and is left
+        out, so that date is filled like a date without the key. A list becomes an array of its own rank; a ragged
+        one has no array shape and is an error naming it.
+        """
+        import numpy as np
+        scalars, arrays = {}, {}
+        for k, v in attrs.items():
+            if k in ('Conventions', 'spatial_ref') or v is None:
+                continue
+            if isinstance(v, (list, tuple)):
+                try:
+                    arrays[k] = np.array(v)
+                except ValueError as ex:
+                    raise ValueError(f'Stack.load: {where}: attribute {k!r} is a ragged list, which has no '
+                                     f'array shape: {ex}') from None
+            elif k not in used:
+                continue
+            elif isinstance(v, str):
+                scalars[k] = v
+            elif isinstance(v, (int, float)):
+                scalars[k] = float(v)
+            else:
+                notes.append(f'WARNING: Stack.load: {where}: attribute {k!r} is a {type(v).__name__}, neither a '
+                             f'scalar nor a list, and is not loaded')
+        return scalars, arrays
+
+    @staticmethod
+    def _load_date_vars(infos: list, where: str, notes: list) -> dict:
+        """The per-date variables of one polarization's dates (sorted by date), from _load_attrs() of each.
+
+        THE UNION OF THE KEYS over the dates, in the order they are first stored. A date that did not store a key
+        gets no value -- NaN for a number, None for a string, which _merge_polarizations() writes as '' -- and
+        never another date's: taking the first date's list wherever a date lacked it put the first orbit on every
+        date, and a key only a later date stored was dropped. A list keeps its rank: (date, <key>_coef) as before
+        for 1-D, (date, <key>_coef, <key>_coef1, ...) beyond. Shapes that differ between the dates cannot be one
+        variable, and are an error naming the attribute and each date's shape.
+        """
+        import numpy as np
+        import xarray as xr
+        out = {}
+        # 'burst' is set by the caller with the polarization replaced, 'polarization' is the variable name
+        scalar_keys = list(dict.fromkeys(k for info in infos for k in info['scalar_attrs']
+                                         if k not in ('burst', 'polarization')))
+        array_keys = list(dict.fromkeys(k for info in infos for k in info['array_attrs']))
+        both = [k for k in array_keys if k in scalar_keys]
+        if both:
+            raise ValueError(f'Stack.load: {where}: attribute(s) {both} are a scalar on some dates and a list on '
+                             f'others; one variable along date needs one kind')
+        for key in scalar_keys:
+            vals = [info['scalar_attrs'].get(key) for info in infos]
+            if all(v is None or isinstance(v, float) for v in vals):
+                out[key] = xr.DataArray(np.array([np.nan if v is None else v for v in vals], dtype=np.float64),
+                                        dims=['date'])
+                continue
+            if not all(v is None or isinstance(v, str) for v in vals):
+                notes.append(f'WARNING: Stack.load: {where}: attribute {key!r} is a number on some dates and a string '
+                             f'on others, and is loaded as strings')
+            out[key] = xr.DataArray(vals, dims=['date'])
+        for key in array_keys:
+            arrs = [info['array_attrs'].get(key) for info in infos]
+            present = [a for a in arrs if a is not None]
+            if len({a.shape for a in present}) > 1:
+                shapes = ', '.join(f"{str(info['date'])[:10]} {'absent' if a is None else a.shape}"
+                                   for info, a in zip(infos, arrs))
+                raise ValueError(f'Stack.load: {where}: attribute {key!r} has different shapes on different dates '
+                                 f'({shapes}); one variable along date needs one shape')
+            if len(present) < len(arrs):
+                fill = (np.full(present[0].shape, np.nan) if present[0].dtype.kind in 'biuf'
+                        else np.full(present[0].shape, None, dtype=object))
+                arrs = [fill if a is None else a for a in arrs]
+            try:
+                stacked = np.stack(arrs)
+            except (TypeError, ValueError) as ex:
+                raise ValueError(f'Stack.load: {where}: attribute {key!r} cannot be combined over the dates: '
+                                 f'{ex}') from None
+            dims = ['date'] + [f'{key}_coef{i}' if i else f'{key}_coef' for i in range(stacked.ndim - 1)]
+            out[key] = xr.DataArray(stacked, dims=dims)
+        return out
+
+    @staticmethod
+    def _merge_polarizations(datas: list):
+        """One burst Dataset from its per-polarization ones.
+
+        A per-date variable holds ONE value per date; one the polarizations of a date store with different values
+        is a merge conflict, and an error. The strings a date did not store are None through the merge, where None
+        counts as missing, and '' after it: a store writes a string array, not an object array.
+        """
+        import xarray as xr
+        ds = xr.merge(datas, compat='no_conflicts', combine_attrs='override')
+        strings = {v: ds[v].fillna('').astype(str) for v in ds.data_vars
+                   if ds[v].dtype == object
+                   and all(s is None or isinstance(s, str) or (isinstance(s, float) and s != s)
+                           for s in ds[v].values.ravel())}
+        if strings:
+            ds = ds.assign(strings)
+        return ds
+
+    def load(self, urls:str | list | pd.DataFrame, storage_options:dict[str, str]|None=None,
              debug:bool=False):
         import numpy as np
         import dask
@@ -3519,6 +3892,7 @@ DEFOMAX_CYCLE  {defomax}
             'startTime', 'polarization', 'burst', 'flightDirection',
             'pathNumber', 'subswath', 'mission', 'beamModeType',
             'fullBurstID', 'geometry',  # Used in to_dataframe()
+            'lookdir', 'band', 'frequency',  # Shown in to_dataframe(): look side, radar band, NISAR sub-band
             # Radar parameters for incidence, elevation, LOS calculations
             'radar_wavelength', 'near_range',
             'SC_height_start', 'SC_height_end', 'earth_radius',
@@ -3553,6 +3927,8 @@ DEFOMAX_CYCLE  {defomax}
 
             # Collect metadata for all bursts (no 2D data loading)
             burst_infos = []
+            # the warnings, printed by the caller: this runs in a loky worker, whose output nobody sees
+            notes = []
             spatial_ref = None
             for burst_key in burst_keys:
                 burst_grp = grp[burst_key]
@@ -3571,21 +3947,8 @@ DEFOMAX_CYCLE  {defomax}
                 if spatial_ref is None and ds.attrs.get('BPR', 1) == 0:
                     spatial_ref = ds.attrs.get('spatial_ref')
 
-                # Extract scalar attrs (only whitelisted keys used by insardev)
-                scalar_attrs = {}
-                array_attrs = {}
-                skip_attrs = {'Conventions', 'spatial_ref'}
-                for k, v in ds.attrs.items():
-                    if k in skip_attrs:
-                        continue
-                    if isinstance(v, (list, tuple)):
-                        array_attrs[k] = np.array(v)
-                    elif k in _USED_SCALAR_ATTRS:
-                        # Only include whitelisted scalar attrs
-                        if isinstance(v, str):
-                            scalar_attrs[k] = v
-                        else:
-                            scalar_attrs[k] = float(v) if isinstance(v, (int, float)) else v
+                # Extract scalar attrs (only whitelisted keys used by insardev) and every list attr
+                scalar_attrs, array_attrs = Stack._load_attrs(ds.attrs, burst_path, notes, _USED_SCALAR_ATTRS)
 
                 # Store only what we need (not the full dataset!)
                 burst_infos.append({
@@ -3603,59 +3966,24 @@ DEFOMAX_CYCLE  {defomax}
 
             # Group by polarization and sort by date
             polarizations = np.unique([info['polarization'] for info in burst_infos])
-
-            datas = []
+            pol_sources = {}
             for polarization in polarizations:
                 pol_infos = sorted(
                     [info for info in burst_infos if info['polarization'] == polarization],
                     key=lambda x: x['date']
                 )
+                # one reader task per zarr disk chunk of each date
+                pol_sources[polarization] = (pol_infos, [Stack._zarr_complex_source(zarr_path, info['burst_path'],
+                                                                                   storage_options)
+                                                         for info in pol_infos])
+            # the dask chunks of every grid: chunk2d logic on the disk chunks of the first polarization's data
+            chunks = Stack._load_chunks(pol_sources[polarizations[0]][1][0][1], _load_target_mb)
 
-                # Create delayed dask arrays for each date
-                delayed_arrays = []
-                for info in pol_infos:
-                    shape = info['shape']
-                    # Get chunk metadata
-                    _, zarr_chunks, scale, fill_value, re_dtype = Stack._get_zarr_slc_meta(
-                        zarr_path, info['burst_path'], storage_options
-                    )
-                    n_chunks_y = (shape[0] + zarr_chunks[0] - 1) // zarr_chunks[0]
-                    n_chunks_x = (shape[1] + zarr_chunks[1] - 1) // zarr_chunks[1]
-
-                    if n_chunks_y == 1 and n_chunks_x == 1:
-                        # Single chunk (S1): one reader for entire array
-                        delayed_load = dask.delayed(Stack._load_zarr_complex)(
-                            zarr_path, info['burst_path'], storage_options
-                        )
-                        arr = da.from_delayed(delayed_load, shape=shape, dtype=np.complex64)
-                    else:
-                        # Multi-chunk (NISAR): one reader call per chunk
-                        chunk_rows = []
-                        for iy in range(n_chunks_y):
-                            chunk_cols = []
-                            for ix in range(n_chunks_x):
-                                # Logical chunk shape (may be smaller at edges)
-                                y0, y1 = iy * zarr_chunks[0], min((iy + 1) * zarr_chunks[0], shape[0])
-                                x0, x1 = ix * zarr_chunks[1], min((ix + 1) * zarr_chunks[1], shape[1])
-                                chunk_shape = (y1 - y0, x1 - x0)
-
-                                delayed_chunk = dask.delayed(Stack._load_zarr_complex_chunk)(
-                                    zarr_path, info['burst_path'], (iy, ix),
-                                    chunk_shape, zarr_chunks, scale, fill_value, storage_options,
-                                    re_dtype=re_dtype
-                                )
-                                chunk_arr = da.from_delayed(delayed_chunk, shape=chunk_shape, dtype=np.complex64)
-                                chunk_cols.append(chunk_arr)
-                            chunk_rows.append(chunk_cols)
-                        arr = da.block(chunk_rows)
-
-                    arr = arr[np.newaxis, :, :]  # Add date dim: (y, x) -> (1, y, x)
-                    delayed_arrays.append(arr)
-
-                # Stack all dates: (n_dates, y, x)
-                stacked = da.concatenate(delayed_arrays, axis=0)
-
-                # Zarr disk chunks are rechunked to dask budget via chunk2d logic below.
+            datas = []
+            for polarization in polarizations:
+                pol_infos, sources = pol_sources[polarization]
+                # Stack all dates: (n_dates, y, x), in the dask chunks (1, chunks)
+                stacked = Stack._zarr_dask(f'load-{polarization}', sources, chunks, np.complex64, lead=True)
 
                 # Create xarray DataArray
                 dates = [info['date'] for info in pol_infos]
@@ -3674,38 +4002,13 @@ DEFOMAX_CYCLE  {defomax}
 
                 # Add scalar metadata as variables along date dimension
                 data_ds['burst'] = xr.DataArray([info['burst_name'] for info in pol_infos], dims=['date'])
-
-                # Add all scalar attrs as variables (replicated per date)
-                # Preserve original order from first burst (to_dataframe expects specific order)
-                # Exclude 'burst' (handled above with XX replacement) and 'polarization' (per-pol)
-                excluded_keys = {'burst', 'polarization'}
-                all_scalar_keys = [k for k in pol_infos[0]['scalar_attrs'].keys() if k not in excluded_keys]
-                # Add any keys from other dates that might be missing
-                for info in pol_infos[1:]:
-                    for k in info['scalar_attrs'].keys():
-                        if k not in all_scalar_keys and k not in excluded_keys:
-                            all_scalar_keys.append(k)
-                for key in all_scalar_keys:
-                    vals = [info['scalar_attrs'].get(key, np.nan) for info in pol_infos]
-                    # Check if all values are numeric
-                    if all(isinstance(v, (int, float, np.number)) for v in vals):
-                        data_ds[key] = xr.DataArray(np.array(vals, dtype=np.float64), dims=['date'])
-                    else:
-                        # String values
-                        data_ds[key] = xr.DataArray(vals, dims=['date'])
-
-                # Add array attrs (e.g., polynomial coefficients) - take from first burst
-                first_info = pol_infos[0]
-                for key, arr in first_info['array_attrs'].items():
-                    if arr.ndim == 1:
-                        # Stack arrays from all dates: (n_dates, n_coef)
-                        stacked = np.stack([info['array_attrs'].get(key, arr) for info in pol_infos])
-                        data_ds[key] = xr.DataArray(stacked, dims=['date', f'{key}_coef'])
+                # the loaded attributes, one variable along date each
+                data_ds = data_ds.assign(Stack._load_date_vars(pol_infos, f'{group} {polarization}', notes))
 
                 datas.append(data_ds)
 
             # Merge polarizations
-            ds = xr.merge(datas, compat='no_conflicts', combine_attrs='override')
+            ds = Stack._merge_polarizations(datas)
             del datas
 
             # Load transform: zarr handles metadata/coords, custom reader for 2D chunks
@@ -3720,40 +4023,12 @@ DEFOMAX_CYCLE  {defomax}
             ds.y.attrs.update(transform.y.attrs)
 
             # 2D vars as lazy dask arrays via custom reader (no persistent file descriptors)
-            # One reader call per chunk for memory efficiency
-            # Transform 2D vars loaded with zarr disk chunks, rechunked via chunk2d logic below.
+            # One reader call per chunk for memory efficiency, in the dask chunks of the data
             transform_path = f"{group}/transform"
             for var in transform.data_vars:
-                shape, zarr_chunks, scale_factor, fill_value, dtype = Stack._get_zarr_array_meta(
-                    zarr_path, transform_path, var, storage_options
-                )
-                n_chunks_y = (shape[0] + zarr_chunks[0] - 1) // zarr_chunks[0]
-                n_chunks_x = (shape[1] + zarr_chunks[1] - 1) // zarr_chunks[1]
-
-                if n_chunks_y == 1 and n_chunks_x == 1:
-                    # Single chunk: one reader for entire array
-                    delayed_load = dask.delayed(Stack._load_zarr_array)(
-                        zarr_path, transform_path, var, storage_options
-                    )
-                    arr = da.from_delayed(delayed_load, shape=shape, dtype=np.float32)
-                else:
-                    # Multi-chunk: one reader per chunk
-                    chunk_rows = []
-                    for iy in range(n_chunks_y):
-                        chunk_cols = []
-                        for ix in range(n_chunks_x):
-                            y0, y1 = iy * zarr_chunks[0], min((iy + 1) * zarr_chunks[0], shape[0])
-                            x0, x1 = ix * zarr_chunks[1], min((ix + 1) * zarr_chunks[1], shape[1])
-                            chunk_shape = (y1 - y0, x1 - x0)
-
-                            delayed_chunk = dask.delayed(Stack._load_zarr_array_chunk)(
-                                zarr_path, transform_path, var, (iy, ix),
-                                chunk_shape, zarr_chunks, scale_factor, fill_value, dtype, storage_options
-                            )
-                            chunk_arr = da.from_delayed(delayed_chunk, shape=chunk_shape, dtype=np.float32)
-                            chunk_cols.append(chunk_arr)
-                        chunk_rows.append(chunk_cols)
-                    arr = da.block(chunk_rows)
+                arr = Stack._zarr_dask(f'load-{var}', [Stack._zarr_array_source(zarr_path, transform_path, var,
+                                                                                storage_options)],
+                                       chunks, np.float32, lead=False)
 
                 # the variable's attributes travel with it: actual_range is
                 # how far it reaches, and reading it beats scanning the raster
@@ -3772,34 +4047,7 @@ DEFOMAX_CYCLE  {defomax}
             transform.close()
             root.store.close()
 
-            # Apply chunk2d logic: rechunk spatial dims to optimal sizes for budget
-            from .utils_dask import rechunk2d
-            sample = None
-            for var in ds.data_vars:
-                arr = ds[var]
-                if arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x'):
-                    sample = arr
-                    break
-            if sample is not None:
-                y_size, x_size = sample.shape[-2], sample.shape[-1]
-                in_chunks = (sample.data.chunks[-2], sample.data.chunks[-1]) if hasattr(sample.data, 'chunks') else None
-                optimal = rechunk2d((y_size, x_size), element_bytes=8,
-                                   input_chunks=in_chunks, merge=False,
-                                   target_mb=_load_target_mb)
-                rechunked_vars = {}
-                for var in ds.data_vars:
-                    arr = ds[var]
-                    if not (arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x')):
-                        continue
-                    if arr.ndim == 3:
-                        var_chunks = {arr.dims[0]: 1, 'y': optimal['y'], 'x': optimal['x']}
-                    else:
-                        var_chunks = {'y': optimal['y'], 'x': optimal['x']}
-                    rechunked_vars[var] = arr.chunk(var_chunks)
-                if rechunked_vars:
-                    ds = ds.assign(rechunked_vars)
-
-            return group, ds
+            return group, Stack._load_rechunk(ds, chunks), notes
 
         # A LOCAL PATH IS THE CALLER'S. The chunks are read by the workers, and a
         # process worker keeps the directory it was started in, so a relative
@@ -3822,8 +4070,10 @@ DEFOMAX_CYCLE  {defomax}
             with progressbar_joblib.progressbar_joblib(tqdm(desc='Loading Dataset...'.ljust(25), total=len(groups))) as progress_bar:
                 dss = joblib.Parallel(n_jobs=-1, backend='loky')\
                     (joblib.delayed(store_open_group_delayed)(zarr_path, group) for group in groups)
+            for note in dict.fromkeys(note for _, _, notes in dss for note in notes):
+                print(note, flush=True)
             # list of key - dataset converted to dict and appended to the existing dict
-            self.update(dss)
+            self.update((group, ds) for group, ds, _ in dss)
         # elif isinstance(urls, FsspecStore):
         #     root = zarr.open_consolidated(urls, zarr_format=3, mode='r')
         #     dss = []
@@ -3857,11 +4107,12 @@ DEFOMAX_CYCLE  {defomax}
 
                 # Read burst metadata eagerly from each URL (attrs, shape, coords)
                 burst_infos = []
+                notes = []
                 spatial_ref = None
                 for burst_url in burst_urls:
                     bds = xr.open_zarr(burst_url, consolidated=True, zarr_format=3,
                                        storage_options=storage_options)
-                    shape = (bds.dims['y'], bds.dims['x'])
+                    shape = (bds.sizes['y'], bds.sizes['x'])
                     date = np.datetime64(bds.attrs['startTime'], 's')
                     polarization = bds.attrs['polarization']
                     burst_name = bds.attrs['burst']
@@ -3869,20 +4120,8 @@ DEFOMAX_CYCLE  {defomax}
                     if spatial_ref is None and bds.attrs.get('BPR', 1) == 0:
                         spatial_ref = bds.attrs.get('spatial_ref')
 
-                    # Extract scalar attrs (only whitelisted keys used by insardev)
-                    scalar_attrs = {}
-                    array_attrs = {}
-                    for k, v in bds.attrs.items():
-                        if k in {'Conventions', 'spatial_ref'}:
-                            continue
-                        if isinstance(v, (list, tuple)):
-                            array_attrs[k] = np.array(v)
-                        elif k in _USED_SCALAR_ATTRS:
-                            # Only include whitelisted scalar attrs
-                            if isinstance(v, str):
-                                scalar_attrs[k] = v
-                            else:
-                                scalar_attrs[k] = float(v) if isinstance(v, (int, float)) else v
+                    # Extract scalar attrs (only whitelisted keys used by insardev) and every list attr
+                    scalar_attrs, array_attrs = Stack._load_attrs(bds.attrs, burst_url, notes, _USED_SCALAR_ATTRS)
 
                     burst_infos.append({
                         'url': burst_url,
@@ -3897,25 +4136,23 @@ DEFOMAX_CYCLE  {defomax}
                     })
                     bds.close()
 
-                # Build dataset same as primary path: delayed complex arrays
+                # Build dataset same as primary path: one reader task per zarr disk chunk of each date
                 polarizations = np.unique([info['polarization'] for info in burst_infos])
-                datas = []
+                pol_sources = {}
                 for polarization in polarizations:
                     pol_infos = sorted(
                         [info for info in burst_infos if info['polarization'] == polarization],
                         key=lambda x: x['date']
                     )
-
-                    delayed_arrays = []
-                    for info in pol_infos:
-                        delayed_load = dask.delayed(Stack._load_zarr_complex)(
-                            info['url'], '', storage_options
-                        )
-                        arr = da.from_delayed(delayed_load, shape=info['shape'], dtype=np.complex64)
-                        arr = arr[np.newaxis, :, :]
-                        delayed_arrays.append(arr)
-
-                    stacked = da.concatenate(delayed_arrays, axis=0)
+                    pol_sources[polarization] = (pol_infos, [Stack._zarr_complex_source(info['url'], '',
+                                                                                       storage_options)
+                                                             for info in pol_infos])
+                # the dask chunks of every grid: chunk2d logic on the disk chunks of the first polarization's data
+                chunks = Stack._load_chunks(pol_sources[polarizations[0]][1][0][1], _load_target_mb)
+                datas = []
+                for polarization in polarizations:
+                    pol_infos, sources = pol_sources[polarization]
+                    stacked = Stack._zarr_dask(f'load-{polarization}', sources, chunks, np.complex64, lead=True)
                     dates = [info['date'] for info in pol_infos]
                     data_arr = xr.DataArray(
                         stacked,
@@ -3928,32 +4165,16 @@ DEFOMAX_CYCLE  {defomax}
                     )
                     data_ds = xr.Dataset({polarization: data_arr})
                     data_ds['burst'] = xr.DataArray([info['burst_name'] for info in pol_infos], dims=['date'])
-
-                    # Exclude 'burst' (handled above with XX replacement) and 'polarization' (per-pol)
-                    excluded_keys = {'burst', 'polarization'}
-                    all_scalar_keys = [k for k in pol_infos[0]['scalar_attrs'].keys() if k not in excluded_keys]
-                    for info in pol_infos[1:]:
-                        for k in info['scalar_attrs'].keys():
-                            if k not in all_scalar_keys and k not in excluded_keys:
-                                all_scalar_keys.append(k)
-                    for key in all_scalar_keys:
-                        vals = [info['scalar_attrs'].get(key, np.nan) for info in pol_infos]
-                        if all(isinstance(v, (int, float, np.number)) for v in vals):
-                            data_ds[key] = xr.DataArray(np.array(vals, dtype=np.float64), dims=['date'])
-                        else:
-                            data_ds[key] = xr.DataArray(vals, dims=['date'])
-
-                    first_info = pol_infos[0]
-                    for key, arr in first_info['array_attrs'].items():
-                        if arr.ndim == 1:
-                            stacked_arr = np.stack([info['array_attrs'].get(key, arr) for info in pol_infos])
-                            data_ds[key] = xr.DataArray(stacked_arr, dims=['date', f'{key}_coef'])
+                    data_ds = data_ds.assign(Stack._load_date_vars(pol_infos, f'{fullBurstID} {polarization}',
+                                                                   notes))
 
                     datas.append(data_ds)
 
                 # Merge polarizations
-                ds = xr.merge(datas, compat='no_conflicts', combine_attrs='override')
+                ds = Stack._merge_polarizations(datas)
                 del datas
+                for note in dict.fromkeys(notes):
+                    print(note, flush=True)
 
                 # Load transform: zarr for metadata/coords, custom reader for 2D
                 transform = xr.open_zarr(transform_url, consolidated=True, zarr_format=3,
@@ -3962,12 +4183,11 @@ DEFOMAX_CYCLE  {defomax}
                 ds.x.attrs.update(transform.x.attrs)
                 ds.y.attrs.update(transform.y.attrs)
                 for var in transform.data_vars:
-                    shape = transform[var].shape
-                    delayed_load = dask.delayed(Stack._load_zarr_array)(
-                        transform_url, '', var, storage_options
-                    )
+                    # one reader task per zarr disk chunk, as the store path does
                     ds[var] = xr.DataArray(
-                        da.from_delayed(delayed_load, shape=shape, dtype=np.float32),
+                        Stack._zarr_dask(f'load-{var}', [Stack._zarr_array_source(transform_url, '', var,
+                                                                                  storage_options)],
+                                         chunks, np.float32, lead=False),
                         dims=['y', 'x'], attrs=dict(transform[var].attrs)
                     )
 
@@ -3979,36 +4199,13 @@ DEFOMAX_CYCLE  {defomax}
                 ds.rio.write_crs(spatial_ref, inplace=True)
                 transform.close()
 
-                # Apply chunk2d logic: rechunk spatial dims to optimal sizes for budget
-                from .utils_dask import rechunk2d
-                sample = None
-                for var in ds.data_vars:
-                    arr = ds[var]
-                    if arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x'):
-                        sample = arr
-                        break
-                if sample is not None:
-                    y_size, x_size = sample.shape[-2], sample.shape[-1]
-                    in_chunks = (sample.data.chunks[-2], sample.data.chunks[-1]) if hasattr(sample.data, 'chunks') else None
-                    optimal = rechunk2d((y_size, x_size), element_bytes=8,
-                                       input_chunks=in_chunks, merge=True)
-                    rechunked_vars = {}
-                    for var_name in ds.data_vars:
-                        arr = ds[var_name]
-                        if not (arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x')):
-                            continue
-                        if arr.ndim == 3:
-                            var_chunks = {arr.dims[0]: 1, 'y': optimal['y'], 'x': optimal['x']}
-                        else:
-                            var_chunks = {'y': optimal['y'], 'x': optimal['x']}
-                        rechunked_vars[var_name] = arr.chunk(var_chunks)
-                    if rechunked_vars:
-                        ds = ds.assign(rechunked_vars)
-
-                dss[fullBurstID] = ds
+                dss[fullBurstID] = Stack._load_rechunk(ds, chunks)
 
             #assert len(np.unique([ds.rio.crs.to_epsg() for ds in dss])) == 1, 'All datasets must have the same coordinate reference system'
             self.update(dss)
+        else:
+            raise ValueError(f'ERROR: urls must be a store path (str), a list of URLs, or a Pandas DataFrame '
+                             f'with (fullBurstID, burst) MultiIndex: {type(urls)}')
 
         # Check for duplicate dates in each burst
         for key, ds in self.items():
@@ -4031,7 +4228,19 @@ DEFOMAX_CYCLE  {defomax}
               debug: bool = False,
               return_residuals: bool = False):
         """
-        Align burst phases using interferometric double differences (ESD).
+        DATEWISE alignment: align the burst phases of each date of a complex SLC
+        stack (the 'date' dimension) using interferometric double differences (ESD).
+
+        The PAIRWISE alignment of interferograms (the 'pair' dimension: real,
+        wrapped or complex) is BatchCore.align(), called on the interferograms.
+
+        Not lazy: the burst overlaps of the stack are computed when this is
+        called (one WARNING says so), and later changes to the input stack do
+        not reach the corrections. Every burst's output carries a 'residual'
+        variable (date,): the per-date residual after the correction, rad, 0
+        for the reference date. One WARNING lists the dates whose residual is
+        larger after the correction than before it; skip them with e.g.
+        stack.sel(date=stack.residual < 0.5).
 
         For Sentinel-1 TOPS, adjacent bursts observe overlap regions at different
         azimuth squint angles, so single-date SLC cross-products have zero coherence.
@@ -4062,7 +4271,7 @@ DEFOMAX_CYCLE  {defomax}
         -------
         Stack or tuple
             If return_residuals is False:
-                Phase-corrected Stack.
+                Phase-corrected Stack, each burst with the 'residual' variable (date,).
             If return_residuals is True:
                 (corrected_stack, residuals) where residuals is list[float].
 
@@ -4107,10 +4316,17 @@ DEFOMAX_CYCLE  {defomax}
         else:
             ref_idx = int(ref)
 
+        def with_residual(stack, residuals):
+            """Every burst with the per-date 'residual' variable (rad, float32); the grids untouched."""
+            res = np.asarray(residuals, dtype=np.float32)
+            return type(stack)({bid: ds.assign(residual=xr.DataArray(res, dims=('date',)))
+                                for bid, ds in stack.items()})
+
         if n_dates < 2:
             if debug:
                 print('align(): need at least 2 dates for double-difference', flush=True)
-            return (self, [0.0]) if return_residuals else self
+            aligned = with_residual(self, [0.0] * n_dates)
+            return (aligned, [0.0]) if return_residuals else aligned
 
         if debug:
             print(f'align(): {n_bursts} bursts, {n_dates} dates, ref=date[{ref_idx}], pol={polarization}', flush=True)
@@ -4138,7 +4354,8 @@ DEFOMAX_CYCLE  {defomax}
         if not overlap_pairs:
             if debug:
                 print('No overlapping bursts found', flush=True)
-            return (self, [0.0] * n_dates) if return_residuals else self
+            aligned = with_residual(self, [0.0] * n_dates)
+            return (aligned, [0.0] * n_dates) if return_residuals else aligned
 
         if debug:
             print(f'Found {len(overlap_pairs)} overlapping burst pairs', flush=True)
@@ -4190,6 +4407,8 @@ DEFOMAX_CYCLE  {defomax}
                 dd_keys.append((d_rep, k))
 
         # Single dask.compute() call — parallel across workers, returns only scalars
+        print('WARNING: Stack.align() is not lazy: it computes the burst overlaps of the stack now; '
+              'later changes to the input stack do not reach its corrections.', flush=True)
         all_scalars = dask.compute(*dd_sums, *dd_counts)
         n = len(dd_keys)
         sums = all_scalars[:n]
@@ -4293,25 +4512,39 @@ DEFOMAX_CYCLE  {defomax}
                     new_vars[var] = da
             result[bid] = xr.Dataset(new_vars, coords=ds.coords, attrs=ds.attrs)
 
-        aligned = type(self)(result)
+        # Per-date residuals: the weighted mean |double difference| over the overlaps,
+        # after the correction (returned and stored) and before it (for the warning)
+        residuals = [0.0] * n_dates
+        residuals_before = [0.0] * n_dates
+        for d_rep in rep_dates:
+            abs_discrepancies = []
+            abs_before = []
+            weights = []
+            for k, (id1, id2) in enumerate(overlap_pairs):
+                stat = dd_stats[(d_rep, k)]
+                if stat is None:
+                    continue
+                dd_phase, cnt = stat
+                i, j = id_to_idx[id1], id_to_idx[id2]
+                corrected = -dd_phase - (corrections[i, d_rep] - corrections[j, d_rep])
+                corrected = (corrected + np.pi) % (2*np.pi) - np.pi
+                abs_discrepancies.append(abs(corrected))
+                abs_before.append(abs((-dd_phase + np.pi) % (2*np.pi) - np.pi))
+                weights.append(float(cnt))
+            if abs_discrepancies:
+                residuals[d_rep] = float(np.average(abs_discrepancies, weights=weights))
+                residuals_before[d_rep] = float(np.average(abs_before, weights=weights))
+
+        aligned = with_residual(type(self)(result), residuals)
+
+        # at the precision shown: a rise below 0.001 rad is not reported
+        rose = [d for d in rep_dates if round(residuals[d], 3) > round(residuals_before[d], 3)]
+        if rose:
+            print(f'WARNING: Stack.align(): the residual rose on {len(rose)} date(s): '
+                  + ', '.join(f'{str(dates[d])[:10]} {residuals_before[d]:.3f} -> {residuals[d]:.3f}' for d in rose)
+                  + ' rad. Skip them with stack.sel(date=stack.residual < t).', flush=True)
 
         if return_residuals:
-            residuals = [0.0] * n_dates
-            for d_rep in rep_dates:
-                abs_discrepancies = []
-                weights = []
-                for k, (id1, id2) in enumerate(overlap_pairs):
-                    stat = dd_stats[(d_rep, k)]
-                    if stat is None:
-                        continue
-                    dd_phase, cnt = stat
-                    i, j = id_to_idx[id1], id_to_idx[id2]
-                    corrected = -dd_phase - (corrections[i, d_rep] - corrections[j, d_rep])
-                    corrected = (corrected + np.pi) % (2*np.pi) - np.pi
-                    abs_discrepancies.append(abs(corrected))
-                    weights.append(float(cnt))
-                if abs_discrepancies:
-                    residuals[d_rep] = float(np.average(abs_discrepancies, weights=weights))
             return aligned, residuals
 
         return aligned
@@ -4329,7 +4562,8 @@ DEFOMAX_CYCLE  {defomax}
         ----------
         pairs : list, np.ndarray, or pd.DataFrame
             Pairs of dates as [(ref1, rep1), (ref2, rep2), ...].
-            Dates can be indices (int) or date strings.
+            Dates can be indices (int) or dates (string, datetime64,
+            Timestamp), matched to the day.
 
         Returns
         -------
@@ -4349,8 +4583,21 @@ DEFOMAX_CYCLE  {defomax}
         intf = (ref * rep.conj()).gaussian(wavelength=30).angle()
         """
         import numpy as np
+        import xarray as xr
 
-        pairs = np.array(pairs if isinstance(pairs[0], (list, tuple, np.ndarray)) else [pairs])
+        rows = pairs if isinstance(pairs[0], (list, tuple, np.ndarray)) else [pairs]
+        # an index goes to isel() as given; a date becomes its index here, matched
+        # to the day. Converting the whole array first turned dates into a string
+        # or datetime64 array, which isel() rejects with an IndexError.
+        def _index(d, row):
+            if isinstance(d, (int, np.integer)):
+                return d
+            try:
+                return Batch._ref_index(d, next(iter(self.values())).coords['date'].values)
+            except (KeyError, TypeError) as e:
+                raise type(e)(f'pairs(): {d!r} in pair {list(row)}: {e.args[0]}') from e
+
+        pairs = np.array([[_index(d, row) for d in row] for row in rows])
 
         # Check for duplicate pairs
         unique, counts = np.unique(pairs, axis=0, return_counts=True)
@@ -4362,30 +4609,40 @@ DEFOMAX_CYCLE  {defomax}
         rep_dates = pairs[:, 1]
         n_pairs = len(ref_dates)
 
-        # Rename date->pair and reset to integer index
-        data1 = self.isel(date=ref_dates).rename(date='pair').map(lambda ds: ds.assign_coords(pair=np.arange(n_pairs)))
-        data2 = self.isel(date=rep_dates).rename(date='pair').map(lambda ds: ds.assign_coords(pair=np.arange(n_pairs)))
+        # Rename date->pair and reset to integer index. The per-date 'residual' of
+        # Stack.align() is dropped: carried as the reference date's value, it would
+        # read as the pairwise 'residual' of BatchCore.align()
+        data1 = self.isel(date=ref_dates).rename(date='pair').map(
+            lambda ds: ds.drop_vars('residual', errors='ignore').assign_coords(pair=np.arange(n_pairs)))
+        data2 = self.isel(date=rep_dates).rename(date='pair').map(
+            lambda ds: ds.drop_vars('residual', errors='ignore').assign_coords(pair=np.arange(n_pairs)))
 
         # BPR differences aligned with pair dimension: BPR(rep) - BPR(ref)
         # Keep as per-burst dict structure (each burst has its own BPR)
         #
         # DataArray arithmetic, not Dataset: a Dataset operation applies to the
         # grids only, so `data2[['BPR']] - data1[['BPR']]` would carry data2's
-        # BPR through unchanged and every baseline would come back 0.
-        bpr = Batch({k: (data2[k]['BPR'] - data1[k]['BPR']).to_dataset(name='BPR')
-                     for k in data1.keys()})
+        # BPR through unchanged and every baseline would come back 0. A Batch of
+        # these DataArrays, as they are (N81): assign_coords() takes it directly.
+        bpr = Batch({k: data2[k]['BPR'] - data1[k]['BPR'] for k in data1.keys()})
 
-        # Store original datetime values for ref/rep (already materialized via .values)
-        ref_values = self.isel(date=ref_dates).coords['date'].values
-        rep_values = self.isel(date=rep_dates).coords['date'].values
+        # EACH BURST ITS OWN ref/rep (N121): a burst's dates are its own startTimes, seconds apart
+        # between bursts. The first burst's for every burst broke each per-burst match of pairs to
+        # dates (rmse() of a per-date solution raised KeyError on multi-burst stores)
+        ref_values = {k: np.asarray(self[k].coords['date'].values)[ref_dates] for k in data1.keys()}
+        rep_values = {k: np.asarray(self[k].coords['date'].values)[rep_dates] for k in data1.keys()}
 
         def add_pair_coords(batch):
-            # Add ref/rep/BPR as non-dimension coordinates along pair dimension
-            return batch.assign_coords(
-                ref=('pair', ref_values),
-                rep=('pair', rep_values),
-                BPR=('pair', bpr)
-            )
+            out = {}
+            for k, ds in batch.items():
+                # A PAIR'S startTime IS THE EARLIER OF ITS TWO DATES (decided 2026-10-01), the burst's
+                # own, on both sides: whichever leads a product, it carries the time bursts are ordered by
+                if 'startTime' in ds.data_vars:
+                    earlier = xr.DataArray(ref_values[k] <= rep_values[k], dims='pair')
+                    ds = ds.assign(startTime=xr.where(earlier, data1[k]['startTime'], data2[k]['startTime']))
+                out[k] = ds.assign_coords(ref=('pair', ref_values[k]), rep=('pair', rep_values[k]))
+            # BPR per burst from its Batch, as before
+            return type(batch)(out).assign_coords(BPR=('pair', bpr))
 
         ref_batch = add_pair_coords(BatchComplex(data1))
         rep_batch = add_pair_coords(BatchComplex(data2))
@@ -4410,7 +4667,8 @@ DEFOMAX_CYCLE  {defomax}
         Returns
         -------
         Batch | float | np.ndarray
-            Elevation grids as float32 datasets, or scalar/array if input was scalar/array.
+            Elevation grids as float32 datasets, or scalar/array if input was scalar/array: the signed height
+            difference the phase difference maps to, without the reference height the grids carry.
         """
         import xarray as xr
         import numpy as np
@@ -4455,10 +4713,10 @@ DEFOMAX_CYCLE  {defomax}
             phase_arr = np.asarray(phase)
             is_scalar = phase_arr.ndim == 0
 
-            ref_height = _scalar_from_ds(tfm, 'ref_height') or 0.0
-
-            # phi = fac * B_perp * dh  ->  dh = phi / (fac * B_perp)
-            elev = ref_height - phase_arr / (fac * baseline)
+            # phi = -fac * B_perp * dh  ->  dh = -phi / (fac * B_perp), the same relation as the grids. A scalar
+            # phase has no pixel and no reference surface: it is a phase DIFFERENCE and maps to a signed height
+            # DIFFERENCE, so ref_height is not added here -- it belongs to the unwrapped grids only
+            elev = -phase_arr / (fac * baseline) + 0.0  # + 0.0 turns -0.0 into 0.0
 
             # Return same type as input, rounded to 3 decimals
             if is_scalar:
@@ -4469,6 +4727,8 @@ DEFOMAX_CYCLE  {defomax}
         if transform is None:
             transform = self.transform()
         ep_batch = transform.elevation_phase()
+        from .Batch import _ref_heights
+        ref_heights = _ref_heights({k: transform[k] for k in phase.keys() if k in ep_batch}, 'Stack.elevation()')
         out: dict[str, xr.Dataset] = {}
 
         for key, phase_ds in phase.items():
@@ -4501,7 +4761,7 @@ DEFOMAX_CYCLE  {defomax}
 
             fac_da = ep_batch[key]['elevation_phase']
 
-            ref_height = _scalar_from_ds(tfm, 'ref_height') or 0.0
+            ref_height = ref_heights[key]
 
             elev_vars: dict[str, xr.DataArray] = {}
             for var_name, data in phase_ds.data_vars.items():

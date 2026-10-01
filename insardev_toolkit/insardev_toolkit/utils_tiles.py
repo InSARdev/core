@@ -19,6 +19,9 @@ Every reader of a DEM goes through open_grid(): NetCDF4 grids (.nc, .netcdf, .gr
 tiles, including a VRT written by gdalbuildvrt over the tile folder. A grid stored with descending latitude is
 read ascending. GeoTIFF and classic NetCDF3 files are refused with a hint how to convert them.
 
+A DEM download records the vertical datum of its heights as a compound CRS (e.g. EPSG:4326+3855, WGS 84 + EGM2008
+height) in the VRT <SRS> and in each tile's crs_wkt with the CF geoid_name; utils_geoid reads it back.
+
 The tiles need the Blosc2 filter of hdf5plugin, which h5py gets by importing hdf5plugin, as every reader here
 does. GDAL, QGIS or netCDF-C read the tiles and the VRT only with HDF5_PLUGIN_PATH set to hdf5plugin.PLUGIN_PATH in
 their own environment. The package never sets that variable itself: a process that inherits it before h5py loads
@@ -26,6 +29,7 @@ cannot write the tiles anymore (HDF5 loads the filter a second time and the comp
 """
 import os
 import numpy as np
+from .utils_files import exists, write_file
 
 TILE_CHUNK = 512
 NETCDF_EXTENSIONS = ('.nc', '.netcdf', '.grd')
@@ -91,7 +95,8 @@ def check_format(path):
     if ext not in NETCDF_EXTENSIONS + ('.vrt',):
         raise ValueError(f'ERROR: DEM file extension not recognized: {path}. Use NetCDF4 (.nc, .netcdf, .grd) '
                          f'or a VRT file of NetCDF4 tiles (.vrt)')
-    if not os.path.exists(path):
+    # an empty file raises
+    if not exists(path):
         also = f' nor {os.path.splitext(path)[0]}.vrt' if ext == '.nc' else ''
         raise FileNotFoundError(f'ERROR: DEM file not found: {path}{also}')
     if not os.path.isfile(path):
@@ -105,18 +110,65 @@ def check_format(path):
 # writing
 # -----------------------------------------------------------------------------------------------------------------
 
-def _define_grid(f, lat, lon, dtype, shape, units=None, source=None, chunks=None, fillvalue=None):
-    """Coordinates, CF grid mapping and the data variable of a NetCDF4 lat/lon grid, in an open h5py file."""
+def vertical_datum_name(crs):
+    """The vertical datum name of a compound CRS (e.g. 'EGM2008 geoid' for EPSG:4326+3855), or None for a CRS
+    without heights, None or one that does not parse."""
+    if crs is None:
+        return None
+    from pyproj import CRS as ProjCRS
+    try:
+        crs = ProjCRS.from_user_input(crs)
+    except Exception:
+        return None
+    for sub in crs.sub_crs_list if crs.is_compound else []:
+        if sub.type_name == 'Vertical CRS':
+            return sub.datum.name
+    return None
+
+
+def declared_crs(path):
+    """The CRS a DEM file declares, as stored: the VRT <SRS>, or the crs_wkt (spatial_ref) of the NetCDF grid
+    mapping 'crs' or 'spatial_ref'; None when there is none."""
+    path = resolve(path)
+    check_format(path)
+    if path.lower().endswith('.vrt'):
+        import xml.etree.ElementTree as ET
+        srs = ET.parse(path).getroot().findtext('SRS')
+        return srs.strip() if srs and srs.strip() else None
+    import h5py
+    with h5py.File(path, 'r') as f:
+        for name in ('crs', 'spatial_ref'):
+            if name in f:
+                for key in ('crs_wkt', 'spatial_ref'):
+                    value = f[name].attrs.get(key)
+                    if value is not None:
+                        return value.decode() if isinstance(value, bytes) else str(value)
+    return None
+
+
+def crs_wkt(crs=None):
+    """WKT of a horizontal lat/lon CRS or a compound one with heights, as GDAL writes it; EPSG:4326 when None."""
     from rasterio.crs import CRS
+    return CRS.from_epsg(4326).to_wkt() if crs is None else CRS.from_user_input(crs).to_wkt()
+
+
+def _define_grid(f, lat, lon, dtype, shape, units=None, source=None, chunks=None, fillvalue=None, crs=None):
+    """
+    Coordinates, CF grid mapping and the data variable of a NetCDF4 lat/lon grid, in an open h5py file. A compound
+    CRS such as 'EPSG:4326+3855' (WGS 84 + EGM2008 height) is written as crs_wkt with the CF geoid_name.
+    """
     dl = f.create_dataset('lat', data=np.asarray(lat, dtype=np.float64), track_times=False)
     dl.make_scale('lat')
     dl.attrs.update(units='degrees_north', standard_name='latitude', long_name='latitude', axis='Y')
     do = f.create_dataset('lon', data=np.asarray(lon, dtype=np.float64), track_times=False)
     do.make_scale('lon')
     do.attrs.update(units='degrees_east', standard_name='longitude', long_name='longitude', axis='X')
-    crs = f.create_dataset('crs', data=np.int32(0), track_times=False)
-    crs.attrs.update(grid_mapping_name='latitude_longitude', semi_major_axis=6378137.0,
-                     inverse_flattening=298.257223563, crs_wkt=CRS.from_epsg(4326).to_wkt())
+    grid_mapping = f.create_dataset('crs', data=np.int32(0), track_times=False)
+    grid_mapping.attrs.update(grid_mapping_name='latitude_longitude', semi_major_axis=6378137.0,
+                              inverse_flattening=298.257223563, crs_wkt=crs_wkt(crs))
+    geoid = vertical_datum_name(crs)
+    if geoid is not None:
+        grid_mapping.attrs['geoid_name'] = geoid
     dtype = np.dtype(dtype)
     if fillvalue is None and dtype.kind == 'f':
         fillvalue = np.nan
@@ -134,7 +186,7 @@ def _define_grid(f, lat, lon, dtype, shape, units=None, source=None, chunks=None
     return dz
 
 
-def write_tile(path, values, lat, lon, units=None, source=None):
+def write_tile(path, values, lat, lon, units=None, source=None, crs=None):
     """
     Store one tile as a NetCDF4 file, built in memory, verified and written atomically.
 
@@ -150,6 +202,8 @@ def write_tile(path, values, lat, lon, units=None, source=None):
         Units of the values.
     source : str, optional
         Where the tile came from.
+    crs : str, optional
+        CRS of the tile, e.g. 'EPSG:4326+3855' for heights on the EGM2008 geoid. EPSG:4326 when None.
     """
     import io
     import h5py
@@ -160,16 +214,13 @@ def write_tile(path, values, lat, lon, units=None, source=None):
         raise ValueError('ERROR: tile coordinates must ascend')
     buf = io.BytesIO()
     with h5py.File(buf, 'w') as f:
-        dz = _define_grid(f, lat, lon, values.dtype, values.shape, units=units, source=source)
+        dz = _define_grid(f, lat, lon, values.dtype, values.shape, units=units, source=source, crs=crs)
         dz[...] = values
     data = buf.getvalue()
     with h5py.File(io.BytesIO(data), 'r') as f:
         if not np.array_equal(f['z'][:], values, equal_nan=True):
             raise ValueError(f'ERROR: tile verification failed for {path}')
-    tmp = path + '.tmp'
-    with open(tmp, 'wb') as fh:
-        fh.write(data)
-    os.replace(tmp, path)
+    write_file(path, data)
 
 
 def tile_grid(path):
@@ -189,15 +240,17 @@ _GDAL_TYPES = {'float32': 'Float32', 'float64': 'Float64', 'int16': 'Int16', 'ui
                'int32': 'Int32', 'uint8': 'Byte', 'int8': 'Int8'}
 
 
-def write_vrt(vrt_path, tile_paths):
+def write_vrt(vrt_path, tile_paths, crs=None):
     """
     Write the VRT index over NetCDF4 tiles, with paths relative to the VRT.
 
     All tiles must share one pixel size and one lattice. Tiles are listed south to north and west to east, so
     where tiles overlap by a shared edge (SRTM) the northern and eastern one gives the value, the same choice
     the merged grids made before.
+
+    crs is the CRS of the <SRS> element, e.g. 'EPSG:4326+3855' for heights on the EGM2008 geoid, written as GDAL
+    writes it (WKT with the lat/lon axes swapped to the data order); EPSG:4326 when None.
     """
-    from rasterio.crs import CRS
     infos = sorted((tile_grid(p) for p in tile_paths), key=lambda t: (t['lat0'], t['lon0']))
     if not infos:
         raise ValueError('ERROR: no tiles to index')
@@ -228,21 +281,33 @@ def write_vrt(vrt_path, tile_paths):
                     f'      <SrcRect xOff="0" yOff="0" xSize="{t["nlon"]}" ySize="{t["nlat"]}"/>\n'
                     f'      <DstRect xOff="{xoff}" yOff="{yoff}" xSize="{t["nlon"]}" ySize="{t["nlat"]}"/>\n'
                     f'    </SimpleSource>\n')
+    # the heights axis of a compound or 3D CRS keeps its place, as GDAL writes it
+    mapping = '2,1'
+    if crs is not None:
+        from pyproj import CRS as ProjCRS
+        if len(ProjCRS.from_user_input(crs).axis_info) == 3:
+            mapping = '2,1,3'
     xml = (f'<VRTDataset rasterXSize="{nx}" rasterYSize="{ny}">\n'
-           f'  <SRS dataAxisToSRSAxisMapping="2,1">{CRS.from_epsg(4326).to_wkt()}</SRS>\n'
+           f'  <SRS dataAxisToSRSAxisMapping="{mapping}">{crs_wkt(crs)}</SRS>\n'
            f'  <GeoTransform>{x0!r}, {a!r}, 0.0, {y0!r}, 0.0, {-e!r}</GeoTransform>\n'
            f'  <VRTRasterBand dataType="Float32" band="1">\n'
            f'    <NoDataValue>nan</NoDataValue>\n' + ''.join(body) +
            f'  </VRTRasterBand>\n</VRTDataset>\n')
-    tmp = vrt_path + '.tmp'
-    with open(tmp, 'w') as f:
-        f.write(xml)
-    os.replace(tmp, vrt_path)
+    write_file(vrt_path, xml)
 
 
 # -----------------------------------------------------------------------------------------------------------------
 # reading
 # -----------------------------------------------------------------------------------------------------------------
+
+def data_variable(f):
+    """The DEM variable of an open NetCDF4 file (h5py.File): the first 2D variable of DATA_NAMES, otherwise the
+    first 2D variable by name; None when there is none."""
+    coords = ('lat', 'lon', 'y', 'x')
+    names = [n for n in DATA_NAMES if n in f and getattr(f[n], 'ndim', 0) == 2]
+    names += sorted(n for n in f if n not in coords and getattr(f[n], 'ndim', 0) == 2)
+    return names[0] if names else None
+
 
 class _NetCDFGrid:
     """A NetCDF4 grid file: lat and lon ascending, a file stored the other way round is flipped on read."""
@@ -257,12 +322,9 @@ class _NetCDFGrid:
                 raise ValueError(f'ERROR: {path} has no lat/lon (or y/x) coordinates')
             self.lat = lat[:].astype(np.float64)
             self.lon = lon[:].astype(np.float64)
-            coords = ('lat', 'lon', 'y', 'x')
-            names = [n for n in DATA_NAMES if n in f and getattr(f[n], 'ndim', 0) == 2]
-            names += sorted(n for n in f if n not in coords and getattr(f[n], 'ndim', 0) == 2)
-            if not names:
+            self.var = data_variable(f)
+            if self.var is None:
                 raise ValueError(f'ERROR: no 2D data variable found in {path}')
-            self.var = names[0]
             if f[self.var].shape != (self.lat.size, self.lon.size):
                 raise ValueError(f'ERROR: {path}: variable {self.var} is {f[self.var].shape}, not (lat, lon) '
                                  f'{(self.lat.size, self.lon.size)}')
@@ -324,7 +386,8 @@ class _VRTGrid:
                 fname = fname[len('NETCDF:'):].rsplit(':', 1)[0].strip('"')
             if name.get('relativeToVRT', '0') == '1':
                 fname = os.path.join(base, fname)
-            if not os.path.exists(fname):
+            # an empty tile raises
+            if not exists(fname):
                 raise FileNotFoundError(f'ERROR: {path}: the tile {name.text.strip()} listed in the index is '
                                         f'missing; run the download again to fetch it')
             if os.path.splitext(fname)[1].lower() not in NETCDF_EXTENSIONS or not is_hdf5(fname):
@@ -374,21 +437,23 @@ def resolve(path):
     """
     The DEM file read for a path. The downloader writes 'dem.vrt' in place of a requested 'dem.nc', so a 'dem.nc'
     that does not exist is read from the 'dem.vrt' next to it, with a warning. An existing 'dem.nc', as downloaded
-    by the versions before, is read itself, with a warning when a newer 'dem.vrt' sits next to it.
+    by the versions before, is read itself, with a warning when a newer 'dem.vrt' sits next to it. An empty file
+    raises.
     """
     if not isinstance(path, str):
         raise TypeError(f'ERROR: the DEM must be a file name, a NetCDF4 grid or a VRT of tiles, got '
                         f'{type(path).__name__}')
     if path.lower().endswith('.nc'):
         vrt = os.path.splitext(path)[0] + '.vrt'
-        if not os.path.exists(path):
-            if os.path.exists(vrt):
+        if not exists(path):
+            if exists(vrt):
                 _once(('replaced', path), f'WARNING: {path} does not exist, {vrt} is read instead: the downloader '
                                           f'stores the tiles with this VRT index in place of a single .nc file.')
                 return vrt
         elif os.path.exists(vrt) and os.path.getmtime(vrt) > os.path.getmtime(path):
             _once(('stale', path), f'WARNING: {path} is read, but the newer {vrt} next to it is not: delete '
                                    f'{path} to use the downloaded tiles.')
+    exists(path)
     return path
 
 
@@ -483,6 +548,9 @@ def open_dem(path, chunks=2048):
     """
     Open a DEM file lazily as an xarray DataArray on (lat, lon), read through h5py block by block.
 
+    The grid keeps the file it is read from as its `source` attribute, so utils_geoid.dem_datum() finds the
+    vertical datum of the grid as it finds the datum of the file.
+
     Parameters
     ----------
     path : str
@@ -498,4 +566,5 @@ def open_dem(path, chunks=2048):
     shape_chunks = (tuple(min(c, ny - i) for i in range(0, ny, c)), tuple(min(c, nx - i) for i in range(0, nx, c)))
     data = da.map_blocks(_read_block, grid.path, grid.stamp, dtype=np.float32, chunks=shape_chunks,
                          meta=np.empty((0, 0), dtype=np.float32))
-    return xr.DataArray(data, coords={'lat': grid.lat, 'lon': grid.lon}, dims=('lat', 'lon'), name='z')
+    return xr.DataArray(data, coords={'lat': grid.lat, 'lon': grid.lon}, dims=('lat', 'lon'), name='z',
+                        attrs={'source': grid.path})

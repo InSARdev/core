@@ -9,6 +9,7 @@
 # ----------------------------------------------------------------------------
 
 import math
+import warnings
 import tqdm.auto as _tqdm_auto
 import tqdm.std as _tqdm_std
 from tqdm.std import tqdm as _tqdm
@@ -142,9 +143,46 @@ class TqdmDaskProgress(ProgressBar):
         """
         self.tqdm.close()
 
+def _scheduler_knows(keys, dask_scheduler=None):
+    return all(k in dask_scheduler.tasks for k in keys)
+
+def _drop_refused(client, futures):
+    """
+    Detach the futures of a graph the scheduler refused from the client, before raising.
+
+    The raised error holds these futures through its traceback (and a cancelled future's
+    own CancelledError, which the client keeps, holds them through the traceback raising it
+    gave it). A future state left in client.futures is shared by the next persist of the
+    same keys -- the recompute from the source the error asks for -- which then starts as
+    'cancelled' and was refused falsely before the scheduler had even seen the new graph.
+    The scheduler has already released the refused keys, so nothing is sent to it; the
+    futures are released, so a kept traceback holds no cluster data either.
+    """
+    for f in futures:
+        client.futures.pop(f.key, None)
+        f.release()
+
+def _refusal_reason(future):
+    """The text of a cancelled future's CancelledError, raised and dropped here so that
+    it keeps no traceback (and so no frame or future) alive."""
+    reason = 'cancelled'
+    try:
+        future.result()
+    except Exception as e:
+        reason = str(e)
+        e.__traceback__ = None
+    return reason
+
 def progressbar(futures, **kwargs):
     """
     Helper function to track progress of Dask computation using tqdm.
+
+    The bar waits until the scheduler has the keys it tracks. A graph that needs data
+    the cluster no longer holds is refused ("lost dependencies"), its keys never appear,
+    and the bar would wait forever. So first wait until the scheduler has all the keys
+    or the futures report the refusal. The refused futures are detached from the client
+    before the error is raised (_drop_refused), so the recompute from the source works
+    on the first attempt.
 
     Parameters
     ----------
@@ -152,9 +190,30 @@ def progressbar(futures, **kwargs):
         List of Dask futures.
     **kwargs : dict
         Additional keyword arguments for TqdmDaskProgress.
+
+    Raises
+    ------
+    RuntimeError
+        The graph needs data the cluster no longer holds.
     """
+    import time
     from distributed.client import futures_of
     futures = futures_of(futures)
     if not isinstance(futures, (set, list)):
         futures = [futures]
+    if futures:
+        client = next(iter(futures)).client
+        keys = [f.key for f in futures]
+        delay = 0.05
+        while not client.run_on_scheduler(_scheduler_knows, keys):
+            refused = next((f for f in futures if f.status in ('error', 'cancelled')), None)
+            if refused is not None:
+                _drop_refused(client, futures)
+                if refused.status == 'error':
+                    refused.result()
+                reason = _refusal_reason(refused)
+                raise RuntimeError(f'Input data is no longer on the cluster ({reason}). '
+                                   'Recompute it from its source.')
+            time.sleep(delay)
+            delay = min(2 * delay, 1.0)
     TqdmDaskProgress(futures, **kwargs)

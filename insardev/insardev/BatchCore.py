@@ -12,6 +12,7 @@ from __future__ import annotations
 from .utils_torch import serialize_gpu
 from . import utils_io,  utils_xarray
 import operator
+from types import FunctionType
 import numpy as np
 import xarray as xr
 from collections.abc import Mapping
@@ -22,6 +23,9 @@ if TYPE_CHECKING:
     import rasterio as rio
     import pandas as pd
     import matplotlib
+
+# the scalar operands of the Batch operators (a complex scalar included: ph * 1j)
+_SCALARS = (int, float, complex, np.number)
 
 
 def _parse_budget(budget):
@@ -42,7 +46,45 @@ def _parse_budget(budget):
     return int(val)
 
 
-def _merge_tiles_for_dask(tiles, offsets, out_shape, fill_dtype):
+def _nodata_of(dtype):
+    """THE NODATA VALUE OF A MERGED GRID, by its dtype (to_dataset()): NaN for float and
+    complex grids, -1 for signed integers (fit3d level and conncomp), 0 for unsigned
+    integers (unwrap2d conncomp: 0 is no component) and False for bool. Not the dtype's
+    maximum: 0 and -1 are the values a plot and a colormap handle easily."""
+    dtype = np.dtype(dtype)
+    if dtype.kind in 'fc':
+        return np.nan
+    if dtype.kind == 'i':
+        return -1
+    if dtype.kind == 'u':
+        return 0
+    if dtype.kind == 'b':
+        return False
+    raise TypeError(f'ERROR: to_dataset() cannot merge a {dtype} grid. Convert it to a number first.')
+
+
+def _warn_int_nodata(who, dtypes):
+    """ONE WARNING per call naming the integer and bool grids of {name: dtype}, whose
+    nodata is set by the dtype (_nodata_of), for one burst or many (decided 2026-09-30:
+    "show warning when such datatype appear - so user is aware")."""
+    ints = [f'{name} {np.dtype(dt)} {_nodata_of(dt)}' for name, dt in dtypes.items() if np.dtype(dt).kind in 'biu']
+    if ints:
+        print(f"WARNING: {who}(): integer grids with nodata by dtype: {', '.join(ints)}. "
+              f"Replace the nodata value or convert the dtype first if that is wrong.")
+
+
+def _skip_nodata(value):
+    """An integer or bool grid's nodata (_nodata_of: -1, 0, False) as NaN, the way the
+    exports skip it as to_dataset() does (decided 2026-10-01): to_geojson() leaves it
+    out, plot() and to_vtk() do not draw it. Float and complex grids as they are."""
+    def skip(a):
+        return a.where(a != _nodata_of(a.dtype)) if a.dtype.kind in 'biu' else a
+    if isinstance(value, xr.DataArray):
+        return skip(value)
+    return value.assign({v: skip(value[v]) for v in value.data_vars if value[v].dtype.kind in 'biu'})
+
+
+def _merge_tiles_for_dask(tiles, offsets, out_shape, fill_dtype, nodata=np.nan):
     """
     Module-level function for merging tiles in to_dataset().
 
@@ -50,16 +92,23 @@ def _merge_tiles_for_dask(tiles, offsets, out_shape, fill_dtype):
     When using dask distributed, closures with nested functions may not serialize correctly,
     causing random/incorrect behavior on workers.
 
+    THE OVERLAP RULE: the tiles come in the bursts' acquisition order and each one is laid
+    over the ones before it, so the MOST RECENT burst's valid value wins; its nodata
+    (_nodata_of: NaN, or -1, 0, False for an integer or bool grid) is transparent and
+    never hides an earlier burst's valid value; a pixel no tile covers stays nodata.
+
     Args:
-        tiles: list of dask delayed objects that will compute to 3D arrays (1, ny, nx)
+        tiles: list of 3D arrays (1, ny, nx), the tiles of _tile_for_dask(), earliest burst first
         offsets: list of (y_offset, x_offset) tuples for each tile
         out_shape: (ny, nx) output shape
-        fill_dtype: output dtype
+        fill_dtype: output dtype, the grid's own
+        nodata: the grid's nodata value, _nodata_of(fill_dtype)
 
     Returns:
         merged 2D numpy array
     """
-    out = np.full(out_shape, np.nan, dtype=fill_dtype)
+    out = np.full(out_shape, nodata, dtype=fill_dtype)
+    nan = isinstance(nodata, float) and np.isnan(nodata)
 
     for tile_3d, (y_off, x_off) in zip(tiles, offsets):
         # Tiles arrive as 3D (1, ny, nx), squeeze to 2D
@@ -78,11 +127,25 @@ def _merge_tiles_for_dask(tiles, offsets, out_shape, fill_dtype):
             ty0, tx0 = y0c - y0, x0c - x0
             ty1, tx1 = ty0 + (y1c - y0c), tx0 + (x1c - x0c)
 
-            # In-place fmin: min of existing and new, NaN treated as missing
+            # the later burst's valid values over the earlier ones; its nodata is transparent
             view = out[y0c:y1c, x0c:x1c]
-            np.fmin(view, tile[ty0:ty1, tx0:tx1], out=view)
+            src = tile[ty0:ty1, tx0:tx1]
+            np.copyto(view, src, where=~np.isnan(src) if nan else src != nodata)
 
     return out
+
+
+def _tile_for_dask(block, s, y0, y1, x0, x1):
+    """One tile of to_dataset(): rows [y0, y1) and columns [x0, x1) of one input block, as (1, ny, nx) --
+    slice s of a 3-D block, or the 2-D block itself (s None)."""
+    if s is None:
+        return block[np.newaxis, y0:y1, x0:x1]
+    return block[s:s + 1, y0:y1, x0:x1]
+
+
+def _merge_parts_for_dask(offsets, out_shape, fill_dtype, nodata, *tiles):
+    """One output block of to_dataset(): _merge_tiles_for_dask() of its tiles, as (1, ny, nx)."""
+    return _merge_tiles_for_dask(tiles, offsets, out_shape, fill_dtype, nodata)[np.newaxis]
 
 
 def _dissolve_pol_for_dask(da_current, das_others, wrap, extend, weight):
@@ -293,6 +356,40 @@ class BatchCore(dict):
     intfs60_detrend.isel(1)
     intfs60_detrend.isel([0, 2])
     intfs60_detrend.isel(slice(1, None))
+
+    THE OPERATOR RULE (N81). A burst Dataset is a container of GRIDS, the
+    variables carrying both y and x. Every operator -- arithmetic with a
+    scalar, a DataArray or a Dataset in either order, comparisons, unary
+    operators, numpy ufuncs, reductions, where() and the map helpers -- acts on
+    the grids only, and every other variable (numeric or string, any dims)
+    passes through unchanged. A Dataset without grids raises and names the
+    variable to select. A Batch of DataArrays takes every operator directly;
+    x.name and x['name'] both give it, as in xarray. A (y, x) grid keeps the
+    batch's class (w['VV'] is a BatchWrap); any other variable or coordinate
+    (BPR, near_range, residual, ref, y, ...) is a plain Batch. Class
+    conversion (BatchWrap wraps) happens on explicit construction only,
+    never on a selection or a mask.
+
+    THE CLASS HOLDS ITS VALUES: BatchWrap(x) wraps float phase and
+    BatchUnit(x) holds float units, and both raise for bool, integer or
+    complex grids; BatchComplex(x) takes any dtype. A result the class does
+    not keep -- a comparison, ~, np.isfinite() of a BatchWrap or a BatchUnit,
+    any boolean result of a BatchComplex -- is a plain Batch (_as_class).
+
+    A MASK MATCHES BY NAME (where(), mask()): a Dataset mask masks each grid
+    by its grid of the same name, and a grid it lacks raises; a DataArray
+    mask masks every grid. Non-grid variables pass through.
+
+    A WEIGHT IS A BATCHUNIT: of Datasets, each grid weighted by its grid of
+    the same name (a grid it lacks raises), or of one (y, x) DataArray that
+    weights every grid. Anything else raises (_weight).
+
+    A BATCH OF DATAARRAYS TAKES THE METHODS DIRECTLY: a DataArray in, a
+    DataArray out (or the method's own named outputs). A method that needs
+    the Dataset's non-grid variables (radar_wavelength, BPR, the radar
+    geometry) raises for it and names them. Only the methods about named
+    Dataset structure (plot, export, save, assign, merge, align) see it as
+    one-variable Datasets (_DA_AS_DATASETS).
     """
 
     class CoordCollection:
@@ -345,10 +442,11 @@ class BatchCore(dict):
         import dask.array as da
 
         for key, ds in self.items():
-            for var in ds.data_vars:
-                if 'y' not in ds[var].dims or 'x' not in ds[var].dims:
+            # a Dataset's variables, or a DataArray as its own one (N81)
+            for var, arr in BatchCore._vars_of(ds).items():
+                if 'y' not in arr.dims or 'x' not in arr.dims:
                     continue
-                if not isinstance(ds[var].data, da.Array):
+                if not isinstance(arr.data, da.Array):
                     return False
             break  # Only check first burst
         return True
@@ -376,11 +474,11 @@ class BatchCore(dict):
             import dask.array as da
             offenders = []
             for key, ds in batch.items():
-                for var in ds.data_vars:
-                    if 'y' not in ds[var].dims or 'x' not in ds[var].dims:
+                for var, arr in BatchCore._vars_of(ds).items():
+                    if 'y' not in arr.dims or 'x' not in arr.dims:
                         continue
-                    if not isinstance(ds[var].data, da.Array):
-                        offenders.append(f"{var} ({type(ds[var].data).__name__})")
+                    if not isinstance(arr.data, da.Array):
+                        offenders.append(f"{var} ({type(arr.data).__name__})")
                 break
             raise TypeError(
                 f"{func_name}() requires lazy (dask) data; these gridded "
@@ -410,7 +508,7 @@ class BatchCore(dict):
         #print('BatchCore __init__ mapping', mapping or {}, '\n')
         super().__init__(mapping or {})
 
-    def from_dataset(self, data: xr.Dataset, **kwargs) -> Batch:
+    def from_dataset(self, data: xr.Dataset | xr.DataArray, **kwargs) -> Batch:
         """
         Create a Batch by selecting each burst's coordinates from a merged Dataset.
 
@@ -419,14 +517,17 @@ class BatchCore(dict):
 
         Parameters
         ----------
-        data : xr.Dataset
-            The input data to split back into per-burst datasets.
+        data : xr.Dataset or xr.DataArray
+            The input data to split back into per-burst datasets. A Batch of
+            DataArrays takes its own variable from a merged Dataset (the one
+            x['VV'].to_dataset() returns) and gives DataArrays back; a merged
+            DataArray (merged['VV']) splits into DataArrays.
 
         Returns
         -------
         Batch
             A new Batch with the same keys as self, each containing the
-            selected subset of the Dataset.
+            selected subset of the Dataset (or of the DataArray).
 
         Examples
         --------
@@ -438,9 +539,26 @@ class BatchCore(dict):
         from .Batch import Batch
         from .utils_dask import rechunk2d
 
-        # Validate input type
-        if not isinstance(data, xr.Dataset):
-            raise TypeError(f"data must be xr.Dataset, got {type(data).__name__}")
+        # Validate input type: a merged Dataset, or a merged DataArray (merged['VV']), which
+        # comes back as a Batch of DataArrays (N81)
+        if not isinstance(data, (xr.Dataset, xr.DataArray)):
+            raise TypeError(f"data must be xr.Dataset or xr.DataArray, got {type(data).__name__}")
+        # A BATCH OF DATAARRAYS takes the merged Dataset's ONE variable (N81): to_dataset()
+        # always returns a Dataset, and the round trip gives DataArrays back. A DataArray is
+        # one variable, so its name is never compared; a Dataset of several RAISES, to be picked
+        first = next(iter(dict.values(self)), None)
+        if isinstance(data, xr.Dataset) and isinstance(first, xr.DataArray):
+            data = BatchCore._mask_of_dataarray(data, first, 'from_dataset', what='data')
+
+        def rechunk_like(arr, src):
+            """`arr` in the chunks of this burst's `src`, where they differ."""
+            if src is None or not hasattr(src.data, 'chunks'):
+                return None
+            chunks = dict(zip(src.dims, src.data.chunks))
+            if isinstance(arr.data, np.ndarray) or \
+               (hasattr(arr.data, 'chunks') and dict(zip(arr.dims, arr.data.chunks)) != chunks):
+                return arr.chunk(chunks)
+            return None
 
         out = {}
         for key, ds in dict.items(self):
@@ -454,18 +572,22 @@ class BatchCore(dict):
                     selected = selected.isel({dim: slice(0, ds.sizes[dim])})
                     selected = selected.assign_coords({dim: ds.coords[dim]})
 
-            # Rechunk to match self's chunk structure per burst
-            rechunked_vars = {}
-            for var_name in selected.data_vars:
-                arr = selected[var_name]
-                src = ds[var_name] if var_name in ds.data_vars else None
-                if src is not None and hasattr(src.data, 'chunks'):
-                    chunks = dict(zip(src.dims, src.data.chunks))
-                    if isinstance(arr.data, np.ndarray) or \
-                       (hasattr(arr.data, 'chunks') and dict(zip(arr.dims, arr.data.chunks)) != chunks):
-                        rechunked_vars[var_name] = arr.chunk(chunks)
-            if rechunked_vars:
-                selected = selected.assign(rechunked_vars)
+            # Rechunk to match self's chunk structure per burst: a burst's variables, or a
+            # DataArray burst as its own one variable (N81)
+            src_vars = BatchCore._vars_of(ds)
+            if isinstance(selected, xr.DataArray):
+                src = src_vars.get(selected.name, ds if isinstance(ds, xr.DataArray) else None)
+                rechunked = rechunk_like(selected, src)
+                if rechunked is not None:
+                    selected = rechunked
+            else:
+                rechunked_vars = {}
+                for var_name in selected.data_vars:
+                    rechunked = rechunk_like(selected[var_name], src_vars.get(var_name))
+                    if rechunked is not None:
+                        rechunked_vars[var_name] = rechunked
+                if rechunked_vars:
+                    selected = selected.assign(rechunked_vars)
 
             # RESTORE THE PER-BURST METADATA FROM SELF. to_dataset() merges the
             # bursts into ONE raster, and only the grids can survive that: the
@@ -483,12 +605,15 @@ class BatchCore(dict):
             # Only what the merged Dataset did NOT bring back is restored, so
             # anything the processing computed keeps precedence over the
             # original, and only where the dims still line up.
+            # A DataArray holds no metadata variables: only a Dataset burst carries them,
+            # into a Dataset result (N81).
+            both = isinstance(ds, xr.Dataset) and isinstance(selected, xr.Dataset)
             carry = {v: ds[v] for v in ds.data_vars
                      if v not in selected.data_vars
                      and not ('y' in ds[v].dims and 'x' in ds[v].dims)
                      and all(d in selected.sizes
                              and selected.sizes[d] == ds.sizes[d]
-                             for d in ds[v].dims)}
+                             for d in ds[v].dims)} if both else {}
             if carry:
                 selected = selected.assign(carry)
             carry_coords = {c: ds.coords[c] for c in ds.coords
@@ -498,8 +623,9 @@ class BatchCore(dict):
                                     for d in ds.coords[c].dims)}
             if carry_coords:
                 selected = selected.assign_coords(carry_coords)
-            for a_, v_ in ds.attrs.items():
-                selected.attrs.setdefault(a_, v_)
+            if type(ds) is type(selected):
+                for a_, v_ in ds.attrs.items():
+                    selected.attrs.setdefault(a_, v_)
             out[key] = selected
         return Batch(out)
 
@@ -633,9 +759,14 @@ class BatchCore(dict):
         # for DatasetCoarsen extract the original Dataset
         if hasattr(sample, 'obj'):
             sample = sample.obj
-        data_var = [var for var in sample.data_vars if (sample[var].ndim in (2,3) and sample[var].dims[-2:] == ('y','x'))][0]
+        if isinstance(sample, xr.DataArray):
+            # a Batch of DataArrays: the chunks of the DataArray itself
+            arr = sample
+        else:
+            data_var = [var for var in sample.data_vars if (sample[var].ndim in (2,3) and sample[var].dims[-2:] == ('y','x'))][0]
+            arr = sample[data_var]
 
-        chunks = sample[data_var].chunks
+        chunks = arr.chunks
         #print ('chunks', chunks)
         if chunks is None:
             # Data is not lazy (numpy arrays) - return empty dict silently
@@ -643,7 +774,7 @@ class BatchCore(dict):
             return {}
 
         # build dict of first‐chunk sizes, one chunk means chunk size 1 or -1
-        return {dim: sizes[0] if len(sizes) > 1 else (1 if sizes[0] == 1 else -1) for dim, sizes in zip(sample[data_var].dims, chunks)}
+        return {dim: sizes[0] if len(sizes) > 1 else (1 if sizes[0] == 1 else -1) for dim, sizes in zip(arr.dims, chunks)}
 
     def __getitem__(self, key):
         """
@@ -676,27 +807,110 @@ class BatchCore(dict):
                     ds = ds.assign({k: self._square_of(ds, k, burst_id)
                                     for k in miss})
                 out[burst_id] = ds[list(key)]
-            return type(self)(out)
+            return self._view(out)
 
         # Try to access as a dataset key first
-        try:
+        if dict.__contains__(self, key):
             return super().__getitem__(key)
-        except KeyError:
-            # If not a dataset key, try to access as coordinate/variable
-            subset = {
-                k: ds[key] if not isinstance(ds, self.CoordCollection) else ds._ds.coords[key]
-                for k, ds in self.items()
-                if (isinstance(ds, self.CoordCollection) and key in ds._ds.coords) or 
-                   (not isinstance(ds, self.CoordCollection) and (key in ds.coords or key in ds.data_vars))
-            }
-            # NEITHER A BURST NOR A NAME ANY BURST CARRIES: that is a miss, and
-            # a miss raises -- as __getattr__ raises AttributeError and
-            # Stack.__getitem__ raises here. An empty Batch made a typo, and a
-            # burst a selection dropped, read as a result that simply held
-            # nothing. A name some bursts carry still returns those bursts.
-            if not subset:
-                raise KeyError(key) from None
-            return type(self)(subset)
+        # If not a dataset key, try to access as coordinate/variable
+        return self._select_var(key)
+
+    def _select_var(self, key):
+        """The variable or coordinate `key` of every burst that carries it: a Batch
+        of DataArrays, as xarray's ds[key] and ds.key both give (N81).
+
+        THE CLASS IS THE GRIDS' (N81, V2). A (y, x) grid keeps this batch's
+        class: w['VV'] is wrapped phase and stays a BatchWrap, corr['VV'] a
+        BatchUnit, intf['VV'] a BatchComplex. Anything else -- BPR,
+        near_range, residual, ref, rep, y, x -- is not what the class
+        describes and comes back as a plain Batch.
+
+        A SELECTION IS NOT A CONSTRUCTION either way: no constructor runs
+        (_view), so the values are the stored ones. A BatchWrap's w.BPR used
+        to keep the class, and the next isel() or compute() rebuilt it through
+        BatchWrap(...) and wrapped it into [-pi, pi].
+        """
+        subset = {
+            k: ds[key] if not isinstance(ds, self.CoordCollection) else ds._ds.coords[key]
+            for k, ds in self.items()
+            if (isinstance(ds, self.CoordCollection) and key in ds._ds.coords) or
+               (not isinstance(ds, self.CoordCollection)
+                and (key in ds.coords or key in getattr(ds, 'data_vars', ())))
+        }
+        # NEITHER A BURST NOR A NAME ANY BURST CARRIES: that is a miss, and
+        # a miss raises -- as __getattr__ raises AttributeError and
+        # Stack.__getitem__ raises here. An empty Batch made a typo, and a
+        # burst a selection dropped, read as a result that simply held
+        # nothing. A name some bursts carry still returns those bursts.
+        if not subset:
+            raise KeyError(key)
+        if all(BatchCore._is_grid(v) for v in subset.values()):
+            return self._view(subset)
+        from .Batch import Batch
+        return BatchCore._view_as(Batch, subset)
+
+    def _view(self, mapping):
+        """This batch's class over `mapping`, WITHOUT the conversion its constructor
+        applies (BatchWrap wraps to [-pi, pi]).
+
+        Class conversion happens on EXPLICIT construction only -- BatchWrap(x)
+        -- never on a selection or a mask taken from data that already is of
+        this class (N81): wrapping a boolean mask made it floats, and sel()
+        then read the floats as labels and kept the wrong pairs.
+        """
+        return BatchCore._view_as(type(self), mapping)
+
+    @staticmethod
+    def _view_as(klass, mapping):
+        """`klass` over `mapping` without running its constructor (see _view)."""
+        out = dict.__new__(klass)
+        dict.__init__(out, mapping)
+        return out
+
+    @staticmethod
+    def _named_dtypes(mapping):
+        """(name, dtype) of every grid of every Dataset in `mapping`, and of every
+        DataArray; anything else (a coarsen() window) has none."""
+        out = []
+        for v in (dict.values(mapping) if isinstance(mapping, dict) else mapping.values()):
+            if isinstance(v, xr.DataArray):
+                out.append((v.name, v.dtype))
+            elif isinstance(v, xr.Dataset):
+                out += [(n, v[n].dtype) for n in v.data_vars if 'y' in v[n].dims and 'x' in v[n].dims]
+        return out
+
+    @classmethod
+    def _keeps(cls, dtype) -> bool:
+        """Whether a result of this dtype keeps the class (_as_class)."""
+        return True
+
+    @staticmethod
+    def _require_float(mapping, what):
+        """THE CLASS HOLDS ITS VALUES (N81): BatchWrap and BatchUnit hold float grids
+        only. `what` names the class and its values in the error."""
+        for name, dt in BatchCore._named_dtypes(mapping or {}):
+            if dt.kind != 'f':
+                raise TypeError(f'ERROR: {what}, got {dt} {name}. Use Batch(x).')
+
+    @staticmethod
+    def _as_class(klass, mapping, view=False):
+        """`klass` over an operation's result when the class keeps its values,
+        otherwise a plain Batch (N81).
+
+        A BatchWrap holds wrapped float phase and a BatchUnit float units: a
+        comparison, ~, np.isfinite() or astype(bool) of either is a mask, not a
+        phase or a unit, and as a BatchWrap it was wrapped into floats, which
+        sel() read as labels. A BatchComplex keeps any result but a boolean one.
+        view=True skips the constructor (_view): a mask is not a construction.
+        """
+        if all(klass._keeps(dt) for _, dt in BatchCore._named_dtypes(mapping)):
+            return BatchCore._view_as(klass, mapping) if view else klass(mapping)
+        from .Batch import Batch
+        return BatchCore._view_as(Batch, mapping)
+
+    def _result(self, mapping, view=False):
+        """This batch's class over an operation's result, or a plain Batch (_as_class)."""
+        return BatchCore._as_class(type(self), mapping, view)
 
     @staticmethod
     def _square_of(ds, name, key=''):
@@ -736,238 +950,545 @@ class BatchCore(dict):
         return q
 
     def __getattr__(self, name: str):
-        """Attribute-style access to coords or data variables (e.g., batch.ele)."""
+        """Attribute-style access to a variable or coordinate: `x.name` is
+        `x['name']`, a Batch of DataArrays, as xarray's ds.name is ds['name']
+        (N81). Only names that are not methods reach here, as in xarray."""
         if name.startswith('_') or name in ('keys', 'values', 'items', 'get'):
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
         if not self:
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
-        def _extract(ds):
-            # CoordCollection wrapper
-            if isinstance(ds, self.CoordCollection):
-                if name in ds._ds.coords:
-                    return ds._ds.coords.to_dataset()[[name]]
-                return None
+        try:
+            return self._select_var(name)
+        except KeyError:
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'") from None
 
-            # Dataset: prefer data_vars, then coords
-            if hasattr(ds, 'data_vars'):
-                if name in ds.data_vars:
-                    return ds[[name]]
-                if name in ds.coords:
-                    return ds.coords.to_dataset()[[name]]
-                return None
+    # A BATCH OF DATAARRAYS TAKES EVERY CORE METHOD DIRECTLY (N81). A method on the
+    # grids alone works variable by variable (_vars_of): a DataArray in, a DataArray
+    # out, or the method's own named outputs (aspect(), stl()). A method that needs
+    # the Dataset's non-grid variables -- radar_wavelength, BPR, the radar geometry --
+    # raises for a DataArray at its start (_needs_dataset): the DataArray does not
+    # carry them, and a fit without them is silently another fit.
+    # ONLY THESE, ABOUT NAMED DATASET STRUCTURE BY DESIGN, see a Batch of DataArrays
+    # as ONE-VARIABLE DATASETS named after the DataArray (what x[['name']] holds):
+    # plot and export by name, the store layout, Dataset structure (assign,
+    # rename_vars, merge) and align(), whose output adds the 'residual' variable.
+    # So do the modules' own methods, which core does not define.
+    _DA_AS_DATASETS = frozenset({
+        'plot', 'plot2', 'rgb', 'to_dataframe', 'to_geojson', 'to_geopackage', 'to_vtk',
+        'to_vtks', 'save', 'snapshot', 'assign', 'rename_vars', 'merge', 'align',
+    })
 
-            # DataArray fallback: match by name
-            if hasattr(ds, 'name') and ds.name == name:
-                return ds.to_dataset()
-            if hasattr(ds, 'coords') and name in ds.coords:
-                return ds.coords.to_dataset()[[name]]
+    def __getattribute__(self, name):
+        if name[0] != '_':
+            first = next(iter(dict.values(self)), None)
+            if isinstance(first, xr.DataArray):
+                # a method or property of the Batch classes (the modules' ones included)
+                for klass in type(self).__mro__:
+                    if klass is dict:
+                        break
+                    attr = klass.__dict__.get(name)
+                    if attr is not None:
+                        if isinstance(attr, (FunctionType, property)) and \
+                                (name in BatchCore._DA_AS_DATASETS or not BatchCore._is_core(attr)):
+                            return getattr(BatchCore._as_datasets(self, name), name)
+                        break
+        return dict.__getattribute__(self, name)
+
+    @staticmethod
+    def _is_core(attr) -> bool:
+        """Whether a method is core insardev's: defined here, or a module's wrapper of a
+        core method (its __wrapped__), which then takes what the core method takes."""
+        fn = attr.fget if isinstance(attr, property) else attr
+        while fn is not None:
+            if (getattr(fn, '__module__', None) or '').split('.')[0] == 'insardev':
+                return True
+            fn = getattr(fn, '__wrapped__', None)
+        return False
+
+    # the per-date radar geometry the scene-centre and pixelwise conversions read
+    _GEOMETRY = ('radar_wavelength', 'near_range', 'rng_samp_rate', 'earth_radius', 'SC_height_start',
+                 'SC_height_end', 'num_lines', 'num_rng_bins')
+
+    @staticmethod
+    def _needs_dataset(batch, what, names, action='Call it on the Dataset batch x.'):
+        """A method that needs the Dataset's non-grid variables `names` RAISES for a Batch
+        of DataArrays (N81): a DataArray does not carry them, and without them the result
+        is another one, silently -- a fit without its baselines, a trend without its epoch."""
+        first = next(iter(dict.values(batch)), None)
+        if isinstance(first, xr.DataArray):
+            raise TypeError(f"ERROR: {what}() needs the Dataset ({', '.join(names)}), which "
+                            f"x['{first.name}'] does not carry. {action}")
+
+    @staticmethod
+    def _needs_vars(batch, what, names, action='Call it on the Dataset batch x.'):
+        """_needs_dataset(), and a Dataset burst without any of `names` RAISES too, naming
+        them (N81): x[['VV']] drops them as x['VV'] does, and the result is then another
+        one, silently -- no height term, or another reference date."""
+        BatchCore._needs_dataset(batch, what, names, action)
+        for key, ds in dict.items(batch):
+            missing = [n for n in names if n not in ds.variables] if isinstance(ds, xr.Dataset) else []
+            if missing:
+                raise KeyError(f"ERROR: {what}() needs {', '.join(missing)}, which burst {key} "
+                               f"does not carry. {action}")
+
+    @staticmethod
+    def _as_datasets(batch, what):
+        """A Batch of DataArrays as one-variable Datasets named after each DataArray, for `what`()
+        (_DA_AS_DATASETS and the modules' methods only)."""
+        out = {}
+        for k, v in dict.items(batch):
+            if isinstance(v, xr.DataArray):
+                if v.name is None:
+                    raise TypeError(f"ERROR: {what}() needs a named DataArray batch. Name it: x.rename('name').")
+                if v.name in v.coords:
+                    # a coordinate's own DataArray (x.BPR on pair products, x.pair) carries
+                    # that coordinate, and xarray refuses a Dataset of it: the variable is
+                    # the coordinate's values, so the coordinate itself is dropped
+                    v = v.drop_vars(v.name)
+                v = v.to_dataset()
+            out[k] = v
+        return batch._view(out)
+
+    @staticmethod
+    def _is_dataarray_batch(batch) -> bool:
+        """A Batch of DataArrays (N81): processed as xarray processes a DataArray, with or
+        without (y, x) -- only a Batch of Datasets applies its operators to the grids only."""
+        return isinstance(next(iter(dict.values(batch)), None), xr.DataArray)
+
+    @staticmethod
+    def _is_grid(da) -> bool:
+        """A GRIDDED variable carries both y and x (N81)."""
+        return 'y' in da.dims and 'x' in da.dims
+
+    @staticmethod
+    def _vars_of(value) -> dict:
+        """{name: DataArray} of one burst: a Dataset's variables, or a DataArray as its own
+        one variable. A method that works variable by variable takes a Batch of DataArrays
+        directly through it (N81), with no Dataset built and no name required."""
+        if isinstance(value, xr.DataArray):
+            return {value.name: value}
+        return {v: value[v] for v in value.data_vars}
+
+    @staticmethod
+    def _acquisition_order(batch, who='to_dataset') -> list:
+        """THE BURSTS IN ACQUISITION ORDER, earliest first: the one order of every merge
+        of bursts, to_dataset() and fit3d()'s seams, where the MOST RECENT burst wins.
+
+        Read from each burst's OWN startTime variable (decided 2026-10-01), the one
+        a stack loads per date and pairs() gives per pair (the earlier of its two
+        dates): a burst comes at its earliest startTime. S1 stores keep its fraction
+        (since 2026-10-01: the subswaths of one burst number start within a second);
+        equal times, in older whole-second stores, keep the fullBurstID order. NISAR
+        keeps whole seconds, its scenes being about 35 s apart. A batch without startTime -- a
+        transform grid or a Batch of DataArrays, by design (user, 2026-10-01) -- is
+        ordered by the fullBurstID numbers: within a track they count the
+        acquisition cycles along the orbit, and the subswaths of a cycle are
+        acquired IW1, IW2, IW3. Bursts only some of which carry startTime, or
+        names that are not fullBurstIDs, are ordered so with a WARNING."""
+        import re
+        import dask
+        keys = list(batch.keys())
+
+        def natural(key):
+            return [(0, int(p), '') if p.isdigit() else (1, 0, p) for p in re.split(r'(\d+)', str(key)) if p]
+        by_name = sorted(keys, key=natural)
+        if len(keys) < 2:
+            return by_name
+        timed = [isinstance(v, xr.Dataset) and 'startTime' in v.data_vars for v in (dict.__getitem__(batch, k) for k in keys)]
+        if all(timed):
+            # an opened store's startTime is lazy: every burst's in ONE compute
+            starts = dask.compute(*[dict.__getitem__(batch, k)['startTime'].data for k in keys])
+            first = {k: np.min(np.asarray(s, dtype='datetime64[us]')) for k, s in zip(keys, starts)}
+            rank = {k: i for i, k in enumerate(by_name)}
+            return sorted(keys, key=lambda k: (first[k], rank[k]))
+        other = [str(k) for k in keys if not re.fullmatch(r'\d+_\d+(_[A-Z]+\d+)?', str(k))]
+        if other:
+            print(f"WARNING: {who}(): {', '.join(other[:3])}{', ...' if len(other) > 3 else ''} "
+                  f"{'is not a fullBurstID' if len(other) == 1 else 'are not fullBurstIDs'}: bursts ordered by name.")
+        elif any(timed):
+            print(f"WARNING: {who}(): {timed.count(False)} of {len(keys)} bursts carry no startTime: "
+                  f"bursts ordered by fullBurstID.")
+        return by_name
+
+    def _start_from(self, source):
+        """THIS BATCH WITH EACH BURST'S startTime FROM `source`: the library's own selections
+        of grids ahead of a merge (plot, to_vtk) drop it, and it is the burst order of the
+        merge (_acquisition_order). The class and the grids stay as they are; a burst or a
+        source without startTime is left as it is."""
+        out = {}
+        for k, v in dict.items(self):
+            s = dict.get(source, k)
+            if isinstance(v, xr.Dataset) and isinstance(s, xr.Dataset) and 'startTime' in s.data_vars:
+                v = v.assign(startTime=s['startTime'])
+            out[k] = v
+        return self._view(out)
+
+    @staticmethod
+    def _grids_of(value) -> dict:
+        """{name: DataArray} of the (y, x) grids of one burst (_vars_of, grids only)."""
+        return {n: a for n, a in BatchCore._vars_of(value).items() if BatchCore._is_grid(a)}
+
+    @staticmethod
+    def _form(value, out_vars, **dataset_kwargs):
+        """A burst's result in its input's form (N81): a DataArray burst gives its one
+        output variable back as a DataArray, named as the output is; a Dataset burst gives
+        xr.Dataset(out_vars, **dataset_kwargs). No Dataset is built for a DataArray.
+        A DataArray with no output -- no (y, x) grid, or not one the method takes -- RAISES."""
+        if isinstance(value, xr.DataArray):
+            if not out_vars:
+                if not BatchCore._is_grid(value):
+                    raise BatchCore._no_grid_error(value)
+                raise TypeError(f"ERROR: x['{value.name}'] ({value.dtype}, dims {tuple(value.dims)}) "
+                                f"is not a grid this method takes.")
+            (name, res), = out_vars.items()
+            return res.rename(name)
+        return xr.Dataset(out_vars, **dataset_kwargs)
+
+    @staticmethod
+    def _no_grid_error(value, who='x'):
+        """THE ERROR FOR A BURST WITHOUT ANY (y, x) GRID (N81), _form's text: a DataArray
+        names itself and its dims, a Dataset lists its variables. `who` names the argument."""
+        if isinstance(value, xr.DataArray):
+            return TypeError(f"ERROR: {who}['{value.name}'] has no (y, x) grid, dims {tuple(value.dims)}.")
+        names = [str(v) for v in value.data_vars]
+        listed = ', '.join(names[:8]) + (', ...' if len(names) > 8 else '')
+        return TypeError(f"ERROR: {who} has no (y, x) grid ({listed}).")
+
+    @staticmethod
+    def _weight_of(w, var):
+        """The weight grid of one burst for the data grid `var`: a DataArray weight weights
+        every grid as it is (N81); a Dataset weight gives the grid of the same name for a
+        Dataset's grid (_weight() matched the names), or its one grid for a DataArray, whose
+        name is never compared (_weight() refused a weight with several)."""
+        if w is None or isinstance(w, xr.DataArray):
+            return w
+        if var in w.data_vars:
+            return w[var]
+        grids = [n for n in w.data_vars if BatchCore._is_grid(w[n])]
+        if len(grids) != 1:
+            listed = ', '.join(str(n) for n in grids[:8]) + (', ...' if len(grids) > 8 else '')
+            raise TypeError(f"ERROR: the weight has {len(grids)} grids ({listed}) for one DataArray. "
+                            f"Pick one: weight['{grids[0] if grids else 'name'}'].")
+        return w[grids[0]]
+
+    @staticmethod
+    def _grid_vars(ds) -> list:
+        """The gridded variables of a Dataset; a Dataset without any RAISES (N81)."""
+        grids = [v for v in ds.data_vars if 'y' in ds[v].dims and 'x' in ds[v].dims]
+        if not grids:
+            names = [str(v) for v in ds.data_vars]
+            if not names:
+                raise TypeError('ERROR: no (y, x) variables to operate on: the Dataset has none. '
+                                "Select a variable: x['name'].")
+            pick = next((v for v in names if ds[v].dtype.kind in 'biufc'), names[0])
+            listed = ', '.join(names[:8]) + (', ...' if len(names) > 8 else '')
+            raise TypeError(f"ERROR: no (y, x) variables to operate on ({listed}). Select one: x['{pick}'].")
+        return grids
+
+    @staticmethod
+    def _mask_names(mgrids, names, how):
+        """THE MASK RULE (N81): a Dataset mask masks each grid `names` holds by its
+        grid of the same name (`mgrids`); a grid it lacks RAISES. There is no
+        case where one mask grid masks every grid: that is a DataArray mask."""
+        for n in names:
+            if n not in mgrids:
+                raise ValueError(f"ERROR: mask has no variable {n}. Use a DataArray mask to mask every "
+                                 f"variable: x.{how}(mask['{mgrids[0]}'])")
+
+    @staticmethod
+    def _mask_of_dataarray(mask, da, how, what='mask'):
+        """THE VARIABLE OF A DATASET FOR A DATAARRAY (N81): a DataArray is one variable by
+        design and compares to a DataArray or to a Dataset of one variable, so its name
+        is NEVER compared -- that is a Dataset's rule, which has many. A Dataset (`what`:
+        a mask, a merged Dataset) gives its one variable (its one (y, x) grid for a
+        gridded DataArray, whatever else rides along); several are ambiguous and RAISE."""
+        names = [str(v) for v in mask.data_vars]
+        if BatchCore._is_grid(da):
+            names = [v for v in names if BatchCore._is_grid(mask[v])] or names
+        if len(names) == 1:
+            return mask[names[0]]
+        if not names:
+            raise ValueError(f"ERROR: the {what} has no variables for x.{how}().")
+        listed = ', '.join(names[:8]) + (', ...' if len(names) > 8 else '')
+        raise ValueError(f"ERROR: the {what} has {len(names)} variables ({listed}) for one DataArray. "
+                         f"Pick one: x.{how}({what}['{names[0]}'])")
+
+    @staticmethod
+    def _no_grid(what, value):
+        """THE ERROR FOR A MASK OR A WEIGHT WITHOUT (y, x) on Dataset data (N81,
+        decided): it RAISES, never broadcasts -- such a mask is commonly a reduction,
+        arr.mean(), that dropped y and x, and broadcast it is very hard to find."""
+        if isinstance(value, xr.Dataset):
+            names = list(value.data_vars)
+            value = value[next((v for v in names if value[v].dtype.kind in 'biufc'), names[0])] if names else None
+        name = getattr(value, 'name', None)
+        dims = tuple(getattr(value, 'dims', ()))
+        return TypeError(f"ERROR: {what} '{name}' has no (y, x) grid, dims {dims}: "
+                         f"a reduction such as .mean() may have dropped y and x.")
+
+    @staticmethod
+    def _mask_grid(mask):
+        """THE MASK RULE (N81): a DataArray mask masks every grid of a Dataset; a
+        mask without (y, x) RAISES there, as a Dataset mask without grids does. (A
+        Batch of DataArrays takes its mask directly, as in xarray.)"""
+        if isinstance(mask, xr.DataArray) and not BatchCore._is_grid(mask):
+            raise BatchCore._no_grid('mask', mask)
+        return mask
+
+    @staticmethod
+    def _mask_dataset(mask):
+        """A Dataset mask needs (y, x) grids: one without any RAISES (_no_grid)."""
+        if not any(BatchCore._is_grid(mask[v]) for v in mask.data_vars):
+            raise BatchCore._no_grid('mask', mask)
+        return BatchCore._grid_vars(mask)
+
+    @staticmethod
+    def _weight(weight, data=None, name='weight', required=False, by_name=True):
+        """A WEIGHT IS A BATCHUNIT (N81), checked where a function starts.
+
+        None is no weight. Anything but a BatchUnit RAISES: the Batches methods
+        took their second element only when it was a BatchUnit and dropped any
+        other without a word, and the rest took any dict and failed later, or
+        not at all. Given `data` (the batch the weight applies to), every burst
+        of it needs a weight -- one missing was skipped, unweighted -- and a
+        BatchUnit of (y, x) DataArrays, BatchUnit(corr['VV']) or corr['VV'],
+        weights every grid of its burst. The weight comes back as it is, never
+        converted: _weight_of(weight[key], var) gives the grid for `var`.
+
+        A DATASET WEIGHT MATCHES BY NAME, as a Dataset mask does: each grid of
+        `data` is weighted by the weight's grid of the same name, and a grid it
+        lacks RAISES -- gaussian() and unwrap2d_snaphu() smoothed such a grid
+        unweighted and rmse() took the weight's first grid instead, without a
+        word. by_name=False skips the match for a caller that weights every grid
+        by one grid of the weight (Batches.coherent()). required=True raises for
+        None too, where the weight is not optional (goldstein()). A Batch of
+        DATAARRAYS is one variable per burst by design: no name is compared, it
+        takes the Dataset weight's one grid, and a weight with several raises,
+        to be picked (weight['VV']) -- as a DataArray takes a Dataset mask.
+        """
+        import xarray as xr
+        from .Batch import BatchUnit
+        if weight is None and not required:
             return None
-
-        subset = {k: out for k, ds in self.items() if (out := _extract(ds)) is not None}
-        if subset:
-            return type(self)(subset)
-
-        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+        if not isinstance(weight, BatchUnit):
+            # a boolean or integer weight is not a unit and BatchUnit() refuses it:
+            # the hint converts it, instead of sending the caller back and forth
+            m = weight if isinstance(weight, dict) else (
+                {'': weight} if isinstance(weight, (xr.Dataset, xr.DataArray)) else {})
+            cast = any(dt.kind != 'f' for _, dt in BatchCore._named_dtypes(m))
+            hint = f"BatchUnit({name}.astype('float32'))" if cast else f'BatchUnit({name})'
+            raise TypeError(f'ERROR: {name} must be a BatchUnit, got {type(weight).__name__}. Use {hint}.')
+        if data is None:
+            return weight
+        missing = [k for k in data.keys() if not dict.__contains__(weight, k)]
+        if missing:
+            more = f' and {len(missing) - 1} more' if len(missing) > 1 else ''
+            raise ValueError(f'ERROR: {name} has no burst {missing[0]}{more}. '
+                             f'Give a {name} for every burst.')
+        for k in data.keys():
+            wv = dict.get(weight, k)
+            # a Dataset weight without (y, x) grids RAISES (N81, decided): it broadcast, or
+            # failed deep in the kernel on a shape
+            if isinstance(wv, xr.Dataset) and not any(BatchCore._is_grid(wv[n]) for n in wv.data_vars):
+                raise BatchCore._no_grid(name, wv)
+        if by_name:
+            for k in data.keys():
+                wv = dict.get(weight, k)
+                if not isinstance(wv, xr.Dataset):
+                    continue
+                d = dict.get(data, k)
+                if isinstance(d, xr.Dataset):
+                    names = [n for n in d.data_vars if BatchCore._is_grid(d[n])]
+                else:
+                    # A DATAARRAY IS ONE VARIABLE by design: no name is compared, it takes the
+                    # weight's one grid (_weight_of), and a weight with several is ambiguous
+                    names = []
+                    grids = [str(n) for n in wv.data_vars if BatchCore._is_grid(wv[n])]
+                    if isinstance(d, xr.DataArray) and BatchCore._is_grid(d) and len(grids) > 1:
+                        listed = ', '.join(grids[:8]) + (', ...' if len(grids) > 8 else '')
+                        raise ValueError(f"ERROR: {name} has {len(grids)} grids ({listed}) for one DataArray. "
+                                         f"Pick one: {name}['{grids[0]}'].")
+                lack = [n for n in names if n not in wv.data_vars]
+                if lack:
+                    have = [n for n in wv.data_vars if BatchCore._is_grid(wv[n])]
+                    form = f"{name}['{have[0]}']" if have else f"{name}['name']"
+                    raise ValueError(f'ERROR: {name} has no variable {lack[0]}. Use a DataArray {name} '
+                                     f'to weight every variable: {form}.')
+                flat = [n for n in names if not BatchCore._is_grid(wv[n])]
+                if flat:
+                    raise BatchCore._no_grid(name, wv[flat[0]])
+        for v in dict.values(weight):
+            # a DataArray weight without (y, x) RAISES too; one with them is taken as it
+            # is, no Dataset built: _weight_of() gives it for every grid
+            if isinstance(v, xr.DataArray) and not BatchCore._is_grid(v):
+                raise BatchCore._no_grid(name, v)
+        return weight
 
     @staticmethod
     def _binary_vars(ds, other, op):
-        """Apply `op` to the DATA variables, carrying metadata through.
+        """`op(ds, other)` by THE OPERATOR RULE (N81), for every operator on a burst.
 
-        A Batch keeps per-date metadata beside the grids -- burst ids, orbit
-        polynomials, strings -- and numpy raises TypeError on subtracting two
-        <U43 arrays, so whole-Dataset arithmetic cannot simply be handed the
-        Dataset.
+        A Dataset is a container of GRIDS: an operator acts on its gridded
+        variables -- those carrying both y and x -- and every other variable
+        (numeric or string, any dims: burst ids, radar metadata, per-date
+        polynomials, a 'residual') passes through from the Dataset unchanged,
+        always. There is no second mode: a Dataset with no gridded variable
+        raises, naming its variables, and the caller selects the one it means
+        as a DataArray, x['HH'] / 2, where the operation is unambiguous.
 
-        THE DISTINCTION IS DTYPE, NOT DIMENSIONALITY. An earlier attempt at
-        this restricted the operation to variables carrying both `y` and `x`,
-        which made every non-gridded quantity a silent pass-through of the LEFT
-        operand: `data2[['BPR']] - data1[['BPR']]` in `pairs()` returned data2's
-        own BPR rather than the difference, so the perpendicular baseline came
-        back as 0 for every pair and every height downstream as -inf or NaN. A
-        numeric variable is data whatever its dims; a string is metadata
-        whatever its dims.
+        A DataArray takes the operator directly. Against a Dataset it applies to
+        each gridded variable of the Dataset, and the Dataset's other variables
+        pass through, in either order.
 
-        Splitting on dtype also lets xarray perform the arithmetic itself, so
-        alignment, broadcasting and the treatment of variables missing from one
-        side keep exactly the meanings they had before `_binary_vars`.
+        Dataset op Dataset pairs the two by gridded variable name, as xarray
+        does; with no name in common it raises instead of returning nothing.
+        A field that applies to every polarisation is a DataArray, x * w['VV'].
         """
-        import xarray as _xr
-        # WHICH NUMERIC VARIABLES ARE *DATA*. Two rules have been tried here and
-        # both were wrong on their own:
-        #   gridded-only   -- made every non-gridded quantity a pass-through of
-        #                     the LEFT operand, so `data2[['BPR']] -
-        #                     data1[['BPR']]` in pairs() returned data2's BPR and
-        #                     every perpendicular baseline came back 0.
-        #   dtype-only     -- applies the op to the radar metadata as well, so
-        #                     `ref * rep.conj()` returned radar_wavelength
-        #                     SQUARED (0.0555 -> 0.003077). meter2rad then came
-        #                     out 4084.7 instead of 226.4, max_dv=100 mm/yr
-        #                     mapped to +-408 rad/yr, and velocity() returned a
-        #                     flat histogram of pure lattice noise.
-        # A Dataset's DATA is its gridded variables WHEN IT HAS ANY; the rest is
-        # metadata riding along and is carried from the left operand. A Dataset
-        # with no grids at all -- `data2[['BPR']]` -- is nothing but the quantity
-        # the caller selected, so there the op applies to all of it.
-        # A DATASET OPERATION APPLIES TO THE GRIDS AND NOTHING ELSE.
-        # Everything shaped (..., y, x) is data; everything else is metadata
-        # riding along, and is carried from the LEFT operand unchanged.
-        #
-        # Applying arithmetic by DTYPE instead returned radar_wavelength SQUARED
-        # from `ref * rep.conj()` (0.0555 -> 0.003077). meter2rad then came out
-        # 4084.7 rather than 226.4, max_dv=100 mm/yr mapped to +-408 rad/yr, and
-        # velocity() produced a flat histogram of pure lattice noise.
-        #
-        # A caller who wants arithmetic on a non-gridded quantity uses a
-        # DataArray, where it is unambiguous -- see pairs(), which differences
-        # BPR as `data2[k]['BPR'] - data1[k]['BPR']`.
-        num = [v for v in ds.data_vars
-               if ds[v].dtype.kind in 'biufc'
-               and 'y' in ds[v].dims and 'x' in ds[v].dims]
-        rest = [v for v in ds.data_vars if v not in num]
-        if isinstance(other, _xr.Dataset):
-            onum = [v for v in other.data_vars
-                    if other[v].dtype.kind in 'biufc']
-            rhs = other[onum]
-            gridded = [v for v in onum
-                       if 'y' in other[v].dims and 'x' in other[v].dims]
-            if len(onum) == 1 and len(gridded) == 1 and onum[0] not in num:
-                # a lone gridded field applies to every polarisation, which is
-                # how a mask or a per-pixel weight is used
-                rhs = other[onum[0]]
-        else:
-            rhs = other
-        res = op(ds[num], rhs)
-        for v in rest:
-            res[v] = ds[v]
+        if isinstance(ds, xr.DataArray):
+            if isinstance(other, xr.Dataset):
+                return BatchCore._binary_vars(other, ds, lambda a, b: op(b, a))
+            return op(ds, other)
+        grids = BatchCore._grid_vars(ds)
+        rhs = other
+        if isinstance(other, xr.Dataset):
+            ogrids = BatchCore._grid_vars(other)
+            if not set(grids) & set(ogrids):
+                raise TypeError(f"ERROR: no common (y, x) variables to operate on: {[str(v) for v in grids]} "
+                                f"and {[str(v) for v in ogrids]}. Select one: y['{ogrids[0]}'].")
+            rhs = other[ogrids]
+        res = op(ds[grids], rhs)
+        for v in ds.data_vars:
+            if v not in grids:
+                res[v] = ds[v]
         res.attrs = ds.attrs
         return res
 
     def __add__(self, other):
         # scalar + batch. Routed through _binary_vars like the Dataset case:
         # a bare `v + other` hits the string metadata and raises UFuncTypeError
-        if isinstance(other, (int, float, np.floating, np.integer)):
+        if isinstance(other, _SCALARS):
             import operator as _operator
-            return type(self)({k: BatchCore._binary_vars(v, other, _operator.add)
+            return self._result({k: BatchCore._binary_vars(v, other, _operator.add)
                                for k, v in self.items()})
         keys = self.keys()
         import operator as _operator
-        return type(self)({k: (BatchCore._binary_vars(self[k], other[k], _operator.add)
+        return self._result({k: (BatchCore._binary_vars(self[k], other[k], _operator.add)
                               if k in other else self[k]) for k in keys})
 
     def __radd__(self, other):
         # scalar + batch → same as batch + scalar
         return self.__add__(other)
 
+    def _sub_coeffs(self, k, ds, val):
+        """`ds - val` for one burst, where `val` may be per-pair polynomial
+        coefficients from align(): [[ramp, off], ...] (degree 1), [off, ...]
+        (degree 0) or [ramp, offset] (one pair). The correction is a DataArray
+        (polyval), so it subtracts from every grid by the operator rule."""
+        import operator as _operator
+        if not isinstance(val, (list, tuple)) or len(val) == 0:
+            return BatchCore._binary_vars(ds, val, _operator.sub)
+        sample_da = ds if isinstance(ds, xr.DataArray) else ds[BatchCore._grid_vars(ds)[0]]
+        has_pair_dim = 'pair' in sample_da.dims
+        n_pairs = sample_da.sizes.get('pair', 1)
+        if isinstance(val[0], (list, tuple)):
+            # multi-pair degree=1: [[ramp0, off0], [ramp1, off1], ...]
+            return BatchCore._binary_vars(ds, self._view({k: ds}).polyval({k: val})[k], _operator.sub)
+        if has_pair_dim and len(val) == n_pairs:
+            # multi-pair degree=0: [off0, off1, ...], concrete scalars or dask 0-d arrays
+            if any(hasattr(v, 'dask') for v in val):
+                import dask.array as _da
+                offsets = xr.DataArray(_da.stack(val), dims=['pair'])
+            else:
+                offsets = xr.DataArray(val, dims=['pair'])
+            return BatchCore._binary_vars(ds, offsets, _operator.sub)
+        if len(val) == 1:
+            # a single value wrapped in a list: [offset]
+            return BatchCore._binary_vars(ds, val[0], _operator.sub)
+        # single pair degree=1: [ramp, offset]
+        return BatchCore._binary_vars(ds, self._view({k: ds}).polyval({k: val})[k], _operator.sub)
+
     def __sub__(self, other):
         # batch - scalar
-        if isinstance(other, (int, float, np.floating, np.integer)):
+        if isinstance(other, _SCALARS):
             import operator as _operator
-            return type(self)({k: BatchCore._binary_vars(v, other, _operator.sub)
+            return self._result({k: BatchCore._binary_vars(v, other, _operator.sub)
                                for k, v in self.items()})
-        keys = self.keys()
-        result = {}
-        for k in keys:
-            if k not in other:
-                result[k] = self[k]
-            else:
-                val = other[k]
-                ds = self[k]
-                # Handle per-pair coefficients from burst_polyfit
-                if isinstance(val, (list, tuple)):
-                    # Get a spatial variable (with y, x dims) to check for pair dimension
-                    spatial_vars = [v for v in ds.data_vars if 'y' in ds[v].dims and 'x' in ds[v].dims]
-                    sample_var = spatial_vars[0] if spatial_vars else list(ds.data_vars)[0]
-                    sample_da = ds[sample_var]
-                    has_pair_dim = 'pair' in sample_da.dims
-                    n_pairs = sample_da.sizes.get('pair', 1)
-
-                    if len(val) > 0 and isinstance(val[0], (list, tuple)):
-                        # Multi-pair degree=1: [[ramp0, off0], [ramp1, off1], ...]
-                        # Use polyval for this case
-                        result[k] = ds - self[[k]].polyval({k: val})[k]
-                    elif has_pair_dim and len(val) == n_pairs:
-                        # Multi-pair degree=0: [off0, off1, ...]
-                        # Handle both concrete scalars and dask 0-d arrays
-                        if any(hasattr(v, 'dask') for v in val):
-                            import dask.array as _da
-                            offsets = xr.DataArray(_da.stack(val), dims=['pair'])
-                        else:
-                            offsets = xr.DataArray(val, dims=['pair'])
-                        result[k] = ds - offsets
-                    else:
-                        # Single pair degree=1: [ramp, offset] or other
-                        result[k] = ds - val
-                elif isinstance(val, (int, float, np.floating, np.integer)) \
-                        or (hasattr(val, 'ndim') and val.ndim == 0):
-                    # Scalar subtraction (concrete or dask 0-d array):
-                    # only apply to spatial variables (y, x dims)
-                    new_ds = ds.copy()
-                    for var in ds.data_vars:
-                        if 'y' in ds[var].dims and 'x' in ds[var].dims:
-                            new_ds[var] = ds[var] - val
-                    result[k] = new_ds
-                else:
-                    import operator as _operator
-                    result[k] = BatchCore._binary_vars(ds, val, _operator.sub)
-        return type(self)(result)
+        # THE LISTS SUBTRACT FROM THE GRIDS, as every operator does: a
+        # whole-Dataset `ds - offsets` reached the per-pair metadata too, so
+        # align() on an unwrapped phase shifted radar_wavelength by the burst's
+        # offset, for fit1d() and predict() to read, and raised TypeError on the
+        # burst strings. _binary_vars is the one place that rule lives.
+        return self._result({k: (self._sub_coeffs(k, self[k], other[k]) if k in other else self[k])
+                           for k in self.keys()})
 
     def __rsub__(self, other):
         # scalar - batch: the operand order is flipped, the metadata rule is not
-        if isinstance(other, (int, float, np.floating, np.integer)):
-            return type(self)({k: BatchCore._binary_vars(v, other, lambda a, b: b - a)
+        if isinstance(other, _SCALARS):
+            return self._result({k: BatchCore._binary_vars(v, other, lambda a, b: b - a)
                                for k, v in self.items()})
         return NotImplemented
 
     def __mul__(self, other):
         # batch * scalar
-        if isinstance(other, (int, float, np.floating, np.integer)):
+        if isinstance(other, _SCALARS):
             import operator as _operator
-            return type(self)({k: BatchCore._binary_vars(v, other, _operator.mul)
+            return self._result({k: BatchCore._binary_vars(v, other, _operator.mul)
                                for k, v in self.items()})
         keys = self.keys()
         import operator as _operator
-        return type(self)({k: (BatchCore._binary_vars(self[k], other[k], _operator.mul)
+        return self._result({k: (BatchCore._binary_vars(self[k], other[k], _operator.mul)
                               if k in other else self[k]) for k in keys})
 
     def __rmul__(self, other):
         # scalar * batch
-        import operator as _operator
-        return type(self)({k: BatchCore._binary_vars(v, other, _operator.mul)
+        return self._result({k: BatchCore._binary_vars(v, other, lambda a, b: b * a)
                            for k, v in self.items()})
 
     def __truediv__(self, other):
         # batch / scalar
-        if isinstance(other, (int, float, np.floating, np.integer)):
+        if isinstance(other, _SCALARS):
             import operator as _operator
-            return type(self)({k: BatchCore._binary_vars(v, other, _operator.truediv)
+            return self._result({k: BatchCore._binary_vars(v, other, _operator.truediv)
                                for k, v in self.items()})
         keys = self.keys()
         import operator as _operator
-        return type(self)({k: (BatchCore._binary_vars(self[k], other[k], _operator.truediv)
+        return self._result({k: (BatchCore._binary_vars(self[k], other[k], _operator.truediv)
                               if k in other else self[k]) for k in keys})
 
     def __rtruediv__(self, other):
         # scalar / batch: flipped operands, same metadata rule
-        if isinstance(other, (int, float, np.floating, np.integer)):
-            return type(self)({k: BatchCore._binary_vars(v, other, lambda a, b: b / a)
+        if isinstance(other, _SCALARS):
+            return self._result({k: BatchCore._binary_vars(v, other, lambda a, b: b / a)
                                for k, v in self.items()})
         return NotImplemented
 
     def __neg__(self):
-        # -batch → negate each dataset
-        return type(self)({k: -v for k, v in self.items()})
+        # -batch: the grids negated, the rest carried
+        return self._result({k: BatchCore._binary_vars(v, None, lambda a, _: -a) for k, v in self.items()})
+
+    def __abs__(self):
+        # abs(batch) is batch.abs(): the grids' magnitude, the rest carried (a
+        # BatchComplex gives a real Batch); Python had no abs() for a batch at all
+        return self.abs()
 
     def _binop(self, other, op):
         """
         generic helper for any binary operator `op(ds, other)` or `op(ds, other_ds)`
+
+        A comparison or a logical operator follows the operator rule
+        (_binary_vars): it acts on the grids and carries the metadata through --
+        numpy raises UFuncTypeError comparing the burst strings with a number,
+        so `corr >= 0.3` failed on any Batch carrying them. A MASK IS NOT A
+        CONSTRUCTION, and not a phase or a unit either: a boolean result of any
+        class is a plain Batch (_as_class), never wrapped into floats.
         """
-        if isinstance(other, (int, float)):
-            return type(self)({k: op(ds, other) for k, ds in self.items()})
+        if isinstance(other, _SCALARS):
+            return self._result({k: BatchCore._binary_vars(ds, other, op) for k, ds in self.items()}, view=True)
         elif isinstance(other, BatchCore):
-            common = set(self) & set(other)
-            return type(self)({k: op(self[k], other[k]) for k in common})
+            return self._result({k: BatchCore._binary_vars(self[k], other[k], op) for k in self if k in other},
+                                view=True)
         else:
             return NotImplemented
 
@@ -979,7 +1500,9 @@ class BatchCore(dict):
     def __ne__(self, other):   return self._binop(other, operator.ne)
     def __and__(self, other):  return self._binop(other, operator.and_)
     def __or__(self, other):   return self._binop(other, operator.or_)
-    def __invert__(self):      return type(self)({k: ~v for k, v in self.items()})
+    # the mask a comparison made carries its metadata unchanged, and numpy has no ~ for a string or a float
+    def __invert__(self):      return self._result({k: BatchCore._binary_vars(v, None, lambda a, _: ~a)
+                                                    for k, v in self.items()}, view=True)
 
     # reversed ops
     __rgt__ = __gt__
@@ -1003,6 +1526,9 @@ class BatchCore(dict):
         if batch is None:
             return NotImplemented
 
+        # THE OPERATOR RULE (_binary_vars): a Dataset argument gives the ufunc its
+        # grids, and the first Dataset's other variables pass through; a
+        # DataArray is taken directly
         result = {}
         for k in batch.keys():
             # build the argument list for this key
@@ -1010,9 +1536,17 @@ class BatchCore(dict):
                 inp[k] if isinstance(inp, BatchCore) else inp
                 for inp in inputs
             ]
-            result[k] = ufunc(*args, **kwargs)
+            carrier = next((a for a in args if isinstance(a, xr.Dataset)), None)
+            args = [a[BatchCore._grid_vars(a)] if isinstance(a, xr.Dataset) else a for a in args]
+            res = ufunc(*args, **kwargs)
+            if carrier is not None and isinstance(res, xr.Dataset):
+                for v in carrier.data_vars:
+                    if not BatchCore._is_grid(carrier[v]):
+                        res[v] = carrier[v]
+                res.attrs = carrier.attrs
+            result[k] = res
 
-        return type(self)(result)
+        return self._result(result)
 
     # def iexp(self):
     #     """
@@ -1034,28 +1568,47 @@ class BatchCore(dict):
     #         for k, ds in self.items()
     #     })
 
-    def map_da(self, func, **kwargs):
-        """Apply func(DataArray) → DataArray to every numeric var in every dataset.
-
-        Non-numeric variables (strings, objects) are passed through unchanged.
-        """
-        def apply_to_numeric(ds):
+    def _map_grids(self, func, _numeric_only=True, **kwargs) -> dict:
+        """func(DataArray) -> DataArray on the GRIDS of every burst, by the operator
+        rule (_binary_vars): every other variable -- numeric or string, any dims
+        -- passes through unchanged, a Dataset without grids raises and a
+        DataArray takes func directly. A plain dict, for the caller's class.
+        _numeric_only=False applies func to every grid whatever its dtype (a
+        boolean mask too), as astype() needs."""
+        def apply(ds):
+            if isinstance(ds, xr.DataArray):
+                return func(ds, **kwargs)
+            grids = BatchCore._grid_vars(ds)
             result_vars = {}
             for var in ds.data_vars:
                 da = ds[var]
-                # Skip non-numeric dtypes (strings, objects, etc.)
-                if not np.issubdtype(da.dtype, np.number) and not np.issubdtype(da.dtype, np.complexfloating):
-                    result_vars[var] = da
-                else:
+                # the grids only, and of those the numeric ones, as before
+                if var in grids and (not _numeric_only or np.issubdtype(da.dtype, np.number)):
                     result_vars[var] = func(da, **kwargs)
+                else:
+                    result_vars[var] = da
             result = xr.Dataset(result_vars)
             result.attrs = ds.attrs
             return result
 
-        return type(self)({k: apply_to_numeric(ds) for k, ds in self.items()})
+        return {k: apply(ds) for k, ds in self.items()}
+
+    def map_da(self, func, **kwargs):
+        """Apply func(DataArray) → DataArray to the gridded variables of every
+        dataset, or to every DataArray of a Batch of DataArrays.
+
+        THE OPERATOR RULE: the (y, x) variables are the data; every other
+        variable passes through unchanged -- the radar metadata was converted
+        before, clip() set near_range to 1.0 and ** squared radar_wavelength.
+        A Dataset without (y, x) variables raises.
+        """
+        return self._result(self._map_grids(func, **kwargs))
 
     def astype(self, dtype, **kwargs):
-        return self.map_da(lambda da: da.astype(dtype), **kwargs)
+        # EVERY grid is converted, whatever its dtype: the numeric-only map helpers
+        # pass a boolean grid through, so (ph > 0).astype('float32') stayed boolean
+        # while the DataArray form (ph['VV'] > 0).astype('float32') converted
+        return self._result(self._map_grids(lambda da: da.astype(dtype), _numeric_only=False, **kwargs))
     
     def abs(self, **kwargs):
         return self.map_da(lambda da: xr.ufuncs.abs(da), **kwargs)
@@ -1156,64 +1709,69 @@ class BatchCore(dict):
 
     def where(self, cond, other=np.nan, **kwargs):
         """
-        Fast batch-wise .where:
+        Batch-wise .where: keep the values where `cond` is True, `other` elsewhere.
 
-        If `cond` is a Batch (or subclass) with exactly the same keys,
-           and each cond[k] is a 1-variable Dataset or a DataArray,
-           we extract the single DataArray mask and do either:
-             - other==0 → simple multiply ds * mask_da
-             - else       → ds.where(mask_da, other, **kwargs)
-
-        Otherwise fall back to per-DataArray map_da (slower).
+        `cond` is a Batch with the same bursts (a mask per burst, reindexed to
+        each grid's coordinates), or a scalar or a DataArray applied to every
+        grid by map_da().
 
         keep_attrs=True argument can be used to preserve attributes of the original data.
+
+        Examples
+        --------
+        >>> ph.where(corr > 0.3)          # VV by corr's VV (and VH by VH)
+        >>> ph.where(corr['VV'] > 0.3)    # every grid by corr's VV
+
+        THE MASK RULE (N81): only the (y, x) variables are masked, everything
+        else passes through, and the mask's own metadata plays no part. A
+        DATASET mask (corr > 0.3) masks each grid by its grid of the SAME NAME
+        -- VV by VV, VH by VH -- and a grid it lacks raises; a DATAARRAY mask
+        (corr['VV'] > 0.3) masks every grid. A Dataset, or a mask for Datasets,
+        without (y, x) variables raises for a Batch of Datasets, whose
+        operators apply to the (y, x) grids only, as in mask(). A BATCH OF
+        DATAARRAYS NEEDS NO GRID: it takes its mask directly, as in xarray --
+        a DataArray mask as it is, a Dataset mask's ONE variable -- with or
+        without (y, x) (w['BPR'].where(...)). A DataArray is one variable by
+        design, so no name is compared: ele.where(adi < 0.4) takes adi's VV;
+        a mask with several variables raises, to be picked (mask['VV']).
         """
         # detect same key Batch-like mask
         if hasattr(cond, 'keys') and set(cond.keys()) == set(self.keys()):
             out = {}
             for k, ds in self.items():
                 mask_obj = cond[k]
-                # extract DataArray from a 1-var Dataset or use it direct
-                if isinstance(mask_obj, xr.Dataset):
-                    mask_vars = list(mask_obj.data_vars)
-                    if isinstance(ds, xr.Dataset):
-                        data_vars = list(ds.data_vars)
-                        # Multi-var case: apply each mask var to corresponding data var
-                        if set(mask_vars) == set(data_vars) or set(mask_vars) >= set(data_vars):
-                            new_ds = ds.copy()
-                            for var in data_vars:
-                                if var in mask_vars:
-                                    mask_da = mask_obj[var]
-                                    extra_dims = set(mask_da.dims) - set(ds[var].dims)
-                                    if extra_dims:
-                                        raise ValueError(
-                                            f"where() mask has extra dimensions {extra_dims} not in data. "
-                                            f"Reduce the mask first, e.g. mask.mean() or mask.min() to collapse extra dims."
-                                        )
-                                    mask_da = mask_da.reindex_like(ds[var], method='nearest')
-                                    new_ds[var] = ds[var].where(mask_da, other, **kwargs)
-                            out[k] = new_ds
-                            continue
-                        # Single mask var case
-                        elif len(mask_vars) == 1:
-                            mask_da = mask_obj[mask_vars[0]]
-                        else:
+                if isinstance(mask_obj, xr.Dataset) and isinstance(ds, xr.DataArray):
+                    # a DataArray takes the mask's one variable directly, grid or not: no name compared
+                    mask_da = BatchCore._mask_of_dataarray(mask_obj, ds, 'where')
+                elif isinstance(mask_obj, xr.Dataset):
+                    mgrids = BatchCore._mask_dataset(mask_obj)
+                    names = BatchCore._grid_vars(ds)
+                    BatchCore._mask_names(mgrids, names, 'where')
+                    # every grid by the mask grid of its own name
+                    new_ds = ds.copy()
+                    for var in names:
+                        mask_da = mask_obj[var]
+                        extra_dims = set(mask_da.dims) - set(ds[var].dims)
+                        if extra_dims:
                             raise ValueError(
-                                f"Batch.where: mask vars {mask_vars} don't match data vars {data_vars} for '{k}'"
+                                f"where() mask has extra dimensions {extra_dims} not in data. "
+                                f"Reduce the mask first, e.g. mask.mean() or mask.min() to collapse extra dims."
                             )
-                    else:
-                        if len(mask_vars) != 1:
-                            raise ValueError(f"Batch.where: expected 1 var in mask for '{k}', got {mask_vars}")
-                        mask_da = mask_obj[mask_vars[0]]
+                        mask_da = mask_da.reindex_like(ds[var], method='nearest')
+                        new_ds[var] = ds[var].where(mask_da, other, **kwargs)
+                    out[k] = new_ds
+                    continue
+                elif isinstance(ds, xr.Dataset):
+                    # a DataArray mask masks every grid of a Dataset
+                    mask_da = BatchCore._mask_grid(mask_obj)
                 else:
+                    # a DataArray takes its mask directly, as in xarray (w['BPR'].where(...))
                     mask_da = mask_obj
 
                 # Align mask to data coordinates (handles different x/y grids)
                 # Get reference DataArray from ds for alignment (use spatial variable)
                 if isinstance(ds, xr.Dataset):
-                    spatial_vars = [v for v in ds.data_vars if 'y' in ds[v].dims and 'x' in ds[v].dims]
-                    ref_var = spatial_vars[0] if spatial_vars else list(ds.data_vars)[0]
-                    ref_da = ds[ref_var]
+                    ref_da = ds[BatchCore._grid_vars(ds)[0]]
                 else:
                     ref_da = ds
 
@@ -1242,6 +1800,22 @@ class BatchCore(dict):
                     out[k] = ds.where(mask_da, other, **kwargs)
             return type(self)(out)
 
+        # A PLAIN XARRAY MASK without (y, x) RAISES for a Batch of Datasets, as mask() raises
+        # for it (N81, decided): their operators apply to the (y, x) grids only, and such a
+        # mask is commonly a reduction, arr.mean(), that dropped y and x, and broadcast it is
+        # very hard to find. A Batch of DataArrays takes it directly, as xarray does
+        if not BatchCore._is_dataarray_batch(self):
+            if isinstance(cond, xr.DataArray):
+                BatchCore._mask_grid(cond)
+            elif isinstance(cond, xr.Dataset):
+                BatchCore._mask_dataset(cond)
+        elif isinstance(cond, xr.Dataset):
+            # a Dataset mask gives each DataArray its one variable, grid or not, as mask() takes
+            # it: no name compared (_mask_of_dataarray); several variables RAISE
+            for da_ in self.values():
+                BatchCore._mask_of_dataarray(cond, da_, 'where')
+            return self.map_da(lambda da: da.where(BatchCore._mask_of_dataarray(cond, da, 'where'),
+                                                   other, **kwargs), **kwargs)
         # fallback: single scalar or DataArray broadcast
         # DataArray case seems not usefull because Batch datasets differ in shape
         return self.map_da(lambda da: da.where(cond, other, **kwargs), **kwargs)
@@ -1272,8 +1846,8 @@ class BatchCore(dict):
         Examples
         --------
         >>> # Process dense and sparse regions separately (same grid)
-        >>> sim_dense = S_sparse.where(dense_mask).similarity(...)
-        >>> sim_sparse = S_sparse.where(sparse_mask).similarity(...)
+        >>> sim_dense = S_sparse.where(dense_mask['VV']).similarity(...)
+        >>> sim_sparse = S_sparse.where(sparse_mask['VV']).similarity(...)
         >>> # Merge: use dense where available, fill with sparse
         >>> sim_merged = sim_dense.combine_first(sim_sparse)
         """
@@ -1325,11 +1899,20 @@ class BatchCore(dict):
 
         Parameters
         ----------
-        mask : xr.DataArray, xr.Dataset, or GeoDataFrame
+        mask : Batch, xr.DataArray, xr.Dataset, or GeoDataFrame
             The mask to apply. Can be:
-            - xr.DataArray: boolean mask reindexed to each burst's coordinates
-            - xr.Dataset: first data variable used as mask, reindexed per burst
+            - Batch with the same bursts (adi < 0.4): each burst by its own
+              mask, by the rules below, as where() takes it
+            - xr.DataArray: boolean (y, x) mask reindexed to each burst's
+              coordinates; it masks every grid
+            - xr.Dataset: its (y, x) variables mask the grids of their own
+              names, as where() takes them, and a grid without one raises
+              (mask it with a DataArray: x.mask(land['VV'])); the other
+              variables play no part
             - GeoDataFrame: polygon(s) to mask by - pixels inside polygons are kept
+            A Batch of DataArrays needs no (y, x) grid: it takes the mask
+            directly, as where() does -- a Dataset mask's one variable, no
+            name compared -- with or without (y, x).
         other : scalar, optional
             Value to use for masked elements. Default is np.nan.
 
@@ -1377,19 +1960,69 @@ class BatchCore(dict):
                 out[key] = ds.rio.clip(geom, all_touched=False)
             return type(self)(out)
 
-        # Handle xarray mask
-        if isinstance(mask, xr.Dataset):
-            mask = next(iter(mask.data_vars.values()))
+        # A BATCH MASK (adi < 0.4), as where() takes it: each burst by the mask of the same
+        # burst, under the rules below; a mask whose bursts are not the data's RAISES
+        if isinstance(mask, BatchCore):
+            lack = [k for k in self.keys() if not dict.__contains__(mask, k)]
+            extra = [k for k in mask.keys() if not dict.__contains__(self, k)]
+            if lack or extra:
+                raise ValueError(f"ERROR: the mask has no burst {lack[0]}." if lack else
+                                 f"ERROR: the mask has burst {extra[0]}, which the data lacks.")
+            out = {}
+            for key, ds in self.items():
+                out[key] = dict.__getitem__(BatchCore.mask(type(self)({key: ds}), dict.__getitem__(mask, key),
+                                                           other), key)
+            return type(self)(out)
 
-        if not np.issubdtype(mask.dtype, np.bool_):
-            raise ValueError('Batch.mask: mask must be a Dataset or DataArray of boolean type, or a GeoDataFrame')
+        # Handle xarray mask by THE MASK RULE (N81), as where() takes it: a Dataset
+        # mask masks each grid by its grid of the same name, and a grid it lacks
+        # raises; a DataArray mask masks every grid; the mask's other variables
+        # play no part (its first variable was taken before, and a metadata
+        # variable first raised "must be ... of boolean type" on a valid mask)
+        # -- for a Batch of Datasets, whose mask needs (y, x). A BATCH OF DATAARRAYS NEEDS
+        # NO GRID (N81): it takes its mask directly, as where() does, with or without (y, x),
+        # a Dataset mask's one variable: a DataArray is one variable, no name is compared
+        das = BatchCore._is_dataarray_batch(self)
+        by_name = isinstance(mask, xr.Dataset)
+        # the mask's variables, for the error that names what it lacks
+        mask_vars = [str(v) for v in mask.data_vars] if by_name else []
+        if by_name and das:
+            # a DataArray takes the mask's one variable, no name compared (_mask_of_dataarray)
+            masks = {ds.name: BatchCore._mask_of_dataarray(mask, ds, 'mask') for ds in self.values()}
+        elif by_name:
+            masks = {v: mask[v] for v in BatchCore._mask_dataset(mask)}
+        else:
+            masks = {None: mask if das else BatchCore._mask_grid(mask)}
+
+        def _on(m, ds):
+            """the mask on the burst's own y and x, as far as both have them"""
+            dims = {d: ds[d] for d in ('y', 'x') if d in m.dims and d in ds.dims}
+            return m.reindex(dims, method='nearest') if dims else m
+
+        for m in masks.values():
+            if not np.issubdtype(m.dtype, np.bool_):
+                raise ValueError('Batch.mask: mask must be a Dataset or DataArray of boolean type, or a GeoDataFrame')
 
         # auto-chunk if not already chunked to avoid high memory usage
-        if not mask.chunks:
-            mask = mask.chunk('auto')
+        masks = {v: (m if m.chunks else m.chunk('auto')) for v, m in masks.items()}
+        mask = masks.get(None)
 
         out = {}
         for key, ds in self.items():
+            if by_name:
+                if isinstance(ds, xr.DataArray):
+                    out[key] = ds.where(_on(masks[ds.name], ds), other)
+                    continue
+                names = BatchCore._grid_vars(ds)
+                BatchCore._mask_names(list(masks) or mask_vars or ['name'], names, 'mask')
+                masked = ds.copy()
+                for v in names:
+                    masked[v] = ds[v].where(masks[v].reindex(y=ds.y, x=ds.x, method='nearest'), other)
+                out[key] = masked
+                continue
+            if isinstance(ds, xr.DataArray):
+                out[key] = ds.where(_on(mask, ds), other)
+                continue
             # the fastest way to align mask to burst coordinates
             mask_burst = mask.reindex(y=ds.y, x=ds.x, method='nearest')
             # THE GRIDS ONLY, as downsample() does it. Dataset.where() broadcasts
@@ -1399,8 +2032,7 @@ class BatchCore(dict):
             # any variable ending in (y, x) for a polarization and dies on it
             # with "can only concatenate str to str", and a mask says nothing
             # about the burst a grid was measured in anyway.
-            _grids = [v for v in ds.data_vars
-                      if ds[v].ndim >= 2 and tuple(ds[v].dims[-2:]) == ('y', 'x')]
+            _grids = BatchCore._grid_vars(ds)
             _meta = [v for v in ds.data_vars if v not in _grids]
             # preserve original chunking structure for lazy computation
             masked = ds[_grids].where(mask_burst, other)
@@ -1506,14 +2138,16 @@ class BatchCore(dict):
         result = {}
         for key in self.keys():
             ds = self[key]
-            for v in ds.data_vars:
-                if 'pair' in ds[v].dims:
+            # a Dataset's variables, or a DataArray as its own one (N81)
+            vars_ = BatchCore._vars_of(ds)
+            for a in vars_.values():
+                if 'pair' in a.dims:
                     raise TypeError(
                         'unwrap3d() operates on the per-DATE stack, not on '
                         'per-pair data. It replaces the per-pair unwrap + lstsq route.')
-            pols = [v for v in ds.data_vars
-                    if ds[v].dtype.kind == 'c' and 'date' in ds[v].dims
-                    and 'y' in ds[v].dims and 'x' in ds[v].dims]
+            pols = [v for v, a in vars_.items()
+                    if a.dtype.kind == 'c' and 'date' in a.dims
+                    and 'y' in a.dims and 'x' in a.dims]
             if not pols:
                 raise TypeError(
                     f'unwrap3d() found no complex (date, y, x) variables in '
@@ -1521,7 +2155,7 @@ class BatchCore(dict):
             date_values = np.asarray(ds.coords['date'].values)
             out_vars = {}
             for pol in pols:
-                da_xr = ds[pol]
+                da_xr = vars_[pol]
                 if da_xr.dims[0] != 'date':
                     da_xr = da_xr.transpose('date', ...)
                 if len(da_xr.data.chunks[0]) != 1:
@@ -1547,6 +2181,10 @@ class BatchCore(dict):
                     meta=np.empty((0, 0, 0), dtype=np.float32))
                 out_vars[pol] = xr.DataArray(out, dims=da_xr.dims,
                                              coords=da_xr.coords, name=pol)
+            if isinstance(ds, xr.DataArray):
+                # a DataArray in, a DataArray out (N81): its coordinates are its own
+                result[key] = BatchCore._form(ds, out_vars)
+                continue
             new_ds = xr.Dataset(out_vars, attrs=ds.attrs)
             if 'spatial_ref' in ds.coords:
                 new_ds = new_ds.assign_coords(spatial_ref=ds.spatial_ref)
@@ -1641,9 +2279,8 @@ class BatchCore(dict):
                 device=device_str
             )
 
-            for var_name in ds.data_vars:
-                data = ds[var_name]
-
+            # a Dataset's variables, or a DataArray as its own one (N81)
+            for var_name, data in BatchCore._vars_of(ds).items():
                 # Skip non-spatial variables
                 if 'y' not in data.dims or 'x' not in data.dims:
                     continue
@@ -1678,7 +2315,8 @@ class BatchCore(dict):
                 count_vars[var_name] = count_xr
 
             if count_vars:
-                results[burst_id] = xr.Dataset(count_vars)
+                # a DataArray in, a DataArray out (N81)
+                results[burst_id] = BatchCore._form(ds, count_vars)
 
         from .Batch import Batch
         return Batch(results)
@@ -2273,10 +2911,9 @@ class BatchCore(dict):
                 for name, coord in coords.items():
                     if name in batch_coords:
                         dims, batch = coord
-                        # Get this burst's values from the batch
-                        burst_ds = batch[key]
-                        var_name = next(iter(burst_ds.data_vars))
-                        data = burst_ds[var_name]
+                        # Get this burst's values from the batch: its first variable, or a
+                        # DataArray burst itself (N81)
+                        data = next(iter(BatchCore._vars_of(batch[key]).values()))
                         # Compute lazy arrays - coordinates should never be lazy
                         values = data.compute().values if hasattr(data.data, 'compute') else data.values
                         ds_coords[name] = (dims, values)
@@ -2465,8 +3102,9 @@ class BatchCore(dict):
     def rename_vars(self, **kw):
         return type(self)({k: ds.rename_vars(**kw) for k, ds in self.items()})
     
-    def rename(self, **kw):
-        return type(self)({k: ds.rename(**kw) for k, ds in self.items()})
+    def rename(self, *args, **kw):
+        """xarray's rename per burst; a Batch of DataArrays takes a new name, x.rename('phase')."""
+        return type(self)({k: ds.rename(*args, **kw) for k, ds in self.items()})
 
     def merge(self, other: 'BatchCore') -> 'Batch':
         """Merge variables from another Batch into this one (per burst xr.merge).
@@ -2525,12 +3163,23 @@ class BatchCore(dict):
         import inspect
         out = {}
         for key, obj in self.items():
-            fn = getattr(obj, name)
+            # THE OPERATOR RULE: the grids are reduced, every other variable
+            # passes through unchanged -- a per-pair BPR keeps its pairs after
+            # mean('pair'), and a burst id is not averaged
+            carry = {}
+            src = obj
+            if isinstance(obj, xr.Dataset):
+                grids = BatchCore._grid_vars(obj)
+                carry = {v: obj[v] for v in obj.data_vars if v not in grids}
+                src = obj[grids]
+            fn = getattr(src, name)
             sig = inspect.signature(fn)
             if "dim" in sig.parameters:
                 out[key] = fn(dim=dim, **kwargs)
             else:
                 out[key] = fn(**kwargs)
+            for v, da_ in carry.items():
+                out[key][v] = da_
             # Preserve attrs (xarray aggregations drop them by default)
             if hasattr(obj, 'attrs') and hasattr(out[key], 'attrs'):
                 out[key].attrs = obj.attrs
@@ -2568,6 +3217,11 @@ class BatchCore(dict):
     def rmse(self, solution, weight=None):
         """RMSE: self (pairs/dates) vs solution (pairs, dates, or velocity).
 
+        A Batch of Datasets compares its (y, x) grids; a Batch of DataArrays
+        is compared as it is, with or without (y, x), broadcast against the
+        solution's grid as xarray broadcasts it. The solution needs a (y, x)
+        grid: it gives the form and the pixels of the result.
+
         Parameters
         ----------
         solution : Batch or BatchWrap
@@ -2588,12 +3242,28 @@ class BatchCore(dict):
         import xarray as xr
         from .Batch import Batch, BatchComplex
 
+        # a BatchUnit (N81), for every burst this computes: those of both self and solution
+        weight = BatchCore._weight(weight, {k: dict.__getitem__(self, k) for k in self if k in solution})
+
         nanoseconds_per_year = np.float64(365.25 * 24 * 60 * 60 * 1e9)
 
-        # Detect solution type: pair-based, date-based, or velocity (spatial-only)
-        sol_sample_ds = next(iter(solution.values()))
-        spatial_vars = [v for v in sol_sample_ds.data_vars if 'y' in sol_sample_ds[v].dims]
-        sample_sol_dims = sol_sample_ds[spatial_vars[0]].dims
+        # Detect solution type: pair-based, date-based, or velocity (spatial-only).
+        # Every burst's variables through _vars_of: a DataArray is its own one (N81)
+        vars_of = BatchCore._vars_of
+
+        def obs_vars_of(value):
+            """The observed variables compared: a Dataset's grids (its operators apply to the
+            grids only), a DataArray AS IT IS, with or without (y, x) -- broadcast against the
+            solution's grid, as xarray does (N81: a Batch of DataArrays needs no grid)."""
+            return {v: a for v, a in vars_of(value).items() if isinstance(value, xr.DataArray) or 'y' in a.dims}
+        # THE SOLUTION NEEDS A (y, x) GRID: it gives the form (pairs, dates or a rate) and the
+        # pixels of the result -- _form's short error, not an IndexError below
+        sol_first = next(iter(solution.values()))
+        sol_sample = vars_of(sol_first)
+        spatial_vars = [v for v, a in sol_sample.items() if 'y' in a.dims]
+        if not spatial_vars:
+            raise BatchCore._no_grid_error(sol_first, 'solution')
+        sample_sol_dims = sol_sample[spatial_vars[0]].dims
         is_date_based = 'date' in sample_sol_dims
         is_pair_based = 'pair' in sample_sol_dims
         is_velocity = not is_date_based and not is_pair_based
@@ -2606,14 +3276,18 @@ class BatchCore(dict):
                 if key not in solution:
                     continue
                 obs_ds = self[key]
-                sol_ds = solution[key]
+                obs_vars = vars_of(obs_ds)
+                sol_vars = vars_of(solution[key])
                 rmse_vars = {}
-                for var in [v for v in obs_ds.data_vars if 'y' in obs_ds[v].dims]:
-                    sol_var = var if var in sol_ds.data_vars else spatial_vars[0]
-                    if sol_var not in sol_ds.data_vars:
+                for var in obs_vars_of(obs_ds):
+                    sol_var = var if var in sol_vars else spatial_vars[0]
+                    if sol_var not in sol_vars:
                         continue
-                    obs_da = obs_ds[var]
-                    vel_da = sol_ds[sol_var]
+                    obs_da = obs_vars[var]
+                    vel_da = sol_vars[sol_var]
+                    if not BatchCore._is_grid(obs_da):
+                        # a DataArray without (y, x): on the rate's grid, as xarray broadcasts it
+                        obs_da = obs_da.broadcast_like(vel_da).transpose(..., *vel_da.dims)
 
                     if 'pair' in obs_da.dims:
                         tdim = 'pair'
@@ -2639,9 +3313,8 @@ class BatchCore(dict):
 
                     w_dask = None
                     if weight is not None and key in weight:
-                        w_ds = weight[key]
-                        w_da = w_ds[var] if var in w_ds.data_vars else w_ds[next(
-                            v for v in w_ds.data_vars if 'y' in w_ds[v].dims)]
+                        # the grid of the same name: _weight() raised for one it lacks
+                        w_da = BatchCore._weight_of(weight[key], var)
                         if w_da.dims[0] != tdim:
                             w_da = w_da.transpose(tdim, ...)
                         w_dask = w_da.data
@@ -2684,7 +3357,10 @@ class BatchCore(dict):
                     rmse_vars[var] = xr.DataArray(
                         rmse_dask, dims=('y', 'x'), coords=coords)
 
-                out[key] = xr.Dataset(rmse_vars, attrs=self[key].attrs)
+                if isinstance(obs_ds, xr.DataArray) and not rmse_vars:
+                    continue
+                # a DataArray in, a DataArray out (N81)
+                out[key] = BatchCore._form(obs_ds, rmse_vars, attrs=obs_ds.attrs)
             return Batch(out)
 
         # --- Non-velocity: date-based or pair-based solution ---
@@ -2695,20 +3371,23 @@ class BatchCore(dict):
                 if key not in solution:
                     continue
                 obs_ds = self[key]
-                sol_ds = solution[key]
+                obs_vars = vars_of(obs_ds)
+                sol_vars = vars_of(solution[key])
                 recon_vars = {}
-                for var in obs_ds.data_vars:
-                    if var not in sol_ds.data_vars or 'y' not in obs_ds[var].dims:
+                for var, obs_da in obs_vars_of(obs_ds).items():
+                    if var not in sol_vars:
                         continue
-                    refs = obs_ds[var].coords['ref'].values
-                    reps = obs_ds[var].coords['rep'].values
+                    refs = obs_da.coords['ref'].values
+                    reps = obs_da.coords['rep'].values
                     recon_list = []
                     for p in range(len(refs)):
                         recon_list.append(
-                            sol_ds[var].sel(date=reps[p]) - sol_ds[var].sel(date=refs[p])
+                            sol_vars[var].sel(date=reps[p]) - sol_vars[var].sel(date=refs[p])
                         )
                     recon_vars[var] = xr.concat(recon_list, dim='pair')
-                recon[key] = xr.Dataset(recon_vars)
+                if isinstance(obs_ds, xr.DataArray) and not recon_vars:
+                    continue
+                recon[key] = BatchCore._form(obs_ds, recon_vars)
             solution_pairs = Batch(recon)
         else:
             solution_pairs = solution
@@ -2720,20 +3399,23 @@ class BatchCore(dict):
                 if key not in solution_pairs:
                     continue
                 obs_ds = self[key]
-                sol_ds = solution_pairs[key]
+                obs_vars = vars_of(obs_ds)
+                sol_vars = vars_of(solution_pairs[key])
                 err_vars = {}
-                for var in [v for v in obs_ds.data_vars if 'y' in obs_ds[v].dims]:
-                    sol_var = var if var in sol_ds.data_vars else next(
-                        (v for v in sol_ds.data_vars if 'y' in sol_ds[v].dims), None)
+                for var in obs_vars_of(obs_ds):
+                    sol_var = var if var in sol_vars else next(
+                        (v for v, a in sol_vars.items() if 'y' in a.dims), None)
                     if sol_var is None:
                         continue
                     err_vars[var] = xr.apply_ufunc(
                         lambda obs, pred: np.angle(
                             obs * np.conj(np.exp(1j * pred))
                         ).astype(np.float32),
-                        obs_ds[var], sol_ds[sol_var],
+                        obs_vars[var], sol_vars[sol_var],
                         dask='parallelized', output_dtypes=[np.float32])
-                error_dict[key] = xr.Dataset(err_vars)
+                if isinstance(obs_ds, xr.DataArray) and not err_vars:
+                    continue
+                error_dict[key] = BatchCore._form(obs_ds, err_vars)
             error = Batch(error_dict)
         else:
             error = self - solution_pairs
@@ -2743,22 +3425,24 @@ class BatchCore(dict):
         for key in error:
             err_ds = error[key]
             rmse_vars = {}
-            for var in err_ds.data_vars:
-                if 'y' not in err_ds[var].dims:
+            for var, err_da in vars_of(err_ds).items():
+                if 'y' not in err_da.dims:
                     continue
-                tdim = next((d for d in ('pair', 'date') if d in err_ds[var].dims), None)
+                tdim = next((d for d in ('pair', 'date') if d in err_da.dims), None)
                 if tdim is None:
                     continue
-                err_sq = err_ds[var] ** 2
+                err_sq = err_da ** 2
                 if weight is not None and key in weight:
-                    w_ds = weight[key]
-                    w_da = w_ds[var] if var in w_ds.data_vars else w_ds[next(
-                        v for v in w_ds.data_vars if 'y' in w_ds[v].dims)]
+                    # the grid of the same name: _weight() raised for one it lacks
+                    w_da = BatchCore._weight_of(weight[key], var)
                     rmse_val = np.sqrt((w_da * err_sq).sum(tdim) / w_da.sum(tdim))
                 else:
                     rmse_val = np.sqrt(err_sq.mean(tdim))
                 rmse_vars[var] = rmse_val.astype('float32')
-            out[key] = xr.Dataset(rmse_vars, attrs=self[key].attrs)
+            if isinstance(err_ds, xr.DataArray) and not rmse_vars:
+                continue
+            # a DataArray in, a DataArray out (N81)
+            out[key] = BatchCore._form(err_ds, rmse_vars, attrs=self[key].attrs)
 
         return Batch(out)
 
@@ -2786,9 +3470,10 @@ class BatchCore(dict):
         Returns
         -------
         BatchCore (or subclass)
-            New batch with polynomial evaluated at each position. The result has
-            the same structure as self, with polynomial values broadcast to match
-            each dataset's shape.
+            A Batch of DataArrays, of this batch's class unconverted: the
+            polynomial evaluated along `dim` (per pair when the coefficients are
+            per pair), named after the first gridded variable. A DataArray, so
+            it applies to every grid of the batch it is combined with (N81).
 
         Examples
         --------
@@ -2810,17 +3495,16 @@ class BatchCore(dict):
         result = {}
         for bid, ds in self.items():
             # Get a spatial variable (with y, x dims)
-            spatial_vars = [v for v in ds.data_vars if 'y' in ds[v].dims and 'x' in ds[v].dims]
-            sample_var = spatial_vars[0] if spatial_vars else list(ds.data_vars)[0]
+            sample_var = ds.name if isinstance(ds, xr.DataArray) else BatchCore._grid_vars(ds)[0]
+            sample_da = ds if isinstance(ds, xr.DataArray) else ds[sample_var]
 
             if bid not in coeffs:
                 # No coefficients for this burst - zero correction
-                result[bid] = xr.zeros_like(ds[sample_var]).to_dataset(name=sample_var)
+                result[bid] = xr.zeros_like(sample_da).rename(sample_var)
                 continue
 
             # Get coordinate for evaluation
             coord = ds.coords[dim]
-            sample_da = ds[sample_var]
 
             coeff = coeffs[bid]
 
@@ -2868,9 +3552,10 @@ class BatchCore(dict):
                 # Single scalar (degree=0, single pair)
                 correction = xr.full_like(coord, float(coeff), dtype=float)
 
-            result[bid] = correction.to_dataset(name=sample_var)
+            result[bid] = correction.rename(sample_var)
 
-        return type(self)(result)
+        # a correction is a polynomial, never re-converted: a BatchWrap does not wrap it
+        return self._view(result)
 
     # def coarsen(self, window: dict[str,int], **kwargs):
     #     """
@@ -2924,9 +3609,10 @@ class BatchCore(dict):
 
         Parameters
         ----------
-        chunks : dict or 'auto'
+        chunks : dict, int or 'auto'
             Chunk specification. If 'auto', uses chunk size 1 for first dimension
-            (date/pair) and uniform chunking for spatial dimensions (y, x).
+            (date/pair) and uniform chunking for spatial dimensions (y, x). An int
+            is one size for every dim, as in xarray: -1 is one chunk.
         p2p : bool
             Use P2P (peer-to-peer) rechunk for constant-memory rechunking.
             Creates a materialization barrier that breaks shared upstream
@@ -2963,33 +3649,49 @@ class BatchCore(dict):
             from contextlib import nullcontext
             ctx = nullcontext()
 
+        def rechunk(arr, dims):
+            """one spatial variable rechunked; `dims` are the dims of its burst"""
+            if chunks == 'auto':
+                # Use rechunk2d for uniform chunk sizes
+                y_size, x_size = arr.shape[-2], arr.shape[-1]
+                element_bytes = arr.dtype.itemsize
+                in_chunks = (arr.data.chunks[-2], arr.data.chunks[-1]) if hasattr(arr.data, 'chunks') else None
+                optimal = rechunk2d((y_size, x_size), element_bytes, input_chunks=in_chunks)
+                if arr.ndim == 3:
+                    var_chunks = {arr.dims[0]: 1, 'y': optimal['y'], 'x': optimal['x']}
+                else:
+                    var_chunks = {'y': optimal['y'], 'x': optimal['x']}
+            elif not isinstance(chunks, dict):
+                # one size for every dim, as xarray's .chunk(-1): the dict branch
+                # below failed on it with "'int' object is not a mapping"
+                var_chunks = {d: chunks for d in arr.dims}
+            else:
+                # Explicit chunks - add first dim=1 for 3D
+                if arr.ndim == 3:
+                    var_chunks = {arr.dims[0]: 1, **chunks}
+                else:
+                    var_chunks = chunks
+                # a dim of the burst this variable lacks -- the 'pair' of the
+                # metadata a reduction carried past a (y, x) grid -- is not its to chunk
+                var_chunks = {d: c for d, c in var_chunks.items() if d in arr.dims or d not in dims}
+            return arr.chunk(var_chunks)
+
         with ctx:
             # Only chunk spatial variables (y, x dims), leave non-spatial as-is
             result = {}
             for k, ds in self.items():
+                if isinstance(ds, xr.DataArray):
+                    # a Batch of DataArrays: the DataArray itself, when it is spatial
+                    spatial = ds.ndim in (2, 3) and ds.dims[-2:] == ('y', 'x')
+                    result[k] = rechunk(ds, ds.dims) if spatial else ds
+                    continue
                 rechunked_vars = {}
                 for var in ds.data_vars:
                     arr = ds[var]
                     # Only touch spatial variables
                     if not (arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x')):
                         continue
-                    if chunks == 'auto':
-                        # Use rechunk2d for uniform chunk sizes
-                        y_size, x_size = arr.shape[-2], arr.shape[-1]
-                        element_bytes = arr.dtype.itemsize
-                        in_chunks = (arr.data.chunks[-2], arr.data.chunks[-1]) if hasattr(arr.data, 'chunks') else None
-                        optimal = rechunk2d((y_size, x_size), element_bytes, input_chunks=in_chunks)
-                        if arr.ndim == 3:
-                            var_chunks = {arr.dims[0]: 1, 'y': optimal['y'], 'x': optimal['x']}
-                        else:
-                            var_chunks = {'y': optimal['y'], 'x': optimal['x']}
-                    else:
-                        # Explicit chunks - add first dim=1 for 3D
-                        if arr.ndim == 3:
-                            var_chunks = {arr.dims[0]: 1, **chunks}
-                        else:
-                            var_chunks = chunks
-                    rechunked_vars[var] = arr.chunk(var_chunks)
+                    rechunked_vars[var] = rechunk(arr, ds.dims)
                 if rechunked_vars:
                     ds = ds.assign(rechunked_vars)
                 result[k] = ds
@@ -3045,12 +3747,14 @@ class BatchCore(dict):
                 # length is read off every (stack, y, x) variable and the
                 # spatial chunks off a stack variable when there is one, picked
                 # by name -- never off whichever variable happens to come first
-                rasters = [v for v in ds.data_vars
-                           if ds[v].ndim in (2, 3) and ds[v].dims[-2:] == ('y', 'x')]
-                stacks = [v for v in rasters if ds[v].ndim == 3]
-                n_stack = max((ds[v].shape[0] for v in stacks), default=0)
+                # (a DataArray is its own one variable, N81)
+                vars_ = BatchCore._vars_of(ds)
+                rasters = [v for v, a in vars_.items()
+                           if a.ndim in (2, 3) and a.dims[-2:] == ('y', 'x')]
+                stacks = [v for v in rasters if vars_[v].ndim == 3]
+                n_stack = max((vars_[v].shape[0] for v in stacks), default=0)
                 picked = sorted(stacks or rasters, key=str)
-                sample = ds[picked[0]] if picked else None
+                sample = vars_[picked[0]] if picked else None
                 if sample is None:
                     result[k] = ds
                     continue
@@ -3062,8 +3766,7 @@ class BatchCore(dict):
                 optimal = rechunk2d((y_size, x_size), element_bytes=8,
                                    input_chunks=in_chunks, target_mb=per_slice_mb, merge=True)
                 rechunked_vars = {}
-                for var in ds.data_vars:
-                    arr = ds[var]
+                for var, arr in vars_.items():
                     if not (arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x')):
                         continue
                     if arr.ndim == 3:
@@ -3079,7 +3782,9 @@ class BatchCore(dict):
                         with dask.config.set({'optimization.fuse.active': n_layers > 3}):
                             (rechunked.data,) = dask.optimize(rechunked.data)
                     rechunked_vars[var] = rechunked
-                if rechunked_vars:
+                if isinstance(ds, xr.DataArray):
+                    ds = rechunked_vars[ds.name]
+                elif rechunked_vars:
                     ds = ds.assign(rechunked_vars)
                 result[k] = ds
         return type(self)(result)
@@ -3127,11 +3832,11 @@ class BatchCore(dict):
         with ctx:
             result = {}
             for k, ds in self.items():
-                # Find the largest dim-0 among 3D variables
+                # Find the largest dim-0 among 3D variables (a DataArray is its own one, N81)
+                vars_ = BatchCore._vars_of(ds)
                 n_stack = 0
                 sample = None
-                for var in ds.data_vars:
-                    arr = ds[var]
+                for var, arr in vars_.items():
                     if arr.ndim == 3 and arr.dims[-2:] == ('y', 'x'):
                         if arr.shape[0] > n_stack:
                             n_stack = arr.shape[0]
@@ -3149,8 +3854,7 @@ class BatchCore(dict):
                 optimal = rechunk2d((y_size, x_size), element_bytes=8,
                                    input_chunks=in_chunks, target_mb=per_slice_mb, merge=True)
                 rechunked_vars = {}
-                for var in ds.data_vars:
-                    arr = ds[var]
+                for var, arr in vars_.items():
                     if not (arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x')):
                         continue
                     if arr.ndim == 3:
@@ -3163,7 +3867,9 @@ class BatchCore(dict):
                         with dask.config.set({'optimization.fuse.active': n_layers > 3}):
                             (rechunked.data,) = dask.optimize(rechunked.data)
                     rechunked_vars[var] = rechunked
-                if rechunked_vars:
+                if isinstance(ds, xr.DataArray):
+                    ds = rechunked_vars[ds.name]
+                elif rechunked_vars:
                     ds = ds.assign(rechunked_vars)
                 result[k] = ds
         return type(self)(result)
@@ -3172,7 +3878,8 @@ class BatchCore(dict):
         return func(self, *args, **kwargs)
 
     def map(self, func, *args, **kwargs):
-        return type(self)({k: func(ds, *args, **kwargs) for k, ds in self.items()})
+        # a result the class does not keep (a mask of a BatchWrap) is a plain Batch
+        return self._result({k: func(ds, *args, **kwargs) for k, ds in self.items()})
 
     def to_dict(self) -> dict:
         """
@@ -3185,15 +3892,16 @@ class BatchCore(dict):
 
         Examples
         --------
-        >>> bpr = stack.BPR(stack.isel(date=[1]), stack.isel(date=[0]))
-        >>> bpr.to_dict()
-        {'123_262885_IW2': {'BPR': array([-158.75])},
-         '123_262886_IW2': {'BPR': array([-158.81])},
-         '123_262887_IW2': {'BPR': array([-158.87])}}
+        >>> # the per-date BPR, a Batch of DataArrays (stack.BPR is stack['BPR'])
+        >>> stack.BPR.to_dict()
+        {'123_262885_IW2': {'BPR': array([   0.  , -166.47])},
+         '123_262886_IW2': {'BPR': array([   0.  , -166.34])},
+         '123_262887_IW2': {'BPR': array([   0.  , -166.2 ])}}
         """
         result = {}
         for key, ds in self.items():
-            result[key] = {var: ds[var].values for var in ds.data_vars}
+            # a DataArray is its own one variable (N81)
+            result[key] = {var: arr.values for var, arr in BatchCore._vars_of(ds).items()}
         return result
 
     def compute(self):
@@ -3204,53 +3912,90 @@ class BatchCore(dict):
         distributed worker memory (not pulled to client), letting the scheduler
         optimize across the full graph. Rechunks results to match input chunk
         structure. For memory-constrained sequential processing, use snapshot().
+        Lazy products of the result (e.g. dissolve()) keep its data in worker
+        memory while they exist, so chains like x.compute().dissolve().compute()
+        work without holding the intermediate result.
+
+        A Batch of DataArrays is computed as the DataArrays it holds (N81): no
+        Dataset, no temporary name. A batch with nothing lazy comes back as it is.
 
         Returns
         -------
         BatchCore
             New batch with computed data, rechunked to match input.
+
+        Raises
+        ------
+        RuntimeError
+            The batch needs data the cluster no longer holds (e.g. after client.restart()).
         """
         import dask
-        from insardev_toolkit.progressbar import progressbar
+        from .utils_dask import progress_persisted
+
+        # NOTHING LAZY, NOTHING TO COMPUTE: the batch as it is (no constructor rerun)
+        if not BatchCore._is_lazy_any(self):
+            return self
 
         # Save input chunk structure per burst
-        all_input_chunks = {}
-        for key, ds in self.items():
-            ic = {}
-            for var_name in ds.data_vars:
-                arr = ds[var_name]
-                if hasattr(arr.data, 'chunks'):
-                    ic[var_name] = dict(zip(arr.dims, arr.data.chunks))
-            all_input_chunks[key] = ic
+        all_input_chunks = {key: BatchCore._input_chunks(v) for key, v in self.items()}
 
         # Persist all bursts at once — single scheduler submission
-        # progressbar extracts futures and blocks until completion
-        progressbar(result := dask.persist(dict(self))[0], desc='Computing Batch...'.ljust(25))
+        # progress_persisted extracts futures and blocks until completion
+        result = dask.persist(dict(self))[0]
+        progress_persisted(result, desc='Computing Batch...'.ljust(25))
 
-        # Finalize: materialize coordinates and rechunk to match input
-        computed = {}
-        for key, ds in result.items():
-            new_coords = {}
-            for name, coord in ds.coords.items():
-                if hasattr(coord, 'data') and hasattr(coord.data, 'compute'):
-                    new_coords[name] = (coord.dims, coord.compute().values)
-            if new_coords:
-                ds = ds.assign_coords(new_coords)
-            input_chunks = all_input_chunks[key]
-            rechunked_vars = {}
-            for var_name in ds.data_vars:
-                arr = ds[var_name]
-                if var_name in input_chunks:
-                    chunks = input_chunks[var_name]
-                    if isinstance(arr.data, np.ndarray):
-                        arr = arr.chunk(chunks)
-                    elif hasattr(arr.data, 'chunks') and dict(zip(arr.dims, arr.data.chunks)) != chunks:
-                        arr = arr.chunk(chunks)
-                    rechunked_vars[var_name] = arr
-            if rechunked_vars:
-                ds = ds.assign(rechunked_vars)
-            computed[key] = ds
-        return type(self)(computed)
+        # Finalize: materialize coordinates, hold the futures, rechunk to match input
+        return type(self)({key: BatchCore._persisted(v, all_input_chunks[key]) for key, v in result.items()})
+
+    @staticmethod
+    def _is_lazy_any(batch) -> bool:
+        """Whether any burst of `batch` holds dask data (a variable or a coordinate), for compute()."""
+        import dask
+        return any(dask.is_dask_collection(v) for v in dict.values(batch))
+
+    @staticmethod
+    def _input_chunks(value) -> dict:
+        """The chunks of every dask variable of one burst, for compute() to restore:
+        {name: {dim: chunks}} of a Dataset, {None: {dim: chunks}} of a DataArray."""
+        if isinstance(value, xr.DataArray):
+            return {None: dict(zip(value.dims, value.data.chunks))} if hasattr(value.data, 'chunks') else {}
+        return {v: dict(zip(value[v].dims, value[v].data.chunks))
+                for v in value.data_vars if hasattr(value[v].data, 'chunks')}
+
+    @staticmethod
+    def _persisted(value, input_chunks):
+        """One burst of a persist, a Dataset or a DataArray taken as it is (N81): the
+        lazy coordinates materialised, every dask variable holding its cluster data
+        (hold_persisted, N111) and put back on its input chunks (_input_chunks)."""
+        import dask.array as da
+        from .utils_dask import hold_persisted
+
+        new_coords = {name: (coord.dims, coord.compute().values) for name, coord in value.coords.items()
+                      if hasattr(coord, 'data') and hasattr(coord.data, 'compute')}
+        if new_coords:
+            value = value.assign_coords(new_coords)
+
+        def finish(arr, chunks):
+            """(the variable held and rechunked, whether it changed)"""
+            # products of this batch keep its cluster data alive, even after the batch is freed
+            held = isinstance(arr.data, da.Array)
+            if held:
+                arr = arr.copy(data=hold_persisted(arr.data))
+            if chunks is not None:
+                if isinstance(arr.data, np.ndarray):
+                    arr = arr.chunk(chunks)
+                elif hasattr(arr.data, 'chunks') and dict(zip(arr.dims, arr.data.chunks)) != chunks:
+                    arr = arr.chunk(chunks)
+            return arr, held or chunks is not None
+
+        if isinstance(value, xr.DataArray):
+            return finish(value, input_chunks.get(None))[0]
+        rechunked_vars = {}
+        for var_name in value.data_vars:
+            arr, changed = finish(value[var_name], input_chunks.get(var_name))
+            if changed:
+                rechunked_vars[var_name] = arr
+        return value.assign(rechunked_vars) if rechunked_vars else value
 
     def to_dataframe(self,
                      crs: str | int | None = 'auto',
@@ -3274,7 +4019,8 @@ class BatchCore(dict):
         -------
         pandas.DataFrame or geopandas.GeoDataFrame
             The DataFrame containing Batch scenes with their attributes.
-            Index is (fullBurstID, burst) matching Stack.to_dataframe.
+            Index is (fullBurstID, burst) when the Datasets carry both in .attrs, else the default
+            RangeIndex; Stack.to_dataframe() indexes by (fullBurstID, startTime).
             For pair-based data, ref and rep columns are added after the index.
 
         Examples
@@ -3297,16 +4043,19 @@ class BatchCore(dict):
         if crs is not None and isinstance(crs, str) and crs == 'auto':
             crs = native_crs
 
-        # Detect spatial data variables (skip 1D/0D vars like converted attributes)
-        spatial_vars = [v for v in sample.data_vars if sample[v].ndim >= 2]
+        # Detect spatial data variables: the GRIDS (the operator rule), not the
+        # per-pair or per-date metadata carried beside them
+        spatial_vars = [v for v in sample.data_vars if BatchCore._is_grid(sample[v])]
         ndims = {sample[v].ndim for v in spatial_vars}
         if len(ndims) > 1:
             raise ValueError(f'Mixed 2D and 3D variables not supported: {{{", ".join(f"{v}: {sample[v].ndim}D" for v in spatial_vars)}}}')
 
-        # Detect dimension: 'date' for BatchComplex, 'pair' for others, None for spatial-only
-        if 'date' in sample.dims:
+        # Detect dimension: 'date' for BatchComplex, 'pair' for others, None for spatial-only.
+        # Read off the grids: after mean('pair') the metadata still carries its pairs.
+        grid_dims = set().union(*(sample[v].dims for v in spatial_vars)) if spatial_vars else set(sample.dims)
+        if 'date' in grid_dims:
             dim = 'date'
-        elif 'pair' in sample.dims:
+        elif 'pair' in grid_dims:
             dim = 'pair'
         else:
             dim = None
@@ -3319,8 +4068,8 @@ class BatchCore(dict):
         if dim is None:
             frames = []
             for key, ds in self.items():
-                # Get spatial data variables (skip 1D/0D vars)
-                spatial_vars = [v for v in ds.data_vars if ds[v].ndim >= 2]
+                # Get spatial data variables (the grids)
+                spatial_vars = [v for v in ds.data_vars if BatchCore._is_grid(ds[v])]
                 if not spatial_vars:
                     continue
                 df_burst = ds[spatial_vars].to_dataframe().reset_index()
@@ -3446,8 +4195,8 @@ class BatchCore(dict):
         if hasattr(sample_ds, 'obj'):
             sample_ds = sample_ds.obj
         output_budget_mb = None
-        for v in sample_ds.data_vars:
-            arr = sample_ds[v]
+        # a Dataset's variables, or a DataArray as its own one (N81)
+        for arr in BatchCore._vars_of(sample_ds).values():
             if arr.ndim >= 2 and arr.dims[-2:] == ('y', 'x') and hasattr(arr.data, 'chunks'):
                 cy0 = arr.data.chunks[-2][0]
                 cx0 = arr.data.chunks[-1][0]
@@ -3462,6 +4211,11 @@ class BatchCore(dict):
         meta_keys = {}
         spatial = {}
         for key, ds in self.items():
+            if isinstance(ds, xr.DataArray):
+                # a DataArray is its own grid and carries no metadata (N81)
+                meta_keys[key] = None
+                spatial[key] = ds
+                continue
             m = [v for v in ds.data_vars
                  if not (ds[v].ndim >= 2 and tuple(ds[v].dims[-2:]) == ('y', 'x'))]
             meta_keys[key] = ds[m] if m else None
@@ -3479,8 +4233,7 @@ class BatchCore(dict):
         # Rechunk output to preserve input spatial granularity
         if output_budget_mb is not None:
             sample_ds = next(iter(result.values()))
-            for v in sample_ds.data_vars:
-                arr = sample_ds[v]
+            for arr in BatchCore._vars_of(sample_ds).values():
                 if arr.ndim >= 2 and arr.dims[-2:] == ('y', 'x') and hasattr(arr.data, 'chunks'):
                     y_size, x_size = arr.shape[-2], arr.shape[-1]
                     optimal = rechunk2d((y_size, x_size), element_bytes=8,
@@ -3514,9 +4267,20 @@ class BatchCore(dict):
         """
         Merge multiple burst DataArrays into a single unified grid.
 
-        This function efficiently combines bursts using dask delayed operations
-        for lazy evaluation. For each output chunk, it selects the minimal set
-        of input bursts needed and combines their data using forward-fill.
+        This function efficiently combines bursts using dask operations for lazy
+        evaluation. For each output chunk, it selects the minimal set of input
+        bursts needed and lays them in ACQUISITION ORDER (_acquisition_order(),
+        by each burst's startTime): where bursts overlap, the MOST RECENT burst's
+        valid value wins; a burst's nodata never hides an earlier burst's valid
+        value; pixels no burst covers hold the nodata value.
+
+        THE NODATA VALUE IS SET BY THE DTYPE: NaN for float and complex grids,
+        -1 for signed integers (fit3d level and conncomp), 0 for unsigned
+        integers (unwrap2d conncomp) and False for bool; every grid keeps its
+        own dtype. Integer or bool grids, of one burst or many, print one
+        WARNING naming them: replace the nodata value or convert the dtype
+        first where that value is wrong. plot(), to_geojson() and to_vtk()
+        skip the same nodata.
 
         For best results with overlapping bursts, call .dissolve() first to average
         values in overlap regions, then call .to_dataset() to merge into a single grid.
@@ -3524,7 +4288,7 @@ class BatchCore(dict):
         Parameters
         ----------
         polarization : str, optional
-            Specific polarization to process. If None, processes all polarizations.
+            Specific (y, x) variable to merge. If None, merges every (y, x) variable.
         chunks : str, int, or tuple, optional
             Spatial chunk size for processing. Options:
             - 'auto' (default): automatically determine chunk size based on memory
@@ -3539,13 +4303,24 @@ class BatchCore(dict):
 
         Returns
         -------
-        xr.DataArray or xr.Dataset
-            Merged data on a unified grid.
+        xr.Dataset
+            Merged data on a unified grid: ALWAYS a Dataset (N81), for one burst
+            or many and for a Batch of Datasets or of DataArrays, holding the
+            (y, x) variables only -- every one, or the one `polarization` names.
+            A burst's other variables have no place on a merged grid. Every
+            grid keeps its dtype, for one burst or many.
+
+        Raises
+        ------
+        ValueError
+            Nothing to merge: the batch has no bursts, or every burst is empty
+            (e.g. after a spatial sel()). Empty bursts next to others are skipped.
 
         Examples
         --------
-        >>> # Merge bursts into single grid (fast, uses ffill for overlaps)
+        >>> # Merge bursts into single grid (the most recent burst wins overlaps)
         >>> merged = batch.to_dataset()
+        >>> vv = batch.to_dataset(polarization='VV')['VV']
         >>>
         >>> # With explicit chunk size for memory-constrained environments
         >>> merged = batch.to_dataset(chunks=1024)
@@ -3563,64 +4338,86 @@ class BatchCore(dict):
         import numpy as np
         import dask
         import dask.array as da
-        from insardev_toolkit import progressbar, datagrid
+        from insardev_toolkit import datagrid
 
+        # NOTHING TO MERGE RAISES (decided): a None result is no input to any next step
         if not len(self):
-            return None
+            raise ValueError('ERROR: to_dataset(): the batch has no bursts. Nothing to merge.')
 
         sample = next(iter(self.values()))
+        # A BATCH OF DATAARRAYS merges as it is (N81): each burst's grid is the DataArray
+        # itself, named as the DataArray in the Dataset returned, as for any batch
+        if isinstance(sample, xr.DataArray) and sample.name is None:
+            raise TypeError("ERROR: to_dataset() needs a named DataArray batch. Name it: x.rename('name').")
+        # THE (y, x) VARIABLES ONLY, the same for one burst or many: a burst's metadata
+        # (BPR, radar_wavelength, burst strings) has no place on a merged grid
+        grids = list(BatchCore._grids_of(sample))
+        if not grids:
+            names = ', '.join(str(v) for v in BatchCore._vars_of(sample))
+            raise TypeError(f'ERROR: to_dataset(): the batch has no (y, x) grid ({names}).')
+        if polarization is None:
+            polarizations = grids
+        elif polarization in grids:
+            polarizations = [polarization]
+        else:
+            raise KeyError(f"ERROR: to_dataset(): no (y, x) variable '{polarization}'; the batch has "
+                           f"{', '.join(str(v) for v in grids)}.")
+        # every burst empty (e.g. after a spatial sel()) RAISES too; an empty burst next
+        # to others is skipped below
+        if not any(v.sizes.get('y', 0) and v.sizes.get('x', 0) for v in self.values()):
+            raise ValueError(f"ERROR: to_dataset(): {'the burst is' if len(self) == 1 else 'every burst is'} "
+                             f"empty (0 pixels), e.g. after a spatial sel(). Nothing to merge.")
+
         if len(self) == 1:
             if debug:
                 print(f"=== to_dataset() debug ===")
                 print(f"Single burst - returning directly (no merge needed)")
                 print(f"Burst key: {next(iter(self.keys()))}")
                 # Get spatial vars
-                spatial_vars = [v for v in sample.data_vars if 'y' in sample[v].dims and 'x' in sample[v].dims]
-                for var in spatial_vars[:3]:  # Show first 3 spatial vars
-                    da = sample[var]
+                for var, da in list(BatchCore._grids_of(sample).items())[:3]:  # Show first 3 spatial vars
                     print(f"  {var}: shape={da.shape}, dtype={da.dtype}")
+            if isinstance(sample, xr.DataArray):
+                # the Dataset of the one grid, named as the DataArray
+                sample = xr.Dataset({sample.name: sample})
+            else:
+                sample = sample[polarizations]
+            # the nodata by dtype holds for one burst too: the exports skip it (_skip_nodata)
+            _warn_int_nodata('to_dataset', {v: sample[v].dtype for v in sample.data_vars})
             if compute:
-                progressbar(sample := sample.persist(), desc=f'Compute Dataset'.ljust(25))
+                from .utils_dask import progress_persisted
+                progress_persisted(sample := sample.persist(), desc=f'Compute Dataset'.ljust(25))
                 return sample
             return sample
 
-        # Determine which polarizations to process
-        if polarization is None:
-            # Filter for spatial variables (with y, x dims) - excludes converted attributes
-            polarizations = [v for v in sample.data_vars
-                            if 'y' in sample[v].dims and 'x' in sample[v].dims]
-        else:
-            polarizations = [polarization]
-
-        # Build data dictionary: {pol: [burst0_data, burst1_data, ...]}
-        burst_keys = list(self.keys())
-        datas_by_pol = {pol: [self[k][pol] for k in burst_keys] for pol in polarizations}
+        # Build data dictionary: {pol: [burst0_data, burst1_data, ...]}, THE EARLIEST BURST
+        # FIRST: laid in this order, the most recent burst wins the overlaps
+        burst_keys = BatchCore._acquisition_order(self)
+        datas_by_pol = {pol: [self[k] if isinstance(self[k], xr.DataArray) and self[k].name == pol
+                              else self[k][pol] for k in burst_keys] for pol in polarizations}
 
         # Get grid info from first polarization (all pols have same grid)
         first_pol = polarizations[0]
         first_datas = datas_by_pol[first_pol]
 
-        # Get signed spacing from first burst
-        dims = first_datas[0].dims
-        stackvar = list(dims)[0] if len(dims) > 2 else None
-
-        # Handle stack dimension - preserve original coordinate values
-        if stackvar is not None:
-            stackval = first_datas[0][stackvar].values
-        else:
-            stackvar = 'fake'
-            stackval = [0]
-            # Expand dims for all polarizations
-            for pol in polarizations:
-                datas_by_pol[pol] = [d.expand_dims({stackvar: [0]}) for d in datas_by_pol[pol]]
-            first_datas = datas_by_pol[first_pol]
+        # Handle stack dimension - preserve original coordinate values. EACH VARIABLE ITS
+        # OWN (N81): a Stack's grids differ -- VV (date, y, x), ele (y, x) -- and the first
+        # one's stack dimension indexed a 2-D grid as 3-D; a 2-D grid is one 'fake' slice
+        # (read as its own 2-D blocks below: no expand_dims layer on the input)
+        stack_of = {}
+        for pol in polarizations:
+            pdims = datas_by_pol[pol][0].dims
+            if len(pdims) > 2:
+                stack_of[pol] = (pdims[0], datas_by_pol[pol][0][pdims[0]].values)
+            else:
+                stack_of[pol] = ('fake', [0])
+        first_datas = datas_by_pol[first_pol]
+        stackvar, stackval = stack_of[first_pol]
 
         n_stack = len(stackval)
 
         # Filter out empty bursts (e.g., after spatial .sel() subsetting)
+        # (not all of them: that raised above)
         nonempty_indices = [i for i, ds in enumerate(first_datas) if ds.y.size > 0 and ds.x.size > 0]
-        if not nonempty_indices:
-            return None
         if len(nonempty_indices) < len(first_datas):
             for pol in polarizations:
                 datas_by_pol[pol] = [datas_by_pol[pol][i] for i in nonempty_indices]
@@ -3730,9 +4527,10 @@ class BatchCore(dict):
                     if coverage > 0:
                         chunk_index[(yi, xi)].append((burst_idx, coverage))
 
-        # Sort each chunk's burst list by coverage (descending)
+        # Each chunk's bursts in acquisition order (burst_idx follows it): the most recent
+        # is laid last and wins the overlaps
         for key in chunk_index:
-            chunk_index[key].sort(key=lambda x: -x[1])
+            chunk_index[key].sort()
 
         # Debug output
         if debug:
@@ -3766,31 +4564,61 @@ class BatchCore(dict):
                 print(f"  [{idx}] y=[{by.min():.1f}, {by.max():.1f}] "
                       f"x=[{bx.min():.1f}, {bx.max():.1f}] ({len(by)}×{len(bx)} pixels)")
 
-        # Build result for each polarization
-        # Note: merge function is defined at module level (_merge_tiles_for_dask)
-        # to avoid dask serialization issues with nested function closures
+        # Build result for each polarization: ONE TASK PER OUTPUT BLOCK, and one per tile it
+        # reads, on the inputs' own blocks, that dask never fuses (_UnfusedTask) -- the same
+        # keys, naming the same tasks, in every graph (as Stack._zarr_dask()). Read through
+        # to_delayed(optimize_graph=False), an input was not Blockwise-fused in a
+        # to_dataset() graph and was in every other: the interferogram product ref *
+        # conj(rep) was mul(getitem, conjugate) here and one fused task of the two getitems
+        # elsewhere. The scheduler, still holding that key among the inputs of a computed
+        # result, kept its old dependencies (dask issue 9888), and to_vtk() failed now and
+        # then with KeyError or 'missing keys'. Now an input's blocks are read as they are
+        # computed anywhere, and nothing here fuses into them.
+        # The merge functions are module level (_tile_for_dask, _merge_parts_for_dask).
+        from dask.base import tokenize
+        from dask._task_spec import TaskRef
+        from dask.highlevelgraph import HighLevelGraph
+        from .utils_dask import _UnfusedTask
+
+        def _overlap(edges, lo, hi):
+            """[(chunk, start, stop within it)] of the chunks the range [lo, hi) overlaps."""
+            first = int(np.searchsorted(edges, lo, 'right')) - 1
+            last = int(np.searchsorted(edges, hi, 'left')) - 1
+            return [(i, max(lo, edges[i]) - edges[i], min(hi, edges[i + 1]) - edges[i])
+                    for i in range(first, last + 1)]
+
+        y_sizes = tuple(min(y_chunk_size, ys.size - yi * y_chunk_size) for yi in range(n_y_chunks))
+        x_sizes = tuple(min(x_chunk_size, xs.size - xi * x_chunk_size) for xi in range(n_x_chunks))
         results = {}
+        # AN INTEGER OR BOOLEAN GRID KEEPS ITS DTYPE (decided): no NaN, so its nodata value
+        # is set by the dtype (_nodata_of: -1 signed, 0 unsigned, False bool), transparent
+        # in overlaps and filling the pixels no burst covers -- ONE WARNING names them all
+        nodata_of = {pol: _nodata_of(datas_by_pol[pol][0].dtype) for pol in polarizations}
+        _warn_int_nodata('to_dataset', {pol: datas_by_pol[pol][0].dtype for pol in polarizations})
         for pol in polarizations:
             datas = datas_by_pol[pol]
+            # this variable's own stack dimension and dtype (a Stack's grids differ)
+            stackvar, stackval = stack_of[pol]
+            n_stack = len(stackval)
+            fill_dtype = np.dtype(datas[0].dtype)
+            nodata = nodata_of[pol]
 
-            # Ensure data is dask and rechunk stack dim to 1 (keep spatial chunks)
-            def ensure_dask_rechunked(d):
-                arr = d.data
-                if not isinstance(arr, da.Array):
-                    arr = da.from_array(arr, chunks=arr.shape)
-                return arr.rechunk({0: 1})
+            # each burst's grid as it is: dask (numpy as one block), 3-D (stack, y, x) or 2-D
+            arrays = [d.data if isinstance(d.data, da.Array) else da.from_array(d.data, chunks=d.data.shape)
+                      for d in datas]
+            edges = [[np.cumsum((0,) + tuple(c)).tolist() for c in a.chunks] for a in arrays]
+            # the same merge of the same inputs on the same grid is the same keys
+            token = tokenize(pol, stackvar, n_stack, ys, xs, y_chunk_size, x_chunk_size, str(fill_dtype), str(nodata),
+                             [(a.name, a.chunks, info['y_coords'], info['x_coords'])
+                              for a, info in zip(arrays, burst_info)])
+            name = f'to_dataset-{token}'
+            tname = f'to_dataset-tile-{token}'
+            layer = {}
 
-            datas_rechunked = [ensure_dask_rechunked(d) for d in datas]
-
-            # Build output blocks for each stack slice separately
-            stack_mosaics = []
             for s_idx in range(n_stack):
-                # Build 2D mosaic for this stack slice
-                blocks_rows = []
                 for yi in range(n_y_chunks):
                     yb0 = yi * y_chunk_size
                     yb1 = min(yb0 + y_chunk_size, ys.size)
-                    blocks_row = []
                     for xi in range(n_x_chunks):
                         xb0 = xi * x_chunk_size
                         xb1 = min(xb0 + x_chunk_size, xs.size)
@@ -3804,93 +4632,80 @@ class BatchCore(dict):
                         out_ys = ys[yb0:yb1]
                         out_xs = xs[xb0:xb1]
 
-                        if len(overlapping) == 0:
-                            # No data - create NaN block
-                            block = da.full(out_shape, np.nan, dtype=fill_dtype)
-                        else:
-                            # Collect delayed tile references and their offsets within this chunk
-                            tiles_delayed = []
-                            offsets = []
+                        # the tiles (a tile over several input blocks: one part per block) and
+                        # their offsets within this chunk; none gives a NaN block
+                        parts = []
+                        offsets = []
 
-                            # Output chunk coordinate bounds (with small tolerance for floating point)
-                            # Use tiny tolerance (1e-6 * spacing) to handle floating point precision
-                            # Apply tolerance to expand bounds (not shrink), regardless of coord direction
-                            tol_y = abs(dy) * 1e-6
-                            tol_x = abs(dx) * 1e-6
-                            y_lo = min(out_ys[0], out_ys[-1]) - tol_y
-                            y_hi = max(out_ys[0], out_ys[-1]) + tol_y
-                            x_lo = min(out_xs[0], out_xs[-1]) - tol_x
-                            x_hi = max(out_xs[0], out_xs[-1]) + tol_x
+                        # Output chunk coordinate bounds (with small tolerance for floating point)
+                        # Use tiny tolerance (1e-6 * spacing) to handle floating point precision
+                        # Apply tolerance to expand bounds (not shrink), regardless of coord direction
+                        tol_y = abs(dy) * 1e-6
+                        tol_x = abs(dx) * 1e-6
+                        y_lo = min(out_ys[0], out_ys[-1]) - tol_y
+                        y_hi = max(out_ys[0], out_ys[-1]) + tol_y
+                        x_lo = min(out_xs[0], out_xs[-1]) - tol_x
+                        x_hi = max(out_xs[0], out_xs[-1]) + tol_x
 
-                            for burst_idx, _ in overlapping:
-                                info = burst_info[burst_idx]
-                                burst_ys = info['y_coords']
-                                burst_xs = info['x_coords']
+                        for burst_idx, _ in overlapping:
+                            info = burst_info[burst_idx]
+                            burst_ys = info['y_coords']
+                            burst_xs = info['x_coords']
 
-                                # Find burst indices that fall within output chunk bounds
-                                mask_y = (burst_ys >= y_lo) & (burst_ys <= y_hi)
-                                mask_x = (burst_xs >= x_lo) & (burst_xs <= x_hi)
-                                idx_y = np.where(mask_y)[0]
-                                idx_x = np.where(mask_x)[0]
+                            # Find burst indices that fall within output chunk bounds
+                            mask_y = (burst_ys >= y_lo) & (burst_ys <= y_hi)
+                            mask_x = (burst_xs >= x_lo) & (burst_xs <= x_hi)
+                            idx_y = np.where(mask_y)[0]
+                            idx_x = np.where(mask_x)[0]
 
-                                if len(idx_y) > 0 and len(idx_x) > 0:
-                                    by0, by1 = idx_y[0], idx_y[-1] + 1
-                                    bx0, bx1 = idx_x[0], idx_x[-1] + 1
+                            if len(idx_y) > 0 and len(idx_x) > 0:
+                                by0, by1 = int(idx_y[0]), int(idx_y[-1]) + 1
+                                bx0, bx1 = int(idx_x[0]), int(idx_x[-1]) + 1
 
-                                    # Compute tile offset within this output chunk
-                                    # Tile's first coord -> global array index -> offset in chunk
-                                    tile_y0_coord = burst_ys[by0]
-                                    tile_x0_coord = burst_xs[bx0]
-                                    # Global array index of tile start
-                                    tile_global_yi = int(round((tile_y0_coord - y_first) / dy))
-                                    tile_global_xi = int(round((tile_x0_coord - x_first) / dx))
-                                    # Offset within this chunk (yb0, xb0 is chunk start in global)
-                                    y_off = tile_global_yi - yb0
-                                    x_off = tile_global_xi - xb0
+                                # Compute tile offset within this output chunk
+                                # Tile's first coord -> global array index -> offset in chunk
+                                tile_y0_coord = burst_ys[by0]
+                                tile_x0_coord = burst_xs[bx0]
+                                # Global array index of tile start
+                                tile_global_yi = int(round((tile_y0_coord - y_first) / dy))
+                                tile_global_xi = int(round((tile_x0_coord - x_first) / dx))
+                                # Offset within this chunk (yb0, xb0 is chunk start in global)
+                                y_off = tile_global_yi - yb0
+                                x_off = tile_global_xi - xb0
 
-                                    # Validate offset is within reasonable bounds
-                                    # (should be within chunk ± 1 for floating point tolerance)
-                                    tile_h, tile_w = by1 - by0, bx1 - bx0
-                                    if y_off < -1 or y_off + tile_h > out_shape[0] + 1:
-                                        continue  # Skip misaligned tiles
-                                    if x_off < -1 or x_off + tile_w > out_shape[1] + 1:
-                                        continue  # Skip misaligned tiles
+                                # Validate offset is within reasonable bounds
+                                # (should be within chunk ± 1 for floating point tolerance)
+                                tile_h, tile_w = by1 - by0, bx1 - bx0
+                                if y_off < -1 or y_off + tile_h > out_shape[0] + 1:
+                                    continue  # Skip misaligned tiles
+                                if x_off < -1 or x_off + tile_w > out_shape[1] + 1:
+                                    continue  # Skip misaligned tiles
 
-                                    # Slice the dask array to get this tile
-                                    # Then rechunk to single spatial chunk for the merge function
-                                    tile_slice = datas_rechunked[burst_idx][s_idx:s_idx+1, by0:by1, bx0:bx1].rechunk({1: -1, 2: -1})
-                                    # Convert to delayed - dask will auto-compute when merge is called
-                                    tile_delayed = tile_slice.to_delayed(optimize_graph=False).ravel()[0]
-                                    tiles_delayed.append(tile_delayed)
-                                    offsets.append((y_off, x_off))
+                                # the tile, cut from each input block it overlaps
+                                arr = arrays[burst_idx]
+                                ey, ex = edges[burst_idx][-2], edges[burst_idx][-1]
+                                if arr.ndim == 3:
+                                    es = edges[burst_idx][0]
+                                    sc = int(np.searchsorted(es, s_idx, 'right')) - 1
+                                    lead, s_local = (sc,), s_idx - es[sc]
+                                else:
+                                    lead, s_local = (), None
+                                for iy, py0, py1 in _overlap(ey, by0, by1):
+                                    for ix, px0, px1 in _overlap(ex, bx0, bx1):
+                                        key = (tname, s_idx, yi, xi, len(parts))
+                                        layer[key] = _UnfusedTask(key, _tile_for_dask,
+                                                                  TaskRef((arr.name,) + lead + (iy, ix)),
+                                                                  s_local, py0, py1, px0, px1)
+                                        parts.append(TaskRef(key))
+                                        offsets.append((y_off + ey[iy] + py0 - by0, x_off + ex[ix] + px0 - bx0))
 
-                            if len(tiles_delayed) == 0:
-                                block = da.full(out_shape, np.nan, dtype=fill_dtype)
-                            else:
-                                # Merge tiles - dask auto-computes delayed tiles before calling
-                                # Tiles arrive as 3D (1, ny, nx), squeeze to 2D in merge
-                                # IMPORTANT: Use standalone function instead of lambda with closure
-                                # to avoid serialization issues with nested functions in dask distributed
-                                # IMPORTANT: Convert to tuples (immutable) before passing to delayed
-                                # This ensures proper serialization in distributed environments
-                                # and prevents any race conditions with list mutations
-                                block = da.from_delayed(
-                                    dask.delayed(_merge_tiles_for_dask, pure=True)(
-                                        tuple(tiles_delayed), tuple(offsets), out_shape, fill_dtype
-                                    ),
-                                    shape=out_shape,
-                                    dtype=fill_dtype
-                                )
+                        key = (name, s_idx, yi, xi)
+                        layer[key] = _UnfusedTask(key, _merge_parts_for_dask, tuple(offsets), out_shape,
+                                                  fill_dtype, nodata, *parts)
 
-                        blocks_row.append(block)
-                    blocks_rows.append(blocks_row)
-
-                # Assemble 2D mosaic for this stack slice
-                mosaic_2d = da.block(blocks_rows)
-                stack_mosaics.append(mosaic_2d[np.newaxis, :, :])
-
-            # Stack all slices along axis 0
-            data = da.concatenate(stack_mosaics, axis=0)
+            graph = HighLevelGraph.from_collections(name, layer, dependencies=arrays)
+            data = da.Array(graph, name, chunks=((1,) * n_stack, y_sizes, x_sizes), dtype=fill_dtype,
+                            meta=np.empty((0, 0, 0), dtype=fill_dtype))
 
             result = xr.DataArray(data, coords={stackvar: stackval, 'y': ys, 'x': xs})\
                 .rename(pol)\
@@ -3903,31 +4718,29 @@ class BatchCore(dict):
                     result = result.assign_coords(rep=(stackvar, datas[0].coords['rep'].values))
             result = datagrid.spatial_ref(result, datas)
             if stackvar == 'fake':
-                result = result.isel({stackvar: 0})
+                # a 2-D grid: no scalar 'fake' coordinate left on it
+                result = result.isel({stackvar: 0}, drop=True)
             results[pol] = result
 
-        # Return DataArray if single polarization was requested, Dataset otherwise
-        if polarization is not None:
-            # Single polarization explicitly requested - return DataArray
-            output = results[polarization]
-        else:
-            # All polarizations - return Dataset (even if only one)
-            #
-            # BOTH KWARGS STATED, not left to the default. Every DataArray here
-            # was built from the SAME `ys`, `xs` and `stackval` -- the grid is
-            # read once from the first polarization, above -- and the names are
-            # the polarizations, so nothing overlaps and nothing needs
-            # reconciling. `compat='override'` says exactly that and skips the
-            # comparison; it is also the default xarray is moving to, so the
-            # result cannot change under us. `join='exact'` turns the shared
-            # grid from an assumption into a check: if two polarizations ever
-            # arrive on different axes this raises, where the default outer
-            # join would quietly pad the union with NaN.
-            output = xr.merge(list(results.values()),
-                              compat='override', join='exact')
+        # ALWAYS A DATASET (N81), of the one polarization requested or of all of them
+        #
+        # BOTH KWARGS STATED, not left to the default. Every DataArray here
+        # was built from the SAME `ys` and `xs` (each with its own stack
+        # dimension) -- the grid is
+        # read once from the first polarization, above -- and the names are
+        # the polarizations, so nothing overlaps and nothing needs
+        # reconciling. `compat='override'` says exactly that and skips the
+        # comparison; it is also the default xarray is moving to, so the
+        # result cannot change under us. `join='exact'` turns the shared
+        # grid from an assumption into a check: if two polarizations ever
+        # arrive on different axes this raises, where the default outer
+        # join would quietly pad the union with NaN.
+        output = xr.merge(list(results.values()),
+                          compat='override', join='exact')
 
         if compute:
-            progressbar(output := output.persist(), desc=f'Computing Dataset...'.ljust(25))
+            from .utils_dask import progress_persisted
+            progress_persisted(output := output.persist(), desc=f'Computing Dataset...'.ljust(25))
         return output
 
     @staticmethod
@@ -4238,8 +5051,8 @@ class BatchCore(dict):
         import geopandas as gpd
         import shapely.geometry
 
-        # Merge to single dataset
-        ds = self.to_dataset()
+        # Merge to single dataset; an integer grid's nodata is left out, as to_dataset() sets it
+        ds = _skip_nodata(self.to_dataset())
 
         # Get spatial data variables (with y, x dims) - excludes converted attributes
         data_vars = [v for v in ds.data_vars
@@ -4334,7 +5147,7 @@ class BatchCore(dict):
         # Handle overlay-only case (export just overlay on topography)
         if not self and overlay is not None and transform is not None:
             tfm = transform if isinstance(transform, BatchCore) else Batch(transform)
-            topo_merged = tfm[['ele']].to_dataset()
+            topo_merged = tfm[['ele']]._start_from(tfm).to_dataset()
             topo_da = topo_merged['ele'] if 'ele' in topo_merged else None
             if topo_da is None:
                 raise ValueError("transform must contain 'ele' variable")
@@ -4391,9 +5204,8 @@ class BatchCore(dict):
         # Compute eagerly — VTK export needs all data in memory anyway,
         # and computing here avoids dask graph issues (stale rechunk keys
         # when downsample/coarsen layers are combined with to_dataset mosaic).
-        merged = self.to_dataset(compute=True)
-        if isinstance(merged, xr.DataArray):
-            merged = merged.to_dataset()
+        # the (y, x) variables only, a Dataset for one burst or many (to_dataset(), N81)
+        merged = _skip_nodata(self.to_dataset(compute=True))
 
         # Get transform elevation merged via to_dataset()
         topo_merged = None
@@ -4417,13 +5229,17 @@ class BatchCore(dict):
             for k in self.keys():
                 if k not in tfm:
                     continue
-                tfm_ds = tfm[k][['ele']]
+                tfm_ds = tfm[k][['ele'] + (['startTime'] if 'startTime' in tfm[k].data_vars else [])]
                 tgt_ds = self[k]
                 y_idx = _nearest_indices(tfm_ds.y.values, tgt_ds.y.values)
                 x_idx = _nearest_indices(tfm_ds.x.values, tgt_ds.x.values)
                 selected = tfm_ds.isel(y=y_idx, x=x_idx)
                 selected = selected.assign_coords(y=tgt_ds.y, x=tgt_ds.x)
                 decimated[k] = selected
+            # a transform without any of the bursts RAISES: it gave no topography, silently
+            if not decimated:
+                raise ValueError(f"ERROR: to_vtk(): the transform has none of the bursts "
+                                 f"({', '.join(list(self.keys())[:3])}). Pass their transform.")
             topo_merged = Batch(decimated).to_dataset(compute=True)
 
         data_vars = list(merged.data_vars)
@@ -4569,16 +5385,23 @@ class BatchCore(dict):
 
         os.makedirs(path, exist_ok=True)
 
+        # the one exported grid of each burst: its integer nodata is not drawn, ONE WARNING
+        _first = BatchCore._grids_of(next(iter(self.values())))
+        if _first:
+            _warn_int_nodata('to_vtks', dict([next((n, a.dtype) for n, a in _first.items())]))
         with tqdm(total=len(self), desc='Exporting VTK') as pbar:
             for burst, ds in self.items():
                 if not ds.data_vars:
                     pbar.update(1)
                     continue
 
-                data_var = next(iter(ds.data_vars))
+                # THE GRID is exported, and its own dims say whether there are pairs:
+                # after mean('pair') the carried metadata still has its pairs, and
+                # reading them off the Dataset wrote <burst>_19700101.vtk once per pair
+                data_var = BatchCore._grid_vars(ds)[0]
                 base_da = ds[data_var]
 
-                if 'pair' in ds.dims:
+                if 'pair' in base_da.dims:
                     pair_coord = ds.coords.get('pair')
                     pair_values = pair_coord.values if pair_coord is not None else range(ds.sizes.get('pair', 0))
                     export_items = []
@@ -4593,7 +5416,8 @@ class BatchCore(dict):
                     export_items = [(None, ds)]
 
                 for pair_val, ds_item in export_items:
-                    base_da_item = ds_item[data_var]
+                    # an integer grid's nodata is not drawn, as to_dataset() sets it (_skip_nodata)
+                    base_da_item = _skip_nodata(ds_item[data_var])
                     layers = [base_da_item.rename(data_var)]
 
                     if tfm is not None and burst in tfm:
@@ -4735,7 +5559,6 @@ class BatchCore(dict):
         from matplotlib.ticker import FuncFormatter
         import matplotlib.pyplot as plt
         from .Batch import BatchWrap
-        from insardev_toolkit import progressbar
 
         # no data means no plot and no error
         if not len(self):
@@ -4748,7 +5571,7 @@ class BatchCore(dict):
             stackvar = list(sample[polarization].dims)[0] if len(sample[polarization].dims) > 2 else None
 
             # Calculate decimation factors from batch extent (without materializing full grid)
-            batch = self[[polarization]]
+            batch = self[[polarization]]._start_from(self)
             if stackvar is not None:
                 batch = batch.isel({stackvar: slice(0, rows*cols)})
             # Estimate merged grid size from coordinate ranges
@@ -4762,13 +5585,15 @@ class BatchCore(dict):
 
             # Decimate batches BEFORE to_dataset() - much more memory efficient
             batch_decimated = batch.isel(y=slice(None, None, factor_y), x=slice(None, None, factor_x))
-            da = batch_decimated.to_dataset()[polarization]
+            # an integer grid's nodata is not drawn, as to_dataset() sets it
+            da = _skip_nodata(batch_decimated.to_dataset()[polarization])
             if stackvar is None:
                 stackvar = 'fake'
                 da = da.expand_dims({stackvar: [0]})
 
             # materialize for all the calculations and plotting
-            progressbar(da := da.persist(), desc=f'Computing {polarization} Plot'.ljust(25))
+            from .utils_dask import progress_persisted
+            progress_persisted(da := da.persist(), desc=f'Computing {polarization} Plot'.ljust(25))
 
             # calculate min, max when needed
             if quantile is not None:
@@ -4857,7 +5682,7 @@ class BatchCore(dict):
             stackvar = list(sample[pol1].dims)[0] if len(sample[pol1].dims) > 2 else None
 
             # Calculate decimation factors
-            batch = self[[pol1, pol2]]
+            batch = self[[pol1, pol2]]._start_from(self)
             if stackvar is not None:
                 batch = batch.isel({stackvar: slice(0, rows*cols)})
             y_coords = np.concatenate([np.asarray(ds[pol1].y) for ds in batch.values()])
@@ -4882,7 +5707,8 @@ class BatchCore(dict):
             # Materialize both polarizations together
             import dask
             da_copol, da_xpol = dask.persist(da_copol, da_xpol)
-            progressbar([da_copol, da_xpol], desc='Computing RGB composite'.ljust(25))
+            from .utils_dask import progress_persisted
+            progress_persisted([da_copol, da_xpol], desc='Computing RGB composite'.ljust(25))
 
             # Compute RGB using shared method from Batch
             from .Batch import Batch
@@ -5030,10 +5856,9 @@ class BatchCore(dict):
                 'gaussian() takes the wavelength first now, as multilook() does. '
                 'Pass the weight by name: gaussian(wavelength, weight=...)')
 
-        # validate weight if provided
-        if weight is not None:
-            if not isinstance(weight, BatchUnit) or set(weight.keys()) != set(self.keys()):
-                raise ValueError('`weight` must be a BatchUnit with the same keys as `self`')
+        # validate weight if provided: a BatchUnit (N81), a DataArray one weighting every grid,
+        # a Dataset one naming every grid; a burst or a grid it lacks raises (_weight)
+        weight = BatchCore._weight(weight, self)
 
         # Validate lazy data
         BatchCore._require_lazy(self, 'gaussian')
@@ -5068,8 +5893,8 @@ class BatchCore(dict):
             w = weight[key] if weight is not None else None
 
             new_vars = {}
-            for var in ds.data_vars:
-                data_arr = ds[var]
+            # a Dataset's variables, or a DataArray as its own one (N81)
+            for var, data_arr in BatchCore._vars_of(ds).items():
                 # Non-spatial variables are CARRIED, not dropped. They are the
                 # radar metadata -- radar_wavelength, near_range, earth_radius,
                 # SC_height_start, rng_samp_rate, BPR -- and dropping them here
@@ -5082,8 +5907,8 @@ class BatchCore(dict):
                 is_complex = np.issubdtype(data_arr.dtype, np.complexfloating)
                 out_dtype = np.complex64 if is_complex else np.float32
 
-                # Get weight dask array for this variable
-                weight_dask = w[var].data if w is not None and var in w.data_vars else None
+                # Get weight dask array for this variable: the grid of the same name (_weight)
+                weight_dask = BatchCore._weight_of(w, var).data if w is not None else None
 
                 # Ensure first dimension chunked as 1 for per-item spatial processing
                 dask_data = data_arr.data
@@ -5183,11 +6008,44 @@ class BatchCore(dict):
                     coords=data_arr.coords
                 )
 
+            if isinstance(ds, xr.DataArray):
+                # a DataArray in, a DataArray out (N81)
+                res = new_vars[ds.name].rename(ds.name)
+                res.attrs = ds.attrs
+                out[key] = res
+                continue
             new_ds = xr.Dataset(new_vars)
             new_ds.attrs = ds.attrs
             out[key] = new_ds
 
         return type(self)(out)
+
+    @staticmethod
+    def _overlap_residual(diff, circular: bool):
+        """One burst overlap's term of residuals(): (|median phase difference|, valid pixel count, median).
+
+        `diff` is the overlap's phase difference, burst 2 minus burst 1; `circular` wraps it and its median to
+        [-pi, pi) first. None when no pixel is valid. align() takes the same term from the overlaps its solve
+        already holds, so its 'residual' is this measure without a second pass over the grids.
+        """
+        wrap = (lambda x: (x + np.pi) % (2*np.pi) - np.pi) if circular else (lambda x: x)
+        valid = np.asarray(diff).ravel()
+        valid = valid[np.isfinite(valid)]
+        if len(valid) == 0:
+            return None
+        median_diff = np.median(wrap(valid))
+        return np.abs(wrap(median_diff)), len(valid), median_diff
+
+    @staticmethod
+    def _residual_mean(terms, n_pairs: int) -> list:
+        """residuals() per pair from (pair index, |median|, weight) overlap terms, in overlap order: the weighted
+        mean rounded to 3 decimals, 0.0 for a pair without a valid overlap."""
+        sums = [0.0] * n_pairs
+        weights = [0.0] * n_pairs
+        for p, value, weight in terms:
+            sums[p] += value * weight
+            weights[p] += weight
+        return [0.0 if weights[p] == 0 else round(sums[p] / weights[p], 3) for p in range(n_pairs)]
 
     def residuals(self, polarization: str | None = None, debug: bool = False) -> float | list[float]:
         """
@@ -5238,26 +6096,21 @@ class BatchCore(dict):
         else:
             raise TypeError(f"residuals() only works with Batch (unwrapped) or BatchWrap (wrapped) phase data, not {type(self).__name__}")
 
-        def maybe_wrap(x):
-            """Wrap to [-π, π) for circular stats, identity otherwise."""
-            if use_circular:
-                return (x + np.pi) % (2*np.pi) - np.pi
-            return x
-
         # Collect burst extents and detect pair dimension
         ids = sorted(self.keys())
 
         # Auto-detect polarization if not specified
-        sample_ds = self[ids[0]]
+        # (a Dataset's variables, or a DataArray as its own one, N81)
+        sample_vars = BatchCore._vars_of(self[ids[0]])
         # Filter for spatial variables (with y, x dims) - excludes converted attributes like 'num_valid_az'
-        available_pols = [v for v in sample_ds.data_vars
-                         if 'y' in sample_ds[v].dims and 'x' in sample_ds[v].dims]
+        available_pols = [v for v, a in sample_vars.items()
+                         if 'y' in a.dims and 'x' in a.dims]
         if polarization is None:
             polarization = available_pols[0]
         if polarization not in available_pols:
             raise ValueError(f"Polarization '{polarization}' not found. Available: {available_pols}")
 
-        sample_da = sample_ds[polarization]
+        sample_da = sample_vars[polarization]
         n_pairs = sample_da.sizes.get('pair', 1)
         has_pair_dim = 'pair' in sample_da.dims
 
@@ -5276,7 +6129,7 @@ class BatchCore(dict):
         extents = {}
         for bid in ids:
             ds = self[bid]
-            da = ds[polarization]
+            da = BatchCore._vars_of(ds)[polarization]
             if 'pair' in da.dims:
                 da = da.isel(pair=0)
             # Get coordinates from Dataset if not on DataArray
@@ -5312,8 +6165,8 @@ class BatchCore(dict):
         jobs = []
         lazy_diffs = []
         for id1, id2 in overlap_pairs:
-            i1 = self[id1][polarization]
-            i2 = self[id2][polarization]
+            i1 = BatchCore._vars_of(self[id1])[polarization]
+            i2 = BatchCore._vars_of(self[id2])[polarization]
 
             for pair_idx in range(n_pairs):
                 i1_p = i1.isel(pair=pair_idx) if 'pair' in i1.dims else i1
@@ -5330,22 +6183,11 @@ class BatchCore(dict):
         # Process computed results
         results = []
         for (id1, id2, pair_idx), phase_diff in zip(jobs, computed_diffs):
-            valid = phase_diff.values.ravel()
-            valid = valid[np.isfinite(valid)]
-
-            if len(valid) == 0:
+            term = BatchCore._overlap_residual(phase_diff.values, use_circular)
+            if term is None:
                 continue
-
-            valid = maybe_wrap(valid)
-            median_diff = np.median(valid)
-            abs_discrepancy = np.abs(maybe_wrap(median_diff))
-            weight = len(valid)
-
+            abs_discrepancy, weight, median_diff = term
             results.append((pair_idx, abs_discrepancy, weight, id1, id2, median_diff))
-
-        # Aggregate results per pair and per subswath
-        total_weights = [0.0] * n_pairs
-        weighted_sums = [0.0] * n_pairs
 
         # Per-subswath tracking for debug
         subswath_stats = {}  # {(subswath, pair_idx): {'sum': float, 'weight': float, 'count': int, 'values': []}}
@@ -5355,8 +6197,6 @@ class BatchCore(dict):
             if result is None:
                 continue
             pair_idx, abs_discrepancy, weight, id1, id2, median_diff = result
-            weighted_sums[pair_idx] += abs_discrepancy * weight
-            total_weights[pair_idx] += weight
             per_overlap_discrepancies[pair_idx].append(abs_discrepancy)
 
             # Extract track info for debug stats
@@ -5378,12 +6218,7 @@ class BatchCore(dict):
                 subswath_stats[key]['count'] += 1
                 subswath_stats[key]['values'].append(abs_discrepancy)
 
-        discrepancies = []
-        for p in range(n_pairs):
-            if total_weights[p] == 0:
-                discrepancies.append(0.0)
-            else:
-                discrepancies.append(round(weighted_sums[p] / total_weights[p], 3))
+        discrepancies = BatchCore._residual_mean([(r[0], r[1], r[2]) for r in results], n_pairs)
 
         if debug:
             # Compute std for overall discrepancy
@@ -5417,7 +6252,8 @@ class BatchCore(dict):
             method: str = 'median',
             polarization: str | None = None,
             debug: bool = False,
-            return_residuals: bool = False):
+            return_residuals: bool = False,
+            lazy_residual: bool = False):
         """
         Estimate per-burst polynomial coefficients using overlap-based least-squares.
 
@@ -5440,6 +6276,10 @@ class BatchCore(dict):
             Print debug information. Default is False.
         return_residuals : bool, optional
             If True, also return input residuals (before correction). Default is False.
+        lazy_residual : bool, optional
+            degree=0 only. If True, also return the residual AFTER subtracting the offsets, by the measure of
+            residuals(), as a lazy float32 dask array (pair,) (0-d without a pair dimension). The solve task
+            takes it from the overlaps it already holds: no second pass over the grids. Default is False.
 
         Returns
         -------
@@ -5453,6 +6293,8 @@ class BatchCore(dict):
                     degree=1: {burst_id: [[ramp0, intercept0], [ramp1, intercept1], ...]}
             If return_residuals is True:
                 (coefficients_dict, residuals) where residuals is float or list[float]
+            If lazy_residual is True, the lazy residual after the correction is appended last:
+                (coefficients_dict, residual) or (coefficients_dict, residuals, residual)
 
         Examples
         --------
@@ -5482,6 +6324,8 @@ class BatchCore(dict):
             use_circular = False
         else:
             raise TypeError(f"_align_coeffs() only works with Batch (unwrapped) or BatchWrap (wrapped) phase data, not {type(self).__name__}")
+        if lazy_residual and degree != 0:
+            raise ValueError(f'_align_coeffs(): lazy_residual needs degree=0, got degree={degree}')
 
         # Constants
         MIN_OVERLAP_PIXELS = 50
@@ -5712,26 +6556,30 @@ class BatchCore(dict):
             from scipy.sparse.linalg import lsqr as _lsqr
             from scipy.sparse.csgraph import connected_components as _cc
 
+            def _overlap_diff(i1_idx, i2_idx, pair_idx):
+                """The overlap's phase difference, burst 2 minus burst 1, on the common coordinates."""
+                d1 = np.asarray(burst_data_arrays[i1_idx])
+                d2 = np.asarray(burst_data_arrays[i2_idx])
+                d1_p = d1[pair_idx] if has_pair_dim else d1
+                d2_p = d2[pair_idx] if has_pair_dim else d2
+
+                # Build xarray DataArrays for coordinate-aware overlap
+                da1 = xr.DataArray(d1_p, dims=['y', 'x'],
+                                   coords={'y': burst_y[i1_idx],
+                                           'x': burst_x[i1_idx]})
+                da2 = xr.DataArray(d2_p, dims=['y', 'x'],
+                                   coords={'y': burst_y[i2_idx],
+                                           'x': burst_x[i2_idx]})
+                return da2 - da1
+
             # Compute overlap diffs and process statistics
             _pbp = {p: [] for p in range(n_pairs)}
             for id1, id2 in all_overlap_pairs:
                 i1_idx = id_to_idx[id1]
                 i2_idx = id_to_idx[id2]
-                d1 = np.asarray(burst_data_arrays[i1_idx])
-                d2 = np.asarray(burst_data_arrays[i2_idx])
 
                 for pair_idx in range(n_pairs):
-                    d1_p = d1[pair_idx] if has_pair_dim else d1
-                    d2_p = d2[pair_idx] if has_pair_dim else d2
-
-                    # Build xarray DataArrays for coordinate-aware overlap
-                    da1 = xr.DataArray(d1_p, dims=['y', 'x'],
-                                       coords={'y': burst_y[i1_idx],
-                                               'x': burst_x[i1_idx]})
-                    da2 = xr.DataArray(d2_p, dims=['y', 'x'],
-                                       coords={'y': burst_y[i2_idx],
-                                               'x': burst_x[i2_idx]})
-                    diff = da2 - da1
+                    diff = _overlap_diff(i1_idx, i2_idx, pair_idx)
                     stat = process_phase_diff(diff.values,
                                               diff.coords['x'].values,
                                               id1, id2, pair_idx)
@@ -5858,11 +6706,32 @@ class BatchCore(dict):
                                 if tw > 0 else 0.0)
                 residuals = disc[0] if (n_pairs == 1 and not has_pair_dim) else disc
 
-            return {'offsets': offsets, 'residuals': residuals}
+            # Residual after the correction (degree 0): residuals()' measure on the
+            # overlaps this task already holds, each shifted by its offset difference
+            residual_after = None
+            if lazy_residual:
+                terms = []
+                for id1, id2 in all_overlap_pairs:
+                    for pair_idx in range(n_pairs):
+                        diff = _overlap_diff(id_to_idx[id1], id_to_idx[id2], pair_idx)
+                        shift = rpp[pair_idx][id2] - rpp[pair_idx][id1]
+                        term = BatchCore._overlap_residual(diff.values - shift, use_circular)
+                        if term is not None:
+                            terms.append((pair_idx, term[0], term[1]))
+                disc = BatchCore._residual_mean(terms, n_pairs)
+                residual_after = np.asarray(disc if has_pair_dim else disc[0], dtype=np.float32)
+
+            return {'offsets': offsets, 'residuals': residuals, 'residual_after': residual_after}
 
         # Single delayed call — dask resolves burst data arrays before calling.
         # Graph has ~N_bursts layers (not ~N_overlaps*3 from xarray diffs).
-        solve_result = dask.delayed(_align_coeffs_all, pure=True)(*burst_data)
+        # A UNIQUE KEY PER CALL (pure=False, N81): the arrays reach the task through
+        # finalize keys that dask names anew in every graph, so a pure key named the
+        # same task over different dependencies in two consecutive computes. When the
+        # second graph reached the scheduler before the first one's release, the
+        # scheduler kept the stale task (dask issue 9888) and the compute failed with
+        # KeyError ('held-sub-sub-...') or an AssertionError on a TaskState.
+        solve_result = dask.delayed(_align_coeffs_all, pure=False)(*burst_data)
 
         # Extract per-burst dask 0-d arrays from delayed solve result
         offsets_part = solve_result['offsets']
@@ -5889,15 +6758,19 @@ class BatchCore(dict):
                     for p in range(n_pairs)
                 ] for bid in ids}
 
+        out = (coeffs,)
         if return_residuals:
             # Residuals require concrete values — triggers the solve chain
             print('_align_coeffs(return_residuals=True): computing residuals breaks lazy chain, use for diagnostics only', flush=True)
             residuals_out = solve_result['residuals'].compute()
             if debug:
                 print(f'Input residuals: {residuals_out}', flush=True)
-            return (coeffs, residuals_out)
+            out += (residuals_out,)
+        if lazy_residual:
+            out += (_da.from_delayed(solve_result['residual_after'],
+                                     shape=(n_pairs,) if has_pair_dim else (), dtype=np.float32),)
 
-        return coeffs
+        return out[0] if len(out) == 1 else out
 
     def align(self,
               degree: int = 0,
@@ -5906,7 +6779,18 @@ class BatchCore(dict):
               debug: bool = False,
               return_residuals: bool = False):
         """
-        Align burst interferograms by removing phase offsets and optionally ionospheric ramps.
+        PAIRWISE alignment: align the bursts of each interferogram (the 'pair'
+        dimension) by removing phase offsets and optionally ionospheric ramps.
+
+        The DATEWISE alignment of a complex SLC stack (the 'date' dimension)
+        is Stack.align(); a complex input without a 'pair' dimension raises.
+
+        Input: unwrapped phase (Batch), wrapped phase (BatchWrap) or a complex
+        interferogram (BatchComplex with a 'pair' dimension, e.g. before angle()).
+        For complex input the coefficients are estimated on its phase, the angle
+        computed lazily, with the wrapped-phase statistics, and applied as a
+        phase rotation, multiplying by exp(-1j * correction): the magnitude is
+        unchanged and the result is a BatchComplex.
 
         Uses a multi-step approach for optimal alignment:
         - degree=0: Single-step offset correction
@@ -5914,6 +6798,13 @@ class BatchCore(dict):
 
         The 3-step approach produces consistent fringes across bursts by removing
         per-track ionospheric ramps, which is essential for deformation analysis.
+
+        Lazy: nothing is computed at call time (return_residuals and debug excepted).
+        Every burst's output carries a 'residual' variable (pair,): the residual
+        after the alignment per pair, the measure of residuals(), lazy, taken
+        from the overlaps the solve already holds. No warning is printed for a
+        pair whose residual rose; select on the variable instead, e.g.
+        aligned.sel(pair=aligned.residual < 0.5).
 
         Parameters
         ----------
@@ -5937,7 +6828,8 @@ class BatchCore(dict):
         -------
         BatchCore or tuple
             If return_residuals is False:
-                Aligned interferograms with phase corrections applied.
+                Aligned interferograms with phase corrections applied, of the
+                input's class, each burst with the 'residual' variable (pair,).
             If return_residuals is True:
                 (aligned_intfs, residuals) where residuals is float or list[float]
 
@@ -5954,6 +6846,12 @@ class BatchCore(dict):
         >>>
         >>> # With coherence filtering
         >>> aligned = intfs.where(corr >= 0.3).align()
+        >>>
+        >>> # Complex interferogram: the phase rotates, the magnitude stays
+        >>> aligned = (ref * rep.conj()).align()
+        >>>
+        >>> # Skip the pairs the alignment left inconsistent
+        >>> aligned = aligned.sel(pair=aligned.residual < 0.5)
         >>>
         >>> # Get alignment quality with result
         >>> aligned, res = intfs.align(return_residuals=True)
@@ -5977,36 +6875,76 @@ class BatchCore(dict):
         methods because it separates the offset and ramp estimation, avoiding
         cross-contamination between the two.
         """
-        from .Batch import Batch, BatchWrap
+        from .Batch import Batch, BatchWrap, BatchComplex
 
         # Validate class type
-        if not isinstance(self, (Batch, BatchWrap)):
-            raise TypeError(f"align() only works with Batch (unwrapped) or BatchWrap (wrapped) phase data, not {type(self).__name__}")
+        is_complex = isinstance(self, BatchComplex)
+        if is_complex:
+            # pairwise only: a complex stack of dates is aligned by Stack.align()
+            sample_ds = next(iter(self.values()))
+            grids = [v for v in sample_ds.data_vars if 'y' in sample_ds[v].dims and 'x' in sample_ds[v].dims]
+            if not grids or 'pair' not in sample_ds[grids[0]].dims:
+                raise ValueError("align() is pairwise: this complex data has no 'pair' dimension. "
+                                 "For a date stack, use Stack.align().")
+        elif not isinstance(self, (Batch, BatchWrap)):
+            raise TypeError(f"align() only works with Batch (unwrapped), BatchWrap (wrapped) or complex "
+                            f"interferograms (BatchComplex with a 'pair' dimension), not {type(self).__name__}")
+
+        # the phase the coefficients are estimated on: a complex input's angle, lazy
+        phase = self.angle() if is_complex else self
+        # the phase of a result, for its residuals()
+        phase_of = (lambda b: b.angle()) if is_complex else (lambda b: b)
 
         # Auto-detect polarization if not specified
         if polarization is None:
-            ids = list(self.keys())
-            sample_ds = self[ids[0]]
+            ids = list(phase.keys())
+            sample_ds = phase[ids[0]]
             # Filter for spatial variables (with y, x dims) - excludes converted attributes like 'num_valid_az'
             available_pols = [v for v in sample_ds.data_vars
                              if 'y' in sample_ds[v].dims and 'x' in sample_ds[v].dims]
             polarization = available_pols[0]
 
+        def rotate(coeffs):
+            """The complex input times exp(-1j * polyval(coeffs)) on every complex grid: the phase is corrected
+            as the real-valued branches subtract it, the magnitude is unchanged."""
+            # polyval() returns DataArrays: the rotation is a DataArray per burst
+            rot = phase.polyval(coeffs).iexp(sign=-1)
+            out = {}
+            for k, ds in self.items():
+                if k not in rot:
+                    out[k] = ds
+                    continue
+                r = rot[k].astype(ds[polarization].dtype)
+                out[k] = BatchCore._binary_vars(ds, r, operator.mul)
+            return type(self)(out)
+
+        def with_residual(batch, residual):
+            """Every burst of `batch` with the lazy 'residual' variable; the grids untouched (no re-wrap)."""
+            dims = ('pair',) if residual.ndim else ()
+            out = {k: ds.assign(residual=xr.DataArray(residual, dims=dims)) for k, ds in batch.items()}
+            return BatchWrap(out, wrap=False) if isinstance(batch, BatchWrap) else type(batch)(out)
+
         if degree == 0:
             # Single-step offset correction
             if debug:
                 print('align(degree=0): single-step offset correction', flush=True)
-                res_in = self.residuals(polarization=polarization)
+                res_in = phase.residuals(polarization=polarization)
                 print(f'Input residuals: {res_in}', flush=True)
 
-            offsets = self._align_coeffs(degree=0, method=method, polarization=polarization, debug=debug)
-            aligned = self - offsets
+            offsets, residual = phase._align_coeffs(degree=0, method=method, polarization=polarization, debug=debug,
+                                                    lazy_residual=True)
+            if is_complex:
+                # the offsets as [[0, offset], ...] per pair: polyval evaluates them lazily
+                aligned = rotate({b: [[0.0, o] for o in offsets[b]] for b in offsets})
+            else:
+                aligned = self - offsets
 
             if debug or return_residuals:
-                res_out = aligned.residuals(polarization=polarization)
+                res_out = phase_of(aligned).residuals(polarization=polarization)
                 if debug:
                     print(f'Output residuals: {res_out}', flush=True)
 
+            aligned = with_residual(aligned, residual)
             if return_residuals:
                 return aligned, res_out
             return aligned
@@ -6015,14 +6953,14 @@ class BatchCore(dict):
             # 3-step offset-ramp-offset correction
             if debug:
                 print('align(degree=1): 3-step offset-ramp-offset correction', flush=True)
-                res_in = self.residuals(polarization=polarization)
+                res_in = phase.residuals(polarization=polarization)
                 print(f'Input residuals: {res_in}', flush=True)
 
             # Step 1: Estimate offsets
             if debug:
                 print('\nStep 1: Estimate offsets...', flush=True)
-            offsets1 = self._align_coeffs(degree=0, method=method, polarization=polarization, debug=debug)
-            intfs1 = self - offsets1
+            offsets1 = phase._align_coeffs(degree=0, method=method, polarization=polarization, debug=debug)
+            intfs1 = phase - offsets1
             if debug:
                 res1 = intfs1.residuals(polarization=polarization)
                 print(f'Residuals after step 1: {res1}', flush=True)
@@ -6039,7 +6977,8 @@ class BatchCore(dict):
             # Step 3: Re-estimate offsets
             if debug:
                 print('\nStep 3: Re-estimate offsets...', flush=True)
-            offsets2 = intfs2._align_coeffs(degree=0, method=method, polarization=polarization, debug=debug)
+            offsets2, residual = intfs2._align_coeffs(degree=0, method=method, polarization=polarization,
+                                                      debug=debug, lazy_residual=True)
 
             # Combine coefficients: [ramp, offset1 + ramp_intercept + offset2]
             # Detect if multi-pair
@@ -6059,13 +6998,14 @@ class BatchCore(dict):
                     for b in offsets1
                 }
 
-            aligned = self - self.polyval(coeffs)
+            aligned = rotate(coeffs) if is_complex else self - self.polyval(coeffs)
 
             if debug or return_residuals:
-                res_out = aligned.residuals(polarization=polarization)
+                res_out = phase_of(aligned).residuals(polarization=polarization)
                 if debug:
                     print(f'Final residuals: {res_out}', flush=True)
 
+            aligned = with_residual(aligned, residual)
             if return_residuals:
                 return aligned, res_out
             return aligned
@@ -6132,10 +7072,12 @@ class BatchCore(dict):
 
         wrap = isinstance(self, BatchWrap)
         burst_ids = list(self.keys())
-        sample = self[burst_ids[0]]
+        # a Dataset's variables, or a DataArray as its own one (N81)
+        vars_of = {bid: BatchCore._vars_of(self[bid]) for bid in burst_ids}
+        sample = vars_of[burst_ids[0]]
         # Filter for spatial variables (with y, x dims) - excludes converted attributes
-        polarizations = [v for v in sample.data_vars
-                        if 'y' in sample[v].dims and 'x' in sample[v].dims]
+        polarizations = [v for v, a in sample.items()
+                        if 'y' in a.dims and 'x' in a.dims]
 
         if debug:
             import time
@@ -6145,8 +7087,8 @@ class BatchCore(dict):
         # Build STRtree for fast spatial queries
         first_pol = polarizations[0]
         burst_extents = tuple(
-            (float(self[bid][first_pol].y.min()), float(self[bid][first_pol].y.max()),
-             float(self[bid][first_pol].x.min()), float(self[bid][first_pol].x.max()))
+            (float(vars_of[bid][first_pol].y.min()), float(vars_of[bid][first_pol].y.max()),
+             float(vars_of[bid][first_pol].x.min()), float(vars_of[bid][first_pol].x.max()))
             for bid in burst_ids
         )
         burst_boxes = [box(xmin, ymin, xmax, ymax) for ymin, ymax, xmin, xmax in burst_extents]
@@ -6175,11 +7117,13 @@ class BatchCore(dict):
                 output[bid] = ds_current
                 continue
 
-            ds_others = [self[burst_ids[idx]] for idx in overlapping_indices]
+            ds_others = [vars_of[burst_ids[idx]] for idx in overlapping_indices]
 
-            new_ds = ds_current.copy()
+            # a DataArray in, a DataArray out (N81)
+            is_array = isinstance(ds_current, xr.DataArray)
+            new_ds = None if is_array else ds_current.copy()
             for pol in polarizations:
-                da_current = ds_current[pol]
+                da_current = vars_of[bid][pol]
                 das_others = [ds[pol] for ds in ds_others]
 
                 # Extract raw arrays and numpy coordinates.
@@ -6203,7 +7147,9 @@ class BatchCore(dict):
                     others_ys.append(d.y.values)
                     others_xs.append(d.x.values)
 
-                delayed_result = dask.delayed(_dissolve_raw_for_dask, pure=True)(
+                # a unique key per call (pure=False): the arrays arrive through finalize
+                # keys named anew in every graph, see _align_coeffs (N81)
+                delayed_result = dask.delayed(_dissolve_raw_for_dask, pure=False)(
                     current_arr, current_y, current_x,
                     others_arrs, others_ys, others_xs,
                     wrap, extend, weight
@@ -6213,7 +7159,10 @@ class BatchCore(dict):
                     shape=da_current.shape,
                     dtype=da_current.dtype
                 )
-                new_ds[pol] = da_current.copy(data=delayed_array)
+                if is_array:
+                    new_ds = da_current.copy(data=delayed_array)
+                else:
+                    new_ds[pol] = da_current.copy(data=delayed_array)
 
             output[bid] = new_ds
 

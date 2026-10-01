@@ -1,0 +1,55 @@
+Geoid grids in this folder: egm2008_2.5min.nc and egm96_7.5min.nc
+=====================================================================
+
+These files are NOT covered by the BSD-3-Clause license of insardev_toolkit. They hold data of the US National
+Geospatial-Intelligence Agency (NGA), converted without adding any creative content, and are distributed under the
+same terms as their sources: public domain.
+
+EGM2008 (egm2008_2.5min.nc)
+---------------------------
+Source: PROJ-data grid us_nga_egm08_25.tif, https://cdn.proj.org/us_nga_egm08_25.tif
+PROJ-data states for it (https://github.com/OSGeo/PROJ-data, files us_nga/us_nga_README.txt and
+copyright_and_licenses.csv):
+
+    *Source*: [NGA](http://earth-info.nga.mil/GandG/wgs84/gravitymod/egm2008/egm08_wgs84.html)
+    *License*: Public Domain
+
+    filename,copyright,license
+    us_nga_egm08_25.tif,Disclaimed,Public domain
+
+EGM96 (egm96_7.5min.nc)
+-----------------------
+Source: NGA EGM96 spherical harmonic coefficients EGM96 and CORRCOEF and NGA's program F477.F, as published on
+http://earth-info.nga.mil/GandG/wgs84/gravitymod/egm96/egm96.html (archived copy:
+https://web.archive.org/web/20061103210455/http://earth-info.nga.mil/GandG/wgs84/gravitymod/egm96/egm96.html).
+PROJ-data distributes NGA's EGM96 15' grid from the same page with "License: Public Domain" (us_nga_egm96_15.tif).
+
+NGA public-information notice
+-----------------------------
+https://www.nga.mil/resources/privacy.html (archived copy:
+https://web.archive.org/web/20220421113353/https://www.nga.mil/resources/privacy.html):
+
+    "Information presented on this Website is considered public information and may be distributed or copied
+    unless otherwise specified. Use of appropriate byline/photo/image credits is requested."
+
+Credit: EGM2008 and EGM96 geoid models, US National Geospatial-Intelligence Agency (NGA); EGM96 jointly with NASA
+Goddard Space Flight Center.
+
+NGA disclaimer of the EGM96 pages
+---------------------------------
+http://earth-info.nga.mil/GandG/disclaim.html (archived copy:
+https://web.archive.org/web/20041020005346/http://earth-info.nga.mil/GandG/disclaim.html):
+
+    DISCLAIMER OF LIABILITY
+    With respect to documents and products available from this server, neither the United States Government nor
+    the National Imagery and Mapping Agency nor any of their employees, makes any warranty, express or implied,
+    including the warranties of merchantability and fitness for a particular purpose, or assumes any legal
+    liability or responsibility for the accuracy, completeness, or usefulness of any information, apparatus,
+    product, or process disclosed, or represents that its use would not infringe privately owned rights.
+
+    DISCLAIMER OF ENDORSEMENT
+    Reference herein to any specific commercial products, process, or service by trade name, trademark,
+    manufacture, or otherwise, does not necessarily constitute or imply its endorsement, recommendation, or
+    favoring by the United States Government or the National Imagery and Mapping Agency.
+
+The conversion (see README.md) is provided as is, without warranty of any kind.

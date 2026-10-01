@@ -110,6 +110,17 @@ class Satellite(progressbar_joblib, datagrid):
         -------
         pandas.Series
             Perpendicular baseline per record, NaN where it cannot be computed.
+
+        Raises
+        ------
+        OSError
+            An input file that cannot be read: empty (utils_files.EmptyFileError), missing, or
+            unreadable. Any other error reading the inputs raises too. Only a baseline that the
+            orbits do not solve (ValueError or IndexError of SAT_baseline) is reported as an
+            ERROR and left NaN.
+        ValueError
+            An orbit that cannot be used: a Sentinel-1 orbit file that does not cover its burst or
+            holds a state vector that is not finite, or a baseline that is not finite.
         """
         import numpy as np
         import pandas as pd
@@ -133,6 +144,8 @@ class Satellite(progressbar_joblib, datagrid):
 
             names = list(firsts.index.get_level_values(record_level))
             name_dates = list(dates[~dates.duplicated()])
+            # the file holding the orbit of each record: the orbit file (Sentinel-1) or the scene (Nisar)
+            sources = dict(zip(names, firsts['orbit' if 'orbit' in firsts.columns else 'path']))
 
             prms = {}
             def prm_of(name):
@@ -149,19 +162,64 @@ class Satellite(progressbar_joblib, datagrid):
                     if name == origin:
                         values[date] = 0.0
                     else:
+                        # the inputs are read outside the try: an empty or missing file (EmptyFileError,
+                        # FileNotFoundError, any OSError) or any other read error raises, it is no unsolved baseline
+                        prm_origin, prm_name = prm_of(origin), prm_of(name)
                         try:
-                            values[date] = float(
-                                prm_of(origin).SAT_baseline(prm_of(name)).get('B_perpendicular'))
-                        except Exception as e:
-                            # every date is a valid reference, so an unsolved baseline is a
+                            value = float(prm_origin.SAT_baseline(prm_name).get('B_perpendicular'))
+                        except (ValueError, IndexError) as e:
+                            # the orbits do not solve it: SAT_baseline raises ValueError for a missing orbit or a
+                            # repeat orbit that does not cover the reference, IndexError for an orbit without state
+                            # vectors. Every date is a valid reference, so an unsolved baseline is a
                             # defect and not a property of the data. Only this one is left out.
                             print(f'ERROR: {group} baseline of {date} is unsolved: {e}')
+                        else:
+                            # an invalid value (an orbit with NaN state vectors gives NaN) raises
+                            if not np.isfinite(value):
+                                raise ValueError(f'ERROR: {group} baseline of {date} is {value}. Check the orbits in '
+                                                 f'{sources[origin]} and {sources[name]}, and download the '
+                                                 f'invalid file again.')
+                            values[date] = value
                     pbar.update(1)
 
             print(f'NOTE: {group} baselines are measured from {origin_date}.')
             BPRs[records.index] = [values.get(date, np.nan) for date in dates]
 
         return BPRs
+
+    def _check_orbits(self, refreps: list, target: str, overwrite: bool, append: bool):
+        """Check the orbit of every record a transform processes, as the processing reads it, before the
+        transform removes or writes anything: an orbit that cannot be used raises there, not after the earlier
+        records are written. Each orbit file is read once for all the records that use it (the mission's
+        _orbit_file and _check_orbit_file). A completed target that the transform keeps (neither overwrite nor
+        append) is not processed and needs no check.
+
+        Parameters
+        ----------
+        refreps : list
+            (reference records, repeat records) per group, the values of get_repref().
+        target, overwrite, append
+            The transform's arguments.
+
+        Raises
+        ------
+        FileNotFoundError
+            A record without its orbit file (Sentinel-1).
+        ValueError
+            An orbit that does not cover its record, has a gap or a state vector that is not finite
+            (utils_satellite.orbit_defect).
+        """
+        import os
+        from tqdm.auto import tqdm
+
+        if not (overwrite or append) and os.path.isfile(os.path.join(target, 'zarr.json')):
+            return
+        records = [record[-1] for refs, reps in refreps for record in refs + reps]
+        by_file = {}
+        for record in records:
+            by_file.setdefault(self._orbit_file(record, self.get_record(record)), []).append(record)
+        for orbit_file, group in tqdm(by_file.items(), desc='Checking Orbits'.ljust(25)):
+            self._check_orbit_file(orbit_file, group)
 
     def to_dataframe(self, crs: int = 4326, ref: str = None) -> pd.DataFrame:
         """
@@ -394,14 +452,35 @@ class Satellite(progressbar_joblib, datagrid):
 
         return date
 
+    def dem_datum(self) -> str:
+        """
+        Get the vertical datum of the DEM: 'EGM2008', 'EGM96' or 'ellipsoid'.
+
+        Resolved once per DEM by insardev_toolkit utils_geoid.dem_datum(): the datum the DEM declares, the tile names
+        of older toolkit downloads, otherwise EGM2008 with a warning. The DEM height plus the geoid height of this
+        datum is the WGS84 ellipsoidal height of the processing.
+
+        Returns
+        -------
+        str
+            The vertical datum.
+        """
+        if self.DEM is None:
+            raise ValueError('ERROR: DEM is not specified.')
+        cached = getattr(self, '_dem_datum', None)
+        if cached is None or cached[0] is not self.DEM:
+            from insardev_toolkit import utils_geoid
+            self._dem_datum = cached = (self.DEM, utils_geoid.dem_datum(self.DEM))
+        return cached[1]
+
     def get_geoid(self, grid: xr.DataArray | xr.Dataset = None) -> xr.DataArray:
         """
-        Get EGM96 geoid heights.
+        Get the geoid heights of the DEM's vertical datum (dem_datum()).
 
         Parameters
         ----------
         grid : xarray array or dataset, optional
-            Interpolate geoid heights on the grid.
+            Interpolate geoid heights on the grid (its lat and lon coordinates). Default is the DEM grid (get_dem()).
 
         Returns
         -------
@@ -410,10 +489,15 @@ class Satellite(progressbar_joblib, datagrid):
 
         Notes
         -----
-        See EGM96 geoid heights on http://icgem.gfz-potsdam.de/tom_longtime
+        The NGA EGM2008 and EGM96 grids of insardev_toolkit, cubic B-spline (utils_geoid.geoid_height()).
         """
-        from .utils_satellite import get_geoid
-        return get_geoid(grid)
+        import xarray as xr
+        from insardev_toolkit import utils_geoid
+        if grid is None:
+            grid = self.get_dem()
+        lat, lon = grid.lat.values, grid.lon.values
+        values = utils_geoid.geoid_height(lat, lon, self.dem_datum(), grid=True)
+        return xr.DataArray(values, coords={'lat': lat, 'lon': lon}, dims=('lat', 'lon'), name='geoid')
 
     def get_dem(self, geometry: gpd.GeoDataFrame = None, buffer_degrees: float = 0):
         """
@@ -475,7 +559,7 @@ class Satellite(progressbar_joblib, datagrid):
 
     def get_dem_wgs84ellipsoid(self, geometry: gpd.GeoDataFrame = None, buffer_degrees: float = 0.04):
         """
-        Load DEM with EGM96 geoid correction (heights relative to WGS84 ellipsoid).
+        Load DEM with the geoid correction of its vertical datum (heights relative to WGS84 ellipsoid).
 
         Parameters
         ----------
@@ -487,11 +571,11 @@ class Satellite(progressbar_joblib, datagrid):
         Returns
         -------
         xarray.DataArray
-            WGS84 ellipsoid DEM data array.
+            WGS84 ellipsoid DEM data array (insardev_toolkit utils_geoid.ellipsoidal_height()).
         """
+        from insardev_toolkit import utils_geoid
         ortho = self.get_dem(geometry, buffer_degrees)
-        geoid = self.get_geoid(ortho)
-        ds = (ortho + geoid).rename("dem")
+        ds = utils_geoid.ellipsoidal_height(ortho, self.dem_datum()).rename("dem")
         return self.spatial_ref(ds, 4326)
 
     def _get_topo_llt(self, record_id: str, degrees: float, debug: bool = False):
@@ -548,12 +632,13 @@ class Satellite(progressbar_joblib, datagrid):
         if debug:
             print(f'DEBUG: DEM decimation factor={dec_factor}, decimated region={z_vals.shape[0]}x{z_vals.shape[1]}')
 
-        # Apply geoid correction (EGM96 -> WGS84 ellipsoid)
-        from .utils_satellite import get_geoid_correction
+        # Apply geoid correction (DEM heights -> WGS84 ellipsoid): the geoid of the DEM's vertical datum
+        import xarray as xr
+        from insardev_toolkit import utils_geoid
+        ortho = xr.DataArray(z_vals, coords={'lat': lat_vals, 'lon': lon_vals}, dims=('lat', 'lon'))
+        z_wgs84 = utils_geoid.ellipsoidal_height(ortho, self.dem_datum()).values.ravel()
+        del ortho
         lon_grid, lat_grid = np.meshgrid(lon_vals, lat_vals)
-        geoid = get_geoid_correction(lat_grid.ravel(), lon_grid.ravel())
-        z_wgs84 = z_vals.ravel() + geoid.astype(np.float32)
-        del geoid
 
         # Build topo_llt array
         topo_llt = np.column_stack([

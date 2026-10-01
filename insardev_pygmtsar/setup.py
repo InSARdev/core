@@ -40,9 +40,6 @@ setup(
     license='BSD-3-Clause',
     packages=['insardev_pygmtsar'],
     include_package_data=True,
-    package_data={
-        'insardev_pygmtsar': ['data/geoid_egm96_icgem.grd'],
-    },
     install_requires=['insardev_toolkit',
                       'xarray[complete]',
                       'numpy',

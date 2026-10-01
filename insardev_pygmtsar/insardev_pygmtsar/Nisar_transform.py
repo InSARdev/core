@@ -15,6 +15,61 @@ def _process_chunk_nisar_worker(args):
     return _process_chunk_nisar(*args)
 
 
+def _radar_boxes(azi, rng, mask, n_azi, n_rng, budget, tile=64):
+    """Split an output chunk into blocks whose radar-coordinate bounding box holds at most budget cells.
+
+    azi, rng are the reference radar coordinates of the chunk's pixels (cell k of the radar grid is centred on
+    coordinate k + 0.5), mask the pixels that need the phase. The extents are taken per tile x tile pixels once; a
+    block of tiles is halved along the output axis that makes its larger half's box smaller, until the box fits.
+    Returns (y0, y1, x0, x1, a0, a1, r0, r1) per block: the output pixels and the radar cells for linear
+    interpolation at them.
+    """
+    import numpy as np
+
+    n_y, n_x = azi.shape
+    ty, tx = -(-n_y // tile), -(-n_x // tile)
+
+    def reduce(arr, fill, op):
+        full = np.full((ty * tile, tx * tile), fill, dtype=np.float32)
+        full[:n_y, :n_x] = np.where(mask, arr, fill)
+        return op(full.reshape(ty, tile, tx, tile), axis=(1, 3))
+
+    a_lo, a_hi = reduce(azi, np.inf, np.min), reduce(azi, -np.inf, np.max)
+    r_lo, r_hi = reduce(rng, np.inf, np.min), reduce(rng, -np.inf, np.max)
+
+    def box(t):
+        y0, y1, x0, x1 = t
+        amin = a_lo[y0:y1, x0:x1].min()
+        if not np.isfinite(amin):
+            return None
+        amax, rmin, rmax = a_hi[y0:y1, x0:x1].max(), r_lo[y0:y1, x0:x1].min(), r_hi[y0:y1, x0:x1].max()
+        return (max(0, int(np.floor(amin - 0.5))), min(n_azi, int(np.floor(amax - 0.5)) + 2),
+                max(0, int(np.floor(rmin - 0.5))), min(n_rng, int(np.floor(rmax - 0.5)) + 2))
+
+    def cells(b):
+        return 0 if b is None else (b[1] - b[0]) * (b[3] - b[2])
+
+    blocks = []
+    stack = [((0, ty, 0, tx), box((0, ty, 0, tx)))]
+    while stack:
+        t, b = stack.pop()
+        if b is None:
+            continue
+        y0, y1, x0, x1 = t
+        if cells(b) <= budget or (y1 - y0 < 2 and x1 - x0 < 2):
+            blocks.append((y0 * tile, min(y1 * tile, n_y), x0 * tile, min(x1 * tile, n_x)) + b)
+            continue
+        halves = []
+        if y1 - y0 >= 2:
+            ym = (y0 + y1) // 2
+            halves.append([((y0, ym, x0, x1), box((y0, ym, x0, x1))), ((ym, y1, x0, x1), box((ym, y1, x0, x1)))])
+        if x1 - x0 >= 2:
+            xm = (x0 + x1) // 2
+            halves.append([((y0, y1, x0, xm), box((y0, y1, x0, xm))), ((y0, y1, xm, x1), box((y0, y1, xm, x1)))])
+        stack.extend(min(halves, key=lambda h: max(cells(h[0][1]), cells(h[1][1]))))
+    return blocks
+
+
 def _process_chunk_nisar(iy, ix, chunk_y, chunk_x, n_y, n_x,
                          outdir, zarr_path,
                          h5_path, pol, frequency,
@@ -22,8 +77,9 @@ def _process_chunk_nisar(iy, ix, chunk_y, chunk_x, n_y, n_x,
                          prm_rep_dict, prm_ref_dict,
                          baseline_params, sc_height_params,
                          num_lines, num_rng_bins,
-                         scale, fill_value, epsg,
-                         remove_topo_phase):
+                         scale, fill_value,
+                         remove_topo_phase, topo_path=None, orbit_ref_dict=None,
+                         reference_height=0.0, radar_shape=None, doppler=None, tide_nodes=None):
     """
     Process a single output chunk - designed for parallel execution.
 
@@ -31,33 +87,28 @@ def _process_chunk_nisar(iy, ix, chunk_y, chunk_x, n_y, n_x,
     Each worker exits after one chunk (max_tasks_per_child=1), releasing all memory.
 
     IMPORTANT: Uses zarr directly (not xarray) to avoid loading full arrays.
+
+    doppler is the date's Doppler centroid of the demodulation (cycles per line) and tide_nodes the tidal phase
+    nodes of tidal_phase_nodes() (None: no tide), both of the whole scene, so the chunk's values do not depend on
+    the chunk size.
     """
     import numpy as np
     import cv2
     import zarr
     import os
     from .utils_nisar import nisar_slc
+    from .utils_satellite import precise_transform_dir
 
     jy = min(iy + chunk_y, n_y)
     jx = min(ix + chunk_x, n_x)
 
-    # Load ONLY the chunk we need directly from zarr (not full arrays via xarray!)
-    trans_path = os.path.join(outdir, 'transform')
-    trans_store = zarr.storage.LocalStore(trans_path)
-    trans_root = zarr.open_group(trans_store, mode='r')
-
-    # Read only the specific chunk region (zarr handles this efficiently)
-    transform_scale = trans_root['azi'].attrs.get('scale_factor', 1.0)
-    transform_fill = trans_root['azi'].attrs.get('_FillValue', 2147483647)
-
-    # Read raw int32 data
-    azi_raw = trans_root['azi'][iy:jy, ix:jx]
-    rng_raw = trans_root['rng'][iy:jy, ix:jx]
-
-    # Convert to float32 with proper fill value handling
-    azi_chunk = np.where(azi_raw == transform_fill, np.nan, azi_raw * transform_scale).astype(np.float32)
-    rng_chunk = np.where(rng_raw == transform_fill, np.nan, rng_raw * transform_scale).astype(np.float32)
-    del azi_raw, rng_raw, trans_store, trans_root
+    # Load ONLY the chunk we need directly from zarr (not full arrays via xarray!): the precise transform of
+    # compute_conversion_chunked (float32, NaN outside the swath), not its copy rounded for the stack
+    precise_path = precise_transform_dir(outdir)
+    trans_root = zarr.open_group(zarr.storage.LocalStore(precise_path), mode='r')
+    azi_chunk = trans_root['azi'][iy:jy, ix:jx]
+    rng_chunk = trans_root['rng'][iy:jy, ix:jx]
+    del trans_root
 
     # Apply alignment offsets for repeat scenes
     # Use original azi/rng in both equations (bilinear model requires original coords)
@@ -87,42 +138,81 @@ def _process_chunk_nisar(iy, ix, chunk_y, chunk_x, n_y, n_x,
                           row_slice=slice(azi_min, azi_max),
                           col_slice=slice(rng_min, rng_max))
 
-    # Adjust coordinates to local SLC chunk
+    # Local coordinates in the SLC chunk, the maps of cv2.remap: for NISAR the transform's azi/rng are the 0-based
+    # pixel-centre line and bin (zeroDopplerTime[i] and slantRange[j] are the centres of line i and bin j), the
+    # coordinates cv2.remap reads, so no S1-style 0.5 shift (float32 minus a whole line or bin: exact)
     azi_local = azi_chunk - azi_min
     rng_local = rng_chunk - rng_min
-
-    # Compute inverse maps for cv2.remap (local chunk coordinates)
-    inv_map_a = (azi_local - 0.5).astype(np.float32)
-    inv_map_r = (rng_local - 0.5).astype(np.float32)
+    del azi_chunk, rng_chunk
 
     # Geocode SLC chunk
     slc_re = slc_chunk.real.astype(np.float32)
     slc_im = slc_chunk.imag.astype(np.float32)
     del slc_chunk
 
-    proj_re = cv2.remap(slc_re, inv_map_r, inv_map_a,
+    # The azimuth spectrum of the RSLC is centred on its Doppler centroid f (about 0.63 cycles per line), not on 0,
+    # and LANCZOS4 passes only a band around 0: the lines are demodulated with the date's f (doppler, one value for
+    # the scene) and the carrier is restored at the output position below. Both carriers are taken at the absolute
+    # scene line, and the products are formed part by part in float32, so every sample and output pixel gets the
+    # same values in any chunk (an f per chunk and a carrier from the chunk's first line made the SLC depend on the
+    # chunk size)
+    assert doppler is not None, 'ERROR: the Doppler centroid of the date is required'
+    carrier = (2 * np.pi * doppler) * np.arange(azi_min, azi_max, dtype=np.float64)
+    cos_k, sin_k = np.cos(carrier).astype(np.float32)[:, None], np.sin(carrier).astype(np.float32)[:, None]
+    del carrier
+    for r0 in range(0, slc_re.shape[0], 512):
+        re_, im_ = slc_re[r0:r0 + 512], slc_im[r0:r0 + 512]
+        c_, s_ = cos_k[r0:r0 + 512], sin_k[r0:r0 + 512]
+        # times exp(-i carrier): re c + im s, im c - re s, in place (one temporary block at a time)
+        t_ = re_ * s_
+        re_ *= c_
+        re_ += im_ * s_
+        im_ *= c_
+        im_ -= t_
+        del re_, im_, c_, s_, t_
+    del cos_k, sin_k
+
+    proj_re = cv2.remap(slc_re, rng_local, azi_local,
                         interpolation=cv2.INTER_LANCZOS4,
                         borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
-    proj_im = cv2.remap(slc_im, inv_map_r, inv_map_a,
+    proj_im = cv2.remap(slc_im, rng_local, azi_local,
                         interpolation=cv2.INTER_LANCZOS4,
                         borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
-    del slc_re, slc_im, inv_map_a, inv_map_r
+    del slc_re, slc_im, rng_local
+
+    # Restore the carrier exp(2 pi i f azi) at the exact output position (the scene line azi_local + azi_min, exact
+    # in float64), in row blocks
+    for r0 in range(0, proj_re.shape[0], 512):
+        phase = (2 * np.pi * doppler) * (azi_local[r0:r0 + 512].astype(np.float64) + azi_min)
+        cos_c, sin_c = np.cos(phase).astype(np.float32), np.sin(phase).astype(np.float32)
+        re_, im_ = proj_re[r0:r0 + 512], proj_im[r0:r0 + 512]
+        re_[:], im_[:] = re_ * cos_c - im_ * sin_c, re_ * sin_c + im_ * cos_c
+        del phase, cos_c, sin_c, re_, im_
 
     # cv2.remap doesn't reliably produce NaN when map values are NaN
     # Explicitly mask pixels where transform was fill (azi/rng was NaN)
     proj_re[~valid_mask] = np.nan
     proj_im[~valid_mask] = np.nan
+    del azi_local, valid_mask
 
-    # Apply topo/tidal phase if needed
+    # Apply topo/tidal phase if needed: the flat-earth and topographic phase of flat_earth_topo_phase() and the
+    # tide of tidal_phase_radar() on the radar-coordinate topo, geocoded (linear) at each pixel's REFERENCE radar
+    # coordinates -- the transform, not the repeat coordinates of the alignment above -- like S1. Block by block of
+    # the output chunk, each with the radar box of its pixels (at most an eighth of a chunk of cells), after the SLC
+    # arrays are gone: the box of a whole chunk spans the full swath and would not fit in memory.
+    # remove_topo_phase=False removes the flat earth alone, like S1: the topo is the WGS84 ellipsoid at
+    # reference_height of reference_surface_topo(), its nodes on the whole radar grid (radar_shape), so each
+    # block holds the whole-grid values; the tide as well
     # Skip for ref bursts: baseline_params=None → drho≈0 (no-op, avoids FP noise)
-    if remove_topo_phase and epsg != 0 and baseline_params is not None:
+    if baseline_params is not None:
         from .utils_satellite import flat_earth_topo_phase, tidal_phase_radar
         from .PRM import PRM
         import xarray as xr
 
-        # Load ONLY the topo chunk we need directly from zarr
-        topo_path = os.path.join(outdir, 'topo')
-        if os.path.exists(topo_path):
+        if remove_topo_phase:
+            # Load the topo from zarr, block by block below
+            if topo_path is None or not os.path.exists(topo_path):
+                raise FileNotFoundError(f'Topo not found: {topo_path}')
             topo_store = zarr.storage.LocalStore(topo_path)
             topo_root = zarr.open_group(topo_store, mode='r')
 
@@ -131,72 +221,96 @@ def _process_chunk_nisar(iy, ix, chunk_y, chunk_x, n_y, n_x,
             topo_n_rng = topo_root['topo'].shape[1]
             topo_scale = topo_root['topo'].attrs.get('scale_factor', 1.0)
             topo_fill = topo_root['topo'].attrs.get('_FillValue', 2147483647)
+        else:
+            # No topo: the radar grid of compute_conversion_chunked(), cell k centred on coordinate k + 0.5
+            from .utils_satellite import reference_surface_topo
+            topo_store = topo_root = None
+            topo_n_azi, topo_n_rng = radar_shape
+            grid_a = np.arange(topo_n_azi, dtype=np.float64) + 0.5
+            grid_r = np.arange(topo_n_rng, dtype=np.float64) + 0.5
 
-            topo_azi_min = max(0, int(np.floor(np.nanmin(azi_chunk))))
-            topo_azi_max = min(topo_n_azi, int(np.ceil(np.nanmax(azi_chunk))) + 1)
-            topo_rng_min = max(0, int(np.floor(np.nanmin(rng_chunk))))
-            topo_rng_max = min(topo_n_rng, int(np.ceil(np.nanmax(rng_chunk))) + 1)
+        # Reconstruct PRM objects from dicts; the reference one with its orbit for the tide
+        prm_rep = PRM()
+        prm_rep.set(**prm_rep_dict)
+        prm_ref = PRM()
+        prm_ref.set(**prm_ref_dict)
+        if orbit_ref_dict is not None:
+            import pandas as pd
+            prm_ref.orbit_df = pd.DataFrame(orbit_ref_dict)
 
-            # Read only the chunk we need with proper fill handling
-            topo_raw = topo_root['topo'][topo_azi_min:topo_azi_max, topo_rng_min:topo_rng_max]
-            topo_data = np.where(topo_raw == topo_fill, np.nan, topo_raw * topo_scale).astype(np.float32)
-            topo_a_coords = topo_root['a'][topo_azi_min:topo_azi_max]
-            topo_r_coords = topo_root['r'][topo_rng_min:topo_rng_max]
-            del topo_raw, topo_store, topo_root
+        # Reference radar coordinates of the chunk, read again from the precise transform now that the SLC arrays
+        # are gone
+        trans_root = zarr.open_group(zarr.storage.LocalStore(precise_path), mode='r')
+        azi_ref = trans_root['azi'][iy:jy, ix:jx]
+        rng_ref = trans_root['rng'][iy:jy, ix:jx]
+        del trans_root
+        need = np.isfinite(azi_ref) & np.isfinite(rng_ref) & np.isfinite(proj_re)
 
-            # Create minimal xarray DataArray for phase computation
-            topo_chunk = xr.DataArray(
-                topo_data,
-                dims=['a', 'r'],
-                coords={'a': topo_a_coords, 'r': topo_r_coords}
-            )
-            del topo_data, topo_a_coords, topo_r_coords
+        for by0, by1, bx0, bx1, topo_azi_min, topo_azi_max, topo_rng_min, topo_rng_max in _radar_boxes(
+                azi_ref, rng_ref, need, topo_n_azi, topo_n_rng, chunk_y * chunk_x // 8):
+            if topo_root is not None:
+                # Read only the block we need with proper fill handling
+                topo_raw = topo_root['topo'][topo_azi_min:topo_azi_max, topo_rng_min:topo_rng_max]
+                topo_data = np.where(topo_raw == topo_fill, np.nan, topo_raw * topo_scale).astype(np.float32)
+                topo_a_coords = topo_root['a'][topo_azi_min:topo_azi_max]
+                topo_r_coords = topo_root['r'][topo_rng_min:topo_rng_max]
+                del topo_raw
 
-            # Reconstruct PRM objects from dicts
-            prm_rep = PRM()
-            prm_rep.set(**prm_rep_dict)
-            prm_ref = PRM()
-            prm_ref.set(**prm_ref_dict)
+                # Create minimal xarray DataArray for phase computation
+                topo_chunk = xr.DataArray(
+                    topo_data,
+                    dims=['a', 'r'],
+                    coords={'a': topo_a_coords, 'r': topo_r_coords}
+                )
+                del topo_data
+            else:
+                # The reference surface of the block (reference_surface_topo reads the coordinates only)
+                topo_a_coords = grid_a[topo_azi_min:topo_azi_max]
+                topo_r_coords = grid_r[topo_rng_min:topo_rng_max]
+                topo_chunk = reference_surface_topo(
+                    prm_ref, xr.DataArray(np.broadcast_to(np.float32(0), (topo_a_coords.size, topo_r_coords.size)),
+                                          dims=['a', 'r'], coords={'a': topo_a_coords, 'r': topo_r_coords}),
+                    reference_height, grid=(grid_a, grid_r))
 
             phase_chunk = flat_earth_topo_phase(topo_chunk, prm_rep, prm_ref,
                                                  baseline_params=baseline_params,
                                                  sc_height_params=sc_height_params)
 
             if tidal_dt is not None:
-                phase_chunk.values += tidal_phase_radar(topo_chunk, prm_ref, tidal_dt).values
+                # between the nodes of the whole radar grid, not the corners of the block (chunk-dependent)
+                phase_chunk.values += tidal_phase_radar(topo_chunk, prm_ref, tidal_dt, nodes=tide_nodes).values
 
-            # Geocode phase to output chunk
-            phase_local_a = (azi_chunk - topo_azi_min - 0.5).astype(np.float32)
-            phase_local_r = (rng_chunk - topo_rng_min - 0.5).astype(np.float32)
-
+            # Geocode phase to the output block at the reference coordinates (cell k is centred on a[k])
+            phase_local_a = (azi_ref[by0:by1, bx0:bx1] - topo_a_coords[0]).astype(np.float32)
+            phase_local_r = (rng_ref[by0:by1, bx0:bx1] - topo_r_coords[0]).astype(np.float32)
             phase_proj = cv2.remap(phase_chunk.values.astype(np.float32),
                                    phase_local_r, phase_local_a,
                                    interpolation=cv2.INTER_LINEAR,
-                                   borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-            del phase_chunk, phase_local_a, phase_local_r, topo_chunk
+                                   borderMode=cv2.BORDER_REPLICATE)
+            del phase_chunk, phase_local_a, phase_local_r, topo_chunk, topo_a_coords, topo_r_coords
 
             # Apply phase correction
             cos_phase = np.cos(phase_proj)
             sin_phase = np.sin(phase_proj)
             del phase_proj
 
-            corrected_re = proj_re * cos_phase + proj_im * sin_phase
-            corrected_im = proj_im * cos_phase - proj_re * sin_phase
+            re_ = proj_re[by0:by1, bx0:bx1]
+            im_ = proj_im[by0:by1, bx0:bx1]
+            corrected_re = re_ * cos_phase + im_ * sin_phase
+            corrected_im = im_ * cos_phase - re_ * sin_phase
             del cos_phase, sin_phase
-            proj_re = corrected_re
-            proj_im = corrected_im
-            del corrected_re, corrected_im
+            proj_re[by0:by1, bx0:bx1] = corrected_re
+            proj_im[by0:by1, bx0:bx1] = corrected_im
+            del re_, im_, corrected_re, corrected_im
+        del azi_ref, rng_ref, need, topo_store, topo_root
+        if not remove_topo_phase:
+            del grid_a, grid_r
 
-    # Convert to int16
-    with np.errstate(invalid='ignore'):
-        re_int16 = np.round(proj_re / scale).astype(np.int16)
-        im_int16 = np.round(proj_im / scale).astype(np.int16)
-
-    nan_mask = ~np.isfinite(proj_re)
+    # Convert to int16: a bright sample past the int16 range would wrap around, so its amplitude is clipped
+    # keeping the phase (pack_complex_int16), below fill_value so a saturated sample is not read as NaN
+    from .utils_satellite import pack_complex_int16
+    re_int16, im_int16 = pack_complex_int16(proj_re, proj_im, scale, fill_value)
     del proj_re, proj_im
-    re_int16[nan_mask] = fill_value
-    im_int16[nan_mask] = fill_value
-    del nan_mask
 
     # Write to zarr (thread-safe for region writes)
     store = zarr.storage.LocalStore(zarr_path)
@@ -211,10 +325,9 @@ def _transform_slc_int16_nisar_chunked(outdir, conversion_dir, prm_rep, prm_ref,
                                         baseline_params=None, sc_height_params=None,
                                         remove_tidal_phase=True,
                                         remove_topo_phase=True,
-                                        remove_thermal_noise=False,
-                                        radiometric_calibration=None,
                                         h5_path=None, pol=None, frequency=None,
-                                        chunk=(8192, 8192), n_jobs=None, debug=False):
+                                        chunk=(8192, 8192), n_jobs=None, debug=False,
+                                        reference_height=0.0):
     """
     Transform Nisar SLC to geocoded int16 zarr using chunked I/O.
 
@@ -224,8 +337,10 @@ def _transform_slc_int16_nisar_chunked(outdir, conversion_dir, prm_rep, prm_ref,
     Parameters
     ----------
     n_jobs : int, optional
-        Number of parallel workers. Default: min(cpu_count, RAM_GB // 2).
-        Each worker uses ~1.5 GB RAM.
+        Number of parallel chunk workers. None or -1 (default): all cores.
+        Each worker holds one chunk: lower n_jobs or chunk to use less RAM.
+    reference_height : float, optional
+        With remove_topo_phase=False: the height of the WGS84 ellipsoid whose flat-earth phase is removed.
     """
     import os
     import time
@@ -249,6 +364,9 @@ def _transform_slc_int16_nisar_chunked(outdir, conversion_dir, prm_rep, prm_ref,
     out_y = trans_root['y'][:]
     out_x = trans_root['x'][:]
     n_y, n_x = len(out_y), len(out_x)
+    # the reference radar extent of the output (the transform's actual_range), for the Doppler centroid below
+    azi_range = trans_root['azi'].attrs.get('actual_range')
+    rng_range = trans_root['rng'].attrs.get('actual_range')
     del trans_store, trans_root
 
     # Check if we need merged transform (repeat scene with alignment offsets)
@@ -265,17 +383,50 @@ def _transform_slc_int16_nisar_chunked(outdir, conversion_dir, prm_rep, prm_ref,
     else:
         alignment_params = None
 
-    # Compute tidal datetime if needed (differential: ref - rep)
+    # The Doppler centroid of the demodulation, one per date: the date's LUT at the centre of the output's radar
+    # extent, in this date's coordinates (the alignment of the chunk workers). A value per chunk, at the centre of
+    # its SLC box, made the SLC depend on the chunk size
+    from .utils_nisar import nisar_doppler_centroid
+    if azi_range is not None and rng_range is not None:
+        azi_c, rng_c = 0.5 * (azi_range[0] + azi_range[1]), 0.5 * (rng_range[0] + rng_range[1])
+    else:
+        # no valid output pixel: every chunk is empty, any value does
+        azi_c, rng_c = 0.5 * (prm_rep.get('num_lines') - 1), 0.5 * (prm_rep.get('num_rng_bins') - 1)
+    if alignment_params is not None:
+        rshift, ashift, stretch_r, a_stretch_r, stretch_a, a_stretch_a = alignment_params
+        azi_c, rng_c = (azi_c + ashift + stretch_a * rng_c + a_stretch_a * azi_c,
+                        rng_c + rshift + stretch_r * rng_c + a_stretch_r * azi_c)
+    doppler = nisar_doppler_centroid(h5_path, frequency, azi_c, rng_c)
+    if debug:
+        print(f'Doppler centroid {doppler:.6f} cycles per line at line {azi_c:.1f}, bin {rng_c:.1f}')
+
+    # Compute tidal datetime if needed (differential: ref - rep), in both modes like S1
     is_reference = prm_rep is prm_ref
     tidal_dt = None
-    if remove_tidal_phase and remove_topo_phase and not is_reference:
+    if remove_tidal_phase and not is_reference:
         import datetime as _dt
         def _sc_clock_to_dt(prm):
             sc_mid = (prm.get('SC_clock_start') + prm.get('SC_clock_stop')) / 2.0
             year = int(sc_mid // 1000)
             doy_frac = sc_mid % 1000
-            return _dt.datetime(year, 1, 1) + _dt.timedelta(days=doy_frac - 1)
+            # SC_clock carries GMTSAR's 0-based day of year: day 0.x is January 1
+            return _dt.datetime(year, 1, 1) + _dt.timedelta(days=doy_frac)
         tidal_dt = (_sc_clock_to_dt(prm_ref), _sc_clock_to_dt(prm_rep))
+
+    # The workers rebuild the PRMs from dicts, without the orbit: tidal_phase_radar() and reference_surface_topo()
+    # need the reference one
+    orbit_ref_dict = prm_ref.orbit_df.to_dict('list') if tidal_dt is not None or not remove_topo_phase else None
+    topo_path = os.path.join(conversion_dir, 'topo')
+    # the radar grid of compute_conversion_chunked(), for the reference surface of remove_topo_phase=False
+    a_max, r_max = prm_ref.bounds()
+    radar_shape = (len(np.arange(0.5, a_max, 1, dtype=np.float32)), len(np.arange(0.5, r_max, 1, dtype=np.float32)))
+    # The tide of the repeat dates at fixed nodes of that whole radar grid (cell k centred on k + 0.5), once per date:
+    # every block of every chunk interpolates the same nodes
+    tide_nodes = None
+    if tidal_dt is not None and baseline_params is not None:
+        from .utils_satellite import tidal_phase_nodes
+        tide_nodes = tidal_phase_nodes(prm_ref, tidal_dt, (np.arange(radar_shape[0], dtype=np.float64) + 0.5,
+                                                           np.arange(radar_shape[1], dtype=np.float64) + 0.5))
 
     # Set scale - NISAR L-band has small amplitudes, use 1e-04 like GMTSAR
     # to avoid quantization to zero (with scale=0.5, ~60% of pixels become zero)
@@ -323,8 +474,9 @@ def _transform_slc_int16_nisar_chunked(outdir, conversion_dir, prm_rep, prm_ref,
          prm_rep_dict, prm_ref_dict,
          baseline_params, sc_height_params,
          num_lines, num_rng_bins,
-         scale, fill_value, epsg,
-         remove_topo_phase)
+         scale, fill_value,
+         remove_topo_phase, topo_path, orbit_ref_dict,
+         reference_height, radar_shape, doppler, tide_nodes)
         for iy, ix in chunks
     ]
 
@@ -359,6 +511,10 @@ def _transform_slc_int16_nisar_chunked(outdir, conversion_dir, prm_rep, prm_ref,
     for name, value in prm_rep.df.itertuples():
         if name not in ['input_file', 'SLC_file', 'led_file']:
             attrs[name] = _convert_value(value)
+    # the flat-earth reference height for the downstream elevation, the same on every date, and NaN in DEM mode
+    # (the grids give a residual height there; the elevation reads NaN as 0); a technical attribute, before BPR,
+    # so to_dataframe() does not list it
+    attrs['ref_height'] = float('nan') if remove_topo_phase else float(reference_height)
 
     # Add baseline BPR (this is the cutoff point for to_dataframe)
     if prm_rep is prm_ref:
@@ -410,10 +566,9 @@ def _transform_slc_int16_nisar_chunked(outdir, conversion_dir, prm_rep, prm_ref,
     attrs['fullBurstID'] = os.path.basename(outdir)
 
     # Add spatial ref
-    if epsg != 0:
-        from pyproj import CRS
-        crs = CRS.from_epsg(epsg)
-        attrs['spatial_ref'] = crs.to_wkt()
+    from pyproj import CRS
+    crs = CRS.from_epsg(epsg)
+    attrs['spatial_ref'] = crs.to_wkt()
 
     # Reload root for metadata update (after parallel writes)
     store = zarr.storage.LocalStore(zarr_path)
@@ -454,257 +609,6 @@ def _transform_slc_int16_nisar_chunked(outdir, conversion_dir, prm_rep, prm_ref,
         print(f'Total time: {time.perf_counter() - _t0_total:.1f}s')
 
 
-def _transform_slc_int16_nisar(outdir, transform, topo, prm_rep, prm_ref, slc_data,
-                               scene_name, record_dict, epsg,
-                               baseline_params=None, sc_height_params=None,
-                               remove_tidal_phase=True,
-                               remove_thermal_noise=False,
-                               radiometric_calibration=None,
-                               h5_path=None, pol=None, frequency=None,
-                               debug=False):
-    """
-    Transform Nisar SLC to geocoded int16 zarr.
-
-    Simplified version for Nisar - no reramp needed (stripmap mode).
-    """
-    import os
-    import time
-    import numpy as np
-    import xarray as xr
-    import pandas as pd
-    from .PRM import PRM
-    from .utils_satellite import remap_radar_to_geo, compute_merged_transform
-    from insardev_toolkit.datagrid import datagrid
-
-    _t0 = time.perf_counter()
-    _timings = {}
-
-    num_lines = prm_rep.get('num_lines')
-    num_rng_bins = prm_rep.get('num_rng_bins')
-
-    # Ensure complex64 format
-    slc_complex = slc_data.astype(np.complex64) if slc_data.dtype != np.complex64 else slc_data
-
-    # Apply radiometric calibration and/or thermal noise removal for Nisar
-    if remove_thermal_noise or radiometric_calibration:
-        try:
-            from insardev_backscatter.utils_nisar import apply_radiometric_correction_nisar
-        except ImportError:
-            raise ImportError(
-                "Nisar radiometric calibration requires insardev_backscatter extension with Nisar support"
-            )
-        slc_complex = apply_radiometric_correction_nisar(
-            slc_complex,
-            h5_path=h5_path,
-            pol=pol,
-            frequency=frequency,
-            calibration_type=radiometric_calibration,
-            remove_noise=remove_thermal_noise
-        )
-
-    # Set output scale based on whether calibration was applied
-    if radiometric_calibration:
-        scale = 1e-04
-        amp_max = 32767 * scale
-        amplitude = np.abs(slc_complex)
-        clip_mask = amplitude > amp_max
-        if clip_mask.any():
-            phase = np.angle(slc_complex[clip_mask])
-            slc_complex[clip_mask] = amp_max * np.exp(1j * phase)
-    else:
-        scale = 0.5
-
-    coords = {'a': np.arange(slc_complex.shape[0]) + 0.5, 'r': np.arange(slc_complex.shape[1]) + 0.5}
-
-    # Mask invalid regions
-    nonzero_mask = slc_complex != 0
-    col_valid = nonzero_mask.sum(axis=0) > 0.8 * slc_complex.shape[0]
-    row_valid = nonzero_mask.sum(axis=1) > 0.8 * slc_complex.shape[1]
-    slc_complex = np.where(col_valid[np.newaxis, :] & row_valid[:, np.newaxis], slc_complex, np.nan + 0j)
-
-    slc_xa = xr.DataArray(slc_complex, coords=coords, dims=['a', 'r']).rename('data')
-    del slc_complex
-    _timings['slc_prep'] = time.perf_counter() - _t0
-
-    # Compute tidal datetime if needed (differential: ref - rep)
-    is_reference = prm_rep is prm_ref
-    tidal_dt = None
-    if remove_tidal_phase and topo is not None and not is_reference:
-        import datetime as _dt
-        def _sc_clock_to_dt(prm):
-            sc_mid = (prm.get('SC_clock_start') + prm.get('SC_clock_stop')) / 2.0
-            year = int(sc_mid // 1000)
-            doy_frac = sc_mid % 1000
-            return _dt.datetime(year, 1, 1) + _dt.timedelta(days=doy_frac - 1)
-        tidal_dt = (_sc_clock_to_dt(prm_ref), _sc_clock_to_dt(prm_rep))
-
-    # Nisar: Direct geocoding (no reramp needed - stripmap mode)
-    if epsg != 0:
-        # Geocoded output path
-        _t0 = time.perf_counter()
-        if prm_rep.get('rshift') is not None:
-            # Rep scene: merged transform with alignment offsets
-            azi_map, rng_map = compute_merged_transform(transform, prm_rep)
-        else:
-            # Ref scene: no alignment offsets, use ref transform directly
-            azi_map = transform.azi.values.astype(np.float32)
-            rng_map = transform.rng.values.astype(np.float32)
-        complex_proj = remap_radar_to_geo(slc_xa, azi_map, rng_map,
-                                          transform.y.values, transform.x.values)
-        complex_proj = complex_proj.transpose('y', 'x')
-        del slc_xa
-        _timings['geocode'] = time.perf_counter() - _t0
-
-        # Compute and geocode topo phase
-        # Skip for ref bursts: baseline=0 → drho≈0 (no-op, avoids FP noise)
-        _t0 = time.perf_counter()
-        if not is_reference:
-            from .utils_satellite import flat_earth_topo_phase, tidal_phase_radar
-            topo_phase = flat_earth_topo_phase(topo, prm_rep, prm_ref,
-                                               baseline_params=baseline_params,
-                                               sc_height_params=sc_height_params)
-            if tidal_dt is not None:
-                topo_phase.values += tidal_phase_radar(topo, prm_ref, tidal_dt).values
-
-            topo_phase_xa = xr.DataArray(topo_phase.values, coords=topo_phase.coords,
-                                         dims=topo_phase.dims).rename('data')
-
-            # Geocode topo phase
-            topo_phase_proj = remap_radar_to_geo(topo_phase_xa, azi_map, rng_map,
-                                                 transform.y.values, transform.x.values).transpose('y', 'x').values
-            del topo_phase, topo_phase_xa
-            _timings['phase_compute'] = time.perf_counter() - _t0
-
-            # Apply topo phase correction
-            _t0 = time.perf_counter()
-            cos_phase = np.cos(topo_phase_proj)
-            sin_phase = np.sin(topo_phase_proj)
-            del topo_phase_proj
-            proj_re = complex_proj.values.real.copy()
-            proj_im = complex_proj.values.imag
-            corrected_re = (proj_re * cos_phase + proj_im * sin_phase)
-            corrected_im = (proj_im * cos_phase - proj_re * sin_phase)
-            del cos_phase, sin_phase, proj_re, proj_im
-            complex_proj = xr.DataArray(
-                (corrected_re + 1j * corrected_im).astype(np.complex64),
-                coords=complex_proj.coords, dims=complex_proj.dims
-            )
-            del corrected_re, corrected_im
-        del azi_map, rng_map
-        _timings['phase_apply'] = time.perf_counter() - _t0
-    else:
-        # Radar coordinates output (epsg=0)
-        _t0 = time.perf_counter()
-        # Skip for ref bursts: baseline=0 → drho≈0 (no-op, avoids FP noise)
-        if not is_reference:
-            from .utils_satellite import flat_earth_topo_phase, tidal_phase_radar
-            phase = flat_earth_topo_phase(topo, prm_rep, prm_ref,
-                                          baseline_params=baseline_params,
-                                          sc_height_params=sc_height_params)
-
-            if tidal_dt is not None:
-                phase.values += tidal_phase_radar(topo, prm_ref, tidal_dt).values
-
-            phase_aligned = phase.reindex_like(slc_xa, method='nearest').values
-            del phase
-            cos_phase = np.cos(phase_aligned)
-            sin_phase = np.sin(phase_aligned)
-            del phase_aligned
-            slc_vals = slc_xa.values
-            corrected_real = slc_vals.real * cos_phase + slc_vals.imag * sin_phase
-            corrected_imag = slc_vals.imag * cos_phase - slc_vals.real * sin_phase
-            del cos_phase, sin_phase
-            slc_corrected = xr.DataArray(
-                (corrected_real + 1j * corrected_imag).astype(np.complex64),
-                coords=slc_xa.coords, dims=slc_xa.dims
-            )
-            del corrected_real, corrected_imag, slc_vals, slc_xa
-        else:
-            slc_corrected = slc_xa
-            del slc_xa
-        complex_proj = slc_corrected.rename({'a': 'y', 'r': 'x'})
-        _timings['phase_apply'] = time.perf_counter() - _t0
-
-    # Convert to int16
-    _t0 = time.perf_counter()
-    fill_value = np.iinfo(np.int16).max
-    re_vals = complex_proj.values.real
-    im_vals = complex_proj.values.imag
-
-    with np.errstate(invalid='ignore'):
-        re_int16 = np.round(re_vals / scale).astype(np.int16)
-        im_int16 = np.round(im_vals / scale).astype(np.int16)
-
-    nan_mask = ~np.isfinite(re_vals)
-    del re_vals, im_vals
-    re_int16[nan_mask] = fill_value
-    im_int16[nan_mask] = fill_value
-    del nan_mask
-
-    y_coords = complex_proj.y.values
-    x_coords = complex_proj.x.values
-    del complex_proj
-
-    data_proj = xr.Dataset({
-        're': xr.DataArray(re_int16, coords={'y': y_coords, 'x': x_coords}, dims=['y', 'x']),
-        'im': xr.DataArray(im_int16, coords={'y': y_coords, 'x': x_coords}, dims=['y', 'x'])
-    })
-    del re_int16, im_int16, y_coords, x_coords
-    _timings['int16_convert'] = time.perf_counter() - _t0
-
-    # Add PRM attributes
-    for name, value in prm_rep.df.itertuples():
-        if name not in ['input_file', 'SLC_file', 'led_file']:
-            data_proj.attrs[name] = value
-
-    # Add baseline
-    if prm_rep is prm_ref:
-        BPR = 0.0
-    else:
-        baseline = prm_ref.SAT_baseline(prm_rep)
-        BPR = baseline.get('B_perpendicular')
-    data_proj.attrs['BPR'] = BPR + 0
-
-    # Add record attributes
-    for name, value in list(record_dict.items())[::-1]:
-        # NOT BPR: the record carries the scan-time baseline, whose origin is
-        # the first date, while the value set above is measured from THIS
-        # transform's reference -- which is what makes BPR == 0 name the
-        # reference in a stored stack.
-        if name not in ['path', 'BPR', 'baseline_model']:
-            if isinstance(value, (pd.Timestamp, np.datetime64)):
-                value = pd.Timestamp(value).strftime('%Y-%m-%d %H:%M:%S')
-            data_proj.attrs[name] = value
-
-    # Add storage attributes
-    for varname in ['re', 'im']:
-        data_proj[varname].attrs['scale_factor'] = scale
-        data_proj[varname].attrs['add_offset'] = 0
-        data_proj[varname].attrs['_FillValue'] = np.iinfo(np.int16).max
-
-    if epsg == 0:
-        radar_crs_wkt = '''ENGCRS["Radar Coordinates",EDATUM["Radar datum"],CS[Cartesian,2],AXIS["azimuth",south,ORDER[1],LENGTHUNIT["pixel",1]],AXIS["range",east,ORDER[2],LENGTHUNIT["pixel",1]]]'''
-        data_proj.attrs['spatial_ref'] = radar_crs_wkt
-    else:
-        data_proj = datagrid.spatial_ref(data_proj, epsg)
-        data_proj.attrs['spatial_ref'] = data_proj.spatial_ref.attrs['spatial_ref']
-        data_proj = data_proj.drop_vars('spatial_ref')
-        data_proj = data_proj.drop_vars(['x', 'y'])
-
-    _t0 = time.perf_counter()
-    shape = data_proj.re.shape
-    encoding = {var: {'chunks': shape} for var in ['re', 'im']}
-    data_proj.to_zarr(
-        store=os.path.join(outdir, scene_name),
-        mode='w',
-        zarr_format=3,
-        consolidated=True,
-        encoding=encoding
-    )
-    _timings['to_zarr'] = time.perf_counter() - _t0
-    del data_proj
-
-
 class Nisar_transform(Nisar_align):
     """Nisar transform - simplified version without reramp (stripmap mode)."""
     import pandas as pd
@@ -720,11 +624,10 @@ class Nisar_transform(Nisar_align):
                   chunk: tuple[int, int] = (8192, 8192),
                   remove_topo_phase: bool = True,
                   remove_tidal_phase: bool = True,
-                  remove_thermal_noise: bool = False,
-                  radiometric_calibration: str | None = None,
+                  reference_height: float | None = None,
                   dem_vertical_accuracy: float = 0.5,
                   alignment_spacing: float = 12.0 / 3600,
-                  xcorr: tuple | None = (512, 512),
+                  xcorr: tuple | int | None = (256, 256),
                   bbox: list | tuple | None = None,
                   overwrite: bool = False,
                   append: bool = False,
@@ -748,26 +651,37 @@ class Nisar_transform(Nisar_align):
             - 'B': Process frequencyB (5MHz, ~25m resolution)
         epsg : str|int|None, optional
             The EPSG code to use for the output data. Use 'auto' for automatic.
-            Use epsg=0 to disable geocoding and keep radar coordinates.
+            With None, each scene uses the UTM zone of its own centroid.
+            Geocoding is always enabled: epsg=0 (radar coordinates) is not supported and raises ValueError.
         resolution : tuple[int, int], optional
             The resolution to use in meters per pixel.
         chunk : tuple[int, int], optional
             Processing chunk size (y, x) in pixels. Default is (8192, 8192).
         remove_topo_phase : bool, optional
-            Remove the topographic phase from SLC data.
+            Remove the topographic phase from SLC data for interferometric processing. Set to False
+            when creating a DEM from interferograms so the topo phase remains: the flat-earth phase of the
+            WGS84 ellipsoid at reference_height (and the tide) is removed instead, like Sentinel-1.
         remove_tidal_phase : bool, optional
             Remove solid Earth tidal displacement phase.
-        remove_thermal_noise : bool, optional
-            Apply thermal noise removal (requires insardev_backscatter).
-        radiometric_calibration : str | None, optional
-            Apply radiometric calibration: 'sigma0', 'beta0', 'gamma0', or None.
+        reference_height : float or None, optional
+            Reference height (meters above WGS84 ellipsoid) for flat-earth phase removal.
+            All scenes use this same value.
+            Set to the elevation of your area of interest for best precision and fewer fringes.
+            Default is None (sea level, i.e. 0). Only used when remove_topo_phase=False.
+            Raises ValueError if set when remove_topo_phase=True.
         dem_vertical_accuracy : float, optional
             The DEM vertical accuracy in meters.
         alignment_spacing : float, optional
             The alignment spacing in decimal degrees.
-        xcorr : tuple | None, optional
-            Xcorr patch size as (height, width). Default (512, 512) for NISAR.
-            Set to None to disable xcorr refinement. Grid is auto-computed.
+        xcorr : tuple | int | None, optional
+            Xcorr window (square patch) in pixels, as (height, width) or one int; the height sets the size.
+            Default (256, 256). Grid is auto-computed over the whole SLC of the input files: band A every other
+            window, band B touching windows, 2x denser on an axis the file covers at most 1/2 of its full frame
+            and 4x at most 1/4 (never closer than half the window); each accepted patch is re-centred 3 times,
+            and a patch whose re-centring stops early is skipped. The correction is bilinear on a full frame
+            (over 1/2 of the frame on both axes) and a constant shift on a crop. When that area is too small for
+            the window (fewer than 8 accepted patches), a RuntimeError asks for a smaller window, e.g.
+            xcorr=192 or xcorr=128. None disables the refinement: the geometry alone is not accurate for NISAR.
         bbox : list | tuple | None, optional
             Bounding box [lon_min, lat_min, lon_max, lat_max] in WGS84 to crop
             output grid. Useful when input data was downloaded for a subregion.
@@ -776,8 +690,9 @@ class Nisar_transform(Nisar_align):
         append : bool, optional
             Append new scenes to existing results.
         n_jobs : int, optional
-            Number of parallel workers for chunk processing. Each worker uses
-            ~1.5 GB RAM. Default: auto-detect based on available RAM.
+            Number of parallel workers of every internal step: the geocoding tiles, the alignment
+            (SAT_llt2rat and xcorr) and the SLC chunks. None or -1 (default): all cores.
+            Each chunk worker holds one chunk: lower n_jobs or chunk to use less RAM.
         scheduler : str, optional
             Not used for NISAR (kept for API compatibility).
         tmpdir : str, optional
@@ -793,8 +708,20 @@ class Nisar_transform(Nisar_align):
         import warnings
         import pandas as pd
         import numpy as np
+        from insardev_toolkit.utils_files import exists
 
         warnings.filterwarnings('ignore', message='.*Consolidated metadata.*', category=UserWarning)
+
+        # radar-coordinate output (epsg=0) is not supported: geocoding is always enabled
+        if epsg is not None and not isinstance(epsg, str) and epsg == 0:
+            raise ValueError("ERROR: epsg=0 (radar coordinates) is not supported, geocoding is always enabled. "
+                             "Use epsg='auto' (default) or an explicit EPSG code.")
+
+        # Validate reference_height vs remove_topo_phase
+        if remove_topo_phase and reference_height is not None:
+            raise ValueError("reference_height is only used when remove_topo_phase=False (flat-earth mode for DEM generation)")
+        if reference_height is None:
+            reference_height = 0.0
 
         # Control library threading
         for var in ['OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
@@ -830,14 +757,9 @@ class Nisar_transform(Nisar_align):
                     f"  frequency='B': 5MHz bandwidth (~25m resolution)"
                 )
 
-        # Store for use in processing (override self.frequency for this transform)
-        original_frequency = self.frequency
-        self.frequency = use_frequency
         print(f'NOTE: Processing frequency{use_frequency}.')
 
-        if epsg == 0:
-            print('NOTE: epsg=0, keeping radar coordinates (no geocoding).')
-        elif epsg is None:
+        if epsg is None:
             print('NOTE: EPSG code will be computed automatically for each scene.')
         elif isinstance(epsg, str) and epsg == 'auto':
             from .utils_satellite import get_utm_epsg
@@ -850,19 +772,28 @@ class Nisar_transform(Nisar_align):
             epsg = epsgs[0]
             print(f'NOTE: EPSG code computed automatically: {epsg}.')
 
+        # Get reference and repeat scenes as groups
+        refrep_dict = self.get_repref(ref=ref)
+        refreps = [v for v in refrep_dict.values()]
+
         assert not os.path.exists(target) or os.path.isdir(target)
+        # an orbit that cannot be used raises before anything is removed or written
+        self._check_orbits(refreps, target, overwrite, append)
         if overwrite and os.path.exists(target):
             print(f'NOTE: Removing all previous results.')
             shutil.rmtree(target)
 
         metafile = os.path.join(target, 'zarr.json')
         if os.path.exists(target):
-            if not os.path.exists(metafile) or os.path.getsize(metafile) == 0:
+            # an empty metadata file raises
+            if not exists(metafile, again='run the processing'):
                 print(f'NOTE: target processing is not completed. Continuing...')
             elif not append:
                 print(f'NOTE: target processing is completed. Skipping...')
-                self.frequency = original_frequency
                 return
+        # an empty metadata file of a scene raises before any scene is processed and before anything is removed
+        for scene_refs, _ in refreps:
+            exists(os.path.join(target, self.sceneId(scene_refs[0][-1]), 'zarr.json'), again='run the processing')
         if os.path.exists(metafile):
             os.remove(metafile)
 
@@ -879,7 +810,7 @@ class Nisar_transform(Nisar_align):
             # Check if already completed
             if os.path.exists(outdir):
                 assert os.path.isdir(outdir)
-                if os.path.exists(metafile_scene) and os.path.getsize(metafile_scene) > 0:
+                if exists(metafile_scene, again='run the processing'):
                     return
                 else:
                     print(f'NOTE: {sceneId} incomplete. Removing...')
@@ -897,110 +828,122 @@ class Nisar_transform(Nisar_align):
             # Compute transform and topo tile-by-tile, writing directly to zarr
             # Never builds full arrays in memory - suitable for 12GB Colab
             # Workers read DEM chunks from file - no full DEM in memory
-            from .utils_satellite import compute_conversion_chunked
+            from .utils_satellite import compute_conversion_chunked, get_utm_epsg, precise_transform_dir
             record = self.get_record(ref_scene_name)
-
-            compute_conversion_chunked(
-                prm_ref_main, self.DEM, record.geometry.iloc[0], outdir,
-                scale_factor=1 / dem_vertical_accuracy,
-                epsg=epsg, resolution=resolution, bbox=bbox,
-                chunk=chunk, compute_topo=remove_topo_phase,
-                n_jobs=n_jobs, debug=debug
-            )
             conversion_dir = os.path.join(outdir, 'conversion')
+            # epsg=None: the scene's own UTM zone, from the centroid of its reference record
+            _centroid = record.geometry.iloc[0].centroid
+            scene_epsg = epsg if epsg is not None else get_utm_epsg(_centroid.y, _centroid.x)
 
-            # Pre-compute SC_height
-            sc_height_cache = {}
-            for scene_ref in scene_refs:
-                scene_ref_name = scene_ref[-1]
-                prm_ref = prm_cache[scene_ref_name]
-                sc_height_result = prm_ref.SAT_baseline(prm_ref)
-                sc_height_cache[scene_ref_name] = {
-                    'SC_height': sc_height_result.get('SC_height'),
-                    'SC_height_start': sc_height_result.get('SC_height_start'),
-                    'SC_height_end': sc_height_result.get('SC_height_end')
-                }
+            try:
+                compute_conversion_chunked(
+                    prm_ref_main, self.DEM, record.geometry.iloc[0], outdir,
+                    scale_factor=1 / dem_vertical_accuracy,
+                    epsg=scene_epsg, resolution=resolution, bbox=bbox,
+                    chunk=chunk, compute_topo=remove_topo_phase,
+                    n_jobs=n_jobs, debug=debug, datum=self.dem_datum()
+                )
 
-            # Phase 2: Process dates sequentially
-            all_dates = scene_reps + scene_refs
-            for scene_item in all_dates:
-                is_reference = scene_item in scene_refs
-                scene_ref = [s for s in scene_refs if s[:2] == scene_item[:2]][0]
-                scene_ref_name = scene_ref[-1]
-                scene_name = scene_item[-1]
-                prm_ref = prm_cache[scene_ref_name]
-
-                # Get HDF5 path and polarization for this scene
-                rec = self.get_record(scene_name)
-                h5_path = rec['path'].iloc[0]
-                pol = rec.index.get_level_values(1)[0]
-
-                if is_reference:
-                    prm, _, _ = self.align_ref(scene_name, debug=debug, return_slc=False)
-                    prm = prm_ref
-                    baseline_params = None
-                else:
-                    prm, _, _ = self.align_rep(scene_name, scene_ref_name, prm_ref,
-                                                degrees=alignment_spacing, debug=debug,
-                                                return_slc=False, xcorr=xcorr)
-                    baseline_result = prm_ref.SAT_baseline(prm)
-                    baseline_params = {
-                        'baseline_start': baseline_result.get('baseline_start'),
-                        'baseline_center': baseline_result.get('baseline_center'),
-                        'baseline_end': baseline_result.get('baseline_end'),
-                        'alpha_start': baseline_result.get('alpha_start'),
-                        'alpha_center': baseline_result.get('alpha_center'),
-                        'alpha_end': baseline_result.get('alpha_end'),
-                        'B_offset_start': baseline_result.get('B_offset_start'),
-                        'B_offset_center': baseline_result.get('B_offset_center'),
-                        'B_offset_end': baseline_result.get('B_offset_end')
+                # Pre-compute SC_height
+                sc_height_cache = {}
+                for scene_ref in scene_refs:
+                    scene_ref_name = scene_ref[-1]
+                    prm_ref = prm_cache[scene_ref_name]
+                    sc_height_result = prm_ref.SAT_baseline(prm_ref)
+                    sc_height_cache[scene_ref_name] = {
+                        'SC_height': sc_height_result.get('SC_height'),
+                        'SC_height_start': sc_height_result.get('SC_height_start'),
+                        'SC_height_end': sc_height_result.get('SC_height_end')
                     }
 
-                # Build record dict
-                record_dict = {}
-                record_reset = rec.reset_index()
-                for col in record_reset.columns:
-                    val = record_reset[col].iloc[0]
-                    if hasattr(val, 'wkt'):
-                        record_dict[col] = val.wkt
-                    else:
-                        record_dict[col] = val
+                # Phase 2: Process dates sequentially
+                all_dates = scene_reps + scene_refs
+                for scene_item in all_dates:
+                    is_reference = scene_item in scene_refs
+                    scene_ref = [s for s in scene_refs if s[:2] == scene_item[:2]][0]
+                    scene_ref_name = scene_ref[-1]
+                    scene_name = scene_item[-1]
+                    prm_ref = prm_cache[scene_ref_name]
 
-                # Use chunked processing for memory efficiency with parallel chunks
-                _transform_slc_int16_nisar_chunked(
-                    outdir=outdir, conversion_dir=conversion_dir,
-                    prm_rep=prm, prm_ref=prm_ref,
-                    scene_name=scene_name, record_dict=record_dict,
-                    epsg=epsg, baseline_params=baseline_params,
-                    sc_height_params=sc_height_cache[scene_ref_name],
-                    remove_tidal_phase=remove_tidal_phase,
-                    remove_topo_phase=remove_topo_phase,
-                    remove_thermal_noise=remove_thermal_noise,
-                    radiometric_calibration=radiometric_calibration,
-                    h5_path=h5_path, pol=pol, frequency=self.frequency,
-                    chunk=chunk, n_jobs=n_jobs, debug=debug
-                )
+                    # Get HDF5 path and polarization for this scene
+                    rec = self.get_record(scene_name)
+                    h5_path = rec['path'].iloc[0]
+                    pol = rec.index.get_level_values(1)[0]
+
+                    if is_reference:
+                        prm, _, _ = self.align_ref(scene_name, debug=debug, return_slc=False)
+                        prm = prm_ref
+                        baseline_params = None
+                    else:
+                        prm, _, _ = self.align_rep(scene_name, scene_ref_name, prm_ref,
+                                                    degrees=alignment_spacing, debug=debug,
+                                                    return_slc=False, xcorr=xcorr, n_jobs=n_jobs)
+                        baseline_result = prm_ref.SAT_baseline(prm)
+                        baseline_params = {
+                            'baseline_start': baseline_result.get('baseline_start'),
+                            'baseline_center': baseline_result.get('baseline_center'),
+                            'baseline_end': baseline_result.get('baseline_end'),
+                            'alpha_start': baseline_result.get('alpha_start'),
+                            'alpha_center': baseline_result.get('alpha_center'),
+                            'alpha_end': baseline_result.get('alpha_end'),
+                            'B_offset_start': baseline_result.get('B_offset_start'),
+                            'B_offset_center': baseline_result.get('B_offset_center'),
+                            'B_offset_end': baseline_result.get('B_offset_end')
+                        }
+
+                    # Build record dict
+                    record_dict = {}
+                    record_reset = rec.reset_index()
+                    for col in record_reset.columns:
+                        val = record_reset[col].iloc[0]
+                        if hasattr(val, 'wkt'):
+                            record_dict[col] = val.wkt
+                        else:
+                            record_dict[col] = val
+
+                    # Use chunked processing for memory efficiency with parallel chunks
+                    _transform_slc_int16_nisar_chunked(
+                        outdir=outdir, conversion_dir=conversion_dir,
+                        prm_rep=prm, prm_ref=prm_ref,
+                        scene_name=scene_name, record_dict=record_dict,
+                        epsg=scene_epsg, baseline_params=baseline_params,
+                        sc_height_params=sc_height_cache[scene_ref_name],
+                        remove_tidal_phase=remove_tidal_phase,
+                        remove_topo_phase=remove_topo_phase,
+                        h5_path=h5_path, pol=pol, frequency=self.frequency,
+                        chunk=chunk, n_jobs=n_jobs, debug=debug,
+                        reference_height=reference_height
+                    )
+            finally:
+                # The radar-coordinate topo and the precise transform are temporary: only the dates above read them
+                # (a completed scene is skipped on a rerun or append, an incomplete one is removed and rebuilt with a
+                # new topo and transform), so they are removed when they are done, and after a failure too, with
+                # their conversion directory
+                for temp_dir in (os.path.join(conversion_dir, 'topo'), precise_transform_dir(outdir)):
+                    if os.path.exists(temp_dir):
+                        shutil.rmtree(temp_dir)
+                if os.path.isdir(conversion_dir) and not os.listdir(conversion_dir):
+                    os.rmdir(conversion_dir)
 
             # Cleanup and consolidate
             del prm_cache
             self.consolidate_metadata(target, record_id=all_dates[-1][-1])
 
-        # Get reference and repeat scenes as groups
-        refrep_dict = self.get_repref(ref=ref)
-        refreps = [v for v in refrep_dict.values()]
-
         n_scenes = len(refreps)
         n_dates = len(refreps[0][0]) + len(refreps[0][1]) if refreps else 1
 
-        # For NISAR: default to all cores for chunk-level parallelization
-        if n_jobs is None:
-            n_jobs = -1  # joblib convention: use all cores
+        # n_jobs of every internal step (tiles, alignment and xcorr, chunks); None or -1: all cores
+        if n_jobs is None or n_jobs == -1:
+            n_jobs = os.cpu_count()
         print(f'NOTE: Processing {n_scenes} scene(s), {n_dates} dates, chunks parallel with n_jobs={n_jobs}')
-        for scenes in tqdm(refreps, desc='Transforming SLC...'.ljust(25)):
-            process_scene_sequential(scenes, target, debug=debug)
+        # the processing reads self.frequency: it is set for this call only, and restored when the call ends or raises
+        original_frequency = self.frequency
+        self.frequency = use_frequency
+        try:
+            for scenes in tqdm(refreps, desc='Transforming SLC...'.ljust(25)):
+                process_scene_sequential(scenes, target, debug=debug)
 
-        # Consolidate zarr metadata
-        self.consolidate_metadata(target)
-
-        # Restore original frequency setting
-        self.frequency = original_frequency
+            # Consolidate zarr metadata
+            self.consolidate_metadata(target)
+        finally:
+            self.frequency = original_frequency

@@ -1,1 +1,6 @@
 include LICENSE
+include insardev_toolkit/data/geoid/*.nc
+include insardev_toolkit/data/geoid/README.md
+include insardev_toolkit/data/geoid/LICENSE
+include insardev_toolkit/data/geoid/egm2008_2.5min.py
+include insardev_toolkit/data/geoid/egm96_7.5min.py

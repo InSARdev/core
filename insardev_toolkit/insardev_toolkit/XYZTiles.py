@@ -101,6 +101,7 @@ class XYZTiles(datagrid, progressbar_joblib):
         import os
         from glob import glob
         from .HTTP import fetch, NotFound, MAGIC_IMAGE
+        from .utils_files import exists, write_file
 
         stem = os.path.join(tiles_dir, str(zoom), str(x), str(y))
         name = f'{zoom}/{x}/{y}'
@@ -113,6 +114,8 @@ class XYZTiles(datagrid, progressbar_joblib):
             for stored in glob(stem + '.*'):
                 if stored.endswith(('.missing', '.tmp')):
                     continue
+                # an empty tile raises
+                exists(stored)
                 with open(stored, 'rb') as f:
                     head = f.read(8)
                 if head.startswith(MAGIC_IMAGE):
@@ -123,9 +126,7 @@ class XYZTiles(datagrid, progressbar_joblib):
             data = fetch(tile_url, headers=self.headers, magic=MAGIC_IMAGE, retries=retries,
                          timeout_second=timeout_second, min_rate=min_rate, min_rate_window=min_rate_window, debug=debug)
             path = f'{stem}.{self._tile_extension(data)}'
-            with open(path + '.tmp', 'wb') as f:
-                f.write(data)
-            os.replace(path + '.tmp', path)
+            write_file(path, data)
             if os.path.exists(stem + '.missing'):
                 os.remove(stem + '.missing')
             return ('tile', path, x, y)
@@ -156,6 +157,7 @@ class XYZTiles(datagrid, progressbar_joblib):
         import os
         import rasterio
         from rasterio.crs import CRS
+        from .utils_files import write_file
 
         infos = []
         for path, x, y in sorted(tiles, key=lambda tile: (tile[2], tile[1])):
@@ -206,10 +208,7 @@ class XYZTiles(datagrid, progressbar_joblib):
                f'  <SRS>{CRS.from_epsg(3857).to_wkt()}</SRS>\n'
                f'  <GeoTransform>{x0!r}, {tile_size / width!r}, 0.0, {y0!r}, 0.0, {-tile_size / height!r}</GeoTransform>\n'
                + ''.join(body) + '</VRTDataset>\n')
-        tmp = vrt_path + '.tmp'
-        with open(tmp, 'w') as f:
-            f.write(xml)
-        os.replace(tmp, vrt_path)
+        write_file(vrt_path, xml)
 
     def _read_vrt(self, vrt_path, bounds, geometry, fill_value):
         """The mosaic of the indexed tiles, cropped to the bounds and reprojected as the geometry asks."""
@@ -314,6 +313,7 @@ class XYZTiles(datagrid, progressbar_joblib):
         from glob import glob
         from tqdm.auto import tqdm
         import joblib
+        from .utils_files import exists
 
         if filename is not None and filename.lower().endswith('.nc'):
             vrt = os.path.splitext(filename)[0] + '.vrt'
@@ -345,6 +345,11 @@ class XYZTiles(datagrid, progressbar_joblib):
         joblib_backend = 'sequential' if n_jobs is None or debug else None
 
         try:
+            # every tile of the zoom in the folder is indexed below; an empty one raises before any download
+            stored = [path for path in glob(os.path.join(tiles_dir, str(zoom), '*', '*'))
+                      if not path.endswith(('.missing', '.tmp'))]
+            for path in stored:
+                exists(path)
             cells = [(x, y) for x in range(x_start, x_end + 1) for y in range(y_start, y_end + 1)]
             with self.progressbar_joblib(tqdm(desc='Downloading Map Tiles'.ljust(25), total=len(cells))) as progress_bar:
                 results = joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(self._download_tile)\

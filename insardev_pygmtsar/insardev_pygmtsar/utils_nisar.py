@@ -22,6 +22,43 @@ from scipy import constants
 SOL = constants.speed_of_light
 
 
+def _nisar_epoch(ds):
+    """The UTC epoch of a NISAR time dataset from its units ("seconds since 2025-10-25T00:00:00"), or None."""
+    units = ds.attrs.get('units')
+    if units is None:
+        return None
+    units = units.decode() if isinstance(units, bytes) else str(units)
+    if 'since' not in units:
+        return None
+    try:
+        return datetime.fromisoformat(units.split('since', 1)[1].strip().replace(' ', 'T')[:19])
+    except ValueError:
+        return None
+
+
+def nisar_start_time(f) -> tuple:
+    """
+    Zero-Doppler time of the first SLC line of an open NISAR RSLC file.
+
+    It is swaths/zeroDopplerTime[0] on the epoch of its units. identification/zeroDopplerStartTime is not used:
+    it is the uncropped frame's start in bbox crops downloaded by insardev_toolkit before it set the crop's own.
+
+    Returns
+    -------
+    tuple
+        (day, sec): the UTC day of the first line (datetime at midnight) and its seconds of that day (float64).
+    """
+    zdt = f['science/LSAR/RSLC/swaths/zeroDopplerTime']
+    epoch = _nisar_epoch(zdt)
+    if epoch is None:
+        raise ValueError(f"{f.filename}: swaths/zeroDopplerTime has no 'seconds since <UTC epoch>' units, so the "
+                         f"time of the first line is unknown")
+    day = epoch.replace(hour=0, minute=0, second=0, microsecond=0)
+    sec = (epoch - day).total_seconds() + float(zdt[0])
+    days = int(np.floor(sec / 86400.0))
+    return day + timedelta(days=days), sec - days * 86400.0
+
+
 def nisar_orbit(h5_path: str, t1: float = None, t2: float = None) -> pd.DataFrame:
     """
     Extract orbit state vectors from NISAR HDF5 file.
@@ -38,6 +75,12 @@ def nisar_orbit(h5_path: str, t1: float = None, t2: float = None) -> pd.DataFram
     t2 : float, optional
         End time as year.day_fraction for filtering
 
+    Raises
+    ------
+    ValueError
+        The orbit cannot be used (utils_satellite.orbit_defect): its state vectors do not cover the scene's
+        first to last line, have a gap, or one is not finite.
+
     Returns
     -------
     pd.DataFrame
@@ -47,7 +90,9 @@ def nisar_orbit(h5_path: str, t1: float = None, t2: float = None) -> pd.DataFram
         - isec: seconds of day
         - px, py, pz: ECEF position (meters)
         - vx, vy, vz: ECEF velocity (m/s)
-        - clock: seconds from Jan 1 of the year (for interpolation)
+        - clock: seconds from Jan 1 of the scene year (for interpolation), continuous through
+          midnight and Jan 1 (a vector of the next year counts on from day 365/366, one of the
+          previous year from day -1), like t1/t2 and PRM clock_start
 
         DataFrame.attrs contains metadata:
         - nd: number of records
@@ -56,33 +101,48 @@ def nisar_orbit(h5_path: str, t1: float = None, t2: float = None) -> pd.DataFram
     import h5py
 
     with h5py.File(h5_path, 'r') as f:
-        # Get reference date from zeroDopplerStartTime
-        ident = f['science/LSAR/identification']
-        zdt_start_str = ident['zeroDopplerStartTime'][()].decode() if isinstance(
-            ident['zeroDopplerStartTime'][()], bytes) else str(ident['zeroDopplerStartTime'][()])
-        # Format: "2025-11-22T02:46:18.000000000"
-        ref_date = datetime.strptime(zdt_start_str.split('T')[0], '%Y-%m-%d')
+        # Reference date: the day of the first SLC line
+        ref_date, _ = nisar_start_time(f)
 
         # Orbit data
         orbit_grp = f['science/LSAR/RSLC/metadata/orbit']
-        # Orbit time is seconds since midnight UTC of the acquisition day
+        # Orbit time is seconds since the epoch of its units, midnight UTC of the frame's acquisition day
         orbit_time = orbit_grp['time'][:]  # shape (N,)
+        epoch = _nisar_epoch(orbit_grp['time'])
+        if epoch is None:
+            print(f"WARNING: {h5_path}: metadata/orbit/time has no 'seconds since <UTC epoch>' units; its epoch is "
+                  f"taken as midnight UTC of the first line's day ({ref_date.date()}).")
+            epoch = ref_date
         position = orbit_grp['position'][:]  # shape (N, 3) - ECEF XYZ
         velocity = orbit_grp['velocity'][:]  # shape (N, 3) - ECEF XYZ
+        # the zero-Doppler times of the scene's first and last lines: the orbit must cover them
+        zdt = f['science/LSAR/RSLC/swaths/zeroDopplerTime']
+        scene = [_nisar_epoch(zdt) + timedelta(seconds=float(zdt[i])) for i in (0, -1)]
+
+    def unusable(defect):
+        return ValueError(f'ERROR: Orbit of scene file {h5_path} {defect} the scene ({ref_date.date()}). '
+                          f'Delete the scene file and download it again.')
+
+    # t1/t2 count the days of the scene year (year * 1000 + day), running below day 0 or past Dec 31 when the
+    # record crosses Jan 1: the vectors of the other year are put on that count too, and so is 'clock'
+    year0 = ref_date.year
 
     records = []
     for i in range(len(orbit_time)):
-        # Convert orbit time (seconds since midnight) to absolute datetime
+        # Convert orbit time (seconds since the epoch) to absolute datetime
         sec_of_day = float(orbit_time[i])
-        dt = ref_date + timedelta(seconds=sec_of_day)
+        dt = epoch + timedelta(seconds=sec_of_day)
 
         # Convert to year, julian day, seconds (GMTSAR format)
         year = dt.year
         jd = dt.timetuple().tm_yday - 1  # 0-based julian day
         sec = dt.hour * 3600 + dt.minute * 60 + dt.second + dt.microsecond / 1e6
 
-        # Year.day_fraction for filtering
-        ydf = year * 1000 + jd + sec / 86400.0
+        # Year.day_fraction for filtering, on the day count of t1/t2
+        if year == year0:
+            ydf = year * 1000 + jd + sec / 86400.0
+        else:
+            ydf = year0 * 1000 + (jd + (datetime(year, 1, 1) - datetime(year0, 1, 1)).days) + sec / 86400.0
 
         # Filter by time range if specified
         if t1 is not None and ydf < t1:
@@ -103,12 +163,21 @@ def nisar_orbit(h5_path: str, t1: float = None, t2: float = None) -> pd.DataFram
         })
 
     if len(records) == 0:
-        raise ValueError(f'No orbit data found in NISAR file: {h5_path}')
+        raise unusable('does not cover')
 
     df = pd.DataFrame(records)
 
-    # Compute clock (seconds from Jan 1) for interpolation
-    df['clock'] = (24 * 60 * 60) * df['id'] + df['isec']
+    # Compute clock (seconds from Jan 1 of the scene year, continuous through Jan 1) for interpolation
+    day = df['id']
+    if (df['iy'] != year0).any():
+        day = day + [(datetime(int(y), 1, 1) - datetime(year0, 1, 1)).days for y in df['iy']]
+    df['clock'] = (24 * 60 * 60) * day + df['isec']
+
+    # an orbit that cannot be used raises: the state vectors must cover the scene, without a gap, and be finite
+    from .utils_satellite import orbit_defect
+    defect = orbit_defect(df, *[(t - datetime(year0, 1, 1)).total_seconds() for t in scene])
+    if defect is not None:
+        raise unusable(defect)
 
     # Store metadata
     if len(df) > 1:
@@ -192,17 +261,10 @@ def nisar_prm(h5_path: str, pol: str = 'HH', frequency: str = 'B') -> dict:
         prf = 1.0 / zdt_spacing
         num_lines = len(zdt)
 
-        # Convert zeroDopplerStartTime to clock_start (year.day_fraction)
-        zdt_start_str = ident['zeroDopplerStartTime'][()].decode() if isinstance(
-            ident['zeroDopplerStartTime'][()], bytes) else str(ident['zeroDopplerStartTime'][()])
-        # Format: "2025-11-22T02:46:18.000000000"
-        zdt_start = datetime.strptime(zdt_start_str.split('.')[0], '%Y-%m-%dT%H:%M:%S')
-        # Add fractional seconds
-        frac_sec = float('0.' + zdt_start_str.split('.')[1][:6]) if '.' in zdt_start_str else 0.0
-
-        year = zdt_start.year
-        jd = zdt_start.timetuple().tm_yday - 1  # 0-based
-        sec = zdt_start.hour * 3600 + zdt_start.minute * 60 + zdt_start.second + frac_sec
+        # The first line's time to clock_start (year.day_fraction)
+        day, sec = nisar_start_time(f)
+        year = day.year
+        jd = day.timetuple().tm_yday - 1  # 0-based
         clock_start = jd + sec / 86400.0
 
         # End time
@@ -336,75 +398,118 @@ def nisar_slc(h5_path: str, pol: str = 'HH', frequency: str = 'B',
     return slc.astype(np.complex64)
 
 
-def nisar_calibration(h5_path: str, pol: str = 'HH', frequency: str = 'B') -> dict:
+def nisar_doppler_centroid(h5_path: str, frequency: str, azi, rng):
     """
-    Read NISAR calibration LUTs from HDF5.
+    Doppler centroid of an RSLC band at swath positions, in cycles per line.
+
+    The azimuth spectrum of the RSLC is centred on the processor's Doppler centroid, stored in
+    science/LSAR/RSLC/metadata/processingInformation/parameters/frequency<X>/dopplerCentroid [Hz] over the
+    zeroDopplerTime x slantRange axes of the same group. It is the absolute value, ambiguity included (about
+    +950 Hz at a 1520 Hz line rate, 0.61-0.66 cycles per line), not the alias f - PRF: the band B minus band A
+    difference of the data's own spectral centroid follows the carrier ratio at the absolute value.
 
     Parameters
     ----------
     h5_path : str
         Path to NISAR RSLC HDF5 file
-    pol : str
-        Polarization ('HH', 'HV', 'VH', 'VV')
+    frequency : str
+        Frequency band ('A' or 'B')
+    azi, rng : float or array-like
+        0-based pixel-centre line and range bin of the swath, the transform's azi and rng (zeroDopplerTime[i] and
+        slantRange[j] are the centres of line i and bin j). Arrays (broadcast together) give one value per
+        position from one read of the LUT.
+
+    Returns
+    -------
+    float or numpy.ndarray
+        f_dc times zeroDopplerTimeSpacing at (azi, rng): the LUT interpolated bilinearly, held at its edges. A float
+        for scalar positions, else an array of their broadcast shape.
+    """
+    import h5py
+
+    root = 'science/LSAR/RSLC/'
+    with h5py.File(h5_path, 'r') as f:
+        grp = f[f'{root}metadata/processingInformation/parameters/frequency{frequency}']
+        values = grp['dopplerCentroid'][:].astype(np.float64)
+        # the band's own axes, else the shared ones of processingInformation/parameters
+        base = grp if 'zeroDopplerTime' in grp else f[f'{root}metadata/processingInformation/parameters']
+        lut_time = base['zeroDopplerTime'][:].astype(np.float64)
+        lut_range = base['slantRange'][:].astype(np.float64)
+        zdt0 = float(f[f'{root}swaths/zeroDopplerTime'][0])
+        dt = float(f[f'{root}swaths/zeroDopplerTimeSpacing'][()])
+        sw = f[f'{root}swaths/frequency{frequency}']
+        sr0 = float(sw['slantRange'][0])
+        dr = float(sw['slantRangeSpacing'][()])
+    assert values.shape == (len(lut_time), len(lut_range)), \
+        f'dopplerCentroid {values.shape} does not match its axes ({len(lut_time)}, {len(lut_range)})'
+    # increasing axes for the interpolation
+    if len(lut_time) > 1 and lut_time[-1] < lut_time[0]:
+        lut_time, values = lut_time[::-1], values[::-1]
+    if len(lut_range) > 1 and lut_range[-1] < lut_range[0]:
+        lut_range, values = lut_range[::-1], values[:, ::-1]
+    if np.any(np.diff(lut_time) <= 0) or np.any(np.diff(lut_range) <= 0):
+        raise ValueError(f'{h5_path}: dopplerCentroid axes of frequency{frequency} are not monotonic')
+    # the LUT axes as fractional line and bin indices of the swath
+    lines = (lut_time - zdt0) / dt
+    bins = (lut_range - sr0) / dr
+    if np.ndim(azi) == 0 and np.ndim(rng) == 0:
+        return float(np.interp(azi, lines, [np.interp(rng, bins, row) for row in values * dt]))
+    # per position the same two interpolations as above: in range on every LUT line, then in azimuth
+    azi, rng = np.broadcast_arrays(np.asarray(azi, dtype=np.float64), np.asarray(rng, dtype=np.float64))
+    on_lines = np.array([np.interp(rng.ravel(), bins, row) for row in values * dt])
+    out = np.array([np.interp(a, lines, on_lines[:, i]) for i, a in enumerate(azi.ravel())], dtype=np.float64)
+    return out.reshape(azi.shape)
+
+
+# the zero-Doppler time span of a full NISAR frame: a nominal constant (a full frame, e.g. track 172 frame 8, has
+# 53,200 lines over 34.999 s); only the telling of a full frame from a crop uses it
+NISAR_FRAME_SECONDS = 35.0
+
+
+def nisar_frame_fraction(h5_path: str, frequency: str) -> tuple:
+    """
+    The extent of an RSLC file against its full frame, per axis: (azimuth, range).
+
+    Azimuth: the swaths/zeroDopplerTime span over NISAR_FRAME_SECONDS (35 s, the nominal full frame). Range: the
+    swaths/frequency<X>/slantRange span over the full frame's slant-range span, which every RSLC carries exactly in
+    metadata/calibrationInformation/frequency<X>/noiseEquivalentBackscatter/slantRange (a crop keeps that axis whole;
+    it also follows modes with a narrower swath). A full frame gives about 1 on both axes, a crop less on the
+    cropped axis.
+
+    Parameters
+    ----------
+    h5_path : str
+        Path to NISAR RSLC HDF5 file
     frequency : str
         Frequency band ('A' or 'B')
 
     Returns
     -------
-    dict
-        Calibration data:
-        - scaleFactor: per-polarization calibration constant
-        - beta0: 2D LUT for beta0 (usually 1.0 everywhere)
-        - sigma0: 2D LUT for sigma0 conversion
-        - gamma0: 2D LUT for gamma0 conversion
-        - slantRange: 1D coordinate for LUT range dimension
-        - zeroDopplerTime: 1D coordinate for LUT azimuth dimension
-        - nesz: noise equivalent sigma-zero (if available)
+    tuple
+        (azimuth fraction, range fraction), floats.
 
-    Notes
-    -----
-    Calibration formulas:
-    - beta0 = |SLC|² / scaleFactor²
-    - sigma0 = beta0 * sigma0_LUT
-    - gamma0 = beta0 * gamma0_LUT
+    Raises
+    ------
+    ValueError
+        When the file has no full-frame slant-range axis: a full frame cannot be told from a crop without it.
     """
     import h5py
 
+    root = 'science/LSAR/RSLC/'
+    full = f'{root}metadata/calibrationInformation/frequency{frequency}/noiseEquivalentBackscatter/slantRange'
     with h5py.File(h5_path, 'r') as f:
-        # Per-polarization scale factor
-        sf_path = f'science/LSAR/RSLC/metadata/calibrationInformation/frequency{frequency}/{pol}/scaleFactor'
-        scale_factor = float(f[sf_path][()])
-
-        # Geometry calibration LUTs
-        geom = f['science/LSAR/RSLC/metadata/calibrationInformation/geometry']
-        beta0 = geom['beta0'][:]
-        sigma0 = geom['sigma0'][:]
-        gamma0 = geom['gamma0'][:]
-        lut_slant_range = geom['slantRange'][:]
-        lut_zdt = geom['zeroDopplerTime'][:]
-
-        # Noise equivalent backscatter (NESZ)
-        nesz_path = f'science/LSAR/RSLC/metadata/calibrationInformation/frequency{frequency}/noiseEquivalentBackscatter/{pol}'
-        if nesz_path in f:
-            nesz = f[nesz_path][:]
-            nesz_sr = f[f'science/LSAR/RSLC/metadata/calibrationInformation/frequency{frequency}/noiseEquivalentBackscatter/slantRange'][:]
-            nesz_zdt = f[f'science/LSAR/RSLC/metadata/calibrationInformation/frequency{frequency}/noiseEquivalentBackscatter/zeroDopplerTime'][:]
-        else:
-            nesz = None
-            nesz_sr = None
-            nesz_zdt = None
-
-    return {
-        'scaleFactor': scale_factor,
-        'beta0': beta0,
-        'sigma0': sigma0,
-        'gamma0': gamma0,
-        'slantRange': lut_slant_range,
-        'zeroDopplerTime': lut_zdt,
-        'nesz': nesz,
-        'nesz_slantRange': nesz_sr,
-        'nesz_zeroDopplerTime': nesz_zdt,
-    }
+        zdt = f[f'{root}swaths/zeroDopplerTime']
+        t0, t1 = float(zdt[0]), float(zdt[-1])
+        sr = f[f'{root}swaths/frequency{frequency}/slantRange']
+        r0, r1 = float(sr[0]), float(sr[-1])
+        if full not in f:
+            raise ValueError(f'{h5_path}: {full} is missing, so the full frame\'s slant-range extent is unknown and '
+                             f'a full frame cannot be told from a crop')
+        sr_full = f[full]
+        f0, f1 = float(sr_full[0]), float(sr_full[-1])
+    if not (np.isfinite(f1 - f0) and abs(f1 - f0) > 0):
+        raise ValueError(f'{h5_path}: {full} spans {f0}..{f1} m, not a valid full-frame slant-range extent')
+    return abs(t1 - t0) / NISAR_FRAME_SECONDS, abs(r1 - r0) / abs(f1 - f0)
 
 
 def nisar_burst(h5_path: str, pol: str = 'HH', frequency: str = 'B') -> tuple:

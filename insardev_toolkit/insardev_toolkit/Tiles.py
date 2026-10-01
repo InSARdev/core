@@ -22,6 +22,10 @@ class Tiles(datagrid, progressbar_joblib):
 
     No single merged file is written: `filename='dem.nc'` is replaced by `dem.vrt` with a warning. The DEM readers
     still take a merged NetCDF4 grid downloaded before.
+
+    A DEM download records the vertical datum of the provider's heights, which the served tiles do not declare,
+    as a compound CRS in the VRT and in each tile it writes: GLO EPSG:4326+3855 (EGM2008), SRTM and ALOS
+    EPSG:4326+5773 (EGM96). utils_geoid reads it back.
     """
 
     http_timeout = 30
@@ -62,11 +66,42 @@ class Tiles(datagrid, progressbar_joblib):
             'SN2x5': f'{"S" if lat<0 else "N"}{abs(lat) - (abs(lat) % 5):02}',
             'SN3x5': f'{"S" if lat<0 else "N"}{abs(lat) - (abs(lat) % 5):03}',
             'WE3x5': f'{"W" if lon<0 else "E"}{abs(lon) - (abs(lon) % 5):03}',
-            # 5 degree alternative grid when negative grid cells aligning differ (ALOS DEM)
+            # 5 degree grid named by the south-west corner of the block (ALOS DEM): S001..S005 are in S005,
+            # S006 in S010, W010 in W010
+            'SN2x5alt': f'{"S" if lat < 0 else "N"}{abs(lat // 5 * 5):02}',
+            'SN3x5alt': f'{"S" if lat < 0 else "N"}{abs(lat // 5 * 5):03}',
+            'WE3x5alt': f'{"W" if lon < 0 else "E"}{abs(lon // 5 * 5):03}'
+        }
+
+    @staticmethod
+    def _legacy_x5alt(lon, lat):
+        """The 5 degree folders of the rule used before the F14 fix, which put the negative multiples of 5 one
+        block too far (S005 in S010, W010 in W015). Kept only to recognise the .missing markers it made."""
+        return {
             'SN2x5alt': f'{"S" if lat < 0 else "N"}{(abs(lat) // 5 * 5 if lat >= 0 else (abs(lat) // 5 + 1) * 5):02}',
             'SN3x5alt': f'{"S" if lat < 0 else "N"}{(abs(lat) // 5 * 5 if lat >= 0 else (abs(lat) // 5 + 1) * 5):03}',
             'WE3x5alt': f'{"W" if lon < 0 else "E"}{(abs(lon) // 5 * 5 if lon >= 0 else (abs(lon) // 5 + 1) * 5):03}'
         }
+
+    @classmethod
+    def _marker_is_stale(cls, marker, tile_url, base_url, path_id, tile, product, lon, lat):
+        """
+        Whether a .missing marker says nothing about the tile's current URL, so the tile is checked again.
+
+        A marker records the URL that was not found. A marker without one was written before the F14 fix: it
+        is stale only where the folder rule of that time gave another URL than the current one, which is the
+        ALOS tiles at negative multiples of 5; every other marker without a URL is kept.
+        """
+        try:
+            with open(marker, errors='replace') as f:
+                checked = f.read().strip()
+        except OSError:
+            return True
+        if checked:
+            return checked != tile_url
+        params = cls._tile_params(product, lon, lat)
+        params.update(cls._legacy_x5alt(lon, lat))
+        return f'{base_url.format(**params)}/{path_id.format(**params)}/{tile}' != tile_url
 
     @staticmethod
     def _tile_name(tile_id, file_id, archive):
@@ -159,9 +194,10 @@ class Tiles(datagrid, progressbar_joblib):
 
     def _download_tile(self, base_url, path_id, tile_id, file_id, archive, filetype, product, lon, lat,
                        tiles_dir, skip_exist=True, retries=30, timeout_second=3, units=None, nodata=None,
-                       min_rate='100KB', min_rate_window=60, debug=False):
+                       min_rate='100KB', min_rate_window=60, debug=False, crs=None):
         """
-        Fetch one tile into `tiles_dir` as NetCDF4.
+        Fetch one tile into `tiles_dir` as NetCDF4, with the CRS `crs` (EPSG:4326 when None). A tile already on
+        disk is kept as it is.
 
         Returns
         -------
@@ -174,6 +210,7 @@ class Tiles(datagrid, progressbar_joblib):
         import zipfile
         from .HTTP import fetch, NotFound, MAGIC_ZIP, MAGIC_GZIP, MAGIC_TIFF, MAGIC_HDF5
         from . import utils_tiles
+        from .utils_files import exists, write_file
 
         params = self._tile_params(product, lon, lat)
         url = base_url.format(**params)
@@ -186,9 +223,11 @@ class Tiles(datagrid, progressbar_joblib):
         missing = out[:-3] + '.missing'
         if debug:
             print('DEBUG _download_tile:', tile_url, '->', out)
-        if skip_exist and os.path.exists(missing):
+        if skip_exist and os.path.exists(missing) and \
+                not self._marker_is_stale(missing, tile_url, base_url, path_id, tile, product, lon, lat):
             return ('missing', name)
-        if skip_exist and os.path.exists(out):
+        # an empty tile raises
+        if skip_exist and exists(out):
             try:
                 utils_tiles.tile_grid(out)
                 return ('tile', out)
@@ -212,13 +251,13 @@ class Tiles(datagrid, progressbar_joblib):
                 values, lats, lons = self._decode_geotiff(data, nodata=nodata)
             else:
                 values, lats, lons = self._decode_hgt(data, lon, lat, nodata=nodata if nodata is not None else -32768)
-            utils_tiles.write_tile(out, values, lats, lons, units=units, source=tile_url)
+            utils_tiles.write_tile(out, values, lats, lons, units=units, source=tile_url, crs=crs)
             if os.path.exists(missing):
                 os.remove(missing)
             return ('tile', out)
         except NotFound:
-            # offshore tiles are missed by design
-            open(missing, 'w').close()
+            # offshore tiles are missed by design; the marker records the URL that was checked
+            write_file(missing, tile_url)
             return ('missing', name)
         except Exception as e:
             return ('failed', name, f'{type(e).__name__}: {e}')
@@ -226,7 +265,7 @@ class Tiles(datagrid, progressbar_joblib):
     def download(self, base_url, path_id, tile_id, archive, filetype,
                   geometry, file_id=None, filename=None, product='1s',
                   n_jobs=4, joblib_backend='loky', skip_exist=True, retries=30, timeout_second=3,
-                  units=None, nodata=None, min_rate='100KB', min_rate_window=60, debug=False):
+                  units=None, nodata=None, min_rate='100KB', min_rate_window=60, debug=False, crs=None):
         """
         Download the tiles covering a geometry.
 
@@ -238,6 +277,10 @@ class Tiles(datagrid, progressbar_joblib):
             None: nothing is kept, the grid cropped to the geometry is returned in memory.
         nodata : float, optional
             Value of the served tiles that reads as NaN, besides the nodata the tiles declare themselves.
+        crs : str, optional
+            CRS written into the VRT and into each tile the download writes, e.g. 'EPSG:4326+3855' for heights on
+            the EGM2008 geoid; EPSG:4326 when None. Tiles already on disk are kept as they are. The vertical
+            datum is also the CF geoid_name attribute of the returned grid.
         min_rate : str or float, optional
             Bytes per second a tile download must keep, a size string such as '100KB' or a number, averaged over
             min_rate_window seconds, or it is retried; the rate every one of the n_jobs parallel downloads must
@@ -257,6 +300,7 @@ class Tiles(datagrid, progressbar_joblib):
         from tqdm.auto import tqdm
         import joblib
         from . import utils_tiles
+        from .utils_files import exists
 
         assert product in ['1s', '3s'], f'ERROR: product name is invalid: {product}. Expected names are "1s", "3s".'
 
@@ -307,12 +351,16 @@ class Tiles(datagrid, progressbar_joblib):
             joblib_backend = 'sequential'
 
         try:
+            # every tile in the folder is indexed below; an empty one raises before any download
+            for name in os.listdir(tiles_dir):
+                if name.endswith('.nc'):
+                    exists(os.path.join(tiles_dir, name))
             cells = [(x, y) for x in range(left, right + 1) for y in range(bottom, top + 1)]
             with self.progressbar_joblib(tqdm(desc=f'Downloading Raster Tiles'.ljust(25), total=len(cells))) as progress_bar:
                 results = joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(self._download_tile)\
                                     (base_url, path_id, tile_id, file_id, archive, filetype, product, x, y,
                                      tiles_dir, skip_exist, retries, timeout_second, units, nodata,
-                                     min_rate, min_rate_window, debug)\
+                                     min_rate, min_rate_window, debug, crs)\
                                     for x, y in cells)
 
             missing = sorted(r[1] for r in results if r[0] == 'missing')
@@ -335,6 +383,8 @@ class Tiles(datagrid, progressbar_joblib):
                 path = os.path.join(tiles_dir, name)
                 if not name.endswith('.nc') or not os.path.isfile(path):
                     continue
+                # an empty tile raises
+                exists(path)
                 try:
                     source = self._tile_source(path)
                 except Exception:
@@ -344,7 +394,7 @@ class Tiles(datagrid, progressbar_joblib):
                 print(f'NOTE: {len(skipped)} files in {tiles_dir} are not tiles of {provider} and are not indexed: '
                       f'{", ".join(os.path.basename(p) for p in skipped)}')
             try:
-                utils_tiles.write_vrt(vrt, tiles)
+                utils_tiles.write_vrt(vrt, tiles, crs=crs)
             except ValueError as e:
                 raise ValueError(f'{e}. Copernicus DEM tiles above 50 degrees of latitude have coarser longitude '
                                  f'spacing than the tiles below; consider using the SRTM DEM instead.') from None
@@ -353,9 +403,15 @@ class Tiles(datagrid, progressbar_joblib):
             da = utils_tiles.crop(utils_tiles.open_dem(vrt), crop)
             if filename is None:
                 da = da.load()
+                # the tiles are removed below, the grid in memory has no file
+                del da.attrs['source']
         finally:
             if workdir is not None:
                 shutil.rmtree(workdir, ignore_errors=True)
+        # the vertical datum travels with the grid, also when it is returned in memory only
+        geoid = utils_tiles.vertical_datum_name(crs)
+        if geoid is not None:
+            da.attrs['geoid_name'] = geoid
         # set CRS and spatial dimensions for rioxarray compatibility
         return self.spatial_ref(da, 4326)
 
@@ -366,9 +422,17 @@ class Tiles(datagrid, progressbar_joblib):
 
         land = Tiles().open('land.vrt')
         landmask = np.isfinite(land.rio.reproject(stack.crs))
+
+        The vertical datum the file declares (its compound CRS) is the CF geoid_name attribute of the grid. The
+        grid keeps the file as its source attribute: utils_geoid.dem_datum() of the grid is the datum of the file,
+        also for older downloads that record none.
         """
         from . import utils_tiles
-        return self.spatial_ref(utils_tiles.open_dem(filename), 4326)
+        da = utils_tiles.open_dem(filename)
+        geoid = utils_tiles.vertical_datum_name(utils_tiles.declared_crs(filename))
+        if geoid is not None:
+            da.attrs['geoid_name'] = geoid
+        return self.spatial_ref(da, 4326)
 
     def download_landmask(self, geometry, filename=None, product='1s', skip_exist=True, n_jobs=8, retries=30,
                           timeout_second=3, min_rate='100KB', min_rate_window=60, debug=False):
@@ -431,7 +495,11 @@ class Tiles(datagrid, progressbar_joblib):
                          units          = 'm',
                          min_rate       = min_rate,
                          min_rate_window = min_rate_window,
-                         debug          = debug)
+                         debug          = debug,
+                         # GLO-30/GLO-90 heights are on the EGM2008 geoid (EPSG:3855); the served tiles declare
+                         # EPSG:4326 only. Copernicus DEM Product Handbook, issue 5.0, §1.1 Table 1 and §1.2.1:
+                         # https://dataspace.copernicus.eu/sites/default/files/media/files/2024-06/geo1988-copernicusdem-spe-002_producthandbook_i5.0.pdf
+                         crs            = 'EPSG:4326+3855')
 
     # aws s3 ls --no-sign-request s3://elevation-tiles-prod/skadi/
     # https://s3.amazonaws.com/elevation-tiles-prod/skadi/N20/N20E000.hgt.gz
@@ -465,7 +533,14 @@ class Tiles(datagrid, progressbar_joblib):
                          nodata         = -32768,
                          min_rate       = min_rate,
                          min_rate_window = min_rate_window,
-                         debug          = debug)
+                         debug          = debug,
+                         # the Tilezen skadi tiles are "referenced to the WGS84/EGM96 geoid" (EPSG:5773):
+                         # https://github.com/tilezen/joerd/blob/master/docs/formats.md (section Skadi), built from
+                         # SRTMGL1 v3, whose heights are EGM96: https://lpdaac.usgs.gov/documents/179/SRTM_User_Guide_V3.pdf
+                         # (§2.1.4). Inside the USA the skadi tiles hold USGS NED/3DEP heights on NAVD88 instead
+                         # (https://github.com/tilezen/joerd/blob/master/docs/data-sources.md); they are recorded
+                         # as EGM96 too.
+                         crs            = 'EPSG:4326+5773')
 
     # Define new method to download ALOS DEM
     # https://www.eorc.jaxa.jp/ALOS/aw3d30/data/release_v2404/N025E040/N027E042.zip N027E042/ALPSMLC30_N027E042_DSM.tif
@@ -497,7 +572,13 @@ class Tiles(datagrid, progressbar_joblib):
                              nodata         = -9999,
                              min_rate       = min_rate,
                              min_rate_window = min_rate_window,
-                             debug          = debug)
+                             debug          = debug,
+                             # AW3D30 heights are converted to orthometric heights with the EGM96 geoid
+                             # (EPSG:5773); the DSM GeoTIFF declares EPSG:4326 only, the geoid is named in the
+                             # tile's HDR.txt header ('NGA-EGM96'; the description also allows 'GSI-2000' in Japan).
+                             # AW3D30 v4.1 product description §2.1 Table 1, §2.4 Table 3:
+                             # https://www.eorc.jaxa.jp/ALOS/en/dataset/aw3d30/data/aw3d30v4.1_product_e_1.0.pdf
+                             crs            = 'EPSG:4326+5773')
 
     def download_dem(self, geometry, filename=None, product='1s', provider='GLO', skip_exist=True, n_jobs=8,
                      retries=30, timeout_second=3, min_rate='100KB', min_rate_window=60, debug=False):
@@ -516,6 +597,8 @@ class Tiles(datagrid, progressbar_joblib):
             The resolution of the DEM. Valid options are '1s' (for 30m) and '3s' (for 90m). Default is '1s'.
         provider : str, optional
             The provider of the DEM. Valid options are 'GLO' (for Copernicus Global Land Service), 'SRTM', and 'ALOS'. Default is 'GLO'.
+            The heights are on the EGM2008 geoid for GLO and on the EGM96 geoid for SRTM and ALOS; the VRT and the
+            tiles record it as a compound CRS.
         skip_exist : bool, optional
             If True, keeps the tiles already downloaded. Default is True.
         n_jobs : int, optional

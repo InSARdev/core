@@ -39,9 +39,9 @@ class Nisar_slc(Satellite):
         import re
         import pandas as pd
         import geopandas as gpd
-        from datetime import datetime
+        from datetime import datetime, timedelta
         import h5py
-        from .utils_nisar import nisar_get_frequencies, nisar_get_polarizations
+        from .utils_nisar import nisar_get_frequencies, nisar_get_polarizations, nisar_start_time
 
         self.datadir = datadir
         # a DEM file name is resolved here once: a dem.nc that the downloader replaced by dem.vrt is read from
@@ -50,6 +50,10 @@ class Nisar_slc(Satellite):
             from insardev_toolkit import utils_tiles
             DEM = utils_tiles.resolve(DEM)
         self.DEM = DEM
+        # its vertical datum as well (dem_datum()): a DEM without one warns here, and a DEM of a vertical datum that
+        # is not supported, or mixing providers, raises before any processing
+        if DEM is not None:
+            self.dem_datum()
         self.frequency = frequency
 
         # Scan for subdirectories with track_frame pattern (like S1)
@@ -69,9 +73,15 @@ class Nisar_slc(Satellite):
 
         if len(h5_files) == 0:
             raise ValueError(f'No Nisar HDF5 files found in {datadir} or subdirectories matching pattern {self.pattern_nisar}')
+        # an empty file raises before any file is read
+        from insardev_toolkit.utils_files import exists
+        for h5_file in h5_files:
+            exists(os.path.join(self.datadir, h5_file))
 
         records = []
         detected_frequency = None
+        # bbox crops whose identification/zeroDopplerStartTime is still the uncropped frame's start
+        frame_starts = []
 
         for h5_file in h5_files:
             h5_path = os.path.join(self.datadir, h5_file)
@@ -87,10 +97,18 @@ class Nisar_slc(Satellite):
                     look_dir = ident['lookDirection'][()].decode() if isinstance(
                         ident['lookDirection'][()], bytes) else str(ident['lookDirection'][()])
 
-                    # Get start time
+                    # Start time: the first SLC line's, to the whole second
+                    day, sec = nisar_start_time(f)
+                    start_time = day + timedelta(seconds=int(sec))
+                    # a bbox crop downloaded before the toolkit set the crop's own start keeps the frame's there
                     zdt_str = ident['zeroDopplerStartTime'][()].decode() if isinstance(
                         ident['zeroDopplerStartTime'][()], bytes) else str(ident['zeroDopplerStartTime'][()])
-                    start_time = datetime.strptime(zdt_str.split('.')[0], '%Y-%m-%dT%H:%M:%S')
+                    ident_start = datetime.strptime(zdt_str[:19], '%Y-%m-%dT%H:%M:%S')
+                    ident_frac = float('0.' + zdt_str[20:]) if len(zdt_str) > 20 else 0.0
+                    lines = (((day - ident_start).total_seconds() + sec - ident_frac)
+                             / float(f['science/LSAR/RSLC/swaths/zeroDopplerTimeSpacing'][()]))
+                    if abs(lines) >= 0.5:
+                        frame_starts.append(f'{h5_file} ({lines:+.0f} lines)')
 
                     # Get available frequencies
                     available_freqs = nisar_get_frequencies(h5_path)
@@ -156,10 +174,16 @@ class Nisar_slc(Satellite):
                             'frame': frame,
                             'flightDirection': 'A' if orbit_dir.lower().startswith('a') else 'D',
                             'lookDirection': look_dir[0].upper(),
+                            'band': 'L',
                             'frequency': use_freq,
                             'geometry': geometry
                         }
                         records.append(record)
+
+        if frame_starts:
+            print(f"NOTE: identification/zeroDopplerStartTime is the uncropped frame's start, not the first line's "
+                  f"time, in {len(frame_starts)} bbox crop(s) downloaded before insardev_toolkit set a crop's own "
+                  f"start; the first line's time (swaths/zeroDopplerTime) is used: {', '.join(frame_starts)}.")
 
         if len(records) == 0:
             raise ValueError(f'No valid Nisar data found in {datadir}')
@@ -178,6 +202,24 @@ class Nisar_slc(Satellite):
         self.df = df
         # a record attribute, placed before the geometry, which is kept last as the long field
         self.df.insert(self.df.columns.get_loc('geometry'), 'BPR', self.baselines())
+
+    def _orbit_file(self, scene: str, record) -> str:
+        """
+        Return the file that holds the orbit of a scene from its record: the scene file itself.
+        """
+        return record['path'].iloc[0]
+
+    def _check_orbit_file(self, h5_path: str, scenes: list):
+        """
+        Check the orbit of a scene file as the processing reads it (utils_nisar.nisar_orbit), once for all the
+        records of the file (its polarizations).
+        """
+        from .utils_nisar import nisar_orbit
+        from insardev_toolkit.utils_files import exists
+
+        # a scene file emptied after the scan raises (utils_files.exists)
+        exists(h5_path)
+        nisar_orbit(h5_path)
 
     def _make_scene(self, scene: str, mode: int = 2, debug: bool = False):
         """
@@ -202,8 +244,12 @@ class Nisar_slc(Satellite):
         from .utils_nisar import nisar_prm, nisar_orbit, nisar_slc
         from .PRM import PRM
 
+        from insardev_toolkit.utils_files import exists
+
         record = self.get_record(scene)
         h5_path = record['path'].iloc[0]
+        # a scene file emptied after the scan raises (utils_files.exists)
+        exists(h5_path)
         pol = record.index.get_level_values(1)[0]
         frequency = self.frequency
 

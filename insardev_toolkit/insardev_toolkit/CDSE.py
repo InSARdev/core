@@ -14,6 +14,8 @@ Provides search and download capabilities for Sentinel-1 SLC bursts from the
 Copernicus Data Space Ecosystem, with API compatible with the ASF module.
 """
 from .progressbar_joblib import progressbar_joblib
+from .utils_S1 import path_number, S1_PLATFORMS, platform_names
+from .HTTP import send
 import requests
 
 # CDSE authentication constants
@@ -27,36 +29,64 @@ _CDSE_PAGE_SIZE = 1000
 _CDSE_CACHE_PROXY = 'https://s1-cache-cdse.insar.dev'
 
 
-def _cdse_query(params, pages=None):
+def _cdse_pages(params):
+    """Follow the @odata.nextLink pages of one catalogue query: the bursts read and the catalogue count of its matches."""
+    values, url, first, count = [], _CDSE_CATALOGUE_URL, True, None
+    while url is not None:
+        # the next link carries its own query, so pass params for the first request only
+        response = send(requests.get, url, params=dict(params, **{'$count': 'true'}) if first else None,
+                        timeout=(30, 300))
+        data = response.json()
+        if first:
+            count, first = data.get('@odata.count'), False
+        values += data.get('value', [])
+        url = data.get('@odata.nextLink')
+    return values, count
+
+
+def _cdse_query(params):
     """Query the CDSE catalogue and return all matching bursts.
 
     The catalogue never returns more than _CDSE_PAGE_SIZE bursts per request and reports the
     rest through an @odata.nextLink, so a query matching more bursts than that is silently
-    truncated unless the link is followed.
+    truncated unless the link is followed. The link stops at the catalogue's $skip limit of 10000
+    too, so a query ordered by 'ContentDate/Start desc' goes on from the start time of the last
+    burst read until one query is read whole; any other query matching more raises an error, and
+    so does a result with fewer distinct bursts than the first query matches.
 
     Parameters
     ----------
     params : dict
         OData parameters, e.g. {'$filter': '...', '$top': 1000}.
-    pages : int, optional
-        Maximum number of pages to read. None reads them all.
 
     Returns
     -------
     list
         List of CDSE burst records.
     """
-    values = []
-    url, page = _CDSE_CATALOGUE_URL, 0
-    while url is not None and (pages is None or page < pages):
-        # the next link carries its own query, so pass params for the first request only
-        response = requests.get(url, params=params if page == 0 else None, timeout=(30, 300))
-        response.raise_for_status()
-        data = response.json()
-        values += data.get('value', [])
-        url = data.get('@odata.nextLink')
-        page += 1
-    return values
+    values, ids, query, total = [], set(), params, None
+    while True:
+        more, count = _cdse_pages(query)
+        # the bursts the first query matches, which the continuations have to read in all
+        total = count if total is None else total
+        new = [v for v in more if v['Id'] not in ids]
+        values += new
+        ids.update(v['Id'] for v in new)
+        if count is None:
+            print(f'WARNING: the CDSE catalogue gave no @odata.count, so {len(values)} bursts are returned '
+                  f'without knowing whether the query matches more')
+            return values
+        if len(more) >= count:
+            if len(ids) < total:
+                raise ValueError(f'ERROR: the CDSE catalogue returned {len(ids)} distinct bursts of the {total} '
+                                 f'matching the query: narrow the query.')
+            return values
+        if params.get('$orderby') != 'ContentDate/Start desc' or not new:
+            raise ValueError(f'ERROR: the CDSE catalogue returned {len(more)} of the {count} bursts matching the '
+                             f'query and pages no further: narrow the query.')
+        # the bursts at and before the last start time read, which are read again and dropped
+        after = f"ContentDate/Start le {more[-1]['ContentDate']['Start']}"
+        query = dict(params, **{'$filter': f"({params['$filter']}) and {after}" if params.get('$filter') else after})
 
 
 class _CDSESession(requests.Session):
@@ -85,7 +115,9 @@ class _CDSESession(requests.Session):
         _CDSESession
             Self, for method chaining.
         """
-        response = self.post(
+        # (connect, read) timeouts, as the other toolkit requests (HTTP.fetch, the Earthdata token POST of ASF)
+        response = send(
+            self.post,
             _CDSE_TOKEN_URL,
             data={
                 "client_id": _CDSE_CLIENT_ID,
@@ -93,8 +125,8 @@ class _CDSESession(requests.Session):
                 "password": password,
                 "grant_type": "password",
             },
+            timeout=(10, 300),
         )
-        response.raise_for_status()
 
         self._token = response.json()["access_token"]
         self.headers["Authorization"] = f"Bearer {self._token}"
@@ -108,7 +140,7 @@ class _CDSESession(requests.Session):
 
 def _cdse_search(start=None, end=None, flightDirection=None, intersectsWith=None,
                  polarization=None, swath=None, burstId=None, relativeOrbit=None,
-                 top=1000):
+                 beamMode=None, platform=None):
     """Search CDSE catalog for Sentinel-1 bursts.
 
     Parameters
@@ -129,13 +161,16 @@ def _cdse_search(start=None, end=None, flightDirection=None, intersectsWith=None
         Burst ID number.
     relativeOrbit : int, optional
         Relative orbit number.
-    top : int, optional
-        Maximum results (default 1000).
+    beamMode : str, optional
+        'IW' or 'EW', the OperationalMode of the burst.
+    platform : str or list, optional
+        'SENTINEL-1' for every satellite, or 'SENTINEL-1A' .. 'SENTINEL-1D' for one, as ASF names them. A list or a
+        comma-separated string names several.
 
     Returns
     -------
     list
-        List of burst metadata dictionaries.
+        List of burst metadata dictionaries, every match.
     """
     filters = []
 
@@ -176,15 +211,28 @@ def _cdse_search(start=None, end=None, flightDirection=None, intersectsWith=None
     if relativeOrbit is not None:
         filters.append(f"RelativeOrbitNumber eq {relativeOrbit}")
 
+    if beamMode:
+        filters.append(f"OperationalMode eq '{beamMode.upper()}'")
+
+    if platform:
+        # the catalog names a satellite by its serial letter, 'SENTINEL-1C' -> 'C'; 'SENTINEL-1' is every one of them
+        names = [name.upper() for name in platform_names(platform)]
+        for name in names:
+            if name not in S1_PLATFORMS:
+                raise ValueError(f"ERROR: unknown platform {name!r}, expected 'SENTINEL-1' or 'SENTINEL-1A' .. "
+                                 f"'SENTINEL-1D'")
+        if 'SENTINEL-1' not in names:
+            filters.append('(' + ' or '.join(f"PlatformSerialIdentifier eq '{name[-1]}'" for name in names) + ')')
+
     params = {
-        '$top': top,
+        '$top': _CDSE_PAGE_SIZE,
         '$orderby': 'ContentDate/Start desc',
     }
     if filters:
         params['$filter'] = ' and '.join(filters)
 
-    # top is the limit the caller asked for, so a single page is exactly what is wanted
-    return _cdse_query(params, pages=1)
+    # the catalog returns the matches a page at a time, so every page is read
+    return _cdse_query(params)
 
 
 def _parse_asf_burst_id(burst_id):
@@ -254,7 +302,8 @@ def _make_asf_burst_id(cdse_burst):
         uuid = cdse_burst.get('Id', '0000')
         scene_hash = uuid[-4:].upper()
 
-    return f"S1_{burst_id}_{swath}_{dt_str}_{polarization}_{scene_hash}-BURST"
+    # the burst ID is zero-padded to 6 digits, as ASF names it
+    return f"S1_{int(burst_id):06d}_{swath}_{dt_str}_{polarization}_{scene_hash}-BURST"
 
 
 def _cdse_to_geojson_feature(cdse_burst):
@@ -276,8 +325,12 @@ def _cdse_to_geojson_feature(cdse_burst):
     # Build ASF-compatible burst ID
     file_id = _make_asf_burst_id(cdse_burst)
 
-    # Extract relative orbit for path number
+    # the relative orbit of the product, which the ASF catalog reports as pathNumber too
     rel_orbit = cdse_burst.get('RelativeOrbitNumber', 0)
+    beam_mode = cdse_burst.get('OperationalMode', 'IW')
+    # the path of the burst directory: path_number() gives it from an IW burst ID, and a burst of another mode
+    # keeps the relative orbit of the product
+    path = path_number(cdse_burst['BurstId']) if beam_mode == 'IW' else rel_orbit
 
     # CDSE returns single-letter platform ('A','B','C','D'); ASF uses 'SENTINEL-1A'/'SENTINEL-1C'/...
     platform_letter = cdse_burst.get('PlatformSerialIdentifier', 'A')
@@ -295,9 +348,11 @@ def _cdse_to_geojson_feature(cdse_burst):
         'polarization': cdse_burst.get('PolarisationChannels', 'VV'),
         'platform': platform,
         'processingLevel': 'BURST',
-        'beamModeType': cdse_burst.get('OperationalMode', 'IW'),
+        'beamModeType': beam_mode,
         'burst': {
-            'fullBurstID': f"{rel_orbit:03d}_{cdse_burst.get('BurstId')}_{cdse_burst.get('SwathIdentifier', 'IW1')}",
+            # the burst directory, named as ASF names it: the path, which for an IW burst differs from the relative
+            # orbit of a product that starts before the ascending node, and the zero-padded burst ID
+            'fullBurstID': f"{path:03d}_{int(cdse_burst['BurstId']):06d}_{cdse_burst.get('SwathIdentifier', 'IW1')}",
             'burstIndex': cdse_burst.get('BurstId', 0),
             'subswath': cdse_burst.get('SwathIdentifier', 'IW1'),
             'absoluteBurstID': cdse_burst.get('AbsoluteBurstId', 0),
@@ -365,26 +420,6 @@ class CDSE(progressbar_joblib):
         if username is None:
             print("NOTE: Using insar.dev Cache API. Free for non-commercial use; license required for funded academic, institutional, or professional use.")
 
-    @staticmethod
-    def _normalize_polarization(polarization):
-        """Convert polarization to list format.
-
-        Parameters
-        ----------
-        polarization : None, str, or list
-            Polarization specification.
-
-        Returns
-        -------
-        list or None
-            None if input is None, otherwise list of uppercase polarizations.
-        """
-        if polarization is None:
-            return None
-        if isinstance(polarization, str):
-            return [polarization.upper()]
-        return [p.upper() for p in polarization]
-
     def _get_session(self):
         """Get authenticated session for CDSE downloads."""
         import time
@@ -422,12 +457,13 @@ class CDSE(progressbar_joblib):
             Stop date (YYYY-MM-DD or ISO format).
         flightDirection : str, optional
             'A'/'ASCENDING' or 'D'/'DESCENDING'.
-        platform : str, optional
-            Platform name (default 'SENTINEL-1').
+        platform : str or list, optional
+            'SENTINEL-1' (default) for every satellite, or 'SENTINEL-1A' .. 'SENTINEL-1D' for one, as in ASF.search. A
+            list or a comma-separated string names several.
         polarization : str, optional
             Polarization (default 'VV').
         beamMode : str, optional
-            Beam mode (default 'IW').
+            Beam mode, 'IW' (default) or 'EW'. None searches every mode.
 
         Returns
         -------
@@ -464,6 +500,8 @@ class CDSE(progressbar_joblib):
             flightDirection=flightDirection,
             intersectsWith=geometry.wkt,
             polarization=polarization,
+            beamMode=beamMode,
+            platform=platform,
         )
 
         # Convert to GeoJSON features
@@ -522,8 +560,10 @@ class CDSE(progressbar_joblib):
         if len(polarizations) == 1:
             filters.append(f"PolarisationChannels eq '{polarizations[0]}'")
 
+        # ordered by start time, so that a query matching more bursts than the catalogue pages goes on from the last
         params = {
             '$top': _CDSE_PAGE_SIZE,
+            '$orderby': 'ContentDate/Start desc',
             '$filter': ' and '.join(filters),
         }
 
@@ -546,7 +586,7 @@ class CDSE(progressbar_joblib):
 
     def download(self, basedir, bursts, polarization=None, session=None, n_jobs=4,
                  joblib_backend='loky', skip_exist=True, retries=30, timeout_second=3,
-                 debug=False):
+                 min_rate='100KB', min_rate_window=60, debug=False):
         """Download Sentinel-1 bursts from CDSE.
 
         Parameters
@@ -556,7 +596,7 @@ class CDSE(progressbar_joblib):
         bursts : str or list
             Burst identifiers (ASF format).
         polarization : str or list, optional
-            Polarization(s) to download.
+            Polarization(s) to download. An empty list raises a ValueError.
         session : requests.Session, optional
             Authenticated session.
         n_jobs : int, optional
@@ -566,9 +606,16 @@ class CDSE(progressbar_joblib):
         skip_exist : bool, optional
             Skip already downloaded (default True).
         retries : int, optional
-            Retry attempts (default 30).
+            Attempts of each burst, the first one included; 0 makes one attempt, as 1 does (HTTP.attempts). A
+            failure that a retry cannot change (HTTP.final, such as HTTP 404) is not retried. Default 30.
         timeout_second : int, optional
             Seconds between retries (default 3).
+        min_rate : str or float, optional
+            Bytes per second a burst download must keep, a size string such as '100KB' or a number, averaged over
+            min_rate_window seconds from its first byte, or it is retried on a new connection (HTTP.read_body); the
+            rate every one of the n_jobs parallel downloads must reach. Default '100KB'.
+        min_rate_window : float, optional
+            Seconds over which the rate is averaged. Default 60.
         debug : bool, optional
             Print debug info (default False).
 
@@ -585,7 +632,14 @@ class CDSE(progressbar_joblib):
         from tqdm.auto import tqdm
         import time
         import warnings
+        from .utils_files import EmptyFileError
+        from .utils_S1 import polarizations
+        from .HTTP import final, attempts
         warnings.filterwarnings("ignore", category=UserWarning)
+
+        # a negative retries and an empty polarization list raise before any file is checked or downloaded
+        attempts(retries)
+        pols = polarizations(polarization)
 
         # Normalize bursts to list
         if isinstance(bursts, str):
@@ -598,15 +652,14 @@ class CDSE(progressbar_joblib):
             print("No valid S1 bursts to download")
             return None
 
-        # Normalize and expand bursts by polarization if specified
-        polarizations = self._normalize_polarization(polarization)
-        if polarizations is not None:
+        # Expand bursts by polarization if specified
+        if pols is not None:
             expanded_bursts = []
             for burst in bursts:
                 # S1_262885_IW2_20190702T032452_VV_69C5-BURST
                 #                              ^^ pol at position 4
                 parts = burst.split('_')
-                for pol in polarizations:
+                for pol in pols:
                     new_parts = parts.copy()
                     new_parts[4] = pol  # Replace polarization
                     new_burst = '_'.join(new_parts)
@@ -665,18 +718,13 @@ class CDSE(progressbar_joblib):
             """Download and extract single burst with full ASF-compatible XML filtering."""
             import requests
             import xmltodict
-            from datetime import datetime, timedelta
+            from datetime import datetime
             from tifffile import TiffFile
             import rasterio
             from rasterio.io import MemoryFile
-            from .utils_S1 import measurement_path, slc_shape, write_slc
-
-            def filter_azimuth_time(items, start_utc_dt, stop_utc_dt, delta=3):
-                if not isinstance(items, list):
-                    items = [items]
-                return [item for item in items if
-                    datetime.strptime(item['azimuthTime'], '%Y-%m-%dT%H:%M:%S.%f') >= start_utc_dt - timedelta(seconds=delta) and
-                    datetime.strptime(item['azimuthTime'], '%Y-%m-%dT%H:%M:%S.%f') <= stop_utc_dt + timedelta(seconds=delta)]
+            from .utils_S1 import measurement_path, slc_shape, write_slc, burst_xmls, PAIRS_TIFF_OFFSET
+            from .utils_files import exists, write_file
+            from .HTTP import send, http_error, NotFound, read_body
 
             props = result.geojson()['properties']
             burst = props['fileID']
@@ -691,21 +739,22 @@ class CDSE(progressbar_joblib):
             xml_annot_dir = os.path.join(burst_dir, 'annotation')
             xml_noise_dir = os.path.join(burst_dir, 'noise')
             xml_calib_dir = os.path.join(burst_dir, 'calibration')
-            xml_file = os.path.join(xml_annot_dir, f'{burst}.xml')
-            xml_noise_file = os.path.join(xml_noise_dir, f'{burst}.xml')
-            xml_calib_file = os.path.join(xml_calib_dir, f'{burst}.xml')
-            # the burst is stored as <burst>.nc; bursts downloaded before keep their <burst>.tiff
-            nc_file = os.path.join(tif_dir, f'{burst}.nc')
+
+            def burst_files(burst):
+                # the annotation, noise and calibration XMLs; the burst is stored as <burst>.nc
+                return (os.path.join(xml_annot_dir, f'{burst}.xml'), os.path.join(xml_noise_dir, f'{burst}.xml'),
+                        os.path.join(xml_calib_dir, f'{burst}.xml'), os.path.join(tif_dir, f'{burst}.nc'))
+
+            xml_file, xml_noise_file, xml_calib_file, nc_file = burst_files(burst)
+            # bursts downloaded before keep their <burst>.tiff
             tif_file = measurement_path(tif_dir, burst)
 
             for dirname in [burst_dir, tif_dir, xml_annot_dir, xml_noise_dir, xml_calib_dir]:
                 os.makedirs(dirname, exist_ok=True)
 
-            # Check if all files already exist and validate
-            all_exist = (os.path.exists(tif_file) and os.path.getsize(tif_file) > 0
-                        and os.path.exists(xml_file) and os.path.getsize(xml_file) > 0
-                        and os.path.exists(xml_noise_file) and os.path.getsize(xml_noise_file) > 0
-                        and os.path.exists(xml_calib_file) and os.path.getsize(xml_calib_file) > 0)
+            # Check if all files already exist and validate; every one is checked before any download, so that an
+            # empty one raises
+            all_exist = all([exists(filepath) for filepath in (tif_file, xml_file, xml_noise_file, xml_calib_file)])
 
             if all_exist:
                 with open(xml_file, 'r') as f:
@@ -728,31 +777,32 @@ class CDSE(progressbar_joblib):
                 headers = {'Authorization': f'Bearer {auth_token}'}
 
                 # Initial request
-                response = requests.post(url, headers=headers, allow_redirects=False, timeout=30)
+                response = send(requests.post, url, headers=headers, allow_redirects=False, timeout=30,
+                                stream=True, check=False)
 
                 # Handle redirect (CDSE redirects to bursts.dataspace.copernicus.eu)
                 if 300 <= response.status_code < 400:
                     redirect_url = response.headers.get('Location')
                     if redirect_url:
+                        response.close()
                         # Follow redirect with auth header, allow further redirects
-                        response = requests.post(redirect_url, headers=headers,
-                                                timeout=(10, 300), allow_redirects=True)
+                        response = send(requests.post, redirect_url, what=url, headers=headers,
+                                        timeout=(10, 300), allow_redirects=True, stream=True, check=False)
             else:
                 # Cache proxy - simple GET
-                response = session.get(url, timeout=(10, 300))
+                response = send(session.get, url, timeout=(10, 300), stream=True, check=False)
 
-            if response.status_code != 200:
-                try:
-                    error_body = response.text[:500] if response.text else 'No response body'
-                except:
-                    error_body = 'Could not read response body'
-                raise Exception(f"CDSE {response.status_code} {response.reason}: {error_body}")
+            with response:
+                if response.status_code != 200:
+                    # an HTTPError with its response, so that HTTP.final judges the status
+                    raise http_error(response, url)
 
-            # Get cache status for debug output
-            cache_status = response.headers.get('cf-cache-status', response.headers.get('x-cache', 'N/A'))
-            cache_enc = response.headers.get('content-encoding', 'none')
+                # Get cache status for debug output
+                cache_status = response.headers.get('cf-cache-status', response.headers.get('x-cache', 'N/A'))
+                cache_enc = response.headers.get('content-encoding', 'none')
 
-            zip_bytes = response.content
+                # a transfer slower than min_rate is cut (HTTP.read_body) and retried on a new connection
+                zip_bytes = read_body(response, min_rate, min_rate_window)
             if len(zip_bytes) == 0:
                 raise Exception(f'ERROR: Downloaded ZIP is empty for {burst}')
 
@@ -813,10 +863,11 @@ class CDSE(progressbar_joblib):
             # the archive is not needed anymore, and the conversion below must not hold it in memory
             del zip_bytes, archive
 
+            # a file missing from an archive that opens is final (HTTP.final), a retry delivers the same archive
             if not tiff_bytes:
-                raise Exception(f'ERROR: No TIFF found in ZIP for {burst}')
+                raise NotFound(f'No TIFF in the CDSE archive of {burst}')
             if not annotation_xml:
-                raise Exception(f'ERROR: No annotation XML found in ZIP for {burst}')
+                raise NotFound(f'No annotation XML in the CDSE archive of {burst}')
 
             # Validate TIFF magic bytes
             if tiff_bytes[:2] not in (b'II', b'MM'):
@@ -838,7 +889,6 @@ class CDSE(progressbar_joblib):
             with TiffFile(io.BytesIO(tiff_bytes)) as tif:
                 page = tif.pages[0]
                 actual_lines, actual_samples = page.shape
-                tiff_offset = page.dataoffsets[0]
             if actual_lines != lines_per_burst or actual_samples != samples_per_burst:
                 raise Exception(f'ERROR: Downloaded TIFF dimensions mismatch for {burst}: '
                               f'got {actual_lines}x{actual_samples}, expected {lines_per_burst}x{samples_per_burst}. '
@@ -854,14 +904,12 @@ class CDSE(progressbar_joblib):
                     _ = ds.read(1, window=rasterio.windows.Window(0, 0, min(100, ds.width), min(100, ds.height)))
 
             # Get burst timing info
-            azimuth_time_interval = annotation['imageAnnotation']['imageInformation']['azimuthTimeInterval']
             burst_list = annotation['swathTiming']['burstList']['burst']
             if not isinstance(burst_list, list):
                 burst_list = [burst_list]
 
             # CDSE returns single burst - burstIndex is always 0
             assert len(burst_list) == 1, f'Expected 1 burst, got {len(burst_list)}'
-            burstIndex = 0
             burst_data = burst_list[0]
             start_utc = burst_data['azimuthTime']
             start_utc_dt = datetime.strptime(start_utc, '%Y-%m-%dT%H:%M:%S.%f')
@@ -873,176 +921,33 @@ class CDSE(progressbar_joblib):
                 raise Exception(f'ERROR: Manifest data mismatch for burst {burst}: '
                               f'parsed startTime {start_utc_dt.date()} does not match expected date {expected_date}. '
                               f'This indicates corrupted manifest data.')
-            burst_time_interval = timedelta(seconds=(lines_per_burst - 1) * float(azimuth_time_interval))
-            stop_utc_dt = start_utc_dt + burst_time_interval
-            stop_utc = stop_utc_dt.strftime('%Y-%m-%dT%H:%M:%S.%f')
-
-            # Build filtered annotation XML (matching ASF.py structure)
-            xml_contents = {}
-
-            # Build product annotation
-            product = {}
-
-            adsHeader = annotation['adsHeader']
-            adsHeader['startTime'] = start_utc
-            adsHeader['stopTime'] = stop_utc
-            adsHeader['imageNumber'] = '001'
-            product['adsHeader'] = adsHeader
-
-            if 'qualityInformation' in annotation:
-                qualityInformation = {}
-                if 'productQualityIndex' in annotation['qualityInformation']:
-                    qualityInformation['productQualityIndex'] = annotation['qualityInformation']['productQualityIndex']
-                if 'qualityDataList' in annotation['qualityInformation']:
-                    qualityInformation['qualityDataList'] = annotation['qualityInformation']['qualityDataList']
-                product['qualityInformation'] = qualityInformation
-
-            if 'generalAnnotation' in annotation:
-                product['generalAnnotation'] = annotation['generalAnnotation']
-
-            imageAnnotation = annotation['imageAnnotation']
-            imageAnnotation['imageInformation']['productFirstLineUtcTime'] = start_utc
-            imageAnnotation['imageInformation']['productLastLineUtcTime'] = stop_utc
-            imageAnnotation['imageInformation']['productComposition'] = 'Assembled'
-            imageAnnotation['imageInformation']['sliceNumber'] = '0'
-            imageAnnotation['imageInformation']['sliceList'] = {'@count': '0'}
-            imageAnnotation['imageInformation']['numberOfLines'] = str(lines_per_burst)
-            product['imageAnnotation'] = imageAnnotation
-
-            if 'dopplerCentroid' in annotation:
-                dopplerCentroid = annotation['dopplerCentroid']
-                items = filter_azimuth_time(dopplerCentroid['dcEstimateList']['dcEstimate'], start_utc_dt, stop_utc_dt)
-                dopplerCentroid['dcEstimateList'] = {'@count': len(items), 'dcEstimate': items}
-                product['dopplerCentroid'] = dopplerCentroid
-
-            if 'antennaPattern' in annotation:
-                antennaPattern = annotation['antennaPattern']
-                items = filter_azimuth_time(antennaPattern['antennaPatternList']['antennaPattern'], start_utc_dt, stop_utc_dt)
-                antennaPattern['antennaPatternList'] = {'@count': len(items), 'antennaPattern': items}
-                product['antennaPattern'] = antennaPattern
-
-            swathTiming = annotation['swathTiming']
-            items = filter_azimuth_time(swathTiming['burstList']['burst'], start_utc_dt, start_utc_dt, 1)
-            assert len(items) == 1, 'ERROR: unexpected bursts count, should be 1'
-            items[0]['byteOffset'] = tiff_offset  # Add TIFF offset
-            swathTiming['burstList'] = {'@count': len(items), 'burst': items}
-            product['swathTiming'] = swathTiming
-
-            geolocationGrid = annotation['geolocationGrid']
-            geoloc_points = geolocationGrid['geolocationGridPointList']['geolocationGridPoint']
-            if not isinstance(geoloc_points, list):
-                geoloc_points = [geoloc_points]
-            items = filter_azimuth_time(geoloc_points, start_utc_dt, stop_utc_dt, 1)
-            # Re-numerate line numbers for the burst (burstIndex=0, so no change needed)
-            for item in items:
-                item['line'] = str(int(item['line']) - (lines_per_burst * burstIndex))
-            geolocationGrid['geolocationGridPointList'] = {'@count': len(items), 'geolocationGridPoint': items}
-            product['geolocationGrid'] = geolocationGrid
-
-            if 'coordinateConversion' in annotation:
-                product['coordinateConversion'] = annotation['coordinateConversion']
-            if 'swathMerging' in annotation:
-                product['swathMerging'] = annotation['swathMerging']
-
-            xml_contents[xml_file] = xmltodict.unparse({'product': product}, pretty=True, indent='  ')
-
-            # Build filtered noise XML
-            if noise_xml:
-                noise_annot = xmltodict.parse(noise_xml)['noise']
-                noise = {}
-
-                if 'adsHeader' in noise_annot:
-                    noise_adsHeader = noise_annot['adsHeader']
-                    noise_adsHeader['startTime'] = start_utc
-                    noise_adsHeader['stopTime'] = stop_utc
-                    noise_adsHeader['imageNumber'] = '001'
-                    noise['adsHeader'] = noise_adsHeader
-
-                if 'noiseVectorList' in noise_annot:
-                    noiseRangeVector = noise_annot['noiseVectorList']
-                    nv_items = noiseRangeVector.get('noiseVector', [])
-                    if not isinstance(nv_items, list):
-                        nv_items = [nv_items]
-                    items = filter_azimuth_time(nv_items, start_utc_dt, stop_utc_dt)
-                    for item in items:
-                        item['line'] = str(int(item['line']) - (lines_per_burst * burstIndex))
-                    noise['noiseVectorList'] = {'@count': len(items), 'noiseVector': items}
-
-                if 'noiseRangeVectorList' in noise_annot:
-                    noiseRangeVector = noise_annot['noiseRangeVectorList']
-                    nrv_items = noiseRangeVector.get('noiseRangeVector', [])
-                    if not isinstance(nrv_items, list):
-                        nrv_items = [nrv_items]
-                    items = filter_azimuth_time(nrv_items, start_utc_dt, stop_utc_dt)
-                    for item in items:
-                        item['line'] = str(int(item['line']) - (lines_per_burst * burstIndex))
-                    noise['noiseRangeVectorList'] = {'@count': len(items), 'noiseRangeVector': items}
-
-                if 'noiseAzimuthVectorList' in noise_annot:
-                    noiseAzimuthVector = noise_annot['noiseAzimuthVectorList']
-                    nav = noiseAzimuthVector.get('noiseAzimuthVector', {})
-                    if nav and 'line' in nav:
-                        line_data = nav['line']
-                        if isinstance(line_data, dict) and '#text' in line_data:
-                            line_items = [int(x) for x in line_data['#text'].split()]
-                        elif isinstance(line_data, str):
-                            line_items = [int(x) for x in line_data.split()]
-                        else:
-                            line_items = []
-
-                        if line_items:
-                            # Find lines within burst range
-                            lowers = [item for item in line_items if item <= burstIndex * lines_per_burst] or [line_items[0]]
-                            uppers = [item for item in line_items if item >= (burstIndex + 1) * lines_per_burst - 1] or [line_items[-1]]
-                            mask = [lowers[-1] <= item <= uppers[0] for item in line_items]
-                            filtered_lines = [item - burstIndex * lines_per_burst for item, m in zip(line_items, mask) if m]
-
-                            nav['firstAzimuthLine'] = str(lowers[-1] - burstIndex * lines_per_burst)
-                            nav['lastAzimuthLine'] = str(uppers[0] - burstIndex * lines_per_burst)
-                            nav['line'] = {'@count': str(len(filtered_lines)), '#text': ' '.join(str(x) for x in filtered_lines)}
-
-                            # Filter noiseAzimuthLut similarly
-                            if 'noiseAzimuthLut' in nav:
-                                lut_data = nav['noiseAzimuthLut']
-                                if isinstance(lut_data, dict) and '#text' in lut_data:
-                                    lut_items = lut_data['#text'].split()
-                                elif isinstance(lut_data, str):
-                                    lut_items = lut_data.split()
-                                else:
-                                    lut_items = []
-                                filtered_lut = [item for item, m in zip(lut_items, mask) if m]
-                                nav['noiseAzimuthLut'] = {'@count': str(len(filtered_lut)), '#text': ' '.join(filtered_lut)}
-
-                            noise['noiseAzimuthVectorList'] = {'noiseAzimuthVector': nav}
-
-                xml_contents[xml_noise_file] = xmltodict.unparse({'noise': noise}, pretty=True, indent='  ')
-
-            # Build filtered calibration XML
-            if calibration_xml:
-                calib_annot = xmltodict.parse(calibration_xml)['calibration']
-                calibration = {}
-
-                if 'adsHeader' in calib_annot:
-                    calib_adsHeader = calib_annot['adsHeader']
-                    calib_adsHeader['startTime'] = start_utc
-                    calib_adsHeader['stopTime'] = stop_utc
-                    calib_adsHeader['imageNumber'] = '001'
-                    calibration['adsHeader'] = calib_adsHeader
-
-                if 'calibrationInformation' in calib_annot:
-                    calibration['calibrationInformation'] = calib_annot['calibrationInformation']
-
-                if 'calibrationVectorList' in calib_annot:
-                    calibrationVector = calib_annot['calibrationVectorList']
-                    cv_items = calibrationVector.get('calibrationVector', [])
-                    if not isinstance(cv_items, list):
-                        cv_items = [cv_items]
-                    items = filter_azimuth_time(cv_items, start_utc_dt, stop_utc_dt)
-                    for item in items:
-                        item['line'] = str(int(item['line']) - (lines_per_burst * burstIndex))
-                    calibration['calibrationVectorList'] = {'@count': len(items), 'calibrationVector': items}
-
-                xml_contents[xml_calib_file] = xmltodict.unparse({'calibration': calibration}, pretty=True, indent='  ')
+            # the files are named after the burst azimuth time of the annotation, as ASF names them, while the
+            # catalog AzimuthTime gave the name the burst was looked up and checked for above
+            parts = burst.split('_')
+            parts[3] = start_utc_dt.strftime('%Y%m%dT%H%M%S')
+            burst = '_'.join(parts)
+            xml_file, xml_noise_file, xml_calib_file, nc_file = burst_files(burst)
+            # the XMLs of the burst, as every source writes them (utils_S1.burst_xmls), for the .nc written below.
+            # A CDSE burst product counts the lines of its XMLs from the first line of the burst, except the noise
+            # azimuth vector, which keeps the lines of the whole subswath. In the subswath the vector and the
+            # geolocation grid both start at line 0, so the burst starts at vector line (first vector line - first
+            # grid line).
+            # a file missing from the archive is final (HTTP.final), a retry delivers the same archive
+            if not noise_xml:
+                raise NotFound(f'No noise XML in the CDSE archive of {burst}')
+            if not calibration_xml:
+                raise NotFound(f'No calibration XML in the CDSE archive of {burst}')
+            noise = xmltodict.parse(noise_xml)['noise']
+            calibration = xmltodict.parse(calibration_xml)['calibration']
+            vector = noise.get('noiseAzimuthVectorList', {}).get('noiseAzimuthVector')
+            noise_azimuth_line = None
+            if isinstance(vector, dict):
+                points = annotation['geolocationGrid']['geolocationGridPointList']['geolocationGridPoint']
+                points = points if isinstance(points, list) else [points]
+                noise_azimuth_line = int(vector['firstAzimuthLine']) - min(int(point['line']) for point in points)
+            xml_contents = dict(zip((xml_file, xml_noise_file, xml_calib_file),
+                                    burst_xmls(annotation, noise, calibration, 0, PAIRS_TIFF_OFFSET,
+                                               noise_azimuth_line)))
 
             # All validations passed - write to temp files then atomic rename.
             # This guarantees no partial files on disk if interrupted mid-write.
@@ -1051,21 +956,25 @@ class CDSE(progressbar_joblib):
             write_slc(tiff_bytes, nc_file)
 
             for filepath, content in xml_contents.items():
-                tmp = filepath + '.tmp'
-                with open(tmp, 'w') as f:
-                    f.write(content)
-                os.rename(tmp, filepath)
+                write_file(filepath, content)
 
             return cache_status  # Return cache status (HIT/MISS/etc)
 
         def download_burst_with_retry(result, retries, timeout_second):
+            # retries=0 makes one attempt (HTTP.attempts); a failure that a retry cannot change (HTTP.final) ends the
+            # attempts of the burst at once
             burst_id = result.geojson()['properties']['fileID']
-            for retry in range(retries):
+            n = attempts(retries)
+            for retry in range(n):
                 try:
                     return download_burst(result)  # Returns cache_status or True (for existing)
+                except EmptyFileError:
+                    raise
                 except Exception as e:
-                    print(f'ERROR: download attempt {retry+1} failed for {burst_id}: {e}')
-                    if retry + 1 == retries:
+                    stop = final(e)
+                    print(f'ERROR: download attempt {retry+1} failed{" (not retried)" if stop else ""} '
+                          f'for {burst_id}: {e}')
+                    if stop or retry + 1 == n:
                         return False
                 time.sleep(timeout_second)
 
@@ -1101,13 +1010,14 @@ class CDSE(progressbar_joblib):
 
     @staticmethod
     def _burst_exists(basedir, burst):
-        """Check if burst is completely downloaded."""
+        """Check if burst is completely downloaded. An empty file of the burst raises."""
         import os
         from glob import glob
+        from .utils_files import exists
 
         # Parse burst ID: S1_043813_IW1_20230210T033452_VV_E5B0-BURST
         parts = burst.split('_')
-        burst_num = str(int(parts[1]))  # Remove leading zeros: 043813 -> 43813
+        burst_num = f'{int(parts[1]):06d}'  # zero-padded as ASF and CDSE name it: 43813 -> 043813
         swath = parts[2]                # IW1
         datetime_full = parts[3]        # 20230210T033452
         datetime_prefix = datetime_full[:13]  # 20230210T0334 (ignore seconds)
@@ -1124,20 +1034,19 @@ class CDSE(progressbar_joblib):
         # Find files matching S1_burstnum_swath_datetime*_pol_* (flexible on seconds)
         file_pattern = f'S1_{burst_num}_{swath}_{datetime_prefix}*_{pol}_*'
 
+        present = True
         for subdir in ['measurement', 'annotation', 'calibration', 'noise']:
             subdir_path = os.path.join(burst_dir, subdir)
-            if not os.path.isdir(subdir_path):
-                return False
             # the measurement is <burst>.nc, or the legacy <burst>.tiff
             exts = ('.nc', '.tiff') if subdir == 'measurement' else ('.xml',)
-            matches = [m for ext in exts for m in glob(file_pattern + ext, root_dir=subdir_path)]
-            if not matches:
-                return False
-            filepath = os.path.join(subdir_path, matches[0])
-            if os.path.getsize(filepath) == 0:
-                return False
+            matches = [m for ext in exts for m in glob(file_pattern + ext, root_dir=subdir_path)] \
+                if os.path.isdir(subdir_path) else []
+            # every matching file of every subdirectory is checked, so that an empty one raises
+            for m in matches:
+                exists(os.path.join(subdir_path, m))
+            present = present and bool(matches)
 
-        return True
+        return present
 
     @staticmethod
     def plot(bursts, ax=None, figsize=None):

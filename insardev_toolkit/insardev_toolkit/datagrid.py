@@ -116,8 +116,8 @@ class datagrid:
         else:
             # projected coordinates
             da_spatial = (
-                da.rio.write_crs(epsg)
-                  .rio.set_spatial_dims(y_dim='y', x_dim='x')
+                da.copy(deep=False).rio.write_crs(epsg, inplace=True)
+                  .rio.set_spatial_dims(y_dim='y', x_dim='x', inplace=True)
                   #.rio.write_grid_mapping()
                   .assign_coords(y=da.y.assign_attrs(axis='Y', 
                                                    standard_name='projection_y_coordinate',

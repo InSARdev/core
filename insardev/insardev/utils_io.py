@@ -22,6 +22,9 @@ zarr.config.set({'array.write_empty_chunks': True})
 # Imported lazily inside _TensorStoreTarget._open() to avoid hard dependency at load time.
 import numpy as np
 
+# the group attribute save() writes the data variable order in, and open() reads and removes
+_DATA_VARS_ATTR = '__data_vars__'
+
 def _store_path_to_kvstore(store_path, storage_options=None):
     """Convert filesystem path to TensorStore kvstore spec."""
     import os
@@ -207,6 +210,17 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
         if not isinstance(args[0], dict):
             raise ValueError(f'Expected Batch dict, got {type(args[0]).__name__}')
         datas.update(args[0])
+
+    # THE LAZY STRINGS OF AN OPENED STORE (burst, startTime, ...), read here in one compute. The lazy variables
+    # are written through TensorStore, which has no string type; these are written directly, as the first save
+    # wrote them.
+    text = [(grp, v) for grp, ds in datas.items() if isinstance(ds, xr.Dataset) for v in ds.data_vars
+            if hasattr(ds[v].data, 'dask') and ds[v].dtype.kind not in 'biufc']
+    if text:
+        values = dask.compute(*[datas[grp][v].data for grp, v in text])
+        for (grp, v), value in zip(text, values):
+            datas[grp] = datas[grp].assign({v: datas[grp][v].copy(data=value)})
+        del values
 
     # Check if store is a string path or a store object
     is_store_object = not isinstance(store, str)
@@ -419,6 +433,10 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
         ds_clean = ds.copy()
         for v in list(ds_clean.data_vars):
             ds_clean = ds_clean.drop_vars(v)
+        # THE VARIABLE ORDER, which a Zarr group does not keep: it lists its arrays sorted or in the order they
+        # come back, which differs between two opens of one store. Stack.to_dataframe() takes its columns by
+        # position (the per-date variables after BPR), so open() restores this order.
+        ds_clean.attrs[_DATA_VARS_ATTR] = [str(v) for v in ds.data_vars]
         for coord in ds_clean.coords:
             ds_clean[coord].encoding.pop('chunks', None)
         if is_store_object:
@@ -495,7 +513,23 @@ def open(store: str, storage_options: dict[str, str] | None = None,
 
     classes = [_resolve(c) for c in root.attrs.get('__class__')]
     interleave = len(classes) > 1
+
+    def _build(cls, dss_):
+        """The stored class over the opened datasets. A BatchUnit or BatchWrap holds float grids only
+        (N81); a store saved before that rule with other grids (unwrap2d's uint16 conncomp was a
+        BatchUnit) is read as a plain Batch, with a WARNING, instead of failing to open."""
+        if cls in (BatchUnit, BatchWrap):
+            from .BatchCore import BatchCore
+            bad = sorted({str(n) for n, dt in BatchCore._named_dtypes(dss_) if dt.kind != 'f'})
+            if bad:
+                print(f'WARNING: open {store!r}: stored {cls.__name__} {", ".join(bad)} is not float; '
+                      f'read as Batch. Save it again to store it as Batch.', flush=True)
+                return Batch(dss_)
+        return cls(dss_)
     groups = list(root.group_keys())
+    # THE STORED COORDINATE ORDER: the 'coordinates' attribute xarray writes on each group (and pops on
+    # decode), read from the consolidated metadata; nothing is added to the store
+    stored_coords = {grp: str(root[grp].attrs.get('coordinates') or '').split() for grp in groups}
 
     joblib_backend = 'sequential' if debug else 'threading'
 
@@ -508,6 +542,18 @@ def open(store: str, storage_options: dict[str, str] | None = None,
             ds = xr.open_zarr(store, group=grp, storage_options=storage_options, consolidated=False, zarr_format=3)
         else:
             ds = xr.open_zarr(f'{store}/{grp}', storage_options=storage_options, consolidated=False, zarr_format=3)
+        # the variable order save() wrote; a store saved before it has none and keeps the listing order
+        order = ds.attrs.pop(_DATA_VARS_ATTR, None)
+        note = None
+        if order is not None:
+            names = [v for v in order if v in ds.data_vars]
+            extra = [v for v in ds.data_vars if v not in order]
+            if len(names) < len(order) or extra:
+                note = (f'group {grp!r}: the stored variable order names {sorted(set(order) - set(names))} '
+                        f'that the group does not hold and misses {extra}, which are placed last')
+            names += extra
+            if list(ds.data_vars) != names:
+                ds = ds.drop_vars(list(ds.data_vars)).assign({v: ds.variables[v] for v in names})
         # Unique dask layer to separate different opens of the same zarr.
         # NOTE: The underlying open_dataset keys are deterministic from the
         # path. If the zarr was overwritten between opens, the scheduler may
@@ -534,14 +580,20 @@ def open(store: str, storage_options: dict[str, str] | None = None,
         # match the dimension order of data variables so that downstream
         # code (e.g. plot.scatter) picks the correct default axis.
         # Zero-cost: reuses same dask arrays, only rebuilds metadata.
-        dim_order = None
+        # A FIXED ORDER, the same on every open: the store lists its members in the order they come back,
+        # which differs between two opens of one store. Dimension coordinates in the first grid's dimension
+        # order, other dimensions by name; then the other coordinates in the stored order, the rest by name.
+        dim_order = []
         for vname in ds.data_vars:
             if ds[vname].ndim >= 2:
                 dim_order = list(ds[vname].dims)
                 break
-        if dim_order is not None:
+        if ds.coords:
+            dim_order += sorted((d for d in ds.dims if d not in dim_order), key=str)
             dim_coords = [c for c in dim_order if c in ds.coords]
-            non_dim_coords = [c for c in ds.coords if c not in set(dim_order)]
+            rest = [c for c in ds.coords if c not in set(dim_order)]
+            stored = [c for c in stored_coords.get(grp, []) if c in rest]
+            non_dim_coords = stored + sorted((c for c in rest if c not in stored), key=str)
             ordered = dim_coords + non_dim_coords
             if list(ds.coords) != ordered:
                 new_vars = {v: (ds[v].dims, ds[v].data, ds[v].attrs) for v in ds.data_vars}
@@ -551,11 +603,20 @@ def open(store: str, storage_options: dict[str, str] | None = None,
                     new_coords[c] = (coord.dims, coord.values, coord.attrs) if coord.dims \
                         else xr.Variable((), coord.values, coord.attrs)
                 ds = xr.Dataset(new_vars, coords=new_coords, attrs=ds.attrs)
-        return grp, ds
+        return grp, ds, order is not None, note
 
     with progressbar_joblib.progressbar_joblib(tqdm(desc=caption.ljust(25), total=len(groups))) as progress_bar:
         results = joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(_load_grp) (grp) for grp in groups)
-    dss = dict(results)
+    dss = {grp: ds for grp, ds, _, _ in results}
+    unordered = [grp for grp, _, ordered, _ in results if not ordered]
+    if unordered:
+        print(f'WARNING: open {store!r}: {len(unordered)} of {len(groups)} group(s) store no variable order (saved '
+              f'before save() wrote it), so their variables come in the order the store lists them, which can '
+              f'differ between two opens. Stack.to_dataframe() takes its columns by that order and can fail or '
+              f'take the wrong ones. Save the snapshot again to fix it.', flush=True)
+    for _, _, _, note in results:
+        if note is not None:
+            print(f'WARNING: open {store!r}: {note}.', flush=True)
     del results
 
     # Read chunks exactly as stored in zarr — no rechunking.
@@ -568,9 +629,9 @@ def open(store: str, storage_options: dict[str, str] | None = None,
         for idx, cls in enumerate(classes):
             prefix = f'i{idx}_'
             batch_dss = {k[len(prefix):]: v for k, v in dss.items() if k.startswith(prefix)}
-            batches.append(cls(batch_dss))
+            batches.append(_build(cls, batch_dss))
         return Batches(batches)
-    result = classes[0](dss)
+    result = _build(classes[0], dss)
     wrapper_name = root.attrs.get('__wrapper__')
     if wrapper_name is not None:
         from .Batch import Batches

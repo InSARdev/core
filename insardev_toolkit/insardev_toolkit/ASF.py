@@ -20,6 +20,8 @@ _EDL_CLIENT_ID = 'BO_n7nTIlMljdvU6kRRB3g'
 _ASF_AUTH_HOST = 'cumulus.asf.alaska.edu'
 _AUTH_DOMAINS = ['asf.alaska.edu', 'earthdata.nasa.gov', 'daac.asf.alaska.edu']
 _AUTH_COOKIES = ['urs_user_already_logged', 'uat_urs_user_already_logged', 'asf-urs']
+# the (URL, error type) of the Earthdata token failures warned about in this process (_ASFSession.auth_with_creds)
+_TOKEN_WARNED = set()
 _ASF_SEARCH_URL = 'https://api.daac.asf.alaska.edu/services/search/param'
 # granules per catalog request, matching the ASF/CMR page size
 _ASF_GRANULE_CHUNK = 250
@@ -40,6 +42,22 @@ class _ASFSearchResult:
 
     def geojson(self):
         return self._geojson
+
+
+def _short_reason(error):
+    """The short reason of a request that got no answer: the text of the operating system error inside the requests
+    error, such as 'Connection refused', or the name of the error type when it holds none."""
+    seen, todo = set(), [error]
+    while todo:
+        e = todo.pop()
+        if not isinstance(e, BaseException) or id(e) in seen:
+            continue
+        seen.add(id(e))
+        if isinstance(e, OSError) and e.strerror:
+            return e.strerror
+        todo += [arg for arg in e.args if isinstance(arg, BaseException)]
+        todo += [getattr(e, 'reason', None), e.__cause__, e.__context__]
+    return type(error).__name__
 
 
 class _ASFSession(requests.Session):
@@ -78,23 +96,33 @@ class _ASFSession(requests.Session):
 
         # Get bearer token using client credentials
         # This is how asf_search authenticates
+        from .HTTP import send, returned
         try:
-            response = self.post(
+            # (connect, read) timeouts, as the other toolkit requests (HTTP.fetch)
+            response = send(
+                self.post,
                 token_url,
                 data={'grant_type': 'client_credentials'},
                 auth=(self._username, self._password),
-                headers={'Content-Type': 'application/x-www-form-urlencoded'}
+                headers={'Content-Type': 'application/x-www-form-urlencoded'},
+                timeout=(10, 300)
             )
-            if response.status_code == 200:
-                token_data = response.json()
-                if 'access_token' in token_data:
-                    self.headers['Authorization'] = f"Bearer {token_data['access_token']}"
-                    self._authenticated = True
-                    return self
-        except Exception:
-            pass
+            token = response.json().get('access_token') if response.status_code == 200 else None
+            if token:
+                self.headers['Authorization'] = f"Bearer {token}"
+                self._authenticated = True
+                return self
+            key, failure = (token_url, None), f'{token_url}: no access token in the answer'
+        except Exception as e:
+            # an HTTP error names the URL and what the server returned (HTTP.send); an error with no answer gives
+            # its short reason, as its full text holds object addresses that differ for every session
+            key = (token_url, type(e))
+            failure = str(e) if returned(e) else f'{token_url}: {_short_reason(e)}'
 
-        # Fallback: use basic auth (works for many ASF endpoints)
+        # Fallback: use basic auth (works for many ASF endpoints); one WARNING per URL and error type in a process
+        if key not in _TOKEN_WARNED:
+            _TOKEN_WARNED.add(key)
+            print(f'WARNING: Earthdata token request failed ({failure}), basic auth is used.')
         self.auth = (username, password)
         self._authenticated = True
         return self
@@ -124,7 +152,8 @@ def _asf_query(params, retries=30, timeout_second=3):
     params : dict
         SearchAPI parameters, e.g. {'granule_list': '...', 'output': 'geojson'}.
     retries : int, optional
-        Number of attempts before giving up. Default 30.
+        Number of attempts, the first one included; 0 makes one attempt (HTTP.attempts). A failure that a retry
+        cannot change (HTTP.final) raises at its first attempt. Default 30.
     timeout_second : int, optional
         Seconds to wait between attempts. Default 3.
 
@@ -134,14 +163,18 @@ def _asf_query(params, retries=30, timeout_second=3):
         Parsed GeoJSON response.
     """
     import time
-    for attempt in range(retries):
+    from .HTTP import final, attempts, send
+    n = attempts(retries)
+    for attempt in range(n):
         try:
             # (connect, read) timeouts: the catalog is slow for large granule lists
-            response = requests.post(_ASF_SEARCH_URL, data=params, timeout=(30, 300))
-            response.raise_for_status()
+            response = send(requests.post, _ASF_SEARCH_URL, data=params, timeout=(30, 300))
             return response.json()
         except Exception as e:
-            if attempt + 1 == retries:
+            stop = final(e)
+            if stop:
+                print(f'ASF catalog search attempt {attempt+1} failed (not retried): {e}')
+            if stop or attempt + 1 == n:
                 raise
             print(f'ASF catalog search attempt {attempt+1} failed: {e}, retrying in {timeout_second}s...')
             time.sleep(timeout_second)
@@ -251,6 +284,76 @@ class _asf_search_module:
 asf_search = _asf_search_module()
 # ============================================================================
 
+
+def _asf_burst_records(bursts, missing_note=None):
+    """Find Sentinel-1 bursts in the ASF catalog by name, in one batched granule search.
+
+    The catalog occasionally omits one polarization channel of an otherwise complete dual-polarization scene. The
+    channels differ only by the polarization in the name and in the url path, so the record of such a burst is rebuilt
+    from a sibling channel, which a second search finds, and a NOTE names the record it was rebuilt from.
+
+    Parameters
+    ----------
+    bursts : list
+        Burst names, e.g. 'S1_262885_IW2_20190702T032452_VV_69C5-BURST'.
+    missing_note : str, optional
+        The NOTE printed for each burst that neither the catalog nor a sibling gives, with '{burst}' for its name.
+        None prints nothing.
+
+    Returns
+    -------
+    list
+        _ASFSearchResult records: those of the catalog, in the requested order, then those rebuilt from a sibling.
+        A burst that neither the catalog nor a sibling gives has none.
+    """
+    from tqdm.auto import tqdm
+
+    with tqdm(desc=f'Downloading ASF Catalog'.ljust(25), total=1) as pbar:
+        results = asf_search.granule_search(bursts)
+        pbar.update(1)
+
+    def polarization_siblings(burst):
+        # the polarization channels of a scene share every part of the name but the channel
+        parts = burst.split('_')
+        names = ['_'.join(parts[:4] + [pol] + parts[5:]) for pol in ['VV', 'VH', 'HH', 'HV']]
+        return [name for name in names if name != burst]
+
+    def replace_polarization(url, polarization):
+        # burst urls end with .../<subswath>/<polarization>/<burstIndex>.<ext>
+        parts = url.split('/')
+        parts[-2] = polarization
+        return '/'.join(parts)
+
+    catalog = {result.geojson()['properties']['fileID']: result for result in results}
+    bursts_absent = [burst for burst in bursts if burst not in catalog]
+    if bursts_absent:
+        # a sibling is not necessarily requested here, it can be downloaded already
+        siblings = {name for burst in bursts_absent for name in polarization_siblings(burst)}
+        for result in asf_search.granule_search(sorted(siblings - set(catalog))):
+            catalog.setdefault(result.geojson()['properties']['fileID'], result)
+    for burst in bursts_absent:
+        sibling = next((catalog[name] for name in polarization_siblings(burst)
+                        if name in catalog), None)
+        if sibling is None:
+            if missing_note is not None:
+                print(missing_note.format(burst=burst))
+            continue
+        feature = sibling.geojson()
+        properties = dict(feature['properties'])
+        polarization = burst.split('_')[4]
+        properties['fileID'] = burst
+        properties['sceneName'] = burst
+        # the catalog names the served TIFF; the measurement is stored as <burst>.nc (or the legacy <burst>.tiff)
+        properties['fileName'] = f'{burst}.tiff'
+        properties['polarization'] = polarization
+        properties['url'] = replace_polarization(properties['url'], polarization)
+        properties['additionalUrls'] = [replace_polarization(url, polarization)
+                                        for url in properties['additionalUrls']]
+        results.append(_ASFSearchResult(dict(feature, properties=properties)))
+        print(f'NOTE: burst {burst} is missing in the ASF catalog, '
+              f'catalog record rebuilt from {feature["properties"]["fileID"]}.')
+    return results
+
 # Cloudflare Worker cache proxy for S1 bursts (handles auth internally)
 _S1_CACHE_PROXY = 'https://s1-cache-asf.insar.dev'
 _ASF_BURST_HOST = 'https://sentinel1-burst.asf.alaska.edu'
@@ -259,6 +362,8 @@ _ASF_BURST_HOST = 'https://sentinel1-burst.asf.alaska.edu'
 # API: /GRANULE_ID/OFFSET.bin → 128MB block at OFFSET
 _NISAR_CACHE_PROXY = 'https://nisar-cache-asf.insar.dev'
 _NISAR_BLOCK_SIZE = 128 * 1024 * 1024  # 128 MB blocks
+# Minimum side of a NISAR bbox crop on the ground: smaller crops cannot be processed accurately
+_NISAR_MIN_CROP_KM = 20
 
 
 class ASF(progressbar_joblib):
@@ -329,26 +434,6 @@ class ASF(progressbar_joblib):
                            f"Expected S1_*-BURST or NISAR_* format.")
 
     @staticmethod
-    def _normalize_polarization(polarization):
-        """Convert polarization to list format.
-
-        Parameters
-        ----------
-        polarization : None, str, or list
-            Polarization specification.
-
-        Returns
-        -------
-        list or None
-            None if input is None, otherwise list of uppercase polarizations.
-        """
-        if polarization is None:
-            return None
-        if isinstance(polarization, str):
-            return [polarization.upper()]
-        return [p.upper() for p in polarization]
-
-    @staticmethod
     def _burst_exists(basedir, burst):
         """
         Check if a burst is completely downloaded with all required files.
@@ -363,10 +448,11 @@ class ASF(progressbar_joblib):
         Returns
         -------
         bool
-            True if all 4 files exist, are regular files, and have non-zero size.
+            True if all 4 files exist and are regular files. An empty one raises.
         """
         import os
         from glob import glob
+        from .utils_files import exists
 
         # Extract burstId pattern from burst name (orbital path unknown, use wildcard)
         # burst: S1_370328_IW1_20150121T134421_VV_DBBE-BURST
@@ -393,16 +479,27 @@ class ASF(progressbar_joblib):
             os.path.join(burst_dir, 'noise', f'{burst}.xml'),
         ]
 
-        # Check all files: exist, regular file, non-zero size
-        for filepath in files:
-            if not os.path.exists(filepath):
-                return False
-            if not os.path.isfile(filepath):
-                return False
-            if os.path.getsize(filepath) == 0:
-                return False
+        # Check all files: exist and regular file; every one is checked, so that an empty one raises
+        present = [exists(filepath) and os.path.isfile(filepath) for filepath in files]
+        return all(present)
 
-        return True
+    @staticmethod
+    def _nisar_path(basedir, granule_id, polarization):
+        """The output file of one polarization of a NISAR granule."""
+        import os
+
+        # Parse granule ID to get output filename
+        # NISAR_L1_PR_RSLC_006_172_A_008_2005_DHDH_A_20251204T024618_...
+        # Output: track_frame/NSR_172_008_20251204T024618_HH.h5
+        parts = granule_id.replace('.h5', '').split('_')
+        track = int(parts[5])  # 172
+        frame = int(parts[7])  # 008
+        datetime_str = parts[11][:15]  # 20251204T024618
+
+        # Files are stored in track_frame subdirectory
+        subdir = f"{track:03d}_{frame:03d}"
+        out_name = f"NSR_{track:03d}_{frame:03d}_{datetime_str}_{polarization}.h5"
+        return os.path.join(basedir, subdir, out_name)
 
     @staticmethod
     def _nisar_exists(basedir, granule_id, polarization):
@@ -420,28 +517,71 @@ class ASF(progressbar_joblib):
         Returns
         -------
         bool
-            True if output file exists.
+            True if output file exists. An empty one raises.
         """
-        import os
+        from .utils_files import exists
+        return exists(ASF._nisar_path(basedir, granule_id, polarization))
 
-        # Parse granule ID to get output filename
-        # NISAR_L1_PR_RSLC_006_172_A_008_2005_DHDH_A_20251204T024618_...
-        # Output: track_frame/NSR_172_008_20251204T024618_HH.h5
-        parts = granule_id.replace('.h5', '').split('_')
-        track = int(parts[5])  # 172
-        frame = int(parts[7])  # 008
-        datetime_str = parts[11][:15]  # 20251204T024618
+    @staticmethod
+    def _nisar_complete(basedir, granule_id, polarizations):
+        """Whether every file of a NISAR granule already exists, for skip_exist=True.
 
-        # Files are stored in track_frame subdirectory
-        subdir = f"{track:03d}_{frame:03d}"
-        out_name = f"NSR_{track:03d}_{frame:03d}_{datetime_str}_{polarization}.h5"
-        out_path = os.path.join(basedir, subdir, out_name)
+        Parameters
+        ----------
+        basedir : str
+            Base directory containing NISAR data.
+        granule_id : str
+            Full NISAR granule ID.
+        polarizations : list or None
+            The requested polarizations. None: the polarizations the product has, read from the metadata of a file
+            of the granule that exists (the listOfPolarizations of the frequencies it holds).
 
-        return os.path.exists(out_path)
+        Returns
+        -------
+        bool
+            True when every file of the granule exists; False with polarizations=None and no file of the granule.
+            An empty file raises.
+        """
+        import h5py
+
+        def present(pols):
+            # every file is checked, so that an empty one raises
+            return [ASF._nisar_exists(basedir, granule_id, p) for p in pols]
+
+        linear = ['HH', 'HV', 'VH', 'VV']
+        if polarizations is None:
+            first = next((p for p in linear if ASF._nisar_exists(basedir, granule_id, p)), None)
+            if first is None:
+                return False
+            path = ASF._nisar_path(basedir, granule_id, first)
+            # a file holds the frequencies it was downloaded with, each with the product's list
+            with h5py.File(path, 'r') as h5:
+                keys = [f'science/LSAR/RSLC/swaths/{freq}/listOfPolarizations' for freq in ('frequencyA', 'frequencyB')]
+                lists = [h5[key][()] for key in keys if key in h5]
+            if not lists:
+                print(f'WARNING: {path} has no science/LSAR/RSLC/swaths/frequency*/listOfPolarizations, so the '
+                      f'polarizations of the product are unknown here: its metadata is downloaded to find them, and '
+                      f'the files that exist are not downloaded again.')
+                present(linear)
+                return False
+            listed = {v.decode() if isinstance(v, bytes) else str(v) for values in lists for v in values}
+            polarizations = [p for p in linear if p in listed]
+        return bool(polarizations) and all(present(polarizations))
+
+    @staticmethod
+    def _nisar_pols(polarizations, available, granule_id):
+        """The polarizations of a NISAR granule to download: the requested ones that the product has (a WARNING
+        names the others), or every one it has for polarizations=None."""
+        if polarizations is None:
+            return list(available)
+        missing = [p for p in polarizations if p not in available]
+        if missing:
+            print(f'WARNING: Polarizations {missing} not available in {granule_id}')
+        return [p for p in polarizations if p in available]
 
     # https://asf.alaska.edu/datasets/data-sets/derived-data-sets/sentinel-1-bursts/
     def download(self, basedir, bursts, polarization=None, frequency=None, bbox=None, session=None, n_jobs=None, joblib_backend='loky', skip_exist=True,
-                        retries=30, timeout_second=3, debug=False):
+                        retries=30, timeout_second=3, min_rate='100KB', min_rate_window=60, debug=False):
         """
         Download SAR data from ASF.
 
@@ -462,16 +602,28 @@ class ASF(progressbar_joblib):
             - None: S1 uses pol from name, NISAR downloads all available
             - 'VV': Download only VV (S1) or 'HH' (NISAR)
             - ['VV', 'VH']: Download both polarizations
+            An empty list raises a ValueError.
         frequency : str or list, required for NISAR
             Which frequency band(s) to download (NISAR stores two frequencies with different resolutions):
             - 'A': frequencyA (20MHz bandwidth, ~7m range resolution, ~10GB per scene)
             - 'B': frequencyB (5MHz bandwidth, ~25m range resolution, ~1.5GB per scene)
             - ['A', 'B']: Both frequencies in same file (~14GB per scene)
-        bbox : tuple or None, optional (NISAR cache proxy only)
+        bbox : tuple or None, optional (NISAR only)
             Bounding box in WGS84 coordinates: (west, south, east, north).
-            When provided, only downloads aligned blocks covering the bbox.
-            Uses cache-optimized multi-offset endpoint for efficient partial extraction.
-            If None, downloads full scene using aligned blocks for caching benefit.
+            When provided, only the part of the frame covering the bbox is downloaded: the exact radar extent
+            of the bbox over every height layer of the product's geolocation grid (such as -500 to 9000 m),
+            with no margin added, rounded out to the file's chunk grid (such as 512 x 512 pixels).
+            Each side must be at least 20 km long on the ground (the south and north sides along their
+            parallels): smaller crops cannot be processed accurately, so a smaller bbox raises a ValueError
+            before anything is downloaded. The bbox is never enlarged. To process a smaller area, download a
+            bbox of at least 20 x 20 km and pass the smaller bbox to the preprocessor, which can use the whole
+            downloaded area for alignment.
+            The bbox checks (this minimum size and the coordinate format) apply to every download that will
+            happen, and to nothing else: with skip_exist=True, a granule whose files already exist is skipped
+            without any check; every other granule is checked before any network call, and when the check fails
+            nothing is downloaded and no folder is created. With skip_exist=False the check always runs.
+            The cache proxy uses its cache-optimized multi-offset endpoint for the partial extraction.
+            If None, downloads the full frame (the cache proxy uses aligned blocks for caching benefit).
         session : asf_search.ASFSession, optional
             Authenticated session. Created automatically if None.
         n_jobs : int or None, optional
@@ -479,18 +631,33 @@ class ASF(progressbar_joblib):
         joblib_backend : str, optional
             Backend for parallel processing. Default 'loky' (multiprocessing, faster on Colab).
         skip_exist : bool, optional
-            Skip already downloaded data. Default True.
+            skip_exist=True skips downloading files that already exist; skip_exist=False downloads them again.
+            Default True. The files of a NISAR granule are those of the requested polarizations, or with
+            polarization=None those the product has, read from the metadata of a file of the granule that exists
+            (with none, every file is missing). Only the missing files are downloaded, and a granule whose files
+            all exist is skipped without network access. The NISAR bbox checks apply to every download that will
+            happen, and to nothing else.
         retries : int, optional
-            Number of retry attempts. Default 30.
+            Number of attempts of each request, the first one included; 0 makes one attempt, as 1 does
+            (HTTP.attempts). A failure that a retry cannot change (HTTP.final, such as HTTP 404) is not retried.
+            Default 30.
         timeout_second : int, optional
             Seconds between retries. Default 3.
+        min_rate : str or float, optional
+            Bytes per second every download request (a Sentinel-1 burst file, a NISAR byte range or cache block)
+            must keep, a size string such as '100KB' or a number, averaged over min_rate_window seconds from its
+            first byte, or it is retried on a new connection (HTTP.read_body); the rate every one of the n_jobs
+            parallel downloads must reach. Default '100KB'.
+        min_rate_window : float, optional
+            Seconds over which the rate is averaged. Default 60.
         debug : bool, optional
             Print debug information. Default False.
 
         Returns
         -------
         pandas.DataFrame or None
-            Downloaded files info, or None if all existed.
+            The files downloaded by this call (the column 'burst' for Sentinel-1, 'file' for NISAR), or None when
+            nothing is downloaded (every file exists).
 
         Examples
         --------
@@ -505,7 +672,11 @@ class ASF(progressbar_joblib):
         >>> asf.download('data/freqB/', 'NISAR_L1_PR_RSLC_006_172_A_008_...', polarization='HH', frequency='B')
         """
         import pandas as pd
-        import os
+        from .HTTP import attempts
+        from .utils_S1 import polarizations
+
+        # a negative retries raises before any file is checked or downloaded
+        attempts(retries)
 
         # Normalize inputs
         import geopandas as gpd
@@ -513,10 +684,9 @@ class ASF(progressbar_joblib):
             bursts = bursts['sceneName'].tolist()
         elif isinstance(bursts, str):
             bursts = list(filter(None, map(str.strip, bursts.split('\n'))))
-        pols = self._normalize_polarization(polarization)
 
-        # Create output directory
-        os.makedirs(basedir, exist_ok=True)
+        # No output directory here: each writer creates its own subdirectory (which creates basedir) once every
+        # check has passed, so a refused request leaves nothing behind
 
         # Group by mission (auto-detect from ID format)
         s1_bursts = []
@@ -527,6 +697,10 @@ class ASF(progressbar_joblib):
                 s1_bursts.append(burst)
             elif mission == 'NISAR':
                 nisar_granules.append(burst)
+
+        # an empty polarization list selects nothing to download and raises, before any request or folder
+        pols = polarizations(polarization, "'HH' or ['HH', 'HV']" if nisar_granules and not s1_bursts
+                             else "'VV' or ['VV', 'VH']")
 
         # Require explicit frequency for NISAR to prevent accidental large downloads
         if nisar_granules and frequency is None:
@@ -553,34 +727,20 @@ class ASF(progressbar_joblib):
         if skip_exist:
             # Filter S1 bursts that need download
             s1_needed = [b for b in s1_bursts if not self._burst_exists(basedir, b)]
-            # Filter NISAR granules that need download (check all requested pols)
-            nisar_needed = []
-            nisar_existing = []  # Track existing files for return
-            for g in nisar_granules:
-                check_pols = pols if pols else ['HH', 'HV', 'VH', 'VV']
-                g_needed = False
-                for p in check_pols:
-                    if not self._nisar_exists(basedir, g, p):
-                        g_needed = True
-                    else:
-                        # Build existing file name
-                        parts = g.replace('.h5', '').split('_')
-                        track = int(parts[5])
-                        frame = int(parts[7])
-                        datetime_str = parts[11][:15]
-                        nisar_existing.append(f"NSR_{track:03d}_{frame:03d}_{datetime_str}_{p}.h5")
-                if g_needed:
-                    nisar_needed.append(g)
+            # Filter NISAR granules that need download: a granule with a missing file; the downloaders then skip its
+            # files that exist, so only the missing ones are downloaded
+            nisar_needed = [g for g in nisar_granules if not self._nisar_complete(basedir, g, pols)]
         else:
             s1_needed = s1_bursts
             nisar_needed = nisar_granules
-            nisar_existing = []
+
+        # NISAR bbox crop: checked for the granules that will be downloaded, before any network call (session, S1
+        # and both NISAR paths); a granule skipped as existing is not checked
+        if nisar_needed and bbox is not None:
+            self._nisar_check_bbox(bbox)
 
         # Return early if nothing to download (no network call!)
         if not s1_needed and not nisar_needed:
-            # Return existing files as DataFrame (NISAR only for now)
-            if nisar_existing:
-                return pd.DataFrame({'file': nisar_existing})
             return None
 
         # Prepare session only when actually needed
@@ -592,14 +752,16 @@ class ASF(progressbar_joblib):
         # Download S1 bursts
         if s1_needed:
             df = self._download_s1(basedir, s1_needed, pols, session,
-                                   n_jobs, joblib_backend, skip_exist, retries, timeout_second, debug)
+                                   n_jobs, joblib_backend, skip_exist, retries, timeout_second,
+                                   min_rate, min_rate_window, debug)
             if df is not None:
                 results.append(df)
 
         # Download NISAR granules
         if nisar_needed:
             df = self._download_nisar(basedir, nisar_needed, pols, frequency, bbox, session,
-                                       n_jobs, joblib_backend, skip_exist, retries, timeout_second, debug)
+                                       n_jobs, joblib_backend, skip_exist, retries, timeout_second,
+                                       min_rate, min_rate_window, debug)
             if df is not None:
                 results.append(df)
 
@@ -608,7 +770,7 @@ class ASF(progressbar_joblib):
         return None
 
     def _download_s1(self, basedir, bursts, polarizations, session, n_jobs,
-                      joblib_backend, skip_exist, retries, timeout_second, debug):
+                      joblib_backend, skip_exist, retries, timeout_second, min_rate, min_rate_window, debug):
         """Internal: Download Sentinel-1 bursts.
 
         Parameters
@@ -625,14 +787,16 @@ class ASF(progressbar_joblib):
 
         import rioxarray as rio
         from tifffile import TiffFile
-        from .utils_S1 import measurement_path, slc_shape, tiff_data_offset, write_slc
+        from .utils_S1 import measurement_path, slc_shape, tiff_data_offset, write_slc, burst_xmls, PAIRS_TIFF_OFFSET
+        from .utils_files import exists, EmptyFileError, write_file
+        from .HTTP import final, attempts, send, read_body
         import xmltodict
         from xml.etree import ElementTree
         import pandas as pd
         import joblib
         from tqdm.auto import tqdm
         import os
-        from datetime import datetime, timedelta
+        from datetime import datetime
         import time
         import warnings
         # supress asf_search 'UserWarning: File already exists, skipping download'
@@ -653,11 +817,6 @@ class ASF(progressbar_joblib):
             # Remove duplicates while preserving order
             seen = set()
             bursts = [b for b in expanded_bursts if not (b in seen or seen.add(b))]
-
-        def filter_azimuth_time(items, start_utc_dt, stop_utc_dt, delta=3):
-            return [item for item in items if
-                 datetime.strptime(item['azimuthTime'], '%Y-%m-%dT%H:%M:%S.%f') >= start_utc_dt - timedelta(seconds=delta) and
-                 datetime.strptime(item['azimuthTime'], '%Y-%m-%dT%H:%M:%S.%f') <= stop_utc_dt + timedelta(seconds=delta)]
 
         # skip existing bursts (check all 4 files: tiff + 3 xml, regular files, non-zero size)
         if skip_exist:
@@ -702,17 +861,15 @@ class ASF(progressbar_joblib):
                 os.makedirs(dirname, exist_ok=True)
 
             def measurement_exists():
-                if not os.path.exists(tif_file):
+                if not exists(tif_file):
                     return False
                 if tif_file.endswith('.tiff'):
                     return os.path.getsize(tif_file) >= int(properties['bytes'])
-                return os.path.getsize(tif_file) > 0
+                return True
 
-            # check if all files already exist
-            all_exist = (measurement_exists()
-                        and os.path.exists(xml_file) and os.path.getsize(xml_file) > 0
-                        and os.path.exists(xml_noise_file) and os.path.getsize(xml_noise_file) > 0
-                        and os.path.exists(xml_calib_file) and os.path.getsize(xml_calib_file) > 0)
+            # check if all files already exist; every one is checked before any download, so that an empty one raises
+            xml_exist = [exists(filepath) for filepath in (xml_file, xml_noise_file, xml_calib_file)]
+            all_exist = measurement_exists() and all(xml_exist)
 
             if all_exist:
                 # validate existing measurement dimensions using local annotation XML
@@ -733,12 +890,12 @@ class ASF(progressbar_joblib):
             # and the server answers nothing at all while it does that, measured at 150s for
             # a single manifest. The read timeout has to outlast that silence, otherwise every
             # attempt aborts before the first byte and no number of retries ever succeeds.
+            # Once the body flows, a transfer slower than min_rate is cut (HTTP.read_body) and retried.
             manifest_url = get_burst_url(properties['additionalUrls'][0])
-            response = session.get(manifest_url, timeout=(10, 300))
-            response.raise_for_status()
-            xml_content = response.text
-            if debug:
+            with send(session.get, manifest_url, stream=True, timeout=(10, 300)) as response:
+                xml_content = read_body(response, min_rate, min_rate_window).decode(response.encoding or 'utf-8')
                 cache_status = response.headers.get('x-cache', 'N/A')
+            if debug:
                 size_mb = len(xml_content.encode()) / 1024 / 1024
                 print(f'  XML  {cache_status:4} {size_mb:5.1f}MB {burst}')
             if len(xml_content) == 0:
@@ -756,7 +913,8 @@ class ASF(progressbar_joblib):
             _ = ElementTree.fromstring(xml_content)
 
             subswathidx = int(subswath[-1:]) - 1
-            content = xmltodict.parse(xml_content)['burst']['metadata']['product'][subswathidx]
+            metadata = xmltodict.parse(xml_content)['burst']['metadata']
+            content = metadata['product'][subswathidx]
             assert polarization == content['polarisation'], 'ERROR: XML polarization differs from burst polarization'
             annotation = content['content']
 
@@ -777,6 +935,7 @@ class ASF(progressbar_joblib):
                               f'This indicates corrupted manifest data.')
 
             # download tif if needed
+            tiff_bytes = None
             if measurement_exists():
                 # validate existing file dimensions
                 actual_lines, actual_samples = slc_shape(tif_file)
@@ -788,23 +947,22 @@ class ASF(progressbar_joblib):
                 # Download and validate TIFF entirely in memory before writing to disk
                 import io
 
-                # Download TIFF fully into memory
+                # Download TIFF fully into memory; a transfer slower than min_rate is cut (HTTP.read_body) and retried
                 tiff_url = get_burst_url(properties['url'])
-                response = session.get(tiff_url, timeout=(10, 300))
-                response.raise_for_status()
-                tiff_bytes = response.content
-                if debug:
+                with send(session.get, tiff_url, stream=True, timeout=(10, 300)) as response:
+                    tiff_bytes = read_body(response, min_rate, min_rate_window)
                     cache_status = response.headers.get('x-cache', 'N/A')
+                    original_size = int(response.headers.get('X-Original-Size', 0))
+                if debug:
                     size_mb = len(tiff_bytes) / 1024 / 1024
                     print(f'  TIFF {cache_status:4} {size_mb:5.1f}MB {burst}')
                 if len(tiff_bytes) == 0:
                     raise Exception(f'ERROR: Downloaded TIFF is empty: {tiff_url}')
 
                 # Early truncation check using expected size from server or ASF metadata
-                expected_size = int(response.headers.get('X-Original-Size', 0)) or int(properties['bytes'])
+                expected_size = original_size or int(properties['bytes'])
                 if expected_size > 0 and len(tiff_bytes) < expected_size:
                     pct = 100 * len(tiff_bytes) / expected_size
-                    cache_status = response.headers.get('x-cache', 'N/A')
                     raise Exception(f'ERROR: Downloaded TIFF truncated for {burst}: '
                                   f'got {len(tiff_bytes)} bytes ({pct:.0f}%) of {expected_size} expected '
                                   f'(cache: {cache_status}). '
@@ -836,216 +994,36 @@ class ASF(progressbar_joblib):
                             raise Exception(f'ERROR: Downloaded TIFF truncated for {burst}: '
                                           f'strip at offset {offset} needs {bytecount} bytes '
                                           f'but file is only {len(tiff_bytes)} bytes.')
-                    # Also get offset for XML creation
-                    tiff_offset = page.dataoffsets[0]
 
                 # TIFF validated - now build XML content in memory before writing anything
 
             # Build XML content in memory (or skip if files exist)
-            xml_contents = {}  # {filepath: content_string}
-            need_xml = not (os.path.exists(xml_file) and os.path.getsize(xml_file) > 0
-                           and os.path.exists(xml_noise_file) and os.path.getsize(xml_noise_file) > 0
-                           and os.path.exists(xml_calib_file) and os.path.getsize(xml_calib_file) > 0)
+            xml_contents = {}  # {filepath: content}
 
-            if need_xml:
-                # Get TIFF offset (already have it if we downloaded, otherwise read from the existing
-                # measurement: a .nc burst keeps the offset of the TIFF it was converted from)
-                if 'tiff_offset' not in dir():
-                    tiff_offset = tiff_data_offset(tif_file)
-                offset = tiff_offset
-
-                azimuth_time_interval = annotation['imageAnnotation']['imageInformation']['azimuthTimeInterval']
-                burst_time_interval = timedelta(seconds=(lines_per_burst - 1) * float(azimuth_time_interval))
-                stop_utc_dt = start_utc_dt + burst_time_interval
-                stop_utc = stop_utc_dt.strftime('%Y-%m-%dT%H:%M:%S.%f')
-                #print ('stop_utc', stop_utc, stop_utc_dt)
-
-                # output xml
-                product = {}
-
-                adsHeader = annotation['adsHeader']
-                adsHeader['startTime'] = start_utc
-                adsHeader['stopTime'] = stop_utc
-                adsHeader['imageNumber'] = '001'
-                product = product   | {'adsHeader': adsHeader}
-
-                qualityInformation = {'productQualityIndex': annotation['qualityInformation']['productQualityIndex']} |\
-                                      {'qualityDataList':     annotation['qualityInformation']['qualityDataList']}
-                product = product   | {'qualityInformation': qualityInformation}
-
-                generalAnnotation = annotation['generalAnnotation']
-                # filter annotation['generalAnnotation']['replicaInformationList'] by azimuthTime
-                product = product   | {'generalAnnotation': generalAnnotation}
-
-                imageAnnotation = annotation['imageAnnotation']
-                imageAnnotation['imageInformation']['productFirstLineUtcTime'] = start_utc
-                imageAnnotation['imageInformation']['productLastLineUtcTime'] = stop_utc
-                imageAnnotation['imageInformation']['productComposition'] = 'Assembled'
-                imageAnnotation['imageInformation']['sliceNumber'] = '0'
-                imageAnnotation['imageInformation']['sliceList'] = {'@count': '0'}
-                imageAnnotation['imageInformation']['numberOfLines'] = str(lines_per_burst)
-                # imageStatistics and inputDimensionsList are not updated
-                product = product   | {'imageAnnotation': imageAnnotation}
-
-                dopplerCentroid = annotation['dopplerCentroid']
-                items = filter_azimuth_time(dopplerCentroid['dcEstimateList']['dcEstimate'], start_utc_dt, stop_utc_dt)
-                dopplerCentroid['dcEstimateList'] = {'@count': len(items), 'dcEstimate': items}
-                product = product   | {'dopplerCentroid': dopplerCentroid}
-
-                antennaPattern = annotation['antennaPattern']
-                items = filter_azimuth_time(antennaPattern['antennaPatternList']['antennaPattern'], start_utc_dt, stop_utc_dt)
-                antennaPattern['antennaPatternList'] = {'@count': len(items), 'antennaPattern': items}
-                product = product   | {'antennaPattern': antennaPattern}
-
-                swathTiming = annotation['swathTiming']
-                items = filter_azimuth_time(swathTiming['burstList']['burst'], start_utc_dt, start_utc_dt, 1)
-                assert len(items) == 1, 'ERROR: unexpected bursts count, should be 1'
-                # add TiFF file information
-                items[0]['byteOffset'] = offset
-                swathTiming['burstList'] = {'@count': len(items), 'burst': items}
-                product = product   | {'swathTiming': swathTiming}
-
-                geolocationGrid = annotation['geolocationGrid']
-                items = filter_azimuth_time(geolocationGrid['geolocationGridPointList']['geolocationGridPoint'], start_utc_dt, stop_utc_dt, 1)
-                # re-numerate line numbers for the burst
-                for item in items: item['line'] = str(int(item['line']) - (lines_per_burst * burstIndex))
-                geolocationGrid['geolocationGridPointList'] = {'@count': len(items), 'geolocationGridPoint': items}
-                product = product   | {'geolocationGrid': geolocationGrid}
-
-                product = product   | {'coordinateConversion': annotation['coordinateConversion']}
-                product = product   | {'swathMerging': annotation['swathMerging']}
-
-                xml_contents[xml_file] = xmltodict.unparse({'product': product}, pretty=True, indent='  ')
-
-                # output noise xml
-                content = xmltodict.parse(xml_content)['burst']['metadata']['noise'][subswathidx]
-                assert polarization == content['polarisation'], 'ERROR: XML polarization differs from burst polarization'
-                annotation = content['content']
-
-                noise = {}
-
-                adsHeader = annotation['adsHeader']
-                adsHeader['startTime'] = start_utc
-                adsHeader['stopTime'] = stop_utc
-                adsHeader['imageNumber'] = '001'
-                noise = noise   | {'adsHeader': adsHeader}
-
-                if 'noiseVectorList' in annotation:
-                    noiseRangeVector = annotation['noiseVectorList']
-                    items = filter_azimuth_time(noiseRangeVector['noiseVector'], start_utc_dt, stop_utc_dt)
-                    # re-numerate line numbers for the burst
-                    for item in items: item['line'] = str(int(item['line']) - (lines_per_burst * burstIndex))
-                    noiseRangeVector = {'@count': len(items), 'noiseVector': items}
-                    noise = noise   | {'noiseVectorList': noiseRangeVector}
-
-                if 'noiseRangeVectorList' in annotation:
-                    noiseRangeVector = annotation['noiseRangeVectorList']
-                    items = filter_azimuth_time(noiseRangeVector['noiseRangeVector'], start_utc_dt, stop_utc_dt)
-                    # re-numerate line numbers for the burst
-                    for item in items: item['line'] = str(int(item['line']) - (lines_per_burst * burstIndex))
-                    noiseRangeVector = {'@count': len(items), 'noiseRangeVector': items}
-                    noise = noise   | {'noiseRangeVectorList': noiseRangeVector}
-
-                if 'noiseAzimuthVectorList' in annotation:
-                    noiseAzimuthVector = annotation['noiseAzimuthVectorList']
-                    items = noiseAzimuthVector['noiseAzimuthVector']['line']['#text'].split(' ')
-                    items = [int(item) for item in items]
-                    lowers = [item for item in items if item <= burstIndex * lines_per_burst] or items[0]
-                    uppers = [item for item in items if item >= (burstIndex + 1) * lines_per_burst - 1] or items[-1]
-                    mask = [True if item>=lowers[-1] and item<=uppers[0] else False for item in items]
-                    items = [item - burstIndex * lines_per_burst for item, m in zip(items, mask) if m]
-                    noiseAzimuthVector['noiseAzimuthVector']['firstAzimuthLine'] = lowers[-1] - burstIndex * lines_per_burst
-                    noiseAzimuthVector['noiseAzimuthVector']['lastAzimuthLine'] = uppers[0] - burstIndex * lines_per_burst
-                    noiseAzimuthVector['noiseAzimuthVector']['line'] = {'@count': len(items), '#text': ' '.join([str(item) for item in items])}
-                    items = noiseAzimuthVector['noiseAzimuthVector']['noiseAzimuthLut']['#text'].split(' ')
-                    items = [item for item, m in zip(items, mask) if m]
-                    noiseAzimuthVector['noiseAzimuthVector']['noiseAzimuthLut'] = {'@count': len(items), '#text': ' '.join(items)}
-                    noise = noise   | {'noiseAzimuthVectorList': noiseAzimuthVector}
-
-                xml_contents[xml_noise_file] = xmltodict.unparse({'noise': noise}, pretty=True, indent='  ')
-
-                # output calibration xml
-                content = xmltodict.parse(xml_content)['burst']['metadata']['calibration'][subswathidx]
-                assert polarization == content['polarisation'], 'ERROR: XML polarization differs from burst polarization'
-                annotation = content['content']
-
-                calibration = {}
-
-                adsHeader = annotation['adsHeader']
-                adsHeader['startTime'] = start_utc
-                adsHeader['stopTime'] = stop_utc
-                adsHeader['imageNumber'] = '001'
-                calibration = calibration   | {'adsHeader': adsHeader}
-
-                calibration = calibration   | {'calibrationInformation': annotation['calibrationInformation']}
-
-                calibrationVector = annotation['calibrationVectorList']
-                items = filter_azimuth_time(calibrationVector['calibrationVector'], start_utc_dt, stop_utc_dt)
-                # re-numerate line numbers for the burst
-                for item in items: item['line'] = str(int(item['line']) - (lines_per_burst * burstIndex))
-                calibrationVector = {'@count': len(items), 'calibrationVector': items}
-                calibration = calibration   | {'calibrationVectorList': calibrationVector}
-
-                xml_contents[xml_calib_file] = xmltodict.unparse({'calibration': calibration}, pretty=True, indent='  ')
+            if not all(xml_exist):
+                # the XMLs of the burst, as every source writes them (utils_S1.burst_xmls); the byteOffset is that of
+                # the measurement stored: the .nc written below, or the existing one
+                byte_offset = PAIRS_TIFF_OFFSET if tiff_bytes is not None else tiff_data_offset(tif_file)
+                parts = {}
+                for kind in ('noise', 'calibration'):
+                    content = metadata[kind][subswathidx]
+                    assert polarization == content['polarisation'], 'ERROR: XML polarization differs from burst polarization'
+                    parts[kind] = content['content']
+                xml_contents[xml_file], xml_contents[xml_noise_file], xml_contents[xml_calib_file] = \
+                    burst_xmls(annotation, parts['noise'], parts['calibration'], burstIndex, byte_offset)
 
             # All validations passed - write to temp files then atomic rename.
             # This guarantees no partial files on disk if interrupted mid-write.
-            if 'tiff_bytes' in dir():
+            if tiff_bytes is not None:
                 # the burst is stored as compressed NetCDF4, converted and verified in memory
                 write_slc(tiff_bytes, nc_file)
 
             for filepath, content in xml_contents.items():
-                tmp = filepath + '.tmp'
-                with open(tmp, 'w') as f:
-                    f.write(content)
-                os.rename(tmp, filepath)
+                write_file(filepath, content)
 
-        with tqdm(desc=f'Downloading ASF Catalog'.ljust(25), total=1) as pbar:
-            results = asf_search.granule_search(bursts_missed)
-            pbar.update(1)
-
-        def polarization_siblings(burst):
-            # the polarization channels of a scene share every part of the name but the channel
-            parts = burst.split('_')
-            names = ['_'.join(parts[:4] + [pol] + parts[5:]) for pol in ['VV', 'VH', 'HH', 'HV']]
-            return [name for name in names if name != burst]
-
-        def replace_polarization(url, polarization):
-            # burst urls end with .../<subswath>/<polarization>/<burstIndex>.<ext>
-            parts = url.split('/')
-            parts[-2] = polarization
-            return '/'.join(parts)
-
-        # The catalog occasionally omits one polarization channel of an otherwise complete
-        # dual-polarization scene. The channels differ only by the polarization in the name
-        # and in the url path, so restore such a burst from a sibling channel.
-        catalog = {result.geojson()['properties']['fileID']: result for result in results}
-        bursts_absent = [burst for burst in bursts_missed if burst not in catalog]
-        if bursts_absent:
-            # a sibling is not necessarily requested here, it can be downloaded already
-            siblings = {name for burst in bursts_absent for name in polarization_siblings(burst)}
-            for result in asf_search.granule_search(sorted(siblings - set(catalog))):
-                catalog.setdefault(result.geojson()['properties']['fileID'], result)
-        for burst in bursts_absent:
-            sibling = next((catalog[name] for name in polarization_siblings(burst)
-                            if name in catalog), None)
-            if sibling is None:
-                print(f'NOTE: burst {burst} is missing in the ASF catalog and is not downloaded.')
-                continue
-            feature = sibling.geojson()
-            properties = dict(feature['properties'])
-            polarization = burst.split('_')[4]
-            properties['fileID'] = burst
-            properties['sceneName'] = burst
-            # the catalog names the served TIFF; the measurement is stored as <burst>.nc (or the legacy <burst>.tiff)
-            properties['fileName'] = f'{burst}.tiff'
-            properties['polarization'] = polarization
-            properties['url'] = replace_polarization(properties['url'], polarization)
-            properties['additionalUrls'] = [replace_polarization(url, polarization)
-                                            for url in properties['additionalUrls']]
-            results.append(_ASFSearchResult(dict(feature, properties=properties)))
-            print(f'NOTE: burst {burst} is missing in the ASF catalog, '
-                  f'catalog record rebuilt from {feature["properties"]["fileID"]}.')
+        # the catalog records of the bursts, rebuilt from a sibling polarization channel the catalog omits
+        results = _asf_burst_records(bursts_missed,
+                                     missing_note='NOTE: burst {burst} is missing in the ASF catalog and is not downloaded.')
 
         # Check for conflicting bursts from different paths with same burstNum_subswath pattern
         # Such data cannot be stored in the same basedir without conflicts
@@ -1070,14 +1048,21 @@ class ASF(progressbar_joblib):
             joblib_backend = 'sequential'
 
         def download_burst_with_retry(result, basedir, session, retries, timeout_second):
+            # retries=0 makes one attempt (HTTP.attempts); a failure that a retry cannot change (HTTP.final) ends the
+            # attempts of the burst at once
             burst_id = result.geojson()['properties']['fileID']
-            for retry in range(retries):
+            n = attempts(retries)
+            for retry in range(n):
                 try:
                     download_burst(result, basedir, session)
                     return True
+                except EmptyFileError:
+                    raise
                 except Exception as e:
-                    print(f'ERROR: download attempt {retry+1} failed for {burst_id}: {e}')
-                    if retry + 1 == retries:
+                    stop = final(e)
+                    print(f'ERROR: download attempt {retry+1} failed{" (not retried)" if stop else ""} '
+                          f'for {burst_id}: {e}')
+                    if stop or retry + 1 == n:
                         return False
                 time.sleep(timeout_second)
 
@@ -1219,8 +1204,61 @@ class ASF(progressbar_joblib):
         return regions
 
     @staticmethod
+    def _nisar_check_bbox(bbox):
+        """Validate a NISAR crop bbox (west, south, east, north) in WGS84 degrees before any download.
+
+        Each side must be at least _NISAR_MIN_CROP_KM long on the WGS84 ellipsoid: the south and north sides
+        along their parallels, the west and east sides along the meridian. The bbox is never enlarged.
+
+        Raises
+        ------
+        ValueError
+            For a malformed bbox, or a side shorter than the minimum.
+        """
+        import numpy as np
+        from pyproj import Geod
+
+        if len(bbox) != 4:
+            raise ValueError("bbox must be (west, south, east, north) in WGS84 coordinates")
+        west, south, east, north = bbox
+        if west >= east or south >= north:
+            raise ValueError("Invalid bbox: west must be < east and south must be < north")
+        if not (-180 <= west <= 180 and -180 <= east <= 180 and -90 <= south <= 90 and -90 <= north <= 90):
+            raise ValueError("bbox coordinates must be valid WGS84 (lon: -180 to 180, lat: -90 to 90)")
+
+        geod = Geod(ellps='WGS84')
+
+        def parallel_km(lat):
+            """Arc of the parallel at lat over the bbox longitudes."""
+            phi = np.radians(lat)
+            return geod.a * np.cos(phi) / np.sqrt(1 - geod.es * np.sin(phi) ** 2) * np.radians(east - west) / 1000
+
+        sides = {'south': parallel_km(south), 'north': parallel_km(north),
+                 'west and east': geod.inv(west, south, west, north)[2] / 1000}
+        # compared at 1 mm
+        short = [k for k, v in sides.items() if round(v * 1e6) < _NISAR_MIN_CROP_KM * 10**6]
+        if short:
+            sizes = ', '.join(f'{k} {v:.3f} km' for k, v in sides.items())
+            raise ValueError(
+                f"NISAR bbox {tuple(float(v) for v in bbox)} is too small to crop (too short: {', '.join(short)}). "
+                f"The minimum is {_NISAR_MIN_CROP_KM} km per side on the ground; the requested sides are {sizes}. "
+                f"Smaller crops cannot be processed accurately, and the bbox is not enlarged automatically. "
+                f"Pass a bbox of at least {_NISAR_MIN_CROP_KM} x {_NISAR_MIN_CROP_KM} km here; a smaller "
+                f"processing bbox can still be passed to the preprocessor, which can use the whole downloaded "
+                f"area for alignment. Nothing was downloaded.")
+
+    @staticmethod
     def _nisar_bbox_to_pixel_indices(h5, bbox, chunk_info_a, chunk_info_b=None):
         """Convert WGS84 bbox to pixel indices using geolocationGrid.
+
+        The geolocation grid gives longitude and latitude on a regular (zeroDopplerTime, slantRange) node grid
+        for every height layer (such as -500 to 9000 m). A lon/lat box is curved in radar coordinates, so
+        its outline is sampled at a quarter of the smallest node spacing and mapped to fractional nodes on
+        every layer, by inverting the bilinear interpolation of the grid (Newton
+        iterations, extrapolated from the edge cells beyond the grid), then to swath lines and range bins. The
+        window is the extreme extent over all layers, so it covers the bbox at any terrain height within the
+        layers. No margin is added: the window ends at the pixels nearest to the extreme outline points. The
+        callers round the window out to the file's chunk grid.
 
         Parameters
         ----------
@@ -1228,8 +1266,8 @@ class ASF(progressbar_joblib):
             Open HDF5 file with geolocationGrid
         bbox : tuple
             (west, south, east, north) in WGS84 degrees
-        chunk_info_a : dict
-            Chunk info for frequencyA (has shape)
+        chunk_info_a : dict or None
+            Chunk info for frequencyA (has shape), None when only frequencyB is requested
         chunk_info_b : dict, optional
             Chunk info for frequencyB
 
@@ -1237,78 +1275,119 @@ class ASF(progressbar_joblib):
         -------
         dict with keys:
             'az_start', 'az_end': azimuth pixel range
-            'rg_start_a', 'rg_end_a': range pixel range for freqA
+            'rg_start_a', 'rg_end_a': range pixel range for freqA (if provided)
             'rg_start_b', 'rg_end_b': range pixel range for freqB (if provided)
+
+        Raises
+        ------
+        ValueError
+            "does not intersect scene" when the bbox misses the swath of a requested band (only the grid nodes
+            inside the swath count) or a window would be empty.
         """
         import numpy as np
+
+        def interp(x, xp, fp):
+            """Linear interpolation over increasing xp, extrapolated linearly beyond both ends."""
+            y = np.interp(x, xp, fp)
+            lo, hi = x < xp[0], x > xp[-1]
+            y[lo] = fp[0] + (x[lo] - xp[0]) * (fp[1] - fp[0]) / (xp[1] - xp[0])
+            y[hi] = fp[-1] + (x[hi] - xp[-1]) * (fp[-1] - fp[-2]) / (xp[-1] - xp[-2])
+            return y
+
+        def window(pixels, n):
+            """Pixels nearest to the extreme fractional positions, clamped to [0, n)."""
+            return max(0, int(np.floor(pixels.min() + 0.5))), min(n, int(np.floor(pixels.max() + 0.5)) + 1)
 
         # Bbox format: (west, south, east, north) = (lon_min, lat_min, lon_max, lat_max)
         west, south, east, north = bbox
         geo = h5['science/LSAR/RSLC/metadata/geolocationGrid']
 
-        # Get geolocation coordinates (use height=0 layer, index 10 of 20)
+        # All height layers, (n_height, n_az_geo, n_rg_geo)
         # NISAR EPSG 4326 convention: coordinateX = longitude, coordinateY = latitude
-        lon = geo['coordinateX'][10, :, :]  # (n_az_geo, n_rg_geo) - longitude
-        lat = geo['coordinateY'][10, :, :]  # latitude
-        geo_az_time = geo['zeroDopplerTime'][:]
-        geo_slant_range = geo['slantRange'][:]
+        lon = geo['coordinateX'][:]
+        lat = geo['coordinateY'][:]
+        n_layers, n_az_geo, n_rg_geo = lon.shape
 
-        # Get full grid coordinates
-        swaths = h5['science/LSAR/RSLC/swaths']
-        full_az_time = swaths['zeroDopplerTime'][:]
-        full_slant_range_a = swaths['frequencyA/slantRange'][:]
-
-        # Find geolocation grid cells inside bbox
-        in_bbox = ((lon >= west) & (lon <= east) &
-                   (lat >= south) & (lat <= north))
-
-        if not np.any(in_bbox):
+        # The part of the bbox beyond the grid's own lon/lat extent is outside the scene
+        w, e = max(west, lon.min()), min(east, lon.max())
+        s, n = max(south, lat.min()), min(north, lat.max())
+        if w >= e or s >= n:
             raise ValueError(f"Bbox {bbox} does not intersect scene")
 
-        # Get azimuth and range indices in geolocation grid
-        az_geo_idx, rg_geo_idx = np.where(in_bbox)
-        az_geo_min, az_geo_max = az_geo_idx.min(), az_geo_idx.max()
-        rg_geo_min, rg_geo_max = rg_geo_idx.min(), rg_geo_idx.max()
+        # Outline of the (clipped) bbox, sampled at a quarter of the smallest node spacing in degrees
+        step = 0.25 * min(np.hypot(np.diff(lon, axis=axis), np.diff(lat, axis=axis)).min() for axis in (1, 2))
+        xs = np.linspace(w, e, int(np.ceil((e - w) / step)) + 1)
+        ys = np.linspace(s, n, int(np.ceil((n - s) / step)) + 1)
+        px = np.concatenate([xs, np.full(ys.size, e), xs, np.full(ys.size, w)])
+        py = np.concatenate([np.full(xs.size, s), ys, np.full(xs.size, n), ys])
 
-        # Convert to full grid indices via time/range interpolation
-        az_time_min = geo_az_time[az_geo_min]
-        az_time_max = geo_az_time[az_geo_max]
-        rg_min = geo_slant_range[rg_geo_min]
-        rg_max = geo_slant_range[rg_geo_max]
+        # Fractional nodes (u along azimuth, v along range) of the outline on every layer, (n_height, n_points).
+        # Start: the affine map through each layer's first node and the two grid axes.
+        k = np.arange(n_layers)[:, None]
+        ox, oy = lon[:, 0, 0][:, None], lat[:, 0, 0][:, None]
+        ux, uy = (lon[:, -1, 0][:, None] - ox) / (n_az_geo - 1), (lat[:, -1, 0][:, None] - oy) / (n_az_geo - 1)
+        vx, vy = (lon[:, 0, -1][:, None] - ox) / (n_rg_geo - 1), (lat[:, 0, -1][:, None] - oy) / (n_rg_geo - 1)
+        det = ux * vy - uy * vx
+        u = ((px - ox) * vy - (py - oy) * vx) / det
+        v = ((py - oy) * ux - (px - ox) * uy) / det
 
-        # Find full grid indices
-        az_start = int(np.searchsorted(full_az_time, az_time_min))
-        az_end = int(np.searchsorted(full_az_time, az_time_max)) + 1
-        rg_start_a = int(np.searchsorted(full_slant_range_a, rg_min))
-        rg_end_a = int(np.searchsorted(full_slant_range_a, rg_max)) + 1
+        def bilinear(g, i, j, a, b):
+            """Value and its derivatives along u and v of grid g in cells (i, j) at cell fractions (a, b)."""
+            g00, g10, g01, g11 = g[k, i, j], g[k, i + 1, j], g[k, i, j + 1], g[k, i + 1, j + 1]
+            c = g11 - g10 - g01 + g00
+            return g00 + a * (g10 - g00) + b * (g01 - g00) + a * b * c, (g10 - g00) + b * c, (g01 - g00) + a * c
 
-        # Clamp to valid range
-        n_az_pixels = chunk_info_a['shape'][0]
-        n_rg_a_pixels = chunk_info_a['shape'][1]
-        az_start = max(0, az_start)
-        az_end = min(n_az_pixels, az_end)
-        rg_start_a = max(0, rg_start_a)
-        rg_end_a = min(n_rg_a_pixels, rg_end_a)
+        for _ in range(50):
+            i = np.clip(np.floor(u).astype(np.int64), 0, n_az_geo - 2)
+            j = np.clip(np.floor(v).astype(np.int64), 0, n_rg_geo - 2)
+            fx, xu, xv = bilinear(lon, i, j, u - i, v - j)
+            fy, yu, yv = bilinear(lat, i, j, u - i, v - j)
+            det = xu * yv - xv * yu
+            du = ((px - fx) * yv - (py - fy) * xv) / det
+            dv = ((py - fy) * xu - (px - fx) * yu) / det
+            u, v = u + du, v + dv
+            if max(np.abs(du).max(), np.abs(dv).max()) < 1e-6:
+                break
+        else:
+            raise ValueError(f"Bbox {bbox}: the geolocation grid inversion did not converge")
 
-        result = {
-            'az_start': az_start,
-            'az_end': az_end,
-            'rg_start_a': rg_start_a,
-            'rg_end_a': rg_end_a,
-        }
+        # Fractional nodes -> zeroDopplerTime / slantRange -> fractional swath lines and range bins
+        swaths = h5['science/LSAR/RSLC/swaths']
+        full_az_time = swaths['zeroDopplerTime'][:]
+        az_time = interp(u.ravel(), np.arange(n_az_geo), geo['zeroDopplerTime'][:])
+        slant_range = interp(v.ravel(), np.arange(n_rg_geo), geo['slantRange'][:])
+        lines = interp(az_time, full_az_time, np.arange(full_az_time.size))
+        az_start, az_end = window(lines, (chunk_info_a or chunk_info_b)['shape'][0])
 
-        # Handle frequencyB if present
-        if chunk_info_b:
-            full_slant_range_b = swaths['frequencyB/slantRange'][:]
-            n_rg_b_pixels = chunk_info_b['shape'][1]
+        # The grid reaches beyond the swath (such as 5 nodes in time and range), so only its nodes inside the
+        # swath count: their lines and each band's bins
+        node_lines = interp(geo['zeroDopplerTime'][:], full_az_time, np.arange(full_az_time.size))
+        in_bbox = (lon >= west) & (lon <= east) & (lat >= south) & (lat <= north)
 
-            rg_start_b = int(np.searchsorted(full_slant_range_b, rg_min))
-            rg_end_b = int(np.searchsorted(full_slant_range_b, rg_max)) + 1
-            rg_start_b = max(0, rg_start_b)
-            rg_end_b = min(n_rg_b_pixels, rg_end_b)
+        def in_swath(lines, bins, n_bins):
+            """Fractional lines and bins inside the swath of a band with n_bins range bins."""
+            return (lines > -0.5) & (lines < full_az_time.size - 0.5) & (bins > -0.5) & (bins < n_bins - 0.5)
 
-            result['rg_start_b'] = rg_start_b
-            result['rg_end_b'] = rg_end_b
+        # Every requested band must intersect the bbox: an outline point inside the band's swath on some layer, or
+        # a node inside the band's swath within the bbox (a bbox containing the whole scene); its window is not empty
+        result = {'az_start': az_start, 'az_end': az_end}
+        missed = []
+        for band, chunk_info in (('A', chunk_info_a), ('B', chunk_info_b)):
+            if not chunk_info:
+                continue
+            full_slant_range = swaths[f'frequency{band}/slantRange'][:]
+            bins = interp(slant_range, full_slant_range, np.arange(full_slant_range.size))
+            node_bins = interp(geo['slantRange'][:], full_slant_range, np.arange(full_slant_range.size))
+            hit = (in_swath(lines, bins, full_slant_range.size).any() or
+                   (in_bbox & in_swath(node_lines[:, None], node_bins[None, :], full_slant_range.size)).any())
+            rg_start, rg_end = window(bins, chunk_info['shape'][1])
+            if not hit or az_start >= az_end or rg_start >= rg_end:
+                missed.append(band)
+            result[f'rg_start_{band.lower()}'], result[f'rg_end_{band.lower()}'] = rg_start, rg_end
+        if missed:
+            requested = [band for band, ci in (('A', chunk_info_a), ('B', chunk_info_b)) if ci]
+            raise ValueError(f"Bbox {bbox} does not intersect scene" +
+                             ('' if missed == requested else f" in frequency{missed[0]}"))
 
         return result
 
@@ -1346,8 +1425,55 @@ class ASF(progressbar_joblib):
 
         return filtered
 
+    @staticmethod
+    def _nisar_crop_times(metadata, az_start, az_end):
+        """identification/zeroDopplerStartTime and zeroDopplerEndTime of a crop of the swath lines [az_start, az_end).
+
+        They are the times of the crop's first and last lines: swaths/zeroDopplerTime on the epoch of its units
+        ("seconds since 2025-12-24T00:00:00"), in the source's format (2025-12-24T01:13:36.042105263). Only a
+        moved side is returned: a crop that starts at line 0 or ends at the frame's last line keeps the source's
+        string there, byte for byte.
+
+        Returns
+        -------
+        dict
+            {dataset path: numpy.bytes_} of the times to replace (empty without a moved side); numpy.bytes_ as
+            read from the source, so the dataset stays a fixed-length string.
+        """
+        import numpy as np
+        from datetime import datetime, timedelta
+
+        zdt = metadata['science/LSAR/RSLC/swaths/zeroDopplerTime']
+        times = zdt['data']
+        az_end = min(az_end, len(times)) if az_end else len(times)
+        sides = {'zeroDopplerStartTime': az_start if az_start > 0 else None,
+                 'zeroDopplerEndTime': az_end - 1 if az_end < len(times) else None}
+        sides = {f'science/LSAR/identification/{k}': v for k, v in sides.items() if v is not None}
+        sides = {k: v for k, v in sides.items() if k in metadata}
+        if not sides:
+            return {}
+        units = zdt['attrs'].get('units', b'')
+        units = units.decode() if isinstance(units, bytes) else str(units)
+        if 'since' not in units:
+            print(f"WARNING: swaths/zeroDopplerTime has no 'seconds since <UTC epoch>' units ({units!r}), so the "
+                  f"crop keeps the frame's identification/zeroDopplerStartTime and zeroDopplerEndTime instead of "
+                  f"its own first and last line times.")
+            return {}
+        epoch = datetime.fromisoformat(units.split('since', 1)[1].strip().replace(' ', 'T')[:19])
+        out = {}
+        for path, line in sides.items():
+            old = metadata[path]['data']
+            old = old.decode() if isinstance(old, bytes) else str(old)
+            digits = len(old.split('.', 1)[1]) if '.' in old else 0
+            ns = int(round(float(times[line]) * 1e9))
+            text = (epoch + timedelta(seconds=ns // 10**9)).strftime('%Y-%m-%dT%H:%M:%S')
+            if digits:
+                text += '.' + f'{ns % 10**9:09d}'[:digits]
+            out[path] = np.bytes_(text.encode())
+        return out
+
     def _download_nisar(self, basedir, granules, polarizations, frequency, bbox, session,
-                         n_jobs, joblib_backend, skip_exist, retries, timeout_second, debug):
+                         n_jobs, joblib_backend, skip_exist, retries, timeout_second, min_rate, min_rate_window, debug):
         """Internal: Download NISAR RSLC granules with per-polarization output.
 
         Uses single HTTP Range request approach (verified 9.2 min for one pol):
@@ -1388,12 +1514,14 @@ class ASF(progressbar_joblib):
         import os
         import time
         import threading
+        from .utils_files import EmptyFileError
+        from .HTTP import final, attempts, send, read_body
 
         # Use cache proxy when no credentials provided
         if self.username is None:
             return self._download_nisar_via_cache(
                 basedir, granules, polarizations, frequency, bbox,
-                n_jobs, skip_exist, retries, timeout_second, debug
+                n_jobs, skip_exist, retries, timeout_second, min_rate, min_rate_window, debug
             )
 
         # Initialize tqdm lock for thread-safe progress bars
@@ -1422,27 +1550,6 @@ class ASF(progressbar_joblib):
         # Use shared helper for chunk info
         get_chunk_info = ASF._nisar_get_chunk_info
 
-        def extract_signed_url(url, auth_tuple, http_session=None):
-            """Extract signed CloudFront URL by following OAuth redirects.
-
-            Makes a small Range request to trigger OAuth flow and capture
-            the final signed URL for direct reuse.
-            """
-            headers = {'Range': 'bytes=0-0'}  # Minimal request
-
-            if http_session:
-                # Follow redirects manually to capture final URL
-                resp = http_session.get(url, headers=headers, allow_redirects=False, timeout=(10, 30))
-                while resp.status_code in (301, 302, 303, 307, 308):
-                    location = resp.headers.get('Location')
-                    if not location:
-                        break
-                    resp = http_session.get(location, headers=headers, allow_redirects=False, timeout=(10, 30))
-                # Final URL after all redirects
-                if 'cloudfront.net' in resp.url:
-                    return resp.url
-            return None
-
         def download_byte_range(url, start, end, auth_tuple, pbar=None, http_session=None, signed_url=None):
             """Download byte range using single HTTP Range request.
 
@@ -1455,31 +1562,28 @@ class ASF(progressbar_joblib):
             size = end - start
             headers = {'Range': f'bytes={start}-{end-1}'}  # HTTP Range is inclusive
 
-            chunks_data = []
             returned_signed_url = signed_url
 
+            # a failed request raises with its response closed (HTTP.http_error), the response of any other is
+            # closed by the with block
             if signed_url:
-                # Use signed URL directly (much faster - no OAuth redirects)
-                r = requests.get(signed_url, headers=headers, stream=True, timeout=(10, 300))
+                # Use signed URL directly (much faster - no OAuth redirects); an error names the file URL
+                r = send(requests.get, signed_url, what=url, headers=headers, stream=True, timeout=(10, 300))
             elif http_session:
-                r = http_session.get(url, headers=headers, stream=True, timeout=(10, 300))
-                # Capture signed URL from redirect chain
-                if 'cloudfront.net' in r.url:
-                    returned_signed_url = r.url
+                r = send(http_session.get, url, headers=headers, stream=True, timeout=(10, 300))
             else:
-                r = requests.get(url, headers=headers, auth=auth_tuple, stream=True, timeout=(10, 300))
+                r = send(requests.get, url, headers=headers, auth=auth_tuple, stream=True, timeout=(10, 300))
 
             with r:
-                r.raise_for_status()
+                # Capture signed URL from redirect chain
+                if http_session and not signed_url and 'cloudfront.net' in r.url:
+                    returned_signed_url = r.url
                 content_length = int(r.headers.get('Content-Length', 0))
                 if content_length > 0 and content_length < size:
                     raise Exception(f'Truncated range response: expected {size} bytes, server reports {content_length}')
-                for chunk in r.iter_content(chunk_size=1024*1024):
-                    chunks_data.append(chunk)
-                    if pbar:
-                        pbar.update(len(chunk))
+                # a transfer slower than min_rate is cut (HTTP.read_body) and retried
+                result = read_body(r, min_rate, min_rate_window, progress=pbar.update if pbar else None)
 
-            result = b''.join(chunks_data)
             if len(result) < size:
                 raise Exception(f'Truncated download: got {len(result)} bytes of {size} expected')
             return result, returned_signed_url
@@ -1556,21 +1660,8 @@ class ASF(progressbar_joblib):
             subdir = f"{track:03d}_{frame:03d}"
             out_dir = os.path.join(basedir, subdir)
 
-            # 3. Check if all requested files already exist (skip remote HDF5 access)
-            pols_to_download = polarizations if polarizations else ['HH', 'HV', 'VH', 'VV']
-
-            if skip_exist:
-                existing_files = []
-                for pol in pols_to_download:
-                    out_name = f"NSR_{track:03d}_{frame:03d}_{datetime_str}_{pol}.h5"
-                    out_path = os.path.join(out_dir, out_name)
-                    if os.path.exists(out_path):
-                        existing_files.append(out_name)
-
-                if len(existing_files) == len(pols_to_download):
-                    if debug:
-                        print(f"NISAR {track}_{frame}: all files exist, skipping download")
-                    return existing_files
+            # 3. download() passes only granules with a missing file (skip_exist); the files that exist are not
+            # downloaded again (below, once the metadata names the polarizations of the product)
 
             # 4. Get URL from pre-fetched lookup (batch search done at start)
             short_name = f"NSR_{track:03d}_{frame:03d}_{datetime_str}"
@@ -1586,8 +1677,12 @@ class ASF(progressbar_joblib):
             http_session = self._get_asf_session()
 
             # Get file size (HEAD request)
-            head_resp = http_session.head(url, allow_redirects=True, timeout=(10, 30))
-            file_size = int(head_resp.headers['Content-Length'])
+            head_resp = send(http_session.head, url, allow_redirects=True, timeout=(10, 30))
+            file_size = head_resp.headers.get('Content-Length')
+            if file_size is None:
+                # a broken answer, retried
+                raise IOError(f'{url}: no Content-Length in the answer')
+            file_size = int(file_size)
 
             # Download 128MB metadata block (same as cache path) with progress bar
             with tqdm(total=128*1024*1024, unit='B', unit_scale=True,
@@ -1596,7 +1691,8 @@ class ASF(progressbar_joblib):
                       disable=(position is not None)) as meta_pbar:
                 layout, metadata_buffer = self._detect_nisar_layout_fast(
                     url, auth_tuple, file_size, http_session=http_session,
-                    pbar=meta_pbar if position is None else None
+                    pbar=meta_pbar if position is None else None,
+                    min_rate=min_rate, min_rate_window=min_rate_window
                 )
 
             if debug and position is None:
@@ -1640,13 +1736,12 @@ class ASF(progressbar_joblib):
                     freq_b_pols = []
 
             # Determine which pols to download
-            if polarizations is None:
-                pols_to_download = available_pols
-            else:
-                pols_to_download = [p for p in polarizations if p in available_pols]
-                missing = set(polarizations) - set(available_pols)
-                if missing:
-                    print(f"WARNING: Polarizations {missing} not available in {granule_id}")
+            pols_to_download = ASF._nisar_pols(polarizations, available_pols, granule_id)
+            # the files that exist are not downloaded again
+            if skip_exist:
+                pols_to_download = [p for p in pols_to_download if not ASF._nisar_exists(basedir, granule_id, p)]
+                if not pols_to_download:
+                    return []
 
             # Update frequency download flags based on actual availability
             # Normalize frequency to list for consistent checking
@@ -1681,7 +1776,7 @@ class ASF(progressbar_joblib):
                     first_ci_b = next((ci_b for _, ci_b in all_chunk_info.values() if ci_b), None)
                     if first_ci_a or first_ci_b:
                         bbox_info = ASF._nisar_bbox_to_pixel_indices(
-                            h5_meta, bbox, first_ci_a or first_ci_b, first_ci_b
+                            h5_meta, bbox, first_ci_a, first_ci_b
                         )
                         if debug and position is None:
                             print(f"  Bbox {bbox} -> pixels az[{bbox_info['az_start']}:{bbox_info['az_end']}], "
@@ -1829,18 +1924,22 @@ class ASF(progressbar_joblib):
             return downloaded_files
 
         def download_with_retry(granule, position=None):
-            """Download single granule with retry logic."""
-            for retry in range(retries):
+            """Download single granule with retry logic: retries=0 makes one attempt (HTTP.attempts), and a failure
+            that a retry cannot change (HTTP.final) raises at its first attempt."""
+            n = attempts(retries)
+            for retry in range(n):
                 try:
                     return download_nisar_granule(
                         granule, basedir, polarizations, skip_exist, debug, position=position
                     )
-                except ValueError:
-                    # Format errors are permanent - don't retry
+                except (ValueError, EmptyFileError):
+                    # Format errors and empty files are permanent - don't retry
                     raise
                 except Exception as e:
-                    print(f"ERROR downloading {granule} (attempt {retry+1}/{retries}): {e}")
-                    if retry + 1 == retries:
+                    stop = final(e)
+                    print(f"ERROR downloading {granule} (attempt {retry+1}/{n}){' (not retried)' if stop else ''}: "
+                          f"{e}")
+                    if stop or retry + 1 == n:
                         raise
                     time.sleep(timeout_second)
 
@@ -1865,7 +1964,7 @@ class ASF(progressbar_joblib):
         return None
 
     def _download_nisar_via_cache(self, basedir, granules, polarizations, frequency, bbox,
-                                   n_jobs, skip_exist, retries, timeout_second, debug):
+                                   n_jobs, skip_exist, retries, timeout_second, min_rate, min_rate_window, debug):
         """Download NISAR via Cloudflare cache proxy (no credentials required).
 
         Uses cache proxy at nisar-cache-asf.insar.dev with two APIs:
@@ -1904,8 +2003,8 @@ class ASF(progressbar_joblib):
         import struct
         import time
         from joblib import Parallel, delayed
+        from .HTTP import final, attempts, send, read_body, MAGIC_HDF5
 
-        MIN_BLOCK = 64 * 1024 * 1024   # 64 MB min block
         MAX_BLOCK = 128 * 1024 * 1024  # 128 MB max block
 
         # 25x25km aligned block constants (for cache efficiency)
@@ -1933,14 +2032,15 @@ class ASF(progressbar_joblib):
             # Get pixel indices from shared helper
             result = ASF._nisar_bbox_to_pixel_indices(h5, bbox, chunk_info_a, chunk_info_b)
 
-            # Calculate exact chunk indices for bbox (not aligned blocks)
-            chunk_az = chunk_info_a['chunk_shape'][0]
-            chunk_rg = chunk_info_a['chunk_shape'][1]
+            # Calculate exact chunk indices for bbox (not aligned blocks); chunk_info_a is None for frequencyB only
+            chunk_az = (chunk_info_a or chunk_info_b)['chunk_shape'][0]
 
             result['az_chunk_start'] = result['az_start'] // chunk_az
             result['az_chunk_end'] = (result['az_end'] + chunk_az - 1) // chunk_az
-            result['rg_chunk_start_a'] = result['rg_start_a'] // chunk_rg
-            result['rg_chunk_end_a'] = (result['rg_end_a'] + chunk_rg - 1) // chunk_rg
+            if chunk_info_a:
+                chunk_rg = chunk_info_a['chunk_shape'][1]
+                result['rg_chunk_start_a'] = result['rg_start_a'] // chunk_rg
+                result['rg_chunk_end_a'] = (result['rg_end_a'] + chunk_rg - 1) // chunk_rg
 
             # Handle frequencyB chunk indices if present
             if chunk_info_b and 'rg_start_b' in result:
@@ -2105,91 +2205,6 @@ class ASF(progressbar_joblib):
 
             return aligned_blocks
 
-        def build_multi_offset_url(granule_id, block_chunks):
-            """Build multi-offset URL for 25x25km aligned block.
-
-            URL format: /{GRANULE}/off1_len1,off2_len2,.../ranges.bin
-
-            Parameters
-            ----------
-            granule_id : str
-                NISAR granule ID
-            block_chunks : list of (offset, size) tuples
-                Chunks to fetch, sorted by offset
-
-            Returns
-            -------
-            str
-                Multi-offset URL for cache proxy
-            """
-            offsets_str = ','.join(f"{off}_{size}" for off, size in block_chunks)
-            return f"{_NISAR_CACHE_PROXY}/{granule_id}/{offsets_str}/ranges.bin"
-
-        def fetch_aligned_block(granule_id, block_chunks, session=None):
-            """Fetch aligned 25x25km block via multi-offset endpoint.
-
-            Returns (content, cache_hit, chunk_offsets) tuple where chunk_offsets
-            maps each original chunk offset to its position in the returned data.
-            """
-            total_size = sum(size for _, size in block_chunks)
-
-            # Validate block size
-            if total_size > MAX_MULTI_BLOCK:
-                # Block too large - shouldn't happen with 25x25km blocks
-                raise ValueError(f"Block size {total_size} exceeds max {MAX_MULTI_BLOCK}")
-
-            url = build_multi_offset_url(granule_id, block_chunks)
-            sess = session or requests.Session()
-            resp = sess.get(url)
-            resp.raise_for_status()
-            if len(resp.content) != total_size:
-                raise ValueError(
-                    f"Response size mismatch: got {len(resp.content)}, expected {total_size}")
-
-            cache_hit = resp.headers.get('cf-cache-status', '').upper() == 'HIT'
-
-            # Build offset map: original chunk offset -> (position_in_data, size)
-            chunk_offsets = {}
-            pos = 0
-            for off, size in block_chunks:
-                chunk_offsets[off] = (pos, size)
-                pos += size
-
-            return resp.content, cache_hit, chunk_offsets
-
-        def split_range_to_blocks(start, end):
-            """Split byte range into deterministic 64-128MB blocks.
-
-            All clients requesting the same range get identical blocks,
-            ensuring consistent cache hits.
-            """
-            total = end - start
-            if total <= MAX_BLOCK:
-                return [(start, total)]
-
-            # Calculate number of chunks so each is 64-128MB
-            n_blocks = (total + MAX_BLOCK - 1) // MAX_BLOCK
-            block_size = total // n_blocks
-
-            # Ensure blocks are >= MIN_BLOCK
-            while n_blocks > 1 and block_size < MIN_BLOCK:
-                n_blocks -= 1
-                block_size = total // n_blocks
-
-            blocks = []
-            offset = start
-            for i in range(n_blocks):
-                if i == n_blocks - 1:
-                    # Last block gets remainder
-                    blocks.append((offset, end - offset))
-                else:
-                    blocks.append((offset, block_size))
-                    offset += block_size
-            return blocks
-
-        # Cache statistics for debug mode
-        cache_stats = {'hits': 0, 'misses': 0, 'bytes_hit': 0, 'bytes_miss': 0}
-
         def fetch_cache_range(granule_id, offset, length, session=None):
             """Fetch range from cache proxy using new API.
 
@@ -2197,162 +2212,42 @@ class ASF(progressbar_joblib):
             """
             url = f"{_NISAR_CACHE_PROXY}/{granule_id}/{offset}/{length}.bin"
             sess = session or requests.Session()
-            resp = sess.get(url, timeout=120)
-            resp.raise_for_status()
-            if len(resp.content) != length:
-                raise ValueError(f'Cache response size mismatch: got {len(resp.content)}, expected {length}')
-            # Check both X-Cache (proxy) and cf-cache-status (CDN) headers
-            cache_hit = (resp.headers.get('X-Cache', '').upper() == 'HIT' or
-                        resp.headers.get('cf-cache-status', '').upper() == 'HIT')
-            return resp.content, cache_hit
+            # a transfer slower than min_rate is cut (HTTP.read_body) and retried
+            with send(sess.get, url, stream=True, timeout=120) as resp:
+                content = read_body(resp, min_rate, min_rate_window)
+                # Check both X-Cache (proxy) and cf-cache-status (CDN) headers
+                cache_hit = (resp.headers.get('X-Cache', '').upper() == 'HIT' or
+                            resp.headers.get('cf-cache-status', '').upper() == 'HIT')
+            if len(content) != length:
+                raise ValueError(f'Cache response size mismatch: got {len(content)}, expected {length}')
+            return content, cache_hit
 
-        def fetch_region_via_cache(granule_id, start, end, pbar=None, session=None):
-            """Fetch byte region using deterministic 64-128MB blocks.
+        def retried(what, request):
+            """request() with the retries of the cache proxy: retries=0 makes one attempt (HTTP.attempts), and a
+            failure that a retry cannot change (HTTP.final, such as HTTP 404) raises at its first attempt, logged as
+            not retried; the last failure is logged too."""
+            n = attempts(retries)
+            for retry in range(n):
+                try:
+                    return request()
+                except Exception as e:
+                    stop = final(e)
+                    if debug or stop or retry + 1 == n:
+                        print(f'ERROR: {what} download attempt {retry+1}/{n} failed'
+                              f'{" (not retried)" if stop else ""}: {e}')
+                    if stop or retry + 1 == n:
+                        raise
+                    time.sleep(timeout_second)
 
-            Splits large regions into cacheable blocks.
-            Returns contiguous bytes from start to end.
-            """
-            sess = session or requests.Session()
-            blocks = split_range_to_blocks(start, end)
-
-            all_data = bytearray()
-            for block_offset, block_length in blocks:
-                block_data, cache_hit = fetch_cache_range(granule_id, block_offset, block_length, session=sess)
-                all_data.extend(block_data)
-
-                # Track cache stats
-                if cache_hit:
-                    cache_stats['hits'] += 1
-                    cache_stats['bytes_hit'] += block_length
-                else:
-                    cache_stats['misses'] += 1
-                    cache_stats['bytes_miss'] += block_length
-                    # Log missed blocks for debugging
-                    if debug:
-                        print(f"    MISS: offset={block_offset} len={block_length/(1024**2):.0f}MB")
-
-                if pbar:
-                    pbar.update(block_length)
-                    # Show cache stats in progress bar
-                    pbar.set_postfix_str(f"H{cache_stats['hits']}M{cache_stats['misses']}")
-
-            return bytes(all_data)
-
-        def fetch_chunks_via_cache(granule_id, chunks, pbar=None, session=None):
-            """Fetch HDF5 chunks by downloading their containing regions.
-
-            Groups adjacent chunks into contiguous regions (1MB gap threshold),
-            then fetches each region using deterministic 64-128MB blocks.
-
-            Returns dict: {chunk_offset: chunk_bytes}
-            """
-            sess = session or requests.Session()
-
-            # Use shared helper to merge chunks with 1MB gap threshold (consistent with aligned blocks)
-            regions = ASF._nisar_merge_chunks_to_regions(chunks, gap_threshold=1024*1024)
-
-            # Download each region and extract chunks
-            chunk_data = {}
-            for region_start, region_size, region_chunks in regions:
-                region_end = region_start + region_size
-                region_bytes = fetch_region_via_cache(
-                    granule_id, region_start, region_end, pbar=pbar, session=sess
-                )
-
-                for chunk in region_chunks:
-                    rel_offset = chunk['offset'] - region_start
-                    chunk_data[chunk['offset']] = region_bytes[rel_offset:rel_offset + chunk['size']]
-
-            return chunk_data
-
-        def fetch_chunks_via_aligned_blocks(granule_id, chunk_info, pbar=None, session=None,
-                                             az_block_start=None, az_block_end=None,
-                                             rg_block_start=None, rg_block_end=None):
-            """Fetch HDF5 chunks using aligned blocks for cache efficiency.
-
-            Uses multi-offset API: /GRANULE/off1_len1,off2_len2,.../ranges.bin
-            All clients requesting the same scene get identical block boundaries.
-
-            Parameters
-            ----------
-            granule_id : str
-                NISAR granule ID
-            chunk_info : dict
-                Output from get_chunk_info()
-            pbar : tqdm, optional
-                Progress bar to update
-            session : requests.Session, optional
-                HTTP session for connection reuse
-            az_block_start, az_block_end : int, optional
-                Azimuth block indices to extract (for bbox subsetting)
-            rg_block_start, rg_block_end : int, optional
-                Range block indices to extract (for bbox subsetting)
-
-            Returns dict: {chunk_offset: chunk_bytes}
-            """
-            sess = session or requests.Session()
-
-            # Get aligned 25x25km blocks
-            aligned_blocks = chunks_to_aligned_blocks(
-                chunk_info,
-                az_block_start=az_block_start, az_block_end=az_block_end,
-                rg_block_start=rg_block_start, rg_block_end=rg_block_end
-            )
-
-            if not aligned_blocks:
-                return {}
-
-            # Debug: show block alignment stats
-            if debug:
-                n_az = max(b['az_block'] for b in aligned_blocks) + 1
-                n_rg = max(b['rg_block'] for b in aligned_blocks) + 1
-                sizes_mb = [b['total_size'] / (1024**2) for b in aligned_blocks]
-                print(f"    Aligned blocks: {n_az}×{n_rg} = {len(aligned_blocks)} blocks, "
-                      f"size: {min(sizes_mb):.1f}-{max(sizes_mb):.1f}MB (avg {sum(sizes_mb)/len(sizes_mb):.1f}MB)")
-
-            chunk_data = {}
-
-            for block in aligned_blocks:
-                chunks = block['chunks']  # Raw chunks (offset, size) - worker handles defragmentation
-                total_size = block['total_size']
-
-                # Try multi-offset API if block is in valid size range
-                if total_size <= MAX_MULTI_BLOCK:
-                    data, cache_hit, chunk_offsets = fetch_aligned_block(
-                        granule_id, chunks, session=sess
-                    )
-
-                    if data is not None:
-                        # Track cache stats
-                        if cache_hit:
-                            cache_stats['hits'] += 1
-                            cache_stats['bytes_hit'] += total_size
-                        else:
-                            cache_stats['misses'] += 1
-                            cache_stats['bytes_miss'] += total_size
-                            if debug:
-                                print(f"    MISS: aligned block ({block['az_block']},{block['rg_block']}) "
-                                      f"{total_size/(1024**2):.0f}MB ({len(chunks)} chunks)")
-
-                        # Extract individual chunks - worker returns them concatenated in order
-                        for chunk_off, chunk_size in chunks:
-                            pos, _ = chunk_offsets[chunk_off]
-                            chunk_data[chunk_off] = data[pos:pos + chunk_size]
-
-                        if pbar:
-                            pbar.update(total_size)
-                            if debug:
-                                pbar.set_postfix_str(f"H{cache_stats['hits']}M{cache_stats['misses']}")
-
-                        continue
-
-                # Block exceeds MAX_MULTI_BLOCK - code bug, should not happen with proper aligned blocks
-                raise RuntimeError(
-                    f"Block ({block['az_block']},{block['rg_block']}) size={total_size/(1024**2):.1f}MB "
-                    f"exceeds MAX_MULTI_BLOCK={MAX_MULTI_BLOCK/(1024**2):.0f}MB - this is a code issue"
-                )
-
-            return chunk_data
+        def fetch_metadata(granule_id):
+            """The metadata block of a granule (fetch_cache_range); a body that is not HDF5 is retried, as a
+            broken transfer."""
+            def request():
+                content, cache_hit = fetch_cache_range(granule_id, 0, MAX_BLOCK)
+                if not content.startswith(MAGIC_HDF5):
+                    raise IOError(f'Cache returned invalid metadata (not HDF5): {content[:100]!r}')
+                return content, cache_hit
+            return retried('metadata', request)
 
         def patch_hdf5_superblock(data):
             """Patch HDF5 superblock EOF to match buffer size."""
@@ -2365,212 +2260,8 @@ class ASF(progressbar_joblib):
                 data[44:48] = struct.pack('<I', self._hdf5_lookup3_hash(bytes(data[0:44])))
             return data
 
-        def download_granule_via_cache(granule_id, position=None, shared_pbar=None, shared_progress=None):
-            """Download single NISAR granule via cache proxy.
-
-            shared_pbar: optional (pbar_list, lock) tuple for threading parallel mode
-            shared_progress: optional (counter, lock) tuple for loky parallel mode
-            """
-            track, frame, datetime_str = parse_nisar_granule_id(granule_id)
-
-            # Output directory
-            subdir = f"{track:03d}_{frame:03d}"
-            out_dir = os.path.join(basedir, subdir)
-
-            # Check what pols to download
-            pols_to_download = polarizations if polarizations else ['HH', 'HV', 'VH', 'VV']
-
-            # Check existing files
-            if skip_exist:
-                existing_files = []
-                for pol in pols_to_download:
-                    out_name = f"NSR_{track:03d}_{frame:03d}_{datetime_str}_{pol}.h5"
-                    out_path = os.path.join(out_dir, out_name)
-                    if os.path.exists(out_path):
-                        existing_files.append(out_name)
-                if len(existing_files) == len(pols_to_download):
-                    if debug:
-                        print(f"NISAR {track}_{frame}: all files exist, skipping")
-                    return existing_files
-
-            # Create session for connection reuse
-            session = requests.Session()
-
-            # Fetch metadata block (offset 0, 128MB for NISAR metadata)
-            short_name = f"NSR_{track:03d}_{frame:03d}_{datetime_str}"
-
-            metadata_raw, meta_cache_hit = fetch_cache_range(granule_id, 0, MAX_BLOCK, session=session)
-            # Track metadata block in cache stats
-            if meta_cache_hit:
-                cache_stats['hits'] += 1
-                cache_stats['bytes_hit'] += MAX_BLOCK
-            else:
-                cache_stats['misses'] += 1
-                cache_stats['bytes_miss'] += MAX_BLOCK
-            if debug:
-                print(f"  {short_name}: metadata {MAX_BLOCK/(1024*1024):.0f}MB {'HIT' if meta_cache_hit else 'MISS'}")
-            metadata_buffer = patch_hdf5_superblock(metadata_raw)
-
-            # Parse metadata to get available pols and chunk info
-            with h5py.File(BytesIO(bytes(metadata_buffer)), 'r') as h5_meta:
-                swaths_path = 'science/LSAR/RSLC/swaths'
-                if swaths_path not in h5_meta:
-                    raise ValueError(f"Unsupported NISAR format: {swaths_path} not found")
-
-                swaths_grp = h5_meta[swaths_path]
-                if 'frequencyA' not in swaths_grp:
-                    raise ValueError(f"Unsupported NISAR format: frequencyA not found")
-
-                available_pols = [k for k in swaths_grp['frequencyA'].keys()
-                                  if k in ['HH', 'HV', 'VH', 'VV']]
-                has_freq_b = 'frequencyB' in swaths_grp
-                freq_b_pols = ([k for k in swaths_grp['frequencyB'].keys()
-                               if k in ['HH', 'HV', 'VH', 'VV']] if has_freq_b else [])
-
-                # Filter to requested pols
-                if polarizations is None:
-                    pols_to_download = available_pols
-                else:
-                    pols_to_download = [p for p in polarizations if p in available_pols]
-                    missing = set(polarizations) - set(available_pols)
-                    if missing:
-                        print(f"WARNING: Polarizations {missing} not available")
-
-                # Frequency flags - normalize to list for consistent checking
-                freq_list = [frequency] if isinstance(frequency, str) else frequency
-                download_freq_a = 'A' in freq_list
-                download_freq_b = 'B' in freq_list and has_freq_b
-
-                # Get chunk info for all pols
-                all_chunk_info = {}
-                for pol in pols_to_download:
-                    chunk_info_a = None
-                    chunk_info_b = None
-                    if download_freq_a:
-                        chunk_info_a = get_chunk_info(h5_meta, pol, 'A')
-                    if download_freq_b and pol in freq_b_pols:
-                        chunk_info_b = get_chunk_info(h5_meta, pol, 'B')
-                    all_chunk_info[pol] = (chunk_info_a, chunk_info_b)
-
-            # Calculate total SLC size (actual chunk bytes, not span)
-            total_slc_size = 0
-            for pol, (chunk_info_a, chunk_info_b) in all_chunk_info.items():
-                if chunk_info_a:
-                    total_slc_size += sum(c['size'] for c in chunk_info_a['chunks'])
-                if chunk_info_b:
-                    total_slc_size += sum(c['size'] for c in chunk_info_b['chunks'])
-
-            if total_slc_size == 0:
-                raise ValueError(f"No SLC data found in {granule_id}")
-
-            if debug:
-                print(f"  Downloading {total_slc_size/(1024**3):.2f} GB SLC data via cache...")
-
-            # Setup progress bar (shared or own)
-            if shared_pbar:
-                pbar_list, pbar_lock = shared_pbar
-                with pbar_lock:
-                    if pbar_list[0] is None:
-                        # First worker initializes shared bar
-                        pbar_list[0] = tqdm(total=0, unit='B', unit_scale=True,
-                                           desc=f"Downloading {len(granule_ids)} granules",
-                                           dynamic_ncols=False, ncols=80, mininterval=0.3, smoothing=0)
-                    pbar_list[0].total += total_slc_size
-                    pbar_list[0].refresh()
-                pbar = pbar_list[0]
-                own_pbar = False
-            else:
-                pbar = tqdm(total=total_slc_size, unit='B', unit_scale=True, desc=short_name,
-                           position=position, leave=True,
-                           dynamic_ncols=False, ncols=80, mininterval=0.3, smoothing=0)
-                own_pbar = True
-
-            downloaded_files = []
-            os.makedirs(out_dir, exist_ok=True)
-
-            for pol in pols_to_download:
-                out_name = f"NSR_{track:03d}_{frame:03d}_{datetime_str}_{pol}.h5"
-                out_path = os.path.join(out_dir, out_name)
-
-                chunk_info_a, chunk_info_b = all_chunk_info[pol]
-
-                # Read metadata from buffer
-                metadata = self._read_nisar_metadata_direct(pol, metadata_buffer)
-
-                # Download frequencyA chunks using aligned 25x25km blocks
-                downloaded_data_a = None
-                if chunk_info_a is not None:
-                    downloaded_data_a = fetch_chunks_via_aligned_blocks(
-                        granule_id,
-                        chunk_info_a,
-                        pbar=pbar if own_pbar else None,
-                        session=session
-                    )
-                    if shared_pbar:
-                        size = sum(c['size'] for c in chunk_info_a['chunks'])
-                        with pbar_lock:
-                            pbar.update(size)
-
-                # Download frequencyB chunks using aligned 25x25km blocks
-                downloaded_data_b = None
-                if chunk_info_b is not None:
-                    downloaded_data_b = fetch_chunks_via_aligned_blocks(
-                        granule_id,
-                        chunk_info_b,
-                        pbar=pbar if own_pbar else None,
-                        session=session
-                    )
-                    if shared_pbar:
-                        size = sum(c['size'] for c in chunk_info_b['chunks'])
-                        with pbar_lock:
-                            pbar.update(size)
-
-                # Write output HDF5
-                self._write_nisar_pol_h5_from_bytes(
-                    downloaded_data_a, chunk_info_a, metadata, pol, out_path,
-                    track, frame, datetime_str, debug and (position is None),
-                    downloaded_data_b=downloaded_data_b, chunk_info_b=chunk_info_b
-                )
-
-                downloaded_files.append(out_name)
-
-            if own_pbar:
-                pbar.close()
-
-            # Print cache stats in debug mode
-            if debug and (cache_stats['hits'] > 0 or cache_stats['misses'] > 0):
-                total_blocks = cache_stats['hits'] + cache_stats['misses']
-                hit_pct = 100 * cache_stats['hits'] / total_blocks if total_blocks > 0 else 0
-                print(f"  Cache: {cache_stats['hits']} HIT / {cache_stats['misses']} MISS "
-                      f"({hit_pct:.0f}% hit rate, {cache_stats['bytes_hit']/(1024**2):.0f} MB cached)")
-
-            return downloaded_files
-
-        def download_with_retry(granule, position=None):
-            """Download single granule with retry logic."""
-            for retry in range(retries):
-                try:
-                    return download_granule_via_cache(granule, position=position)
-                except ValueError:
-                    raise  # Format errors are permanent
-                except Exception as e:
-                    print(f"ERROR downloading {granule} (attempt {retry+1}/{retries}): {e}")
-                    if retry + 1 == retries:
-                        raise
-                    time.sleep(timeout_second)
-
-        # Process granules
+        # Process granules (the bbox is validated by download())
         granule_ids = [g.replace('.h5', '') for g in granules]
-
-        # Handle bbox parameter
-        if bbox is not None:
-            if len(bbox) != 4:
-                raise ValueError("bbox must be (west, south, east, north) in WGS84 coordinates")
-            west, south, east, north = bbox
-            if west >= east or south >= north:
-                raise ValueError("Invalid bbox: west must be < east and south must be < north")
-            if not (-180 <= west <= 180 and -180 <= east <= 180 and -90 <= south <= 90 and -90 <= north <= 90):
-                raise ValueError("bbox coordinates must be valid WGS84 (lon: -180 to 180, lat: -90 to 90)")
 
         print(f"Downloading {len(granule_ids)} NISAR granule(s) via cache proxy (aligned blocks)...")
 
@@ -2583,39 +2274,28 @@ class ASF(progressbar_joblib):
             """Download aligned 25x25km block via multi-offset API."""
             import requests
             url = f"{_NISAR_CACHE_PROXY}/{gid}/{offsets_str}/ranges.bin"
-            for retry in range(retries):
-                try:
-                    resp = requests.get(url, timeout=120)
-                    resp.raise_for_status()
-                    if len(resp.content) != total_size:
-                        raise ValueError(
-                            f"Response size mismatch: got {len(resp.content)}, expected {total_size}")
+            def request():
+                # a transfer slower than min_rate is cut (HTTP.read_body) and retried
+                with send(requests.get, url, stream=True, timeout=120) as resp:
+                    content = read_body(resp, min_rate, min_rate_window)
                     # Check both X-Cache (proxy) and cf-cache-status (CDN) headers
                     cache_hit = (resp.headers.get('X-Cache', '').upper() == 'HIT' or
                                 resp.headers.get('cf-cache-status', '').upper() == 'HIT')
-                    return (offsets_str, resp.content, cache_hit)
-                except Exception as e:
-                    if debug:
-                        print(f'ERROR: block download attempt {retry+1}/{retries} failed: {e}')
-                    if retry + 1 == retries:
-                        raise
-                    time.sleep(timeout_second)
+                if len(content) != total_size:
+                    raise ValueError(
+                        f"Response size mismatch: got {len(content)}, expected {total_size}")
+                return (offsets_str, content, cache_hit)
+            return retried('block', request)
 
         def download_single_chunk(gid, offset, length):
             """Download single chunk via single-block API (for small blocks)."""
             import requests
             url = f"{_NISAR_CACHE_PROXY}/{gid}/{offset}/{length}.bin"
-            for retry in range(retries):
-                try:
-                    resp = requests.get(url, timeout=120)
-                    resp.raise_for_status()
-                    return (offset, length, resp.content)
-                except Exception as e:
-                    if debug:
-                        print(f'ERROR: single chunk download attempt {retry+1}/{retries} failed: {e}')
-                    if retry + 1 == retries:
-                        raise
-                    time.sleep(timeout_second)
+            def request():
+                # a transfer slower than min_rate is cut (HTTP.read_body) and retried
+                with send(requests.get, url, stream=True, timeout=120) as resp:
+                    return (offset, length, read_body(resp, min_rate, min_rate_window))
+            return retried('single chunk', request)
 
         all_downloaded = []
 
@@ -2624,9 +2304,7 @@ class ASF(progressbar_joblib):
             # 1. Fetch metadata for this granule
             if debug:
                 print(f"Fetching metadata for {gid}...")
-            meta_raw, _ = fetch_cache_range(gid, 0, MAX_BLOCK)
-            if meta_raw[:4] != b'\x89HDF':
-                raise Exception(f'Cache returned invalid metadata (not HDF5): {meta_raw[:100]!r}')
+            meta_raw, _ = fetch_metadata(gid)
             meta_buf = patch_hdf5_superblock(meta_raw)
             if debug:
                 print(f"  Metadata: {len(meta_buf)/(1024**2):.1f}MB")
@@ -2634,7 +2312,10 @@ class ASF(progressbar_joblib):
             with h5py.File(BytesIO(bytes(meta_buf)), 'r') as h5:
                 swaths = h5['science/LSAR/RSLC/swaths']
                 avail_pols = [k for k in swaths['frequencyA'].keys() if k in ['HH','HV','VH','VV']]
-                pols = [p for p in (polarizations or avail_pols) if p in avail_pols]
+                pols = ASF._nisar_pols(polarizations, avail_pols, gid)
+                # the files that exist are not downloaded again
+                if skip_exist:
+                    pols = [p for p in pols if not ASF._nisar_exists(basedir, gid, p)]
                 has_freq_b = 'frequencyB' in swaths
                 freq_b_pols = [k for k in swaths['frequencyB'].keys() if k in ['HH','HV','VH','VV']] if has_freq_b else []
                 # Normalize frequency to list for consistent checking
@@ -2659,7 +2340,7 @@ class ASF(progressbar_joblib):
                     first_ci_a = next((ci_a for ci_a, _ in all_chunk_info.values() if ci_a), None)
                     first_ci_b = next((ci_b for _, ci_b in all_chunk_info.values() if ci_b), None)
                     if first_ci_a or first_ci_b:
-                        bbox_info = bbox_to_block_indices(h5, bbox, first_ci_a or first_ci_b, first_ci_b)
+                        bbox_info = bbox_to_block_indices(h5, bbox, first_ci_a, first_ci_b)
                         if debug:
                             print(f"  Bbox {bbox} -> chunks az[{bbox_info['az_chunk_start']}:{bbox_info['az_chunk_end']}], "
                                   f"rg_a[{bbox_info.get('rg_chunk_start_a', 'N/A')}:{bbox_info.get('rg_chunk_end_a', 'N/A')}]")
@@ -2810,7 +2491,8 @@ class ASF(progressbar_joblib):
             return pd.DataFrame({'file': all_downloaded})
         return None
 
-    def _detect_nisar_layout_fast(self, url, auth_tuple, file_size, http_session=None, pbar=None):
+    def _detect_nisar_layout_fast(self, url, auth_tuple, file_size, http_session=None, pbar=None,
+                                  min_rate='100KB', min_rate_window=60):
         """Download 128MB metadata block and detect layout.
 
         Downloads first 128MB (same as cache path), patches HDF5 superblock,
@@ -2823,24 +2505,20 @@ class ASF(progressbar_joblib):
         import struct
         import h5py
         from io import BytesIO
+        from .HTTP import send, read_body
 
         METADATA_SIZE = 128 * 1024 * 1024  # 128 MB - matches cache path
 
         # Download first 128MB (reuse session if provided)
         headers = {'Range': f'bytes=0-{METADATA_SIZE-1}'}
         if http_session:
-            response = http_session.get(url, headers=headers, stream=True, timeout=(10, 300))
+            response = send(http_session.get, url, headers=headers, stream=True, timeout=(10, 300))
         else:
-            response = requests.get(url, headers=headers, auth=auth_tuple, stream=True, timeout=(10, 300))
-        response.raise_for_status()
+            response = send(requests.get, url, headers=headers, auth=auth_tuple, stream=True, timeout=(10, 300))
 
-        # Stream download with progress
-        chunks = []
-        for chunk in response.iter_content(chunk_size=1024*1024):
-            chunks.append(chunk)
-            if pbar:
-                pbar.update(len(chunk))
-        data = bytearray(b''.join(chunks))
+        # Stream download with progress; a transfer slower than min_rate is cut (HTTP.read_body) and retried
+        with response:
+            data = bytearray(read_body(response, min_rate, min_rate_window, progress=pbar.update if pbar else None))
 
         # Validate HDF5 magic bytes
         if data[:4] != b'\x89HDF':
@@ -2869,141 +2547,6 @@ class ASF(progressbar_joblib):
         except:
             return 'B', data  # Failed - metadata is at end
 
-    def _detect_nisar_layout(self, h5_remote):
-        """Detect NISAR file layout offsets using open remote HDF5.
-
-        Returns tuple: (metadata_end, slc_start, slc_end)
-        - metadata_end: byte offset where metadata ends
-        - slc_start: byte offset where SLC starts
-        - slc_end: byte offset where SLC ends
-        """
-        import h5py
-
-        main_slc_a = {f'science/LSAR/RSLC/swaths/frequencyA/{p}' for p in ['HH', 'HV', 'VH', 'VV']}
-        main_slc_b = {f'science/LSAR/RSLC/swaths/frequencyB/{p}' for p in ['HH', 'HV', 'VH', 'VV']}
-        all_slc = main_slc_a | main_slc_b
-
-        metadata_max = 0
-        slc_min = float('inf')
-        slc_max = 0
-
-        def analyze_offsets(name, obj):
-            nonlocal metadata_max, slc_min, slc_max
-            if not isinstance(obj, h5py.Dataset):
-                return
-
-            if name in all_slc:
-                # SLC dataset - get chunk offset range
-                if obj.chunks:
-                    try:
-                        # First chunk for min
-                        info = obj.id.get_chunk_info(0)
-                        slc_min = min(slc_min, info.byte_offset)
-                        # Last chunk for max
-                        n_chunks = obj.id.get_num_chunks()
-                        info = obj.id.get_chunk_info(n_chunks - 1)
-                        slc_max = max(slc_max, info.byte_offset + info.size)
-                    except:
-                        pass
-            else:
-                # Metadata dataset - get max end offset
-                if obj.chunks:
-                    for idx in range(obj.id.get_num_chunks()):
-                        try:
-                            info = obj.id.get_chunk_info(idx)
-                            metadata_max = max(metadata_max, info.byte_offset + info.size)
-                        except:
-                            pass
-                else:
-                    offset = obj.id.get_offset()
-                    if offset:
-                        metadata_max = max(metadata_max, offset + obj.id.get_storage_size())
-
-        h5_remote.visititems(analyze_offsets)
-
-        return int(metadata_max * 1.01), slc_min, slc_max  # Add 1% buffer to metadata_max
-
-    def _download_nisar_metadata_start(self, url, auth_tuple, download_size, pbar=None, http_session=None):
-        """Download metadata from file start (Layout A).
-
-        Used when metadata is stored before SLC data.
-        Downloads bytes 0 to download_size and patches HDF5 superblock.
-
-        Returns bytearray with patched HDF5 data.
-        """
-        import requests
-        import struct
-
-        headers = {'Range': f'bytes=0-{download_size-1}'}
-        if http_session:
-            response = http_session.get(url, headers=headers, stream=True)
-        else:
-            response = requests.get(url, headers=headers, auth=auth_tuple, stream=True)
-        response.raise_for_status()
-
-        data = bytearray()
-        for chunk in response.iter_content(chunk_size=1024*1024):
-            data.extend(chunk)
-            if pbar:
-                pbar.update(len(chunk))
-
-        # Detect superblock version and patch EOF
-        version = data[8]
-        if version == 0:
-            # v0: EOF at bytes 40-47, no checksum
-            data[40:48] = struct.pack('<Q', len(data))
-        else:
-            # v2/3: EOF at bytes 28-35, checksum at 44-47
-            data[28:36] = struct.pack('<Q', len(data))
-            data[44:48] = struct.pack('<I', self._hdf5_lookup3_hash(bytes(data[0:44])))
-
-        return data
-
-    def _download_nisar_metadata_sparse(self, url, auth_tuple, file_size, header_size, tail_start, pbar=None):
-        """Download NISAR metadata using sparse buffer approach (Layout B).
-
-        Downloads header (0 to header_size) + tail (tail_start to file_size) and
-        creates a sparse buffer with zeros for the SLC region in between.
-
-        Parameters
-        ----------
-        header_size : int
-            Size of header to download (bytes before SLC).
-        tail_start : int
-            Byte offset where tail begins (after SLC ends).
-
-        Returns bytearray with sparse buffer (header + zeros + tail).
-        """
-        import requests
-
-        # Download header (0 to header_size)
-        headers_h = {'Range': f'bytes=0-{header_size-1}'}
-        response_h = requests.get(url, headers=headers_h, auth=auth_tuple, stream=True)
-        response_h.raise_for_status()
-        header = bytearray()
-        for chunk in response_h.iter_content(chunk_size=1024*1024):
-            header.extend(chunk)
-            if pbar:
-                pbar.update(len(chunk))
-
-        # Download tail (tail_start to file_size)
-        headers_t = {'Range': f'bytes={tail_start}-{file_size-1}'}
-        response_t = requests.get(url, headers=headers_t, auth=auth_tuple, stream=True)
-        response_t.raise_for_status()
-        tail = bytearray()
-        for chunk in response_t.iter_content(chunk_size=1024*1024):
-            tail.extend(chunk)
-            if pbar:
-                pbar.update(len(chunk))
-
-        # Create sparse buffer: header + zeros + tail
-        gap_size = tail_start - header_size
-        data = bytearray(header)
-        data.extend(b'\x00' * gap_size)
-        data.extend(tail)
-
-        return data
-
     def _read_nisar_metadata_direct(self, pol, metadata_buffer):
         """Read metadata from pre-downloaded buffer.
 
@@ -3015,7 +2558,8 @@ class ASF(progressbar_joblib):
         pol : str
             Polarization being processed (e.g., 'HH').
         metadata_buffer : bytearray
-            Pre-downloaded metadata buffer (from _download_nisar_metadata_start).
+            Pre-downloaded metadata buffer: the patched first 128 MB of the file (_detect_nisar_layout_fast, or
+            the metadata block of the cache proxy).
 
         Returns dict with all metadata datasets to copy.
         """
@@ -3090,262 +2634,6 @@ class ASF(progressbar_joblib):
 
         return metadata
 
-    def _get_nisar_metadata_size(self, h5_remote, pol):
-        """Calculate metadata download size without downloading.
-
-        Returns size in bytes needed to download all metadata (excludes all SLC datasets).
-        """
-        import h5py
-
-        # ALL main SLC datasets to skip (they're downloaded separately)
-        main_slc_a = {f'science/LSAR/RSLC/swaths/frequencyA/{p}' for p in ['HH', 'HV', 'VH', 'VV']}
-        main_slc_b = {f'science/LSAR/RSLC/swaths/frequencyB/{p}' for p in ['HH', 'HV', 'VH', 'VV']}
-        all_slc = main_slc_a | main_slc_b
-
-        max_offset = 0
-
-        def find_max_offset(name, obj):
-            nonlocal max_offset
-            if not isinstance(obj, h5py.Dataset):
-                return
-            # Skip ALL SLC datasets - they're downloaded separately
-            if name in all_slc:
-                return
-
-            if obj.chunks:
-                for idx in range(obj.id.get_num_chunks()):
-                    try:
-                        info = obj.id.get_chunk_info(idx)
-                        end = info.byte_offset + info.size
-                        if end > max_offset:
-                            max_offset = end
-                    except:
-                        pass
-            else:
-                offset = obj.id.get_offset()
-                if offset:
-                    end = offset + obj.id.get_storage_size()
-                    if end > max_offset:
-                        max_offset = end
-
-        h5_remote.visititems(find_max_offset)
-        return int(max_offset * 1.01)  # Add 1% buffer
-
-    def _download_nisar_metadata(self, url, auth_tuple, download_size, pol, pbar=None):
-        """Download and parse NISAR metadata with shared progress bar.
-
-        Returns dict with all metadata datasets to copy.
-        """
-        import h5py
-        import requests
-        import struct
-        from io import BytesIO
-
-        main_slc_a = {f'science/LSAR/RSLC/swaths/frequencyA/{p}' for p in ['HH', 'HV', 'VH', 'VV']}
-        main_slc_b = {f'science/LSAR/RSLC/swaths/frequencyB/{p}' for p in ['HH', 'HV', 'VH', 'VV']}
-
-        def should_skip(name):
-            if name in main_slc_a and name != f'science/LSAR/RSLC/swaths/frequencyA/{pol}':
-                return True
-            if name in main_slc_b and name != f'science/LSAR/RSLC/swaths/frequencyB/{pol}':
-                return True
-            return False
-
-        # Download metadata block
-        headers = {'Range': f'bytes=0-{download_size-1}'}
-        response = requests.get(url, headers=headers, auth=auth_tuple, stream=True)
-        response.raise_for_status()
-
-        data = bytearray()
-        for chunk in response.iter_content(chunk_size=1024*1024):
-            data.extend(chunk)
-            if pbar:
-                pbar.update(len(chunk))
-
-        # Patch HDF5 superblock
-        data[28:36] = struct.pack('<Q', len(data))
-        new_checksum = self._hdf5_lookup3_hash(bytes(data[0:44]))
-        data[44:48] = struct.pack('<I', new_checksum)
-
-        # Parse metadata from BytesIO
-        metadata = {}
-        buf = BytesIO(bytes(data))
-
-        with h5py.File(buf, 'r') as h5_local:
-            # Collect dataset names
-            datasets_to_read = []
-            def collect_datasets(name, obj):
-                if should_skip(name):
-                    return
-                if isinstance(obj, h5py.Dataset) and name not in main_slc_a and name not in main_slc_b:
-                    datasets_to_read.append(name)
-            h5_local.visititems(collect_datasets)
-
-            # Read all metadata datasets
-            for name in datasets_to_read:
-                try:
-                    ds = h5_local[name]
-                    metadata[name] = {
-                        'data': ds[()],
-                        'dtype': ds.dtype,
-                        'shape': ds.shape,
-                        'attrs': dict(ds.attrs)
-                    }
-                except:
-                    pass
-
-            # Collect group attributes
-            metadata['_group_attrs'] = {}
-            def collect_group_attrs(name, obj):
-                if isinstance(obj, h5py.Group) and obj.attrs:
-                    metadata['_group_attrs'][name] = dict(obj.attrs)
-            h5_local.visititems(collect_group_attrs)
-
-            # Root attributes
-            metadata['_root_attrs'] = dict(h5_local.attrs)
-
-        return metadata
-
-    def _read_nisar_metadata(self, url, auth_tuple, h5_remote, pol, out_name, debug=False, position=None):
-        """Read ALL metadata from remote HDF5 using single-block download.
-
-        Copies the entire HDF5 structure except:
-        - SLC datasets for polarizations other than `pol` (frequencyA and frequencyB)
-
-        FrequencyB is INCLUDED because it's needed for ionospheric correction
-        (split-spectrum technique within L-band, NOT a different radar band).
-
-        Uses optimized in-memory approach:
-        1. Query byte offsets for all metadata datasets (fast - just metadata)
-        2. Download required bytes in ONE HTTP Range request
-        3. Patch HDF5 superblock to allow opening truncated data
-        4. Read all metadata from BytesIO (no temp file!)
-
-        This is ~30x faster than reading each dataset individually via remote HDF5.
-
-        Returns dict with all datasets to copy.
-        """
-        import h5py
-        import requests
-        import struct
-        from io import BytesIO
-        from tqdm.auto import tqdm
-
-        # Main SLC datasets to skip (downloaded separately via direct chunk API)
-        main_slc_a = {f'science/LSAR/RSLC/swaths/frequencyA/{p}' for p in ['HH', 'HV', 'VH', 'VV']}
-        main_slc_b = {f'science/LSAR/RSLC/swaths/frequencyB/{p}' for p in ['HH', 'HV', 'VH', 'VV']}
-
-        def should_skip(name):
-            """Check if this path should be skipped."""
-            # Skip SLC data for other polarizations in frequencyA
-            if name in main_slc_a and name != f'science/LSAR/RSLC/swaths/frequencyA/{pol}':
-                return True
-            # Skip SLC data for other polarizations in frequencyB
-            if name in main_slc_b and name != f'science/LSAR/RSLC/swaths/frequencyB/{pol}':
-                return True
-            return False
-
-        # Step 1: Find maximum byte offset across all metadata datasets
-        if debug:
-            print("    Calculating metadata byte range...")
-
-        max_offset = 0
-        datasets_to_read = []
-
-        def find_max_offset(name, obj):
-            nonlocal max_offset
-            if should_skip(name):
-                return
-            if not isinstance(obj, h5py.Dataset):
-                return
-            if name in main_slc_a or name in main_slc_b:
-                return
-
-            datasets_to_read.append(name)
-
-            # Check byte offsets (handle both chunked and contiguous)
-            if obj.chunks:
-                # Chunked dataset - check all chunks
-                for idx in range(obj.id.get_num_chunks()):
-                    try:
-                        info = obj.id.get_chunk_info(idx)
-                        end = info.byte_offset + info.size
-                        if end > max_offset:
-                            max_offset = end
-                    except:
-                        pass
-            else:
-                # Contiguous dataset
-                offset = obj.id.get_offset()
-                if offset:
-                    end = offset + obj.id.get_storage_size()
-                    if end > max_offset:
-                        max_offset = end
-
-        h5_remote.visititems(find_max_offset)
-
-        # Add 1% buffer
-        download_size = int(max_offset * 1.01)
-        if debug:
-            print(f"    Metadata requires {max_offset:,} bytes ({max_offset/(1024**2):.1f} MB)")
-            print(f"    Downloading {download_size:,} bytes ({download_size/(1024**2):.1f} MB)...")
-
-        # Step 2: Download metadata block in single Range request
-        headers = {'Range': f'bytes=0-{download_size-1}'}
-        response = requests.get(url, headers=headers, auth=auth_tuple, stream=True)
-        response.raise_for_status()
-
-        data = bytearray()
-        # Always show progress for metadata (it's ~100 MB)
-        # out_name is like "NSR_172_008_20251204T024618_HH.h5"
-        desc = f"{out_name[:-3]} metadata" if out_name else f"{pol} metadata"
-        with tqdm(total=download_size, unit='B', unit_scale=True, desc=desc,
-                  position=position, leave=(position is None), smoothing=0) as pbar:
-            for chunk in response.iter_content(chunk_size=1024*1024):
-                data.extend(chunk)
-                pbar.update(len(chunk))
-
-        # Step 3: Patch HDF5 superblock (EOF and checksum)
-        # Superblock v2/3: EOF at offset 28, checksum at offset 44
-        data[28:36] = struct.pack('<Q', len(data))
-        new_checksum = self._hdf5_lookup3_hash(bytes(data[0:44]))
-        data[44:48] = struct.pack('<I', new_checksum)
-
-        # Step 4: Read metadata from BytesIO (no temp file needed!)
-        metadata = {}
-        buf = BytesIO(bytes(data))
-
-        with h5py.File(buf, 'r') as h5_local:
-            if debug:
-                print(f"    Reading {len(datasets_to_read)} metadata datasets...")
-
-            pbar = tqdm(datasets_to_read, desc='    Reading metadata',
-                       leave=False) if debug else datasets_to_read
-
-            for name in pbar:
-                try:
-                    obj = h5_local[name]
-                    metadata[name] = {
-                        'data': obj[()],
-                        'dtype': obj.dtype,
-                        'shape': obj.shape,
-                        'attrs': dict(obj.attrs)  # Copy dataset attributes (description, units, etc.)
-                    }
-                except Exception:
-                    pass  # Skip datasets that can't be read
-
-            # Also copy root attributes
-            metadata['_root_attrs'] = dict(h5_local.attrs)
-
-            # Copy group attributes (important for HDF5 structure)
-            metadata['_group_attrs'] = {}
-            def collect_group_attrs(name, obj):
-                if isinstance(obj, h5py.Group) and obj.attrs:
-                    metadata['_group_attrs'][name] = dict(obj.attrs)
-            h5_local.visititems(collect_group_attrs)
-
-        return metadata
-
     @staticmethod
     def _hdf5_lookup3_hash(data):
         """Jenkins lookup3 hash for HDF5 superblock checksum."""
@@ -3410,7 +2698,8 @@ class ASF(progressbar_joblib):
         - FrequencyB only: downloaded_data is None, downloaded_data_b present
         - Both frequencies: both present
 
-        When crop_info is provided, crops SLC data and coordinate arrays to bbox extent.
+        When crop_info is provided, crops SLC data and coordinate arrays to bbox extent, and sets
+        identification/zeroDopplerStartTime and zeroDopplerEndTime to the crop's first and last lines.
 
         Parameters
         ----------
@@ -3420,7 +2709,7 @@ class ASF(progressbar_joblib):
         chunk_info : dict or None
             Chunk metadata from get_chunk_info() for frequencyA.
         metadata : dict
-            ALL metadata from _read_nisar_metadata().
+            ALL metadata from _read_nisar_metadata_direct().
         downloaded_data_b : bytes, dict, or None
             Raw bytes or dict for frequencyB (ionospheric correction / quick look).
         chunk_info_b : dict, optional
@@ -3582,7 +2871,9 @@ class ASF(progressbar_joblib):
                         chunk_bytes = downloaded_data_b[offset_in_data:offset_in_data + chunk['size']]
                     dst_slc_b.id.write_direct_chunk(new_coord, chunk_bytes)
 
-            # 3. Write metadata datasets (filter by frequency if needed)
+            # 3. Write metadata datasets (filter by frequency if needed); a crop gets the identification start and
+            # end times of its own first and last lines
+            crop_times = self._nisar_crop_times(metadata, crop_az_start, crop_az_end) if crop_info else {}
             for ds_path, ds_info in metadata.items():
                 if ds_path in ('_root_attrs', '_group_attrs'):
                     continue  # Handle separately
@@ -3617,6 +2908,9 @@ class ASF(progressbar_joblib):
                     elif 'validSamplesSubSwath' in ds_path and len(data.shape) == 2:
                         az_end = min(crop_az_end, data.shape[0]) if crop_az_end else data.shape[0]
                         data = data[crop_az_start:az_end, :]
+                    # identification/zeroDopplerStartTime and zeroDopplerEndTime of the cropped lines
+                    elif ds_path in crop_times:
+                        data = crop_times[ds_path]
 
                 # GeolocationGrid: select sea level height layer (index 1 = 0m)
                 # Keep 3D shape (1, az, rg) for compatibility - saves ~162MB (20 layers -> 1 layer)
@@ -3678,10 +2972,8 @@ class ASF(progressbar_joblib):
                 raise ValueError(f'No SLC dataset found for {pol}')
 
         # Write to temp file, then atomic rename
-        tmp_path = out_path + '.tmp'
-        with open(tmp_path, 'wb') as f:
-            f.write(mem_buffer.getvalue())
-        os.rename(tmp_path, out_path)
+        from .utils_files import write_file
+        write_file(out_path, mem_buffer.getvalue())
 
         if debug:
             file_size = os.path.getsize(out_path)
@@ -3708,14 +3000,19 @@ class ASF(progressbar_joblib):
         if isinstance(geometry, (gpd.GeoDataFrame, gpd.GeoSeries)):
             geometry = geometry.geometry.union_all()
         # convert closed linestring to polygon
-        if geometry.type == 'LineString' and geometry.coords[0] == geometry.coords[-1]:
+        if geometry.geom_type == 'LineString' and geometry.coords[0] == geometry.coords[-1]:
             geometry = shapely.geometry.Polygon(geometry.coords)
-        if geometry.type == 'Polygon':
+        if geometry.geom_type == 'Polygon':
             # force counterclockwise orientation.
             geometry = shapely.geometry.polygon.orient(geometry, sign=1.0)
         #print ('wkt', geometry.wkt)
 
-        if isinstance(processingLevel, str) and processingLevel=='auto' and platform == 'SENTINEL-1':
+        # one platform name, a comma-separated string or a list; the catalog takes several as a comma-separated string
+        from .utils_S1 import S1_PLATFORMS, platform_names
+        names = platform_names(platform) if platform else []
+        # 'auto' is the burst level of every Sentinel-1 platform name
+        if isinstance(processingLevel, str) and processingLevel=='auto' and names \
+                and all(name.upper() in S1_PLATFORMS for name in names):
             processingLevel = asf_search.PRODUCT_TYPE.BURST
 
         # search bursts
@@ -3724,7 +3021,7 @@ class ASF(progressbar_joblib):
             end=stopTime,
             flightDirection=flightDirection,
             intersectsWith=geometry.wkt,
-            platform=platform,
+            platform=','.join(names) if names else platform,
             processingLevel=processingLevel,
             polarization=polarization,
             beamMode=beamMode,

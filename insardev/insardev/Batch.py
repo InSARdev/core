@@ -10,7 +10,7 @@
 # ----------------------------------------------------------------------------
 from __future__ import annotations
 from .utils_torch import serialize_gpu
-from .BatchCore import BatchCore
+from .BatchCore import BatchCore, _SCALARS
 import numpy as np
 import xarray as xr
 from . import utils_xarray
@@ -20,6 +20,52 @@ if TYPE_CHECKING:
     import inspect
 
 
+def _ref_height_stored(ds) -> float | None:
+    """The stack's flat-earth reference height from `ref_height`, signed (a height below sea level stays negative).
+
+    Every preprocessor stores ONE value on every date: the reference height in flat-earth mode
+    (remove_topo_phase=False), where the unwrapped grids give an absolute height, and NaN in DEM (InSAR) mode,
+    where they give a residual height -- NaN reads as 0.0, the value the elevation arithmetic always used there.
+    Older stores carry 0.0 in DEM mode, and older ecef flat-mode stores 0 on the reference date and the height on
+    the repeat dates: the value of largest magnitude is the height in every case. None when the Dataset stores no
+    ref_height at all: callers go through _ref_heights() or _ref_height(), which warn.
+    """
+    if 'ref_height' in ds:
+        v = np.asarray(ds['ref_height'].values, dtype=np.float64).ravel()
+    elif ds.attrs.get('ref_height') is not None:
+        v = np.asarray([ds.attrs['ref_height'] or 0.0], dtype=np.float64)
+    else:
+        return None
+    v = v[np.isfinite(v)]
+    return float(v[np.argmax(np.abs(v))]) if v.size else 0.0
+
+
+# what Batch.incidence() reads from a transform Dataset (N81: a DataArray batch lacks it)
+_INCIDENCE_VARS = ('near_range', 'rng_samp_rate', 'earth_radius', 'SC_height_start', 'SC_height_end', 'num_lines',
+                   'azi', 'rng', 'ele')
+
+
+def _ref_heights(batch, where: str | None = None) -> dict:
+    """`{burst: height}` from _ref_height_stored() for every burst Dataset of `batch` (a Batch or a dict).
+
+    A burst without ref_height gets 0.0, and the call prints ONE warning naming all of them: 0.0 is right for a
+    DEM-mode stack and wrong by the reference height for a flat-earth one, and a stack that does not store the
+    value cannot tell which it is.
+    """
+    heights = {key: _ref_height_stored(ds) for key, ds in batch.items()}
+    missing = [str(key) for key, h in heights.items() if h is None]
+    if missing:
+        names = [k for k in missing if k]
+        print(f'WARNING: {where + ": " if where else ""}ref_height is missing'
+              f'{" in burst(s) " + ", ".join(names) if names else ""}, so 0.0 is used as the flat-earth reference '
+              f'height. That is right for a DEM-mode stack (remove_topo_phase=True) and wrong by the reference '
+              f'height for a flat-earth one (remove_topo_phase=False).', flush=True)
+    return {key: 0.0 if h is None else h for key, h in heights.items()}
+
+
+def _ref_height(ds, where: str | None = None) -> float:
+    """_ref_heights() of one burst Dataset: it warns on every call that finds no ref_height."""
+    return _ref_heights({'': ds}, where)['']
 
 
 def _trend2d_accumulate_for_dask(data_blk, *args, stats=None, n_vars=0,
@@ -988,9 +1034,10 @@ class Batch(BatchCore):
     
     def clip(self, min=None, max=None, **kwargs):
         """
-        used for correlation in [0,1] range
+        used for correlation in [0,1] range: a BatchUnit when the values are
+        float, otherwise a plain Batch (a BatchUnit holds float units only)
         """
-        return BatchUnit(super().clip(min=min, max=max, **kwargs))
+        return BatchCore._as_class(BatchUnit, dict(super().clip(min=min, max=max, **kwargs)))
 
     @staticmethod
     def _compute_rgb(copol: np.ndarray, xpol: np.ndarray,
@@ -1127,7 +1174,6 @@ class Batch(BatchCore):
         import numpy as np
         import xarray as xr
         import dask
-        from insardev_toolkit import progressbar
 
         # Check for exactly 2 polarizations
         sample = next(iter(self.values()))
@@ -1153,7 +1199,8 @@ class Batch(BatchCore):
 
         # Materialize
         da_copol, da_xpol = dask.persist(da_copol, da_xpol)
-        progressbar([da_copol, da_xpol], desc='Computing RGB composite'.ljust(25))
+        from .utils_dask import progress_persisted
+        progress_persisted([da_copol, da_xpol], desc='Computing RGB composite'.ljust(25))
 
         # Compute RGB using shared method from BatchCore
         copol = da_copol.values
@@ -1470,9 +1517,9 @@ class Batch(BatchCore):
         """
         Compute 2D polynomial trend (ramp) from data.
 
-        Two modes:
-        - Complex (BatchComplex): unit-circle fitting, returns BatchComplex
-        - Real (Batch): standard polynomial, returns Batch
+        Real data (Batch): standard polynomial, returns Batch. Complex data
+        have their own BatchComplex.trend2d(): a per-date table without (y, x)
+        grids, which no operator takes (N81); detrend() removes it.
 
         Parameters
         ----------
@@ -1499,13 +1546,12 @@ class Batch(BatchCore):
 
         Examples
         --------
-        >>> # With radar coordinates
-        >>> trend = phase.trend2d(stack.transform(), weight=corr)
+        >>> # With radar coordinates, the transform at the phase posting
+        >>> trend = phase.trend2d(stack.transform()[['azi', 'rng']].downsample(phase.spacing), weight=corr)
         >>> # With y,x grid coordinates (no transform needed)
         >>> trend = phase.trend2d(weight=corr)
-        >>> # Complex interferogram
-        >>> trend = intf_complex.trend2d(stack.transform(), weight=corr)
-        >>> detrended = intf_complex * trend.conj()
+        >>> # Complex data: a per-date trend table, removed by detrend()
+        >>> flat = stack.detrend(stack.trend2d('northing', 'easting', 'ele'))
         """
         import dask.array as da
         import numpy as np
@@ -1514,6 +1560,8 @@ class Batch(BatchCore):
         from .Batch import Batch, BatchComplex
 
         phase = self
+        # a BatchUnit (N81); a DataArray one weights every grid
+        weight = BatchCore._weight(weight, phase)
 
         # Validate lazy data
         BatchCore._require_lazy(phase, 'trend2d')
@@ -1537,11 +1585,14 @@ class Batch(BatchCore):
         result = {}
         for key in phase.keys():
             ds = phase[key]
+            # the grids of a Dataset, or a DataArray as its own one (N81); none is _form's
+            # short error, not an IndexError
+            grids = BatchCore._grids_of(ds)
+            if not grids:
+                raise BatchCore._no_grid_error(ds)
+            pols = list(grids)
 
-            pols = [v for v in ds.data_vars
-                   if 'y' in ds[v].dims and 'x' in ds[v].dims]
-
-            phase_da_ref = ds[pols[0]]
+            phase_da_ref = grids[pols[0]]
             phase_shape = phase_da_ref.shape[-2:]
             phase_dy = float(phase_da_ref.y.diff('y')[0])
             phase_dx = float(phase_da_ref.x.diff('x')[0])
@@ -1568,11 +1619,9 @@ class Batch(BatchCore):
                 var_names = ['y', 'x']
 
             if weight is not None:
-                weight_ds = weight[key]
-                weight_pols = [v for v in weight_ds.data_vars
-                              if 'y' in weight_ds[v].dims and 'x' in weight_ds[v].dims]
-                if weight_pols:
-                    weight_da_ref = weight_ds[weight_pols[0]]
+                weight_grids = BatchCore._grids_of(weight[key])
+                if weight_grids:
+                    weight_da_ref = next(iter(weight_grids.values()))
                     weight_shape = weight_da_ref.shape[-2:]
                     if phase_shape != weight_shape:
                         weight_dy = float(weight_da_ref.y.diff('y')[0])
@@ -1589,8 +1638,8 @@ class Batch(BatchCore):
 
             result_ds = {}
             for pol in pols:
-                phase_da = ds[pol]
-                weight_da = weight[key][pol] if weight is not None else None
+                phase_da = grids[pol]
+                weight_da = BatchCore._weight_of(weight[key], pol) if weight is not None else None
 
                 phase_dask = phase_da.data
 
@@ -1632,10 +1681,11 @@ class Batch(BatchCore):
                         da.from_array(x_np, chunks=phase_spatial_chunks),
                     ]
 
-                # Phase 0: Compute global feature standardization (pair-independent)
+                # Phase 0: Compute global per-variable standardization (pair-independent),
+                # applied to every variable BEFORE the polynomial terms are built
                 feature_mean, feature_std = utils_detrend._compute_feature_stats(
                     var_dask_list, degree)
-                n_poly = len(feature_mean)
+                n_poly = utils_detrend._n_poly_features(len(var_dask_list), degree)
                 n_feat = n_poly + 1  # +1 for bias
                 n_feat_b = 2 * n_feat if is_complex else n_feat
                 n_accum = n_feat * n_feat + n_feat_b + 1
@@ -1746,7 +1796,8 @@ class Batch(BatchCore):
 
                 result_ds[pol] = trend_da
 
-            result[key] = xr.Dataset(result_ds, attrs=ds.attrs)
+            # a DataArray in, a DataArray out (N81)
+            result[key] = BatchCore._form(ds, result_ds, attrs=ds.attrs)
 
         if is_complex:
             return BatchComplex(result)
@@ -1872,8 +1923,14 @@ class Batch(BatchCore):
         import dask
         import dask.array as da
 
+        # the radar geometry is the Dataset's (N81): a DataArray batch raises here;
+        # baseline=None reads radar_wavelength alone (the pair baselines are coordinates)
+        BatchCore._needs_dataset(self, 'fit1d', BatchCore._GEOMETRY if baseline else ('radar_wavelength',))
+        # a BatchUnit (N81); a DataArray one weights every grid
+        weight = BatchCore._weight(weight, self)
         BatchCore._require_lazy(self, 'fit1d')
         model_result = {}
+        _ep_all = None  # computed on first use: once per call, so a missing ref_height warns once and not once per burst
         for key in self.keys():
             ds = self[key]
             # a PAIR dim, not merely a grid: `rng` and friends are (y, x)
@@ -1955,7 +2012,9 @@ class Batch(BatchCore):
                 # the metadata it reads, so it never supplied anything missing,
                 # and the value only rescales `height` inversely and cancels in
                 # the product.
-                _fac = Batch._elevation_phase_approximate(self)[key]
+                if _ep_all is None:
+                    _ep_all = Batch._elevation_phase_approximate(self)
+                _fac = _ep_all[key]
                 e2p = bp / ((4.0 * np.pi / lam) / _fac)
             if e2p is None:
                 print(f"fit1d(): baseline=None for '{key}' -- the height column "
@@ -2046,7 +2105,7 @@ class Batch(BatchCore):
             d_dask = da_.data
             w_dask = None
             if weight is not None:
-                w_dask = weight[key][pol].transpose('pair', ...).chunk(
+                w_dask = BatchCore._weight_of(weight[key], pol).transpose('pair', ...).chunk(
                     {'pair': -1, 'y': cy, 'x': cx}).data
                 if w_dask.chunks != d_dask.chunks:
                     w_dask = w_dask.rechunk(d_dask.chunks)
@@ -2189,7 +2248,10 @@ class Batch(BatchCore):
         import pandas as pd
         import xarray as xr
 
+        # radar_wavelength and the radar geometry are the Dataset's (N81)
+        BatchCore._needs_dataset(self, 'predict', BatchCore._GEOMETRY)
         out = {}
+        _ep_all = None  # computed on first use: once per call, so a missing ref_height warns once and not once per burst
         for key in self.keys():
             ds = self[key]
             if key not in model:
@@ -2276,7 +2338,9 @@ class Batch(BatchCore):
                     f"one baseline per observation.")
             e2p = None
             if bp is not None:
-                _fac = Batch._elevation_phase_approximate(self)[key]
+                if _ep_all is None:
+                    _ep_all = Batch._elevation_phase_approximate(self)
+                _fac = _ep_all[key]
                 e2p = bp / ((4.0 * np.pi / lam) / _fac)
 
             import dask.array as da
@@ -2395,6 +2459,8 @@ class Batch(BatchCore):
         >>> disp  = phase.mix(model)
         >>> disp.displacement_los(stack.transform())
         """
+        # predict() reads the Dataset's radar geometry (N81)
+        BatchCore._needs_dataset(self, 'mix', BatchCore._GEOMETRY)
         for key, ds in self.items():
             if 'pair' not in ds.dims:
                 raise TypeError(
@@ -2448,6 +2514,9 @@ class Batch(BatchCore):
         """
         import numpy as np
 
+        # a transform Dataset: the radar geometry and its grids (N81)
+        BatchCore._needs_dataset(self, 'elevation_phase', ('radar_wavelength',) + _INCIDENCE_VARS,
+                                 'Call it on stack.transform().')
         c_light = 299792458.0
         inc_batch = self.incidence()
         out: dict[str, xr.Dataset] = {}
@@ -2498,6 +2567,7 @@ class Batch(BatchCore):
 
         c_light = 299792458.0
         out: dict = {}
+        ref_heights = _ref_heights(self, 'scene-centre elevation_phase()')
         for key, ds in self.items():
             g = lambda n: float(np.asarray(ds[n].values).ravel().mean())
             wavelength = g('radar_wavelength')
@@ -2537,9 +2607,7 @@ class Batch(BatchCore):
                 pass
 
             slant_range = near_range + rng_c * (c_light / (2.0 * rng_samp_rate))
-            ground_dist = earth_radius + (
-                float(np.asarray(ds['ref_height'].values).ravel().mean())
-                if 'ref_height' in ds else 0.0)
+            ground_dist = earth_radius + ref_heights[key]
             sat_dist = earth_radius + sc_height
             cos_earth = np.clip(
                 (ground_dist ** 2 + sat_dist ** 2 - slant_range ** 2)
@@ -2563,6 +2631,8 @@ class Batch(BatchCore):
 
         c = 299792458.0  # speed of light
 
+        # a transform Dataset: the radar geometry and its grids (N81)
+        BatchCore._needs_dataset(self, 'incidence', _INCIDENCE_VARS, 'Call it on stack.transform().')
         # Get CRS from input batch
         crs = self.crs
 
@@ -2655,11 +2725,15 @@ class Batch(BatchCore):
 
         out: dict[str, xr.Dataset] = {}
         for key, tfm in self.items():
-            if 'ele' not in tfm.variables:
+            # the transform's `ele`, or a DataArray batch of it, stack.ele (N81)
+            if isinstance(tfm, xr.DataArray):
+                z = tfm if tfm.name == 'ele' else None
+            else:
+                z = tfm['ele'] if 'ele' in tfm.variables else None
+            if z is None:
                 raise KeyError(
                     f'aspect(): {key!r} carries no {"ele"!r} to differentiate. '
                     'Call it on transform(), which delivers the DEM.')
-            z = tfm['ele']
             if z.dims[-2:] != ('y', 'x'):
                 raise ValueError(
                     f'aspect(): {key!r} has ele on {z.dims}, not a (y, x) '
@@ -2698,10 +2772,13 @@ class Batch(BatchCore):
             aspect = (da.rad2deg(da.arctan2(-grad.real, -grad.imag)) % 360.0)
             aspect = da.where(mag > 0, aspect, np.nan).astype('float32')
 
+            # TWO NAMED OUTPUTS, a Dataset whatever the input form; a DataArray's own
+            # attributes describe `ele`, not the result (N81)
             result_ds = xr.Dataset({
                 'slope': xr.DataArray(slope, dims=z.dims, coords=z.coords),
                 'aspect': xr.DataArray(aspect, dims=z.dims, coords=z.coords)})
-            result_ds.attrs = tfm.attrs
+            if isinstance(tfm, xr.Dataset):
+                result_ds.attrs = tfm.attrs
             # Preserve CRS
             if crs is not None:
                 result_ds = result_ds.rio.write_crs(crs)
@@ -2781,7 +2858,8 @@ class Batch(BatchCore):
         out: dict[str, xr.Dataset] = {}
         for key, phase_ds in self.items():
             disp_vars: dict[str, xr.DataArray] = {}
-            for var_name, data in phase_ds.data_vars.items():
+            # a Dataset's variables, or a DataArray as its own one (N81)
+            for var_name, data in BatchCore._vars_of(phase_ds).items():
                 # A DATASET OPERATION APPLIES TO THE GRIDS AND NOTHING ELSE.
                 # radar_wavelength, burst ids and the rest ride along and are
                 # carried through untouched; multiplying a <U43 burst name by
@@ -2791,7 +2869,8 @@ class Batch(BatchCore):
                     continue
                 disp = (data * scale).astype('float32')
                 disp_vars[var_name] = disp
-            out[key] = xr.Dataset(disp_vars, coords=phase_ds.coords, attrs=phase_ds.attrs)
+            # a DataArray in, a DataArray out (N81)
+            out[key] = BatchCore._form(phase_ds, disp_vars, coords=phase_ds.coords, attrs=phase_ds.attrs)
 
         return Batch(out)
 
@@ -2820,8 +2899,10 @@ class Batch(BatchCore):
 
             inc_da = incidence_batch[key]['incidence']
             comp_vars: dict[str, xr.DataArray] = {}
+            # a Dataset's variables, or a DataArray as its own one (N81)
+            los_vars = BatchCore._vars_of(los_ds)
 
-            for var_name, data in los_ds.data_vars.items():
+            for var_name, data in los_vars.items():
                 # A DATASET OPERATION APPLIES TO THE GRIDS AND NOTHING ELSE.
                 # radar_wavelength, burst ids and the rest ride along and are
                 # carried through untouched; multiplying a <U43 burst name by
@@ -2839,7 +2920,7 @@ class Batch(BatchCore):
 
                 comp = (data / func(incidence)).astype('float32')
 
-                if len(los_ds.data_vars) == 1:
+                if len(los_vars) == 1:
                     name = suffix
                 elif var_name.endswith('_los'):
                     name = var_name[:-4] + f'_{suffix}'
@@ -2848,7 +2929,8 @@ class Batch(BatchCore):
 
                 comp_vars[name] = comp
 
-            out[key] = xr.Dataset(comp_vars, coords=los_ds.coords, attrs=los_ds.attrs)
+            # a DataArray in, a DataArray out (N81), named as a one-variable Dataset names it
+            out[key] = BatchCore._form(los_ds, comp_vars, coords=los_ds.coords, attrs=los_ds.attrs)
 
         return Batch(out)
 
@@ -2927,6 +3009,8 @@ class Batch(BatchCore):
             transform = transform.transform()
 
         ep_batch = transform.elevation_phase()
+        ref_heights = _ref_heights({k: transform[k] for k in self.keys() if k in ep_batch},
+                                   f'{type(self).__name__}.elevation()')
         out: dict[str, xr.Dataset] = {}
 
         for key, phase_ds in self.items():
@@ -2965,10 +3049,12 @@ class Batch(BatchCore):
             # see elevation_phase() for the references and the numbers.
             fac_da = ep_batch[key]['elevation_phase']
 
-            ref_height = _scalar_from_ds(tfm, 'ref_height') or 0.0
+            ref_height = ref_heights[key]
 
             elev_vars: dict[str, xr.DataArray] = {}
-            for var_name, data in phase_ds.data_vars.items():
+            # a Dataset's variables, or a DataArray as its own one (N81): BPR is a
+            # coordinate of the pairs, which a DataArray carries
+            for var_name, data in BatchCore._vars_of(phase_ds).items():
                 # A DATASET OPERATION APPLIES TO THE GRIDS AND NOTHING ELSE.
                 # radar_wavelength, burst ids and the rest ride along and are
                 # carried through untouched; multiplying a <U43 burst name by
@@ -2987,7 +3073,8 @@ class Batch(BatchCore):
                 elev = ref_height - data / (fac * bpr)
                 elev_vars[var_name] = elev.astype('float32')
 
-            out[key] = xr.Dataset(elev_vars, coords=phase_ds.coords, attrs=phase_ds.attrs)
+            # a DataArray in, a DataArray out (N81)
+            out[key] = BatchCore._form(phase_ds, elev_vars, coords=phase_ds.coords, attrs=phase_ds.attrs)
 
         return Batch(out)
 
@@ -2996,7 +3083,8 @@ class Batch(BatchCore):
         Perform Seasonal-Trend decomposition using LOESS (STL).
 
         Decomposes time series into trend, seasonal, and residual components.
-        The Batch must have a 'date' dimension.
+        The Batch must have a 'date' dimension and ONE (y, x) variable: x['VV']
+        or x[['VV']]; several raise (the outputs are named by component alone).
 
         Parameters
         ----------
@@ -3011,13 +3099,13 @@ class Batch(BatchCore):
         Returns
         -------
         Batch
-            Batch containing 'trend', 'seasonal', and 'resid' variables for each polarization.
+            Batch of Datasets with the 'trend', 'seasonal' and 'residual' variables.
 
         Examples
         --------
         >>> model = (unwrapped - unwrapped.gaussian(wavelength=40000)).fit1d(weight=corr)
-        >>> stl_result = displacement.stl(freq='W', periods=52)
-        >>> stl_result.plot()  # Shows trend, seasonal, resid components
+        >>> stl_result = displacement['VV'].stl(freq='W', periods=52)
+        >>> stl_result.plot()  # Shows trend, seasonal, residual components
 
         See Also
         --------
@@ -3039,8 +3127,15 @@ class BatchWrap(BatchCore):
         if not wrap:
             dict.__init__(self, mapping or {})
         else:
+            # FLOAT PHASE ONLY (N81): a bool, integer or complex grid is not a phase
+            BatchCore._require_float(mapping, 'BatchWrap wraps float phase only')
             wrapped = {k: self.wrap(v) for k, v in (mapping or {}).items()}
             dict.__init__(self, wrapped)
+
+    @classmethod
+    def _keeps(cls, dtype) -> bool:
+        """A result keeps the class when it is float phase (BatchCore._as_class)."""
+        return dtype.kind == 'f'
 
     @staticmethod
     def wrap(data):
@@ -3048,13 +3143,22 @@ class BatchWrap(BatchCore):
 
         Wrapping the whole Dataset would fold the radar metadata too --
         near_range 800000 m comes back as 2.3 rad, silently -- so only variables
-        that actually carry phase are wrapped.
+        that actually carry phase are wrapped: the gridded ones, by the operator
+        rule. A DataArray is wrapped whole: BatchWrap(x['VV']) is an explicit
+        conversion. A selection from a BatchWrap is never converted: w['VV']
+        stays a BatchWrap as stored, and w['BPR'], w.residual, w.y are plain
+        Batch objects, so no later isel() or compute() wraps them
+        (BatchCore._select_var).
+
+        Only float phase gets here: BatchWrap(x) raises for a bool, integer or
+        complex grid, and a mask of a BatchWrap (w > 0, np.isfinite(w)) is a
+        plain Batch (BatchCore._as_class), so no rebuild wraps it into floats.
         """
         if isinstance(data, xr.Dataset):
             out = data.copy()
             for v in data.data_vars:
                 da_ = data[v]
-                if da_.ndim >= 2 and tuple(da_.dims[-2:]) == ('y', 'x'):
+                if BatchCore._is_grid(da_):
                     out[v] = np.mod(da_ + np.pi, 2 * np.pi) - np.pi
             out.attrs = data.attrs
             return out
@@ -3066,9 +3170,17 @@ class BatchWrap(BatchCore):
             "Use BatchComplex for complex phase fitting, or unwrap first for real polynomial fitting."
         )
 
+    # THE OPERATOR RULE (BatchCore._binary_vars): the grids are operated on, the
+    # rest passes through; the result is wrapped again, as wrapped-phase
+    # arithmetic is. `w + w` doubled radar_wavelength and `w * 2` raised on the
+    # burst strings before.
     def __add__(self, other: Batch):
+        import operator as _operator
+        if isinstance(other, _SCALARS):
+            return self._result({k: BatchCore._binary_vars(v, other, _operator.add) for k, v in self.items()})
         keys = self.keys()
-        return type(self)({k: (self[k] + other[k] if k in other else self[k]) for k in keys})
+        return self._result({k: (BatchCore._binary_vars(self[k], other[k], _operator.add) if k in other else self[k])
+                           for k in keys})
 
     def __sub__(self, other: Batch):
         import xarray as xr
@@ -3079,61 +3191,31 @@ class BatchWrap(BatchCore):
         # 0, so meter2rad became infinite where it did not. _binary_vars is the
         # one place that rule lives.
         _sub_grids = lambda d, v: BatchCore._binary_vars(d, v, _operator.sub)
-        keys = self.keys()
-        result = {}
-        for k in keys:
-            if k not in other:
-                result[k] = self[k]
-            else:
-                val = other[k]
-                ds = self[k]
-                # Handle per-pair coefficients from burst_polyfit
-                if isinstance(val, (list, tuple)) and len(val) > 0:
-                    # Get a spatial variable (with y, x dims) to check for pair dimension
-                    spatial_vars = [v for v in ds.data_vars if 'y' in ds[v].dims and 'x' in ds[v].dims]
-                    sample_var = spatial_vars[0] if spatial_vars else list(ds.data_vars)[0]
-                    sample_da = ds[sample_var]
-                    has_pair_dim = 'pair' in sample_da.dims
-                    n_pairs = sample_da.sizes.get('pair', 1)
-                    first_elem = val[0]
-
-                    if isinstance(first_elem, (list, tuple)):
-                        # Multi-pair degree=1: [[ramp0, off0], [ramp1, off1], ...]
-                        result[k] = _sub_grids(ds, self[[k]].polyval({k: val})[k])
-                    elif has_pair_dim and len(val) == n_pairs:
-                        # Multi-pair degree=0: [off0, off1, ...]
-                        # Use da.stack for dask 0-d arrays to avoid triggering .compute()
-                        if any(hasattr(v, 'dask') for v in val):
-                            import dask.array as _da
-                            offsets = xr.DataArray(_da.stack(val), dims=['pair'])
-                        else:
-                            offsets = xr.DataArray(val, dims=['pair'])
-                        result[k] = _sub_grids(ds, offsets)
-                    elif len(val) == 1:
-                        # Single value wrapped in list: [offset]
-                        result[k] = _sub_grids(ds, val[0])
-                    else:
-                        # Single pair degree=1: [ramp, offset]
-                        result[k] = _sub_grids(ds, self[[k]].polyval({k: val})[k])
-                elif isinstance(val, (int, float)) \
-                        or (hasattr(val, 'ndim') and val.ndim == 0):
-                    # Scalar subtraction (concrete or dask 0-d array)
-                    result[k] = _sub_grids(ds, val)
-                else:
-                    result[k] = _sub_grids(ds, val)
-        return type(self)(result)
+        if isinstance(other, _SCALARS):
+            return self._result({k: _sub_grids(v, other) for k, v in self.items()})
+        # the per-pair coefficients of align() go through the DataArray polyval() correction
+        return self._result({k: (self._sub_coeffs(k, self[k], other[k]) if k in other else self[k])
+                           for k in self.keys()})
 
     def __mul__(self, other: Batch):
+        import operator as _operator
+        if isinstance(other, _SCALARS):
+            return self._result({k: BatchCore._binary_vars(v, other, _operator.mul) for k, v in self.items()})
         keys = self.keys()
-        return type(self)({k: self[k] * other[k] if k in other else self[k] for k in keys})
+        return self._result({k: (BatchCore._binary_vars(self[k], other[k], _operator.mul) if k in other else self[k])
+                           for k in keys})
 
     def __rmul__(self, other):
         # scalar * batch  → map scalar * each dataset
-        return type(self)({k: other * v for k, v in self.items()})
+        return self._result({k: BatchCore._binary_vars(v, other, lambda a, b: b * a) for k, v in self.items()})
 
     def __truediv__(self, other: Batch):
+        import operator as _operator
+        if isinstance(other, _SCALARS):
+            return self._result({k: BatchCore._binary_vars(v, other, _operator.truediv) for k, v in self.items()})
         keys = self.keys()
-        return type(self)({k: self[k] / other[k] if k in other else self[k] for k in keys})
+        return self._result({k: (BatchCore._binary_vars(self[k], other[k], _operator.truediv) if k in other else self[k])
+                           for k in keys})
 
     def sin(self, **kwargs) -> Batch:
         """
@@ -3155,11 +3237,16 @@ class BatchWrap(BatchCore):
         - If sign = +1, this is exp(+1j * da).
         """
         from .Batch import BatchComplex
-        return BatchComplex(self.map_da(lambda da, **kw: xr.ufuncs.exp(sign * 1j * da), **kwargs))
+        # the phasors are built as a plain dict: rebuilding a BatchWrap first
+        # wrapped the complex values, which numpy refuses (interferogram(phase=BatchWrap))
+        return BatchComplex(self._map_grids(lambda da, **kw: xr.ufuncs.exp(sign * 1j * da), **kwargs))
 
     def _agg(self, name: str, dim=None, **kwargs):
         """
         Converts wrapped phase to complex numbers before aggregation and back to wrapped phase after.
+
+        THE OPERATOR RULE: the grids are aggregated, every other variable passes
+        through unchanged (the string metadata raised in astype() before).
         """
         #print ('wrap _agg')
         import inspect
@@ -3167,10 +3254,18 @@ class BatchWrap(BatchCore):
         import pandas as pd
         out = {}
         for key, obj in self.items():
+            carry = {}
+            if isinstance(obj, xr.Dataset):
+                grids = BatchCore._grid_vars(obj)
+                carry = {v: obj[v] for v in obj.data_vars if v not in grids}
+                obj = obj[grids]
+            elif hasattr(obj, 'obj') and isinstance(obj.obj, xr.Dataset):
+                # a coarsen() window over the complex grids, the metadata carried by coarsen()
+                carry = {v: obj.obj[v] for v in obj.obj.data_vars if not BatchCore._is_grid(obj.obj[v])}
             # get the aggregation function
             fn = getattr(obj, name)
             sig = inspect.signature(fn)
-            
+
             # perform aggregation in complex domain
             if 'dim' in sig.parameters:
                 # intfs.mean('pair').isel(0)
@@ -3196,18 +3291,25 @@ class BatchWrap(BatchCore):
                 # intfs.coarsen({'y':2, 'x':2}, boundary='trim').mean()
                 # already in complex domain, see coarsen()
                 if name in ('var', 'std'):
-                    R = xr.ufuncs.abs(obj.mean(**kwargs))
+                    R = obj.mean(**kwargs)
+                    if carry:
+                        R = R[[v for v in R.data_vars if v not in carry]]
+                    R = xr.ufuncs.abs(R)
                     if name == 'var':
                         agg_result = (1 - R)
                     else:  # std
                         agg_result = xr.ufuncs.sqrt(-2 * xr.ufuncs.log(R))
                 else:
                     agg_result = fn(**kwargs)
+                    if carry:
+                        agg_result = agg_result[[v for v in agg_result.data_vars if v not in carry]]
                     agg_result = xr.ufuncs.angle(agg_result)
-            
+
             # Convert back to wrapped phase
             out[key] = agg_result.astype('float32')
-            
+            for v, da_ in carry.items():
+                out[key][v] = da_
+
         #print ('wrap _agg self.chunks', self.chunks)
         #return type(self)(out).chunk(self.chunks)
         #print ('wrap _agg self.chunks', self.chunks)
@@ -3246,8 +3348,16 @@ class BatchWrap(BatchCore):
         out = {}
         # produce unified grid and chunks for all datasets in the batch
         for key, ds in self.items():
-            # convert to complex numbers for proper circular statistics
-            ds2 = xr.ufuncs.exp(1j * ds.astype('float32'))
+            # convert to complex numbers for proper circular statistics: the
+            # grids, by the operator rule, and every other variable carried
+            if isinstance(ds, xr.Dataset):
+                grids = BatchCore._grid_vars(ds)
+                ds2 = xr.ufuncs.exp(1j * ds[grids].astype('float32'))
+                meta = [v for v in ds.data_vars if v not in grids]
+                if meta:
+                    ds2 = ds2.assign({v: ds[v] for v in meta})
+            else:
+                ds2 = xr.ufuncs.exp(1j * ds.astype('float32'))
             # align each dimension
             for dim, factor in window.items():
                 start = utils_xarray.coarsen_start(ds2, dim, factor)
@@ -3320,7 +3430,7 @@ class BatchWrap(BatchCore):
         import xarray as xr
 
         keep_attrs = kwargs.pop('keep_attrs', False)
-        data_vars = next(iter(self.values())).data_vars
+        data_vars = list(BatchCore._vars_of(next(iter(self.values()))))
 
         # build two Batches of the real sin and cos components and filter them
         sin = self.sin(keep_attrs=keep_attrs).gaussian(*args, **kwargs)
@@ -3329,6 +3439,17 @@ class BatchWrap(BatchCore):
         # compute wrapped phase using arctan2
         out: dict[str, xr.Dataset] = {}
         for k in self.keys():
+            if isinstance(self[k], xr.DataArray):
+                # a DataArray in, a DataArray out (N81)
+                src = self[k]
+                if not ('y' in src.dims and 'x' in src.dims):
+                    out[k] = src
+                    continue
+                phase = xr.ufuncs.arctan2(sin[k], cos[k]).astype('float32').rename(src.name)
+                if keep_attrs:
+                    phase.attrs = src.attrs.copy()
+                out[k] = phase
+                continue
             phase_vars = {}
             for var in data_vars:
                 src = self[k][var]
@@ -3384,12 +3505,15 @@ class BatchWrap(BatchCore):
             Print diagnostic information.
         **kwargs
             Additional arguments: max_iter, tol, cg_max_iter, cg_tol, epsilon.
+            Relaxed defaults: max_iter=50, tol=1e-2, cg_max_iter=10, cg_tol=1e-3,
+            epsilon=1e-2. Strong set: max_iter=200, tol=1e-3, cg_max_iter=20,
+            cg_tol=1e-4, epsilon=1e-2. A looser setting prints one WARNING per call.
 
         Returns
         -------
         Batch or tuple
             If conncomp=False: Batch of unwrapped phase.
-            If conncomp=True: tuple of (Batch unwrapped, BatchUnit conncomp).
+            If conncomp=True: tuple of (Batch unwrapped, Batch conncomp).
 
         Examples
         --------
@@ -3422,15 +3546,15 @@ class BatchWrap(BatchCore):
         device : str
             PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
         max_iter : int
-            Maximum IRLS iterations. Default 50.
+            Maximum IRLS iterations. Default 50 (relaxed; strong: 200).
         tol : float
-            Convergence tolerance. Default 1e-2.
+            Convergence tolerance. Default 1e-2 (relaxed; strong: 1e-3).
         cg_max_iter : int
-            Maximum conjugate gradient iterations. Default 10.
+            Maximum conjugate gradient iterations. Default 10 (relaxed; strong: 20).
         cg_tol : float
-            Conjugate gradient tolerance. Default 1e-3.
+            Conjugate gradient tolerance. Default 1e-3 (relaxed; strong: 1e-4).
         epsilon : float
-            Smoothing parameter for L1 approximation. Default 1e-2.
+            Smoothing parameter for L1 approximation. Default 1e-2 (strong: 1e-2).
         conncomp_size : int
             Minimum connected component size in pixels. Components smaller than this
             are marked invalid (label 0). Default 30.
@@ -3442,15 +3566,21 @@ class BatchWrap(BatchCore):
         Returns
         -------
         Batches
-            Tuple-like container with (Batch, BatchUnit):
+            Tuple-like container with (Batch, Batch):
             - unwrapped: Batch of unwrapped phase (float32)
-            - conncomp: BatchUnit of component labels (uint16, 0=invalid, 1=largest, ...)
+            - conncomp: Batch of component labels (uint16, 0=invalid, 1=largest, ...)
 
         Notes
         -----
         Uses a novel DCT+IRLS algorithm that combines DCT efficiency with IRLS
         robustness. See `utils_unwrap2d.irls_unwrap_2d` for algorithm details
         and references.
+
+        The defaults are the relaxed, fast set: max_iter=50, tol=1e-2,
+        cg_max_iter=10, cg_tol=1e-3. The strong set is the defaults of
+        `utils_unwrap2d.irls_unwrap_2d`: max_iter=200, tol=1e-3, cg_max_iter=20,
+        cg_tol=1e-4, epsilon=1e-2. Any parameter looser than the strong set
+        prints one WARNING per call naming the strong values.
 
         Examples
         --------
@@ -3520,7 +3650,14 @@ class BatchUnit(BatchCore):
         from .Stack import Stack
         if isinstance(mapping, (Stack, BatchWrap, BatchComplex)):
             raise ValueError(f'ERROR: BatchUnit does not support Stack, BatchWrap or BatchComplex objects.')
+        # FLOAT UNITS ONLY (N81): a bool, integer or complex grid is not a unit
+        BatchCore._require_float(mapping, 'BatchUnit holds float units only')
         dict.__init__(self, mapping or {})
+
+    @classmethod
+    def _keeps(cls, dtype) -> bool:
+        """A result keeps the class when it is float units (BatchCore._as_class)."""
+        return dtype.kind == 'f'
 
     def plot(
         self,
@@ -3589,7 +3726,7 @@ class BatchComplex(BatchCore):
             Remove each block's common phase per date first: fit its top 1% of
             finite pixels by raw resultant (at least one), average their
             residual phasors per date and rotate that angle out of each series.
-            One constant per date per block, not a substitute for detrend2d().
+            One constant per date per block, not a substitute for detrend().
             A block whose references all fail the bounds is NaN.
 
         Returns
@@ -3616,6 +3753,10 @@ class BatchComplex(BatchCore):
         import xarray as xr
         from .Batch import Batch
 
+        # the baselines and the radar geometry are the Dataset's (N81); baseline=None reads
+        # radar_wavelength alone
+        BatchCore._needs_dataset(self, 'fit1d', (baseline,) + BatchCore._GEOMETRY if baseline
+                                 else ('radar_wavelength',))
         BatchCore._require_lazy(self, 'fit1d')
 
         # a stack with any `pair` variable is refused; use the per-date stack
@@ -3628,6 +3769,7 @@ class BatchComplex(BatchCore):
                 'or unwrap and call Batch.fit1d() on the unwrapped pairs.')
 
         model_result = {}
+        _ep_all = None  # computed on first use: once per call, so a missing ref_height warns once and not once per burst
         for burst_id, ds in self.items():
 
             pols = [v for v in ds.data_vars
@@ -3663,7 +3805,9 @@ class BatchComplex(BatchCore):
                     if bp.ndim > 1:
                         bp = np.nanmean(bp.reshape(len(dates), -1), axis=1)
                     # elevation_phase() = 4 pi / (lambda R sin(inc))
-                    _fac = Batch._elevation_phase_approximate(self)[burst_id]
+                    if _ep_all is None:
+                        _ep_all = Batch._elevation_phase_approximate(self)
+                    _fac = _ep_all[burst_id]
                     ele2phase = bp / (meter2rad / _fac)
             if meter2rad is None:
                 raise TypeError(
@@ -3827,16 +3971,16 @@ class BatchComplex(BatchCore):
             `seasonal`
             (unprefixed, one polarisation).
         baseline : str or None
-            Per-date perpendicular baseline variable. DEFAULT None, i.e. the
-            topographic term is NOT projected onto dates, so the prediction is
-            rate + seasonal only -- the object that matches phase which has
-            already had topography removed. Pass 'BPR' to include it and predict
-            the raw phase instead. Verified: predict('BPR') / predict(None) is
+            Per-date perpendicular baseline variable. DEFAULT 'BPR', i.e. the
+            topographic term is projected onto dates and the prediction is the
+            raw phase. Pass None to leave it out: the prediction is then rate +
+            seasonal only -- the object that matches phase which has already had
+            topography removed. Verified: predict('BPR') / predict(None) is
             exactly exp(1j*ele2phase*height) to 4e-07 rad.
         vars : Batch or None
             Only for a trend2d() model: the covariates it names, at this
             stack's posting, when the stack does not carry them itself -- the
-            same argument detrend2d() takes.
+            same argument detrend() takes.
 
         Returns
         -------
@@ -3856,10 +4000,10 @@ class BatchComplex(BatchCore):
         Examples
         --------
         >>> model  = stack.fit3d()
-        >>> ground = stack * stack.predict(model=model).conj()
-        >>> resid  = stack * stack.predict(model=model, baseline='BPR').conj()
-        >>> # modelled displacement per date, unwrapped:
-        >>> disp = (stack.predict(model=model, phasor=False)
+        >>> ground = stack * stack.predict(model=model, baseline=None).iexp(sign=1)
+        >>> resid  = stack * stack.predict(model=model).iexp(sign=1)
+        >>> # modelled displacement per date, unwrapped (no height term):
+        >>> disp = (stack.predict(model=model, baseline=None)
         ...              .displacement_los(stack.transform()))
         """
         import numpy as np
@@ -3873,11 +4017,20 @@ class BatchComplex(BatchCore):
         if vars is not None:
             raise TypeError("predict(): `vars` are the covariates of a trend2d() "
                             "model; a fit3d() / fit1d() model names none.")
+        if baseline:
+            # the height term reads the Dataset's baselines and radar geometry (N81);
+            # baseline=None predicts from the model and the dates alone. A Dataset
+            # without them raises too: the height term was dropped, silently
+            BatchCore._needs_vars(self, 'predict', (baseline,) + BatchCore._GEOMETRY,
+                                  'Call it on the Dataset batch x, or pass baseline=None.')
         out = {}
+        _ep_all = None  # computed on first use: once per call, so a missing ref_height warns once and not once per burst
         for key, ds in self.items():
-            pols = [v for v in ds.data_vars
-                    if ds[v].dtype.kind == 'c' and 'date' in ds[v].dims
-                    and 'y' in ds[v].dims and 'x' in ds[v].dims]
+            # a Dataset's variables, or a DataArray as its own one (N81)
+            vars_ = BatchCore._vars_of(ds)
+            pols = [v for v, a in vars_.items()
+                    if a.dtype.kind == 'c' and 'date' in a.dims
+                    and 'y' in a.dims and 'x' in a.dims]
             if len(pols) > 1:
                 raise ValueError(
                     f"predict() takes ONE polarisation, burst '{key}' carries "
@@ -3886,7 +4039,7 @@ class BatchComplex(BatchCore):
                 raise TypeError(
                     f"predict() found no complex (date, y, x) variables in '{key}'.")
             pol = pols[0]
-            da_xr = ds[pol]
+            da_xr = vars_[pol]
             if da_xr.dims[0] != 'date':
                 da_xr = da_xr.transpose('date', ...)
 
@@ -3946,7 +4099,9 @@ class BatchComplex(BatchCore):
                 # the model it inverts. Nothing physical rode on the choice
                 # either: the scalar rescales `height` inversely and cancels in
                 # the product.
-                _fac = Batch._elevation_phase_approximate(self)[key]
+                if _ep_all is None:
+                    _ep_all = Batch._elevation_phase_approximate(self)
+                _fac = _ep_all[key]
                 bp = np.asarray(ds[baseline].values, dtype=float)
                 while bp.ndim > 1:
                     bp = np.nanmean(bp, axis=-1)
@@ -4009,8 +4164,9 @@ class BatchComplex(BatchCore):
             coords = {'date': np.asarray(da_xr.coords['date'].values),
                       'y': np.asarray(mds.coords['y'].values),
                       'x': np.asarray(mds.coords['x'].values)}
-            pds = xr.Dataset({pol: xr.DataArray(pred, dims=('date', 'y', 'x'),
-                                                coords=coords)}, attrs=ds.attrs)
+            # a DataArray in, a DataArray out (N81)
+            pds = BatchCore._form(ds, {pol: xr.DataArray(pred, dims=('date', 'y', 'x'),
+                                                         coords=coords)}, attrs=ds.attrs)
             sref = (mds['spatial_ref'] if 'spatial_ref' in mds.coords
                     else (ds['spatial_ref'] if 'spatial_ref' in ds.coords else None))
             if sref is not None:
@@ -4084,6 +4240,11 @@ class BatchComplex(BatchCore):
         >>> # smooth model for comparison -- same convention, no noise:
         >>> stack.predict(model=model, baseline=None)
         """
+        if baseline:
+            # the height term reads the Dataset's baselines and radar geometry (N81); a
+            # Dataset without them raises too: the height term was dropped, silently
+            BatchCore._needs_vars(self, 'mix', (baseline,) + BatchCore._GEOMETRY,
+                                  'Call it on the Dataset batch x, or pass baseline=None.')
         # The height term's metres-to-radians scale comes from this stack on both
         # sides, as it does in fit1d()/fit3d(), so it cancels in the product.
         full = self.predict(model, baseline=baseline, ref=ref)
@@ -4109,10 +4270,10 @@ class BatchComplex(BatchCore):
         phasor: `phi_d = sum_i g_di * (v_i - z_i) + k_d`, or `phi_d = k_d`
         alone when no covariate is given, so removing it is a rotation.
 
-        >>> trend = stack.where(stack.adi() < 0.25).trend2d('northing', 'easting', 'ele')
-        >>> trend = stack.where(stack.adi() < 0.25).trend2d(
+        >>> trend = stack.where(stack.adi()['VV'] < 0.25).trend2d('northing', 'easting', 'ele')
+        >>> trend = stack.where(stack.adi()['VV'] < 0.25).trend2d(
         ...     stack.transform()[['northing','easting','ele']])       # the same
-        >>> flat  = stack.detrend2d(trend)
+        >>> flat  = stack.detrend(trend)
 
         IT RUNS ON THE RAW STACK, where detrending belongs. The scatterer phase
         is still there, and being constant in time is what cancels it: one
@@ -4174,7 +4335,7 @@ class BatchComplex(BatchCore):
           pixels -- samples fitted.
         NaN only when there is no fit at all: no pixels, a degenerate
         covariate, a trend walking out of `range`, or no convergence.
-        THIS ONLY FITS; detrend2d() applies.
+        THIS ONLY FITS; detrend() applies.
 
         Parameters
         ----------
@@ -4191,8 +4352,8 @@ class BatchComplex(BatchCore):
             no slopes, and 'stderr_intercept' prices the constant instead. A
             higher degree is not an argument either: it is named, `'ele²'`.
 
-            TAKE THEM FROM THE UNFILTERED STACK: where() masks the geometry
-            too. And mind the frame -- `azi` and `rng` restart at every burst,
+            The geometry is the stack's transform: where() on a Stack masks
+            the data only (N81). And mind the frame -- `azi` and `rng` restart at every burst,
             so one plane cannot be written in them across bursts; `northing`
             and `easting` are the same grid for all of them.
 
@@ -4240,7 +4401,7 @@ class BatchComplex(BatchCore):
             covariate only 'intercept', 'stderr_intercept', 'coherence',
             'coherence0', 'gain' and 'pixels', with no covariate named. No
             raster: `stack.predict(trend)` evaluates the phase per chunk when
-            asked, `stack.detrend2d(trend)` removes it.
+            asked, `stack.detrend(trend)` removes it.
         """
         import numpy as np
         import builtins as _builtins
@@ -4249,6 +4410,9 @@ class BatchComplex(BatchCore):
         import dask.array as da
         from . import utils_detrend
 
+        # the reference epoch is where the Dataset's BPR is smallest (N81): without it the
+        # fit is referenced to another date, silently -- for a Dataset without BPR too
+        BatchCore._needs_vars(self, 'trend2d', ('BPR',))
         # the covariates: named, or the Batch they always were; a gradient per
         # covariate and the constant, or -- with none -- the constant alone
         degree = 1
@@ -4295,7 +4459,7 @@ class BatchComplex(BatchCore):
                     f"{len(pols)}: {pols}. The atmosphere is the same for "
                     f"every polarisation, and per-pol trends would break any "
                     f"PolSAR analysis -- select one (e.g. "
-                    f"stack[['{pols[0]}']]), fit it, and detrend2d() applies "
+                    f"stack[['{pols[0]}']]), fit it, and detrend() applies "
                     f"the one trend to every polarisation.")
             data_da = ds[pols[0]]
             if 'pair' in data_da.dims:
@@ -4577,7 +4741,7 @@ class BatchComplex(BatchCore):
             # into a (date, y, x) phasor made a raster the size of the
             # stack, which compute() then persisted across the cluster and
             # every block read had to fetch pieces of. predict() evaluates
-            # it lazily where it is asked for; detrend2d() applies it so.
+            # it lazily where it is asked for; detrend() applies it so.
             # SCIPY'S NAMES, IN FLOAT64: `slope_<var>` is the gradient per
             # unit of the covariate and `intercept` the phase where every
             # covariate sits at its 'trend2d_zero'. The fit itself is centred
@@ -4682,9 +4846,10 @@ class BatchComplex(BatchCore):
             mds = model[key]
             names = list(mds.attrs['trend2d_vars'])
             dims = list(mds.attrs['trend2d_dims'])
-            grids = [v for v in ds.data_vars
-                     if ds[v].dtype.kind == 'c' and 'date' in ds[v].dims
-                     and 'y' in ds[v].dims and 'x' in ds[v].dims]
+            # a Dataset's variables, or a DataArray as its own one (N81)
+            grids = [v for v, a in BatchCore._vars_of(ds).items()
+                     if a.dtype.kind == 'c' and 'date' in a.dims
+                     and 'y' in a.dims and 'x' in a.dims]
             if not grids:
                 raise TypeError(
                     f"predict() found no (date, y, x) complex variable in "
@@ -4706,7 +4871,7 @@ class BatchComplex(BatchCore):
                         f"{_miss.size} date(s) this stack does not: "
                         f"{[str(d) for d in _miss[:5]]}.")
                 ds = ds.sel(date=_md)
-            ref = ds[grids[0]].transpose('date', 'y', 'x')
+            ref = BatchCore._vars_of(ds)[grids[0]].transpose('date', 'y', 'x')
             data = ref.data
             # the model per date, as CONSTANTS in the graph; the phase is
             # evaluated in float64 -- an intercept at zero and a slope times
@@ -4717,12 +4882,14 @@ class BatchComplex(BatchCore):
                                chunks=(_dc,))
             phi = kd[:, None, None]
             src = vars[key] if vars is not None else ds
+            # a DataArray burst carries no covariate but its map coordinates (N81)
+            src_vars = BatchCore._vars_of(src)
             # absent in a model fitted before the attribute existed: zero
             _zero = list(mds.attrs.get('trend2d_zero', []))
 
             def _plain(nm):
-                if nm in src.data_vars:
-                    return src[nm]
+                if nm in src_vars:
+                    return src_vars[nm]
                 if nm == 'northing' and 'y' in src.coords:
                     return xr.DataArray(np.asarray(src.y.values, np.float32),
                                         dims=('y',))
@@ -4780,14 +4947,17 @@ class BatchComplex(BatchCore):
                 phi = da.broadcast_to(phi, data.shape, chunks=data.chunks)
             coords = {k_: v_ for k_, v_ in ref.coords.items()
                       if k_ in ('date', 'y', 'x', 'spatial_ref')}
-            out[key] = xr.Dataset({'phase': xr.DataArray(
+            # a DataArray in, a DataArray out (N81): the trend's 'phase'
+            out[key] = BatchCore._form(ds, {'phase': xr.DataArray(
                 phi.astype(np.float32), dims=('date', 'y', 'x'),
                 coords=coords)}, attrs=dict(ds.attrs))
         return Batch(out)
 
-    def detrend2d(self, trend: 'Batch', vars=None) -> 'BatchComplex':
+    def detrend(self, trend: 'Batch', vars=None) -> 'BatchComplex':
         """
-        Remove a trend2d() model from EVERY pixel: `self * exp(-1j * phase)`.
+        Remove a trend from EVERY pixel: `self * exp(-1j * phase)`. The trend says
+        what it is, as predict()'s model does, so the name carries no dims: today a
+        trend2d() model; detrend2d() is an alias.
 
         The phase is predict(trend): the model's per-date coefficients over
         the stack's own covariates, evaluated per chunk -- nothing of raster
@@ -4816,12 +4986,13 @@ class BatchComplex(BatchCore):
         for key in self.keys():
             if key not in trend or 'trend2d_vars' not in trend[key].attrs:
                 raise ValueError(
-                    f"detrend2d(): no trend2d() model for burst '{key}' -- "
+                    f"detrend(): no trend2d() model for burst '{key}' -- "
                     f"pass what trend2d() returned for this stack.")
         pred = self._trend2d_predict(trend, vars=vars)
         res = {}
         for key, ds in self.items():
-            phi = pred[key]['phase']
+            # the trend's phase: a DataArray burst's prediction is the DataArray itself (N81)
+            phi = BatchCore._vars_of(pred[key])['phase']
             _pd = np.asarray(phi.coords['date'].values)
             _sd = np.asarray(ds.coords['date'].values)
             if _pd.shape != _sd.shape or not np.array_equal(_pd, _sd):
@@ -4835,11 +5006,21 @@ class BatchComplex(BatchCore):
             rot = xr.DataArray(
                 da.exp(np.complex64(-1j) * phi.data.astype(np.complex64)),
                 dims=phi.dims, coords=phi.coords)
-            upd = {v: ds[v] * rot for v in ds.data_vars
-                   if ds[v].dtype.kind == 'c' and 'y' in ds[v].dims
-                   and 'x' in ds[v].dims and 'date' in ds[v].dims}
+            upd = {v: a * rot for v, a in BatchCore._vars_of(ds).items()
+                   if a.dtype.kind == 'c' and 'y' in a.dims
+                   and 'x' in a.dims and 'date' in a.dims}
+            if isinstance(ds, xr.DataArray):
+                # a DataArray in, a DataArray out (N81)
+                res[key] = BatchCore._form(ds, upd)
+                continue
             res[key] = ds.assign(upd)
         return type(self)(res)
+
+    def detrend2d(self, trend: 'Batch', vars=None) -> 'BatchComplex':
+        """Alias of detrend(), for code that names the dims: prints a WARNING and calls
+        detrend(trend, vars), which reads what the trend is (user, 2026-10-01)."""
+        print('WARNING: detrend2d() calls detrend(). Use detrend(trend).')
+        return self.detrend(trend, vars=vars)
 
     def fit3d(self, threshold: float = 0.5, window: tuple = (400, 4000),
                 cell: 'float | tuple' = 24,
@@ -5184,6 +5365,8 @@ class BatchComplex(BatchCore):
         >>> good = model.where(model['conncomp'] == 0)
         >>> main = velocity.where(labels == 0)   # one datum, comparable
         """
+        # the baselines and the radar geometry are the Dataset's (N81)
+        BatchCore._needs_dataset(self, 'fit3d', ('BPR',) + BatchCore._GEOMETRY)
         # DELEGATE BY STACK TYPE, exactly as fit1d() does: pairs take the
         # pair branch (not implemented), dates take the PS network below.
         if any('pair' in ds[v].dims
@@ -5219,10 +5402,13 @@ class BatchComplex(BatchCore):
         # to ask for one answer there.
         from .Batch import Batch
         chain = _Fit3dChain()
+        # ONCE FOR THE CALL, not once per burst: a missing ref_height warns
+        # once, naming every burst. Each burst's value is its own either way.
+        ep = Batch._elevation_phase_approximate(self)
         out = {}
         for k in self.keys():
             out.update(type(self)({k: self[k]})._fit3d_union(
-                chain=chain, tag=f' [{k}]', **_kw).items())
+                chain=chain, tag=f' [{k}]', ep=ep, **_kw).items())
         return Batch(out)
 
 
@@ -5230,14 +5416,16 @@ class BatchComplex(BatchCore):
     def _fit3d_setup(self, threshold, window, cell, baseline, level,
                      max_dh, max_dv, step_dh, step_dv, max_seasonal,
                      consensus, err_dh, err_dv, iterations, debug,
-                     chain=None, tag=''):
+                     chain=None, tag='', ep=None):
         """WHAT EVERY fit3d() DRIVER SHARES: the polarisation, the windows,
         the cluster's shape, each burst's frame and the kwargs the stage
         functions take, and the scene lattice the bursts sit on.
 
         One place, so the union driver and the per-chunk driver cannot read
         the same stack two ways. Returns a dict; `_fit3d_scan` adds the
-        pass-1 graph to it.
+        pass-1 graph to it. `ep` is `_elevation_phase_approximate()` of a
+        stack holding these bursts, computed once by a caller that loops over
+        bursts; None computes it here.
         """
         import os as _os
         import numpy as np
@@ -5292,9 +5480,9 @@ class BatchComplex(BatchCore):
         elif chain.width is None:
             chain.width = int(_width)
 
-        # EARLIEST BURST FIRST, so the later one wins the seam it shares
-        _keys = sorted(self.keys(), key=lambda k: np.asarray(
-            self[k].coords['date'].values).min())
+        # EARLIEST BURST FIRST, so the later one wins the seam it shares: the one
+        # acquisition order of every burst merge, as to_dataset() lays the bursts
+        _keys = BatchCore._acquisition_order(self, 'fit3d')
         _dss = [self[k] for k in _keys]
 
         # EVERY CHUNK ANSWERS TO ITS OWN BURST'S GEOMETRY. Averaging the
@@ -5307,7 +5495,7 @@ class BatchComplex(BatchCore):
         def _scalar(v):
             a = np.asarray(v, dtype=float).ravel()
             return float(a[0]) if a.size == 1 else float(np.mean(a))
-        _ep = Batch._elevation_phase_approximate(self)
+        _ep = Batch._elevation_phase_approximate(self) if ep is None else ep
 
         def _frame(key, ds):
             lam_ = _scalar(ds['radar_wavelength'].values)
@@ -5375,7 +5563,7 @@ class BatchComplex(BatchCore):
     def _fit3d_scan(self, threshold, window, cell, baseline, level,
                     max_dh, max_dv, step_dh, step_dv, max_seasonal,
                     consensus, err_dh, err_dv, iterations, debug,
-                    chain=None, tag=''):
+                    chain=None, tag='', ep=None):
         """PASS 1, SHARED: every chunk scanned on the scene lattice.
 
         This is the first half of fit3d()'s union driver, and the whole of
@@ -5399,7 +5587,7 @@ class BatchComplex(BatchCore):
         _su = self._fit3d_setup(threshold, window, cell, baseline, level,
                                 max_dh, max_dv, step_dh, step_dv, max_seasonal,
                                 consensus, err_dh, err_dv, iterations, debug,
-                                chain=chain, tag=tag)
+                                chain=chain, tag=tag, ep=ep)
         pol, _keys, _dss = _su['pol'], _su['keys'], _su['dss']
         _kw_of, _kw_net = _su['kw_of'], _su['kw_net']
         _cores, _threads, _width = _su['cores'], _su['threads'], _su['width']
@@ -5505,7 +5693,7 @@ class BatchComplex(BatchCore):
     def _fit3d_union(self, threshold, window, cell, baseline, level,
                      max_dh, max_dv, step_dh, step_dv, max_seasonal,
                      consensus, err_dh, err_dv, iterations, debug,
-                     chain=None, tag=''):
+                     chain=None, tag='', ep=None):
         """One network over the union of the bursts, returned on the burst grid.
 
         A node's partners are whatever lies inside the window, and a burst edge
@@ -5534,7 +5722,7 @@ class BatchComplex(BatchCore):
         _s = self._fit3d_scan(threshold, window, cell, baseline, level,
                               max_dh, max_dv, step_dh, step_dv, max_seasonal,
                               consensus, err_dh, err_dv, iterations, debug,
-                              chain=chain, tag=tag)
+                              chain=chain, tag=tag, ep=ep)
         _keys, _grid, _blocks = _s['keys'], _s['grid'], _s['blocks']
         chain = _s['chain']
         _kw_of, _kw_net = _s['kw_of'], _s['kw_net']
@@ -5690,13 +5878,17 @@ class BatchComplex(BatchCore):
         from .Batch import Batch, Batches
         groups = ([self] if union else
                   [type(self)({k: self[k]}) for k in self.keys()])
+        # per burst: computed ONCE for the call, as fit3d() does, so a missing
+        # ref_height warns once and not once per burst
+        ep = None if union else Batch._elevation_phase_approximate(self)
         ds_out, ps_out = {}, {}
         chain = _Fit3dChain()
         for grp in groups:
             _s = grp._fit3d_scan(threshold, window, cell, baseline, 0,
                                  25.0, 25.0, 8.0, 2.0, 0.0, consensus,
                                  4.0, 1.0, iterations, debug, chain=chain,
-                                 tag='' if union else f' [{list(grp.keys())[0]}]')
+                                 tag='' if union else f' [{list(grp.keys())[0]}]',
+                                 ep=ep)
             _keys, _grid, _blocks = _s['keys'], _s['grid'], _s['blocks']
             _test = _dask.delayed(_fit3d_select_ps)(
                 [((b[5][1], b[5][2], b[5][3]), b[8]) for b in _blocks],
@@ -5756,28 +5948,41 @@ class BatchComplex(BatchCore):
         # delegate to your base class for the actual init
         super().__init__(mapping or {})
 
+    @classmethod
+    def _keeps(cls, dtype) -> bool:
+        """A result keeps the class unless it is a boolean mask (BatchCore._as_class):
+        BatchComplex takes any dtype, a mask is a plain Batch in every class."""
+        return dtype.kind != 'b'
+
+    @staticmethod
+    def _grids_map(ds, f, **kwargs):
+        """f on the gridded variables of a Dataset, every other variable carried
+        unchanged (the operator rule); f on a DataArray directly."""
+        if isinstance(ds, xr.DataArray):
+            return f(ds)
+        grids = BatchCore._grid_vars(ds)
+        res = ds[grids].map(f, **kwargs)
+        for v in ds.data_vars:
+            if v not in grids:
+                res[v] = ds[v]
+        return res
+
     def real(self, **kwargs):
         """
         Return the real part of each complex data variable,
         producing a Batch of real-valued Datasets.
+        The grids only: the metadata passes through unchanged.
         """
-        out = {}
-        for key, ds in self.items():
-            # ds.map() applies the lambda to each DataArray in the Dataset
-            ds_real = ds.map(lambda da: da.real, **kwargs)
-            out[key] = ds_real
-        return Batch(out)
+        return Batch({key: BatchComplex._grids_map(ds, lambda da: da.real, **kwargs) for key, ds in self.items()})
 
     def imag(self, **kwargs):
         """
         Return the imaginary part of each complex data variable,
         producing a Batch of real-valued Datasets.
+        The grids only: imag() of the metadata set radar_wavelength to 0 and
+        the burst id to '' before.
         """
-        out = {}
-        for key, ds in self.items():
-            ds_imag = ds.map(lambda da: da.imag, **kwargs)
-            out[key] = ds_imag
-        return Batch(out)
+        return Batch({key: BatchComplex._grids_map(ds, lambda da: da.imag, **kwargs) for key, ds in self.items()})
 
     def abs(self, **kwargs):
         return Batch(self.map_da(lambda da: xr.ufuncs.abs(da), **kwargs))
@@ -5811,15 +6016,20 @@ class BatchComplex(BatchCore):
         import xarray as xr
         from . import utils_detrend
 
+        # a BatchUnit (N81); a DataArray one weights every grid
+        weight = BatchCore._weight(weight, self)
         BatchCore._require_lazy(self, 'threshold')
 
         results = {}
         for burst_id, burst_ds in self.items():
             burst_weight = weight[burst_id] if weight is not None else None
             filtered_vars = {}
-            for pol in [v for v in burst_ds.data_vars if v not in ['ref', 'rep', 'BPR', 'BPT']]:
-                data_da = burst_ds[pol]
-                weight_da = burst_weight[pol] if burst_weight is not None else None
+            # THE GRIDS ONLY (N81): the radar metadata a burst carries -- burst
+            # strings, near_range, ... -- is not phase, and a name list could not
+            # keep up with it; blockwise() raised on the first 1-D variable. A
+            # DataArray burst is its own one grid
+            for pol, data_da in BatchCore._grids_of(burst_ds).items():
+                weight_da = BatchCore._weight_of(burst_weight, pol)
 
                 if data_da.dims[0] != 'pair':
                     data_da = data_da.transpose('pair', ...)
@@ -5859,8 +6069,9 @@ class BatchComplex(BatchCore):
                 filtered_vars[pol] = xr.DataArray(filtered_dask, dims=data_da.dims,
                                                    coords=data_da.coords, name=pol)
 
-            filtered_ds = burst_ds.assign(filtered_vars)
-            results[burst_id] = filtered_ds
+            # a DataArray in, a DataArray out (N81)
+            results[burst_id] = BatchCore._form(burst_ds, filtered_vars) \
+                if isinstance(burst_ds, xr.DataArray) else burst_ds.assign(filtered_vars)
 
         return BatchComplex(results)
 
@@ -5923,6 +6134,9 @@ class BatchComplex(BatchCore):
 
         ds0 = self[list(self.keys())[0]]
         if baseline:
+            # the reference epoch is where the Dataset's baseline is smallest (N81)
+            BatchCore._needs_dataset(self, 'singlelook', (baseline,),
+                                     'Call it on the Dataset batch x, or pass baseline=None.')
             if baseline not in ds0.variables:
                 raise KeyError(
                     f'singlelook(): no {baseline!r} to pick the reference epoch from; '
@@ -5986,6 +6200,12 @@ class BatchComplex(BatchCore):
         """
         if not wavelength > 0:
             raise ValueError(f'multilook() needs a positive wavelength in metres, got {wavelength}')
+        if baseline:
+            # singlelook()'s reference epoch is where the Dataset's baseline is smallest (N81)
+            BatchCore._needs_dataset(self, 'multilook', (baseline,),
+                                     'Call it on the Dataset batch x, or pass baseline=None.')
+        # a BatchUnit (N81), checked here; gaussian() fits it to the grids
+        BatchCore._weight(weight)
         return self.singlelook(baseline).gaussian(
             weight=weight, wavelength=wavelength, threshold=threshold,
             device=device, debug=debug)
@@ -6017,13 +6237,14 @@ class BatchComplex(BatchCore):
         ref_idx = [date_to_idx[np.datetime64(d, 'D')] for d in ref_dates]
         rep_idx = [date_to_idx[np.datetime64(d, 'D')] for d in rep_dates]
 
-        # Select, rename date→pair, and assign pair coords matching the caller
+        # Select, rename date→pair, and assign pair coords matching the caller.
+        # The per-date 'residual' of Stack.align() is dropped, as Stack.pairs() does
         n_pairs = len(ref_idx)
         pair_coords = np.arange(n_pairs)
         screen_ref = self.isel(date=ref_idx).rename(date='pair').map(
-            lambda ds: ds.assign_coords(pair=pair_coords))
+            lambda ds: ds.drop_vars('residual', errors='ignore').assign_coords(pair=pair_coords))
         screen_rep = self.isel(date=rep_idx).rename(date='pair').map(
-            lambda ds: ds.assign_coords(pair=pair_coords))
+            lambda ds: ds.drop_vars('residual', errors='ignore').assign_coords(pair=pair_coords))
 
         return screen_ref, screen_rep
 
@@ -6034,27 +6255,32 @@ class BatchComplex(BatchCore):
         """
         out = {}
         for k, ds in self.items():
-            # select only the vars whose dtype is complex
+            if isinstance(ds, xr.DataArray):
+                # a Batch of DataArrays takes angle() directly
+                out[k] = xr.ufuncs.angle(ds).astype('float32')
+                continue
+            # the COMPLEX GRIDS, by the operator rule; a Dataset without grids raises
+            grids = BatchCore._grid_vars(ds)
             complex_vars = [
-                var for var in ds.data_vars
+                var for var in grids
                 if ds[var].dtype.kind == 'c'
             ]
             if not complex_vars:
                 # no complex vars → skip
                 continue
 
-            # subset to just those, then map over each DataArray. The 1D radar
-            # metadata rides along afterwards -- angle() of near_range is
-            # meaningless, but DROPPING it strands every downstream unit
-            # conversion, which is how radar_wavelength went missing.
+            # subset to just those, then map over each DataArray. EVERY
+            # non-gridded variable rides along afterwards -- angle() of
+            # near_range is meaningless, but DROPPING it strands every
+            # downstream unit conversion, which is how radar_wavelength went
+            # missing. A real grid (a Stack's ele) is not a phase and is left out.
             ds_complex = ds[complex_vars]
             ds_phase = ds_complex.map(
                 lambda da: xr.ufuncs.angle(da).astype('float32'),
                 **kwargs
             )
 
-            meta = [v for v in ds.data_vars
-                    if v not in complex_vars and ds[v].ndim <= 1]
+            meta = [v for v in ds.data_vars if v not in grids]
             if meta:
                 ds_phase = ds_phase.assign({v: ds[v] for v in meta})
             ds_phase.attrs = ds.attrs
@@ -6064,11 +6290,21 @@ class BatchComplex(BatchCore):
         return BatchWrap(out)
 
     def unwrap2d(self, *args, **kwargs):
-        """Unwrap complex interferogram via .angle() conversion."""
+        """Unwrap complex interferogram via .angle() conversion, see BatchWrap.unwrap2d().
+
+        Relaxed IRLS defaults: max_iter=50, tol=1e-2, cg_max_iter=10, cg_tol=1e-3. Strong set:
+        max_iter=200, tol=1e-3, cg_max_iter=20, cg_tol=1e-4, epsilon=1e-2. A looser
+        setting prints one WARNING per call.
+        """
         return self.angle().unwrap2d(*args, **kwargs)
 
     def unwrap2d_irls(self, *args, **kwargs):
-        """Unwrap complex interferogram via .angle() conversion."""
+        """Unwrap complex interferogram via .angle() conversion, see BatchWrap.unwrap2d_irls().
+
+        Relaxed IRLS defaults: max_iter=50, tol=1e-2, cg_max_iter=10, cg_tol=1e-3. Strong set:
+        max_iter=200, tol=1e-3, cg_max_iter=20, cg_tol=1e-4, epsilon=1e-2. A looser
+        setting prints one WARNING per call.
+        """
         return self.angle().unwrap2d_irls(*args, **kwargs)
 
     def plot(self, *args, **kwargs):
@@ -6197,12 +6433,9 @@ class BatchComplex(BatchCore):
         if window is None:
             return self
 
-        # Check if correlation is a BatchUnit by checking its class name
-        if corr.__class__.__name__ != 'BatchUnit':
-            raise ValueError("corr must be a BatchUnit")
-
-        if set(corr.keys()) != set(self.keys()):
-            raise ValueError("corr must have the same keys as self")
+        # a BatchUnit for every burst, the shared check and messages (N81); a DataArray
+        # BatchUnit weights every grid, a Dataset one names every grid
+        corr = BatchCore._weight(corr, self, 'corr', required=True)
 
         # Validate lazy data
         BatchCore._require_lazy(self, 'goldstein')
@@ -6241,10 +6474,11 @@ class BatchComplex(BatchCore):
                     f'goldstein() window {window_m} m is under four pixels per '
                     f'axis on burst {k} after rounding down to even')
 
-            # Process each complex data variable in the dataset
-            for var_name, var_data in ds.data_vars.items():
+            # Process each complex data variable in the dataset; a DataArray burst is
+            # its own one (N81)
+            for var_name, var_data in BatchCore._vars_of(ds).items():
                 if var_data.dtype.kind == 'c':  # Only process complex variables
-                    corr_da = corr_ds[var_name]
+                    corr_da = BatchCore._weight_of(corr_ds, var_name)
                     phase_dask = var_data.data
                     corr_dask = corr_da.data
 
@@ -6285,8 +6519,10 @@ class BatchComplex(BatchCore):
                 else:
                     filtered_vars[var_name] = var_data
 
-            # Create a new dataset with the filtered variables
-            result[k] = xr.Dataset(
+            # Create a new dataset with the filtered variables; a DataArray in, a
+            # DataArray out (N81)
+            result[k] = BatchCore._form(
+                ds,
                 filtered_vars,
                 coords=ds.coords,
                 attrs=ds.attrs
@@ -6676,13 +6912,25 @@ class Batches(tuple):
             raise ValueError('coherent() requires a BatchUnit (correlation) in Batches')
         results = []
         for b in self:
+            # the shared weight check (N81): a burst corr lacks, or a DataArray corr without
+            # (y, x) (BatchUnit(corr['BPR'])), raises. Not by name: one correlation grid
+            # masks every grid of every batch
+            BatchCore._weight(corr, b, 'corr', by_name=False)
             out = {}
             for key in b:
                 corr_ds = corr[key]
-                corr_var = next(v for v in corr_ds.data_vars if 'y' in corr_ds[v].dims)
-                corr_da = corr_ds[corr_var]
+                if isinstance(corr_ds, xr.DataArray):
+                    # a DataArray BatchUnit (N81) is its own one grid
+                    corr_da = corr_ds
+                else:
+                    corr_var = next(v for v in corr_ds.data_vars if 'y' in corr_ds[v].dims)
+                    corr_da = corr_ds[corr_var]
                 mask = corr_da.mean('pair') >= threshold if 'pair' in corr_da.dims else corr_da >= threshold
-                out[key] = b[key].where(mask)
+                ds = b[key]
+                # THE GRIDS ONLY (N81): xarray's where() on the whole Dataset turned
+                # the string metadata into objects that failed on compute
+                out[key] = ds.where(mask) if isinstance(ds, xr.DataArray) else ds.assign(
+                    {v: ds[v].where(mask) for v in ds.data_vars if BatchCore._is_grid(ds[v])})
             results.append(type(b)(out))
         return Batches(results)
 
@@ -6740,8 +6988,8 @@ class Batches(tuple):
 
         if not isinstance(phase, BatchComplex):
             raise TypeError(f"First element must be BatchComplex, got {type(phase).__name__}")
-        if not isinstance(corr, BatchUnit):
-            raise TypeError(f"Second element must be BatchUnit, got {type(corr).__name__}")
+        # the correlation is the weight: the shared check and messages (N81)
+        BatchCore._weight(corr, phase, 'corr', required=True)
 
         filtered_phase = phase.goldstein(corr, window, threshold=threshold, device=device)
         return Batches([filtered_phase, corr] + list(self[2:]))
@@ -6807,11 +7055,8 @@ class Batches(tuple):
                 f'does, and got a {type(wavelength).__name__}. Pass the others '
                 f'by name: interferogram(wavelength, weight=..., phase=...)')
 
-        if weight is not None and not isinstance(weight, BatchUnit):
-            raise TypeError(
-                f'weight must be a BatchUnit, got {type(weight).__name__}. '
-                'Use BatchUnit(stack.from_dataset(data)) to convert a single DataArray.'
-            )
+        # a BatchUnit (N81); a DataArray one weights every grid
+        weight = BatchCore._weight(weight, ref)
 
         intf = ref * rep.conj()
         if phase is not None:
@@ -6821,7 +7066,19 @@ class Batches(tuple):
                 intf = intf * phase.iexp(-1)
 
         if wavelength is not None:
+            # THE FILTERED INTERFEROGRAM IS SHARED by the phase and the correlation, and each
+            # block of the product spans every pair: both are read through unfused tasks, so
+            # every graph built on either -- the phase, the correlation, one pair of a merge
+            # -- defines the filter's chain and the keys on it the same way (dask 9888)
+            from .utils_dask import unfused
+
+            def _unfused(v):
+                if isinstance(v, xr.DataArray):
+                    return v.copy(data=unfused(v.data))
+                return v.assign({n: v[n].copy(data=unfused(v[n].data)) for n in BatchCore._grid_vars(v)})
+            intf = intf._view({k: _unfused(v) for k, v in dict.items(intf)})
             intf_look = intf.gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold, device=device)
+            intf_look = intf_look._view({k: _unfused(v) for k, v in dict.items(intf_look)})
             intensity_ref = ref.power().gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold, device=device)
             intensity_rep = rep.power().gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold, device=device)
             del ref, rep
@@ -6859,65 +7116,40 @@ class Batches(tuple):
         between dependent batches (e.g., phase and correlation). For
         memory-constrained sequential processing, use snapshot().
 
+        A batch of DataArrays is computed as the DataArrays it holds, and a
+        batch with nothing lazy comes back as it is (BatchCore.compute, N81).
+
         Returns
         -------
         Batches
             Computed batches with data in memory.
         """
         import dask
-        import numpy as np
-        from insardev_toolkit.progressbar import progressbar
+        from .utils_dask import progress_persisted
 
-        # Get all burst keys (should be same across all batches)
-        keys = list(self[0].keys())
-        n_batches = len(self)
+        lazy = [BatchCore._is_lazy_any(batch) for batch in self]
+        if not any(lazy):
+            return self
 
         # Save input chunk structure per batch per burst
-        all_input_chunks = []  # list of {burst_key: {var_name: chunks_dict}}
-        for batch in self:
-            batch_chunks = {}
-            for key, ds in batch.items():
-                ic = {}
-                for var_name in ds.data_vars:
-                    arr = ds[var_name]
-                    if hasattr(arr.data, 'chunks'):
-                        ic[var_name] = dict(zip(arr.dims, arr.data.chunks))
-                batch_chunks[key] = ic
-            all_input_chunks.append(batch_chunks)
+        all_input_chunks = [{key: BatchCore._input_chunks(v) for key, v in batch.items()}
+                            for batch, l in zip(self, lazy) if l]
 
-        # Persist all batches at once — single scheduler submission
-        # progressbar extracts futures and blocks until completion
-        all_dicts = [dict(batch) for batch in self]
-        all_results = list(dask.persist(*all_dicts))
-        progressbar(all_results, desc='Computing bursts'.ljust(25))
+        # Persist all lazy batches at once — single scheduler submission
+        # progress_persisted extracts futures and blocks until completion
+        all_results = list(dask.persist(*[dict(batch) for batch, l in zip(self, lazy) if l]))
+        progress_persisted(all_results, desc='Computing bursts'.ljust(25))
 
-        # Finalize: materialize coordinates and rechunk to match input
+        # Finalize: materialize coordinates, hold the futures, rechunk to match input
+        computed = iter(zip(all_results, all_input_chunks))
         computed_batches = []
-        for bi in range(n_batches):
-            result = all_results[bi]
-            computed = {}
-            for key, ds in result.items():
-                new_coords = {}
-                for name, coord in ds.coords.items():
-                    if hasattr(coord, 'data') and hasattr(coord.data, 'compute'):
-                        new_coords[name] = (coord.dims, coord.compute().values)
-                if new_coords:
-                    ds = ds.assign_coords(new_coords)
-                input_chunks = all_input_chunks[bi][key]
-                rechunked_vars = {}
-                for var_name in ds.data_vars:
-                    arr = ds[var_name]
-                    if var_name in input_chunks:
-                        chunks = input_chunks[var_name]
-                        if isinstance(arr.data, np.ndarray):
-                            arr = arr.chunk(chunks)
-                        elif hasattr(arr.data, 'chunks') and dict(zip(arr.dims, arr.data.chunks)) != chunks:
-                            arr = arr.chunk(chunks)
-                        rechunked_vars[var_name] = arr
-                if rechunked_vars:
-                    ds = ds.assign(rechunked_vars)
-                computed[key] = ds
-            computed_batches.append(type(self[bi])(computed))
+        for batch, l in zip(self, lazy):
+            if not l:
+                computed_batches.append(batch)
+                continue
+            result, input_chunks = next(computed)
+            computed_batches.append(type(batch)({key: BatchCore._persisted(v, input_chunks[key])
+                                                 for key, v in result.items()}))
         return Batches(computed_batches)
 
     def unwrap2d(self, conncomp=False, conncomp_size=1000, conncomp_gap=None,
@@ -6954,12 +7186,15 @@ class Batches(tuple):
             Print diagnostic information.
         **kwargs
             Additional arguments: max_iter, tol, cg_max_iter, cg_tol, epsilon.
+            Relaxed defaults: max_iter=50, tol=1e-2, cg_max_iter=10, cg_tol=1e-3,
+            epsilon=1e-2. Strong set: max_iter=200, tol=1e-3, cg_max_iter=20,
+            cg_tol=1e-4, epsilon=1e-2. A looser setting prints one WARNING per call.
 
         Returns
         -------
         Batch or tuple
             If conncomp=False: Batch of unwrapped phase.
-            If conncomp=True: tuple of (Batch unwrapped, BatchUnit conncomp).
+            If conncomp=True: tuple of (Batch unwrapped, Batch conncomp).
 
         Examples
         --------
@@ -6971,7 +7206,8 @@ class Batches(tuple):
             raise ValueError("unwrap2d() requires Batches with at least 1 element: [phase]")
 
         phase = self[0]
-        weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
+        # the second element IS the weight: a BatchUnit or an error, never dropped (N81)
+        weight = BatchCore._weight(self[1] if len(self) >= 2 else None)
 
         # Auto-convert complex phase to wrapped phase
         if isinstance(phase, BatchComplex):
@@ -7082,8 +7318,8 @@ class Batches(tuple):
         """
         Filter pixels by circular standard deviation (cstd) of pair phases.
 
-        Pixels with cstd >= threshold are set to NaN. Uses correlation
-        weights from the second element if available.
+        Pixels with cstd >= threshold are set to NaN. The second element,
+        if any, is the correlation weight and must be a BatchUnit.
 
         Parameters
         ----------
@@ -7096,7 +7332,8 @@ class Batches(tuple):
             Batches with filtered phase, preserving other elements.
         """
         phase = self[0]
-        weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
+        # the second element IS the weight: a BatchUnit or an error, never dropped (N81)
+        weight = BatchCore._weight(self[1] if len(self) >= 2 else None)
 
         if not isinstance(phase, BatchComplex):
             raise TypeError(f"threshold() requires BatchComplex, got {type(phase).__name__}")
@@ -7117,11 +7354,16 @@ class Batches(tuple):
             fit3d()'s, so predict() consumes either.
         """
         phase = self[0]
-        weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
+        # the second element IS the weight: a BatchUnit or an error, never dropped (N81)
+        weight = BatchCore._weight(self[1] if len(self) >= 2 else None)
         # BatchComplex.fit1d() normalises every sample to a unit phasor, so a
         # magnitude weight has nothing to act on and it takes none -- complex
-        # data carries no correlation. Only the unwrapped fit is offered one.
-        if weight is None or isinstance(phase, BatchComplex):
+        # data carries no correlation. Only the unwrapped fit is offered one;
+        # a weight given with complex data raises instead of being dropped.
+        if weight is not None and isinstance(phase, BatchComplex):
+            raise TypeError('ERROR: fit1d() of complex data takes no weight. '
+                            'Use Batches([phase]).fit1d().')
+        if weight is None:
             return phase.fit1d(**kwargs)
         return phase.fit1d(weight=weight, **kwargs)
 
@@ -7147,16 +7389,19 @@ class Batches(tuple):
             raise ValueError("rmse() requires Batches with at least 1 element: [phase]")
 
         phase = self[0]
-        weight = self[1] if len(self) >= 2 and isinstance(self[1], BatchUnit) else None
+        # the second element IS the weight: a BatchUnit or an error, never dropped (N81)
+        weight = BatchCore._weight(self[1] if len(self) >= 2 else None)
 
         rmse_result = phase.rmse(solution, weight=weight)
 
         if weight is not None:
             # Reduce weight to (y, x) — detect temporal dimension
-            w_sample_ds = next(iter(weight.values()))
-            w_spatial = [v for v in w_sample_ds.data_vars if 'y' in w_sample_ds[v].dims]
+            w_sample = next(iter(dict.values(weight)))
+            # a DataArray weight (N81) is its own one grid, taken as it is
+            w_spatial = [w_sample] if isinstance(w_sample, xr.DataArray) else \
+                [w_sample[v] for v in w_sample.data_vars if 'y' in w_sample[v].dims]
             tdim = next((d for d in ('pair', 'date')
-                         if w_spatial and d in w_sample_ds[w_spatial[0]].dims), None)
+                         if w_spatial and d in w_spatial[0].dims), None)
             reduced_weight = weight.mean(tdim) if tdim else weight
             elements = [rmse_result, reduced_weight]
         else:
@@ -7182,7 +7427,8 @@ class Batches(tuple):
         Returns
         -------
         Batch
-            Batch containing 'trend', 'seasonal', and 'resid' variables.
+            Batch of Datasets with the 'trend', 'seasonal' and 'residual' variables
+            (one (y, x) variable in, see Batch.stl()).
 
         Examples
         --------
