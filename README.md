@@ -41,34 +41,42 @@ All examples are tested to work even on FREE Google Colab instances (2 slow vCPU
 
 For a $10/month Google Colab subscription, you get approximately 60 hours of L4 GPU instances—enough to run the NISAR processing example at full resolution 100–300 times (depending on NASA ASF portal download speed) with the full pipeline including SLC data downloading and preprocessing, or more than 500 times using preprocessed Zarr datasets stored on Zenodo, GitHub, etc. Often, complete PolSAR and InSAR analysis can be done in a few minutes. For NISAR, use frequency B to reduce download size and processing time; if better resolution is needed, just rerun the same pipeline with frequency A.
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1JbBnHnyM1hnIfq2YmPLbQrUbspTiyMZu?usp=sharing) NISAR L-band FrequencyA/B Split-Spectrum HH Time Series Analysis for Mexico City Subsidence.
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1Sl0gUW693FNRuyZlePR-gy3IFaybmMlX?usp=sharing) NISAR L-band FrequencyA/B Split-Spectrum HH Time Series Analysis for Mexico City Subsidence.
 
 <img src="assets/NisarL_Mexico_City_Subsidence.jpg" />
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/156sHUllAORmb3LmZoHz3YPecG7HWdie-?usp=sharing) NISAR L-Band HH/HV RGB composite, HH interferogram, and unwrapped phase.
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1QREa6Edg-yV79jDYHx6IBlegNjP6iDsU?usp=sharing) NISAR L-Band HH/HV RGB composite, HH interferogram, and unwrapped phase.
 
 <img src="assets/NisarLB.jpg" />
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1QBOu2_KHjgKEJTtEeQI0wQ7MbNoHUCJ9?usp=sharing) **Iran–Iraq Earthquake (2017)**. The results compared to outputs from GMTSAR, SNAP, and GAMMA software. Illustrates bursts search by area, date, and attributes.
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1WEutnqPzsYno4qC9EDP_8rohqugZrGji?usp=sharing) **Iran–Iraq Earthquake (2017)**. The results compared to outputs from GMTSAR, SNAP, and GAMMA software. Illustrates bursts search by area, date, and attributes.
 
 <img src="assets/Iran–Iraq_Earthquake_2017.jpg" />
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1pz4QkvJmqagVuLmuLMlfGOSrZLFnJWBw?usp=sharing) **Central Türkiye Earthquakes (2023).** Interferogram covering two consecutive Sentinel-1 scenes (56 bursts).
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/17h8OdohGO9XuHUY_jkwSFu2IrD7uUsPU?usp=sharing) **Central Türkiye Earthquakes (2023).** Interferogram covering two consecutive Sentinel-1 scenes (56 bursts).
 
 <img src="assets/Türkiye_Earthquakes_2023_intf.jpg" />
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1YnXVOpEW8lOkCQ-SV6ki5FN4-YEfKWUL?usp=sharing) **Imperial Valley Subsidence, CA USA (2015).** SBAS velocity map from a Sentinel-1 time series stack. Interactive result: [Imperial_Valley_2015.html](https://insar.dev/ui/Imperial_Valley_2015_ipyleaflet.html). Uses the same bursts as the GMTSAR ['Sentinel-1 TOPS Time Series' example](http://topex.ucsd.edu/gmtsar/tar/S1A_Stack_CPGF_T173.tar.gz).
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1jDdGWlNUI4upclLKDsezcVjLjIuD-rkK?usp=sharing) **Imperial Valley Subsidence, CA USA (2015).** SBAS velocity map from a Sentinel-1 time series stack. Interactive result: [Imperial_Valley_2015.html](https://insar.dev/ui/Imperial_Valley_2015_ipyleaflet.html). Uses the same bursts as the GMTSAR ['Sentinel-1 TOPS Time Series' example](http://topex.ucsd.edu/gmtsar/tar/S1A_Stack_CPGF_T173.tar.gz).
 
 <img src="assets/Imperial_Valley_Subsidence.jpg" />
 
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1KJgX69LyKLfGUkiRLiStR-SMnJOy-eDs?usp=sharing) **Golden Valley Subsidence, CA USA (2021).** SBAS velocity map detecting subsidence exceeding 5 cm/year near Antelope Valley Freeway in Santa Clarita, CA. Reproduces results from the EarthDaily [Sentinel-1 Technical Series](https://earthdaily.com/blog/sentinel-1-targeted-analysis).
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1ip5PEHo4ZWCQWkHRFHGzpLcEHzk_Wala?usp=sharing) **Golden Valley Subsidence, CA USA (2021).** SBAS velocity map detecting subsidence exceeding 5 cm/year near Antelope Valley Freeway in Santa Clarita, CA. Reproduces results from the EarthDaily [Sentinel-1 Technical Series](https://earthdaily.com/blog/sentinel-1-targeted-analysis).
 
 <img src="assets/Golden_Valley_Subsidence.jpg" />
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/12oss994Pabq_8JDv4Dj-R6iqfGEalHCe?usp=sharing) **Erzincan Elevation, Türkiye (2019).** DEM generation from a single Sentinel-1 interferometric pair. Reproduces the ESA tutorial [DEM generation with Sentinel-1 IW](https://step.esa.int/docs/tutorials/S1TBX%20DEM%20generation%20with%20Sentinel-1%20IW%20Tutorial.pdf).
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1Jh3VQ7JqL7dTP0130fjxImL3dVj5Uw42?usp=sharing) **Erzincan Elevation, Türkiye (2019).** DEM generation from a single Sentinel-1 interferometric pair. Reproduces the ESA tutorial [DEM generation with Sentinel-1 IW](https://step.esa.int/docs/tutorials/S1TBX%20DEM%20generation%20with%20Sentinel-1%20IW%20Tutorial.pdf).
 
 <img src="assets/Türkiye_Elevation_2019_ele.jpg" />
+
+## InSAR.dev Premium
+
+InSAR.dev Premium modules extend the packages above with the precise ECEF preprocessor, PolSAR phase optimization, advanced per-date atmospheric trends, radiometric calibration, and more. The example notebooks open for everyone on Google Colab; rerunning them requires an active InSAR.dev Premium subscription, see [pechnikov.dev](https://pechnikov.dev).
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1JMY9ocwgyajLVTXfd_5YsfEk-OEgrShf?usp=sharing) **Gastein Valley, Austria (2023–2026).** Persistent and distributed scatterer (PS/DS) line-of-sight velocity from 91 dual-polarization Sentinel-1 dates with PolSAR phase optimization: 7,950 PS and 178,418 DS, down to the power line pylons hidden in vegetation.
+
+<img src="assets/InSARdevPremium_GasteinValley.jpg" />
 
 ## Contact
 
