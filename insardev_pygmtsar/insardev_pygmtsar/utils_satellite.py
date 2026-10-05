@@ -85,6 +85,58 @@ def get_dem_wgs84ellipsoid(dem_path, geometry, buffer_degrees=0.04, geoid_correc
         return ortho.astype(np.float32)
 
 
+def dem_interp_cubic(dem, dem_path, lat, lon):
+    """The heights of a DEM window at lat/lon by cv2.remap INTER_CUBIC (float32 of lat's shape, NaN where a point's
+    4x4 posts leave the window), the DEM interpolation of the pygmtsar S1 and NISAR transforms.
+
+    dem is a window of the DEM file dem_path (get_dem_wgs84ellipsoid() of it), lat and lon arrays of one shape in
+    degrees. Each point goes to its post position in the lattice of the whole DEM file, not of the window: the window
+    follows the caller (a NISAR tile, an S1 burst), and a position measured from the window's own first post and step
+    (and rounded to float32 there) took another of cv2's 1/32 fractions in another window, so the height depended on
+    the window and the chunk size. The file position is rounded to the 1/32 of cv2.remap there and shifted by the
+    window's first post (whole posts: exact in float32).
+    """
+    import cv2
+    from insardev_toolkit import utils_tiles
+    dem_grid = utils_tiles.open_grid(dem_path)
+    dem_lat = dem.lat.values.astype(np.float64)
+    dem_lon = dem.lon.values.astype(np.float64)
+    dem_vals = dem.values.astype(np.float32)
+
+    def lattice_map(coords, first, values):
+        # the window's first post in the file lattice (read_dem returns a slice of it), and each value's fractional
+        # index in the lattice, linear between its two posts
+        i0 = int(np.searchsorted(coords, first))
+        v = values.astype(np.float64)
+        g = np.clip(np.searchsorted(coords, v, side='right') - 1, 0, coords.size - 2)
+        pos = g + (v - coords[g]) / (coords[g + 1] - coords[g])
+        return (np.round(pos * 32) / 32 - i0).astype(np.float32)
+
+    map_row = lattice_map(dem_grid.lat, dem_lat[0], np.asarray(lat))
+    map_col = lattice_map(dem_grid.lon, dem_lon[0], np.asarray(lon))
+
+    def remap(cols, rows):
+        return cv2.remap(dem_vals, cols, rows, interpolation=cv2.INTER_CUBIC,
+                         borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
+
+    if map_row.ndim == 2 and max(map_row.shape) < 32767:
+        return remap(map_col, map_row)
+    # cv2.remap takes maps below 32767 on each side: the points in rows of 4096, at most 4096 rows per call (every
+    # point is interpolated on its own, so the layout changes no value)
+    shape = map_row.shape
+    map_row = map_row.ravel()
+    map_col = map_col.ravel()
+    out = np.empty(map_row.size, dtype=np.float32)
+    width = 4096
+    full = map_row.size // width * width
+    for i in range(0, full, width * width):
+        j = min(full, i + width * width)
+        out[i:j] = remap(map_col[i:j].reshape(-1, width), map_row[i:j].reshape(-1, width)).ravel()
+    if full < map_row.size:
+        out[full:] = remap(map_col[full:].reshape(1, -1), map_row[full:].reshape(1, -1)).ravel()
+    return out.reshape(shape)
+
+
 def _process_tile_worker(args):
     """Worker function for processing a single tile in spawned subprocess.
 
@@ -98,7 +150,6 @@ def _process_tile_worker(args):
     This eliminates 240x overhead from repeated Hermite interpolations.
     """
     import numpy as np
-    import cv2
     import zarr
     from scipy import constants
 
@@ -196,12 +247,14 @@ def _process_tile_worker(args):
         batch_shape = (ey - by, tile_width)
 
         # Compute coordinates locally from grid params (no full arrays!)
-        # Grid coords are pixel centers: coord[i] = origin + spacing * (i + 0.5)
+        # Grid coords are pixel centers: coord[i] = origin + spacing * (i + 0.5), float64: the stored y/x of
+        # compute_conversion_chunked, so every pixel is computed at its stored centre (in float32 a 1.25 m centre near
+        # 2.1e6 m is rounded by 0.125 m)
         _arr = np.arange(iy + by, iy + ey) + 0.5
         if not np.isscalar(dy):
             raise ValueError(f"dy is array! type={type(dy)}, shape={dy.shape}, by={by}, ey={ey}")
-        y_batch = (y_min + dy * _arr).astype(np.float32)
-        x_batch = (x_min + dx * (np.arange(ix, jx) + 0.5)).astype(np.float32)
+        y_batch = y_min + dy * _arr
+        x_batch = x_min + dx * (np.arange(ix, jx) + 0.5)
         x_grid, y_grid = np.meshgrid(x_batch, y_batch)
 
         # Project batch to lon/lat
@@ -250,33 +303,10 @@ def _process_tile_worker(args):
             # DEM tile missing or too small for interpolation - fill with NaN
             batch_ele = np.full(batch_shape, np.nan, dtype=np.float32)
         else:
-            # Interpolate DEM tile using cv2.remap at each pixel's post position in the lattice of the whole DEM
-            # file, not of this window: the window follows the tile, and a position measured from the window's own
-            # first post and step (and rounded to float32 there) took another of cv2's 1/32 fractions in another
-            # window, so ele, and azi/rng with it, depended on the chunk size. The file position is rounded to the
-            # 1/32 of cv2.remap there and shifted by the window's first post (whole posts: exact in float32)
-            from insardev_toolkit import utils_tiles
-            dem_grid = utils_tiles.open_grid(dem_path)
-            dem_lat = dem_tile.lat.values.astype(np.float64)
-            dem_lon = dem_tile.lon.values.astype(np.float64)
-            dem_vals = dem_tile.values.astype(np.float32)
-
-            def lattice_map(coords, first, values):
-                # the window's first post in the file lattice (read_dem returns a slice of it), and each value's
-                # fractional index in the lattice, linear between its two posts
-                i0 = int(np.searchsorted(coords, first))
-                assert coords[i0] == first, 'ERROR: the DEM window is not a slice of the DEM lattice'
-                v = values.astype(np.float64)
-                g = np.clip(np.searchsorted(coords, v, side='right') - 1, 0, coords.size - 2)
-                pos = g + (v - coords[g]) / (coords[g + 1] - coords[g])
-                return (np.round(pos * 32) / 32 - i0).astype(np.float32)
-
-            map_row = lattice_map(dem_grid.lat, dem_lat[0], batch_lat)
-            map_col = lattice_map(dem_grid.lon, dem_lon[0], batch_lon)
-            batch_ele = cv2.remap(dem_vals, map_col, map_row,
-                                  interpolation=cv2.INTER_CUBIC,
-                                  borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
-            del dem_tile, dem_lat, dem_lon, dem_vals, map_row, map_col
+            # cv2.remap INTER_CUBIC at each pixel's post position in the lattice of the whole DEM file, so ele, and
+            # azi/rng with it, do not depend on the chunk size (dem_interp_cubic, as the S1 transform)
+            batch_ele = dem_interp_cubic(dem_tile, dem_path, batch_lat, batch_lon)
+            del dem_tile
 
         # === INLINE LLT2RAT using pre-computed orbit (no function call overhead) ===
         # Only process pixels inside radar polygon (skip pixels outside for performance)
@@ -382,9 +412,10 @@ def _process_tile_worker(args):
         del xp, yp, zp
 
         # Mark out-of-bounds as NaN (in the flat inside arrays), and a pixel without a radar position (NaN azi or
-        # rng): its ele is not written either
-        out_of_bounds = ((batch_azi_pix < 0.5) | (batch_azi_pix > n_azi - 0.5) |
-                        (batch_rng_pix < 0.5) | (batch_rng_pix > n_rng - 0.5) |
+        # rng): its ele is not written either. azi/rng are the 0-based line and bin: the window is the first to the
+        # last pixel centre, [0, n - 1]
+        out_of_bounds = ((batch_azi_pix < 0) | (batch_azi_pix > n_azi - 1) |
+                        (batch_rng_pix < 0) | (batch_rng_pix > n_rng - 1) |
                         ~np.isfinite(batch_azi_pix) | ~np.isfinite(batch_rng_pix))
         batch_azi_pix[out_of_bounds] = np.nan
         batch_rng_pix[out_of_bounds] = np.nan
@@ -808,6 +839,27 @@ def proj(ys, xs, to_epsg, from_epsg):
     return ys_new, xs_new
 
 
+# the points projected on each edge of a bbox (bbox_grid_bounds): the extreme of a curved edge between two of them
+# is missed by at most 0.06 mm for a bbox up to 1 degree wide and 2.7 mm up to 6 degrees (UTM, measured)
+BBOX_EDGE_POINTS = 1025
+
+
+def bbox_grid_bounds(bbox, epsg, dy, dx):
+    """The grid edges (y_min, y_max, x_min, x_max) in EPSG epsg that cover a WGS84 bbox [lon_min, lat_min, lon_max,
+    lat_max]: its projected extent, snapped outward to multiples of the spacing (dy, dx). The four EDGES are projected
+    (BBOX_EDGE_POINTS points each), not two corners: a lon/lat rectangle is not a rectangle in the output CRS, and its
+    extreme x/y can lie at any corner or inside a curved edge (a parallel across a UTM central meridian). The S1 and
+    NISAR transforms crop their grid to these edges."""
+    t = np.linspace(0.0, 1.0, BBOX_EDGE_POINTS)
+    lon = np.r_[bbox[0] + (bbox[2] - bbox[0]) * t, np.full(t.size, bbox[2]),
+                bbox[2] - (bbox[2] - bbox[0]) * t, np.full(t.size, bbox[0])]
+    lat = np.r_[np.full(t.size, bbox[1]), bbox[1] + (bbox[3] - bbox[1]) * t,
+                np.full(t.size, bbox[3]), bbox[3] - (bbox[3] - bbox[1]) * t]
+    ys, xs = proj(lat, lon, from_epsg=4326, to_epsg=epsg)
+    return (float(dy * np.floor(np.min(ys) / dy)), float(dy * np.ceil(np.max(ys) / dy)),
+            float(dx * np.floor(np.min(xs) / dx)), float(dx * np.ceil(np.max(xs) / dx)))
+
+
 def orbit_defect(orbit_df, start=None, stop=None):
     """
     The defect that makes orbit state vectors unusable, or None: the check of every orbit the processing reads
@@ -1062,7 +1114,7 @@ def geocentric_radius(lat_rad):
     return np.sqrt(((a**2 * cos)**2 + (b**2 * sin)**2) / ((a * cos)**2 + (b * sin)**2))
 
 
-def reference_surface_topo(prm, topo, height, nodes=(33, 65), iterations=4, grid=None, pixel_offset=(0.0, 0.0)):
+def reference_surface_topo(prm, topo, height, nodes=(33, 65), iterations=4, grid=None):
     """Flat-earth topo for `remove_topo_phase=False`: the WGS84 ellipsoid at `height`, per radar pixel.
 
     Returns a DataArray on topo's (a, r) grid holding R_surface - earth_radius, where R_surface is the geocentric
@@ -1078,9 +1130,8 @@ def reference_surface_topo(prm, topo, height, nodes=(33, 65), iterations=4, grid
     span that grid, so the block holds the whole-grid values bit for bit. None, the default, is topo's own grid;
     only topo's coordinates are read, never its values.
 
-    pixel_offset : (line, bin) minus (a, r): the GMTSAR pixel of radar coordinate (a, r), in the SAT_llt2rat
-    convention (time clock_start + line / PRF, slant range near_range + bin * dr), as for flat_earth_topo_phase().
-    (0, 0), the default, for NISAR, whose radar coordinates are that line and bin; (-0.5, 0.5) for S1.
+    The radar coordinates (a, r) are the 0-based line and range sample of both missions: time clock_start + a / PRF,
+    slant range near_range + r * dr (near_range the slant range of sample 0).
     """
     import numpy as np
     import xarray as xr
@@ -1101,7 +1152,7 @@ def reference_surface_topo(prm, topo, height, nodes=(33, 65), iterations=4, grid
     vx, vy, vz = (prm.orbit_df[k].values for k in ('vx', 'vy', 'vz'))
     dt = orbit_time[1] - orbit_time[0]
     ax, ay, az = np.gradient(vx, dt), np.gradient(vy, dt), np.gradient(vz, dt)
-    t = 86400.0 * prm.get('clock_start') + (ya + pixel_offset[0]) / prm.get('PRF')
+    t = 86400.0 * prm.get('clock_start') + ya / prm.get('PRF')
     S = np.stack([_hermite_interp(orbit_time, p, v, t, nval=6) for p, v in ((px, vx), (py, vy), (pz, vz))], axis=-1)
     V = np.stack([_hermite_interp(orbit_time, v, a, t, nval=6) for v, a in ((vx, ax), (vy, ay), (vz, az))], axis=-1)
 
@@ -1114,13 +1165,13 @@ def reference_surface_topo(prm, topo, height, nodes=(33, 65), iterations=4, grid
     nd /= k[:, None]
     cr = np.cross(nd, vh)
     cr /= np.linalg.norm(cr, axis=1)[:, None]
-    lookdir = prm.get('lookdir') if 'lookdir' in prm.df.index else 'R'
+    lookdir = prm.get('lookdir')
     # the same side rule as satellite_rat2llt (GMTSAR SAT_llt2rat)
     det = np.dot(np.cross(cr[0], vh[0]), S[0])
     if det * (-1 if str(lookdir).upper() == 'L' else 1) < 0:
         cr = -cr
 
-    rho = prm.get('near_range') + (xr_ + pixel_offset[1]) * (299792458.0 / (2.0 * prm.get('rng_samp_rate')))
+    rho = prm.get('near_range') + xr_ * (299792458.0 / (2.0 * prm.get('rng_samp_rate')))
     Sg, ndg, crg = S[:, None, :], nd[:, None, :], cr[:, None, :]
     rs, kg, rhog = r_sat[:, None], k[:, None], rho[None, :]
     R = np.full((len(ya), len(xr_)), prm.get('earth_radius') + height, dtype=np.float64)
@@ -1154,8 +1205,7 @@ def reference_surface_topo(prm, topo, height, nodes=(33, 65), iterations=4, grid
 
 def satellite_rat2llt(azi, rng, orbit_time, orbit_pos, orbit_vel,
                       clock_start, prf, near_range, rng_samp_rate,
-                      earth_radius, dem=None, max_iter=50, tol=0.01, n_chunks=1,
-                      lookdir='R'):
+                      earth_radius, dem=None, max_iter=50, tol=0.01, n_chunks=1, *, lookdir):
     """
     Direct radar-to-geographic coordinate transform with optional DEM.
 
@@ -1193,6 +1243,8 @@ def satellite_rat2llt(azi, rng, orbit_time, orbit_pos, orbit_vel,
         Maximum iterations for DEM refinement (default 4)
     tol : float, optional
         Convergence tolerance in meters (default 0.1)
+    lookdir : str
+        Look side of the scene, prm.get('lookdir'): 'R' (Sentinel-1) or 'L' (NISAR). Required, never defaulted.
 
     Returns
     -------
@@ -1208,13 +1260,13 @@ def satellite_rat2llt(azi, rng, orbit_time, orbit_pos, orbit_vel,
     >>> # Without DEM (spherical Earth approximation):
     >>> lon, lat, h = satellite_rat2llt(
     ...     azi_grid, rng_grid, orbit_time, orbit_pos, orbit_vel,
-    ...     clock_start, prf, near_range, rng_samp_rate, earth_radius
+    ...     clock_start, prf, near_range, rng_samp_rate, earth_radius, lookdir=prm.get('lookdir')
     ... )
     >>> # With DEM (iterative refinement):
     >>> lon, lat, h = satellite_rat2llt(
     ...     azi_grid, rng_grid, orbit_time, orbit_pos, orbit_vel,
     ...     clock_start, prf, near_range, rng_samp_rate, earth_radius,
-    ...     dem=dem_dataarray
+    ...     dem=dem_dataarray, lookdir=prm.get('lookdir')
     ... )
     """
     import xarray as xr
@@ -1570,6 +1622,30 @@ def satellite_rat2llt(azi, rng, orbit_time, orbit_pos, orbit_vel,
     del dem_values, cos_look, sin_look
 
     return lon, lat, height
+
+
+def radar_extent_polygon(prm):
+    """The radar extent of a PRM's SLC grid as a closed lon/lat polygon (WKT), the 'geometry' of S1 and NISAR
+    stores: its four corner pixel centres, the 0-based (line, bin) (0, 0), (0, N - 1), (M - 1, N - 1), (M - 1, 0),
+    by satellite_rat2llt() without a DEM (the earth_radius sphere)."""
+    from shapely.geometry import Polygon
+    num_lines = prm.get('num_lines')
+    num_rng = prm.get('num_rng_bins')
+    orbit = prm.orbit_df
+    corner_azi = np.array([0, 0, num_lines - 1, num_lines - 1], dtype=np.float64)
+    corner_rng = np.array([0, num_rng - 1, num_rng - 1, 0], dtype=np.float64)
+    lookdir = prm.get('lookdir')
+    # 'clock' (day * 86400 + isec), the units of 86400 * clock_start
+    lon, lat, _ = satellite_rat2llt(
+        corner_azi, corner_rng,
+        orbit['clock'].values, orbit[['px', 'py', 'pz']].values, orbit[['vx', 'vy', 'vz']].values,
+        86400.0 * prm.get('clock_start'),
+        prm.get('PRF'), prm.get('near_range'), prm.get('rng_samp_rate'),
+        prm.get('earth_radius'), dem=None, max_iter=1, tol=1.0, n_chunks=1, lookdir=lookdir
+    )
+    coords = list(zip(lon.tolist(), lat.tolist()))
+    coords.append(coords[0])
+    return Polygon(coords).wkt
 
 
 def satellite_baseline(orbit_df1: "pd.DataFrame", orbit_df2: "pd.DataFrame",
@@ -2130,7 +2206,6 @@ def satellite_llt2rat(lon: np.ndarray, lat: np.ndarray, elevation: np.ndarray,
                       ra: float = 6378137.0,
                       rc: float = 6356752.31424518,
                       precise: int = 1,
-                      lookdir: str = 'R',
                       fd1: float = 0.0,
                       fdd1: float = 0.0,
                       wavelength: float = None,
@@ -2181,8 +2256,6 @@ def satellite_llt2rat(lon: np.ndarray, lat: np.ndarray, elevation: np.ndarray,
         Semi-minor axis of reference ellipsoid (default WGS84)
     precise : int
         Precision level (0=standard, 1=polynomial refinement)
-    lookdir : str
-        Look direction ('R' for right-looking, 'L' for left-looking)
     fd1 : float
         Doppler centroid (Hz). Set to 0 to disable Doppler correction.
     fdd1 : float
@@ -2387,11 +2460,11 @@ def save_transform(transform, outdir, scale_factor=2.0):
 
     def _placeholder(da, scale):
         # the dtype, attributes and encoding of the int32 expression (the source's attributes, no encoding), from
-        # one element; zeros, the zarr fill value of the array xarray creates, with no memory behind them
+        # one element; the fill value, the zarr fill value of the array xarray creates, with no memory behind them
         one = da.isel({dim: slice(0, 1) for dim in da.dims})
         tmpl = (scale * one).round()
         tmpl = tmpl.fillna(0).astype(np.int32).where(np.isfinite(tmpl), fill_value)
-        res = xr.DataArray(np.broadcast_to(tmpl.dtype.type(0), da.shape), coords=da.coords, dims=da.dims,
+        res = xr.DataArray(np.broadcast_to(tmpl.dtype.type(fill_value), da.shape), coords=da.coords, dims=da.dims,
                            attrs=dict(tmpl.attrs))
         res.encoding = dict(tmpl.encoding)
         return res
@@ -2442,8 +2515,9 @@ def save_transform(transform, outdir, scale_factor=2.0):
     chunk_x = min(CHUNK_SIZE, n_x)
 
     all_vars = ['rng', 'azi', 'ele'] + [v for v in ['look_E', 'look_N', 'look_U'] if v in trans_int]
-    # _FillValue is set as an attribute above
-    encoding = {var: {'chunks': (chunk_y, chunk_x)} for var in all_vars}
+    # _FillValue is set as an attribute above; the Zarr array's own fill_value is the same sentinel (as the NISAR
+    # transform), so a reader never sees an unwritten chunk as 0, a valid value, and an all-fill chunk is not stored
+    encoding = {var: {'chunks': (chunk_y, chunk_x), 'fill_value': fill_value} for var in all_vars}
     store = os.path.join(outdir, 'transform')
     trans_int.to_zarr(
         store=store,
@@ -2855,7 +2929,7 @@ def _tidal_enu_look(azi_corners, rng_corners, prm, tidal_dt):
     near_range = prm.get('near_range')
     rng_samp_rate = prm.get('rng_samp_rate')
     earth_radius = prm.get('earth_radius')
-    lookdir = prm.get('lookdir') if 'lookdir' in prm.df.index else 'R'
+    lookdir = prm.get('lookdir')
 
     lon_corners, lat_corners, _ = satellite_rat2llt(
         azi_corners, rng_corners,
@@ -3022,8 +3096,7 @@ def tidal_phase_radar(topo, prm, tidal_dt, nodes=None):
     return xr.DataArray(tidal_phase, coords=topo.coords, dims=topo.dims).rename('tidal_phase')
 
 
-def flat_earth_topo_phase(topo, prm_rep, prm_ref, earth_radius_azi=None, baseline_params=None, sc_height_params=None,
-                          pixel_offset=(0.0, 0.0)):
+def flat_earth_topo_phase(topo, prm_rep, prm_ref, earth_radius_azi=None, baseline_params=None, sc_height_params=None):
     """Compute the combined earth curvature and topographic phase correction.
 
     Uses the full GMTSAR algorithm with time-varying baseline geometry.
@@ -3047,13 +3120,10 @@ def flat_earth_topo_phase(topo, prm_rep, prm_ref, earth_radius_azi=None, baselin
         Pre-computed baseline parameters.
     sc_height_params : dict, optional
         Pre-computed SC_height parameters.
-    pixel_offset : tuple, optional
-        (line, bin) minus (a, r): the GMTSAR pixel of radar coordinate (a, r), in the SAT_llt2rat convention (time
-        clock_start + line / PRF, slant range near_range + bin * dr), at which GMTSAR's phasediff expressions are
-        evaluated (time line * dt, range near_range + bin * dr). (0, 0), the default, for NISAR, whose radar
-        coordinates are that line and bin (compute_conversion_chunked); (-0.5, 0.5) for S1, whose coordinates are
-        line + 0.5 and bin - 0.5 (compute_transform_inverse; the S1 near_range is one bin before the first sample),
-        so the phase refers to the pixel the SLC is sampled at, not half a bin short and half a line late.
+
+    GMTSAR's phasediff expressions are evaluated at the radar coordinates (a, r) of topo, the 0-based line and range
+    sample of both missions (time a * dt, slant range near_range + r * dr, near_range the slant range of sample 0):
+    the pixel the SLC is sampled at.
 
     Returns
     -------
@@ -3070,12 +3140,13 @@ def flat_earth_topo_phase(topo, prm_rep, prm_ref, earth_radius_azi=None, baselin
     if topo is None:
         xdim = prm_ref.get('num_rng_bins')
         ydim = prm_ref.get('num_patches') * prm_ref.get('num_valid_az')
-        azis = np.arange(0.5, ydim, 1)
-        rngs = np.arange(0.5, xdim, 1)
+        # the radar grid: the 0-based line and range sample of every pixel centre, 0 .. n - 1
+        azis = np.arange(0, ydim, 1)
+        rngs = np.arange(0, xdim, 1)
         topo = xr.DataArray(np.zeros((len(azis), len(rngs)), dtype=np.float32),
                             dims=['a', 'r'], coords={'a': azis, 'r': rngs}).rename('topo')
         if earth_radius_azi is None:
-            topo = reference_surface_topo(prm_ref, topo, 0.0, pixel_offset=pixel_offset)
+            topo = reference_surface_topo(prm_ref, topo, 0.0)
 
     def calc_drho(rho, topo_vals, earth_radius, height, b, alpha, Bx):
         sina = np.sin(alpha)
@@ -3158,9 +3229,9 @@ def flat_earth_topo_phase(topo, prm_rep, prm_ref, earth_radius_azi=None, baselin
     dht = (-3 * ht0 + 4 * htc - htf) / tspan
     ddht = (2 * ht0 - 4 * htc + 2 * htf) / (tspan * tspan)
 
-    # the GMTSAR line and bin of the radar coordinates (pixel_offset)
-    x_coords_f64 = x_coords.astype(np.float64) + pixel_offset[1]
-    y_coords_f64 = y_coords.astype(np.float64) + pixel_offset[0]
+    # the line and bin of the radar coordinates, in float64
+    x_coords_f64 = x_coords.astype(np.float64)
+    y_coords_f64 = y_coords.astype(np.float64)
 
     t_arr = y_coords_f64 * tspan / (ydim - 1)
     Bh = Bh0 + dBh * t_arr + ddBh * t_arr**2
@@ -3200,9 +3271,9 @@ def flat_earth_topo_phase(topo, prm_rep, prm_ref, earth_radius_azi=None, baselin
     return topo_phase
 
 
-# valid output pixels per block of compute_transform_inverse(): its float64 temporaries (the DEM interpolation
-# mostly, about 130 bytes per pixel) and the per-block call overheads are set by it; 4M points were faster than
-# the whole-grid steps and 2M points slower (measured on a 30 M-pixel burst)
+# valid output pixels per block of compute_transform_inverse(): its float64 temporaries and the per-block call
+# overheads are set by it; 4M points were faster than the whole-grid steps and 2M points slower (measured on a 30
+# M-pixel burst, with the former xarray DEM interpolation)
 _TRANSFORM_BLOCK_POINTS = 4_000_000
 # points per satellite_llt2rat() call there: all its parallel chunks are in flight at once (inside a burst worker
 # process they are threads of that process); 2M points took no more time than 4M and ~540 MB less (16 threads)
@@ -3282,7 +3353,7 @@ class _CellScatter:
             del ele_sum
 
 
-def compute_transform_inverse(prm, dem,
+def compute_transform_inverse(prm, dem, dem_path,
                               scale_factor=2.0,
                               epsg=None,
                               resolution=(16.0, 4.0),
@@ -3303,6 +3374,9 @@ def compute_transform_inverse(prm, dem,
         The reference burst PRM object with orbit_df attached.
     dem : xarray.DataArray
         Pre-loaded ellipsoid-corrected DEM (WGS84 ellipsoidal heights).
+    dem_path : str
+        The DEM file dem is a window of (get_dem_wgs84ellipsoid() of it): the pixel heights are interpolated at
+        their positions in its lattice (dem_interp_cubic(), as the NISAR transform).
     scale_factor : float, optional
         Scale factor for integer compression. Default is 2.0.
     epsg : int, optional
@@ -3356,14 +3430,15 @@ def compute_transform_inverse(prm, dem,
     near_range = prm.get('near_range')
     rng_samp_rate = prm.get('rng_samp_rate')
     earth_radius = prm.get('earth_radius')
-    lookdir = prm.get('lookdir') if 'lookdir' in prm.df.index else 'R'
+    lookdir = prm.get('lookdir')
     a_max, r_max = prm.bounds()
     num_lines = int(a_max)
     num_rng = int(r_max)
 
-    # Create radar grid coordinates
-    azi_coords = np.arange(0.5, a_max, 1, dtype=np.float32)
-    rng_coords = np.arange(0.5, r_max, 1, dtype=np.float32)
+    # Create radar grid coordinates: the 0-based line and range sample of every pixel centre, 0 .. n - 1 (radar cell
+    # k of the topo is centred on coordinate k)
+    azi_coords = np.arange(0, a_max, 1, dtype=np.float32)
+    rng_coords = np.arange(0, r_max, 1, dtype=np.float32)
     n_azi = len(azi_coords)
     n_rng = len(rng_coords)
 
@@ -3373,7 +3448,7 @@ def compute_transform_inverse(prm, dem,
     # WGS84 constants
     ra = 6378137.0
     rc = 6356752.31424518
-    e2 = np.float32((ra**2 - rc**2) / ra**2)
+    e2 = (ra**2 - rc**2) / ra**2
 
     # Auto-detect EPSG if not specified
     if epsg is None:
@@ -3410,22 +3485,20 @@ def compute_transform_inverse(prm, dem,
     x_max = dx * (np.ceil(np.nanmax([np.nanmax(x_first), np.nanmax(x_last)]) / dx) + margin)
     del y_first, x_first, y_last, x_last
 
-    # Apply bbox crop if specified (WGS84: [lon_min, lat_min, lon_max, lat_max])
+    # Apply bbox crop if specified (WGS84: [lon_min, lat_min, lon_max, lat_max]): its densely projected edges
     if bbox is not None:
-        bbox_y, bbox_x = proj(
-            np.array([bbox[1], bbox[3]]),
-            np.array([bbox[0], bbox[2]]),
-            from_epsg=4326, to_epsg=epsg
-        )
-        y_min = max(y_min, dy * np.floor(min(bbox_y) / dy))
-        y_max = min(y_max, dy * np.ceil(max(bbox_y) / dy))
-        x_min = max(x_min, dx * np.floor(min(bbox_x) / dx))
-        x_max = min(x_max, dx * np.ceil(max(bbox_x) / dx))
+        bbox_y_min, bbox_y_max, bbox_x_min, bbox_x_max = bbox_grid_bounds(bbox, epsg, dy, dx)
+        y_min = max(y_min, bbox_y_min)
+        y_max = min(y_max, bbox_y_max)
+        x_min = max(x_min, bbox_x_min)
+        x_max = min(x_max, bbox_x_max)
         if debug:
             print(f'  bbox crop: y=[{y_min:.0f}, {y_max:.0f}], x=[{x_min:.0f}, {x_max:.0f}]')
 
-    out_y = np.arange(y_min + dy/2, y_max, dy).astype(np.float32)
-    out_x = np.arange(x_min + dx/2, x_max, dx).astype(np.float32)
+    # The pixel centres edge + (i + 0.5) * spacing, float64 on the lattice of the spacing (in float32 a 2.5 m centre
+    # near 5.2e6 m is rounded by 0.25 m), as the NISAR grid
+    out_y = y_min + dy * (np.arange(int(round((y_max - y_min) / dy))) + 0.5)
+    out_x = x_min + dx * (np.arange(int(round((x_max - x_min) / dx))) + 0.5)
 
     # Note: OpenCV cv2.remap has 32767 pixel limit per dimension.
     # Instead of cropping here, _geocode_standalone handles this via x-chunking.
@@ -3553,13 +3626,14 @@ def compute_transform_inverse(prm, dem,
         del x_grid, y_grid
         lat_b, lon_b = proj(vy, vx, from_epsg=epsg, to_epsg=4326)
         del vy, vx
-        lat_b = lat_b.astype(np.float32)
-        lon_b = lon_b.astype(np.float32)
-        ele_b = dem.interp(
-            lat=xr.DataArray(lat_b, dims='z'),
-            lon=xr.DataArray(lon_b, dims='z'),
-            method='linear'
-        ).values.astype(np.float32)
+        # float64 lat/lon, elevation and ECEF target below (as the NISAR tile worker): in float32 a latitude steps by
+        # about 0.4 m and a radius near 6.4e6 m by 0.5 m, which the target radius of the topo and the zero-Doppler and
+        # slant-range solve carried. Per block, so the memory stays bounded; only the outputs are float32
+        lat_b = np.asarray(lat_b, dtype=np.float64)
+        lon_b = np.asarray(lon_b, dtype=np.float64)
+        # cv2.remap INTER_CUBIC at each pixel's position in the DEM file's lattice, as the NISAR tile worker (the
+        # value does not depend on the block or the DEM window); float32 DEM heights, the arithmetic below in float64
+        ele_b = dem_interp_cubic(dem, dem_path, lat_b, lon_b)
 
         # Step 6: inverse transform, in calls of at most _LLT2RAT_CALL_POINTS points: satellite_llt2rat returns
         # float64 [N, 5] and its parallel chunks are all in flight at once (threads, inside a burst worker process)
@@ -3575,42 +3649,40 @@ def compute_transform_inverse(prm, dem,
                 earth_radius=earth_radius, precise=1, fd1=0.0,
                 n_jobs=n_jobs, debug=debug
             )
-            # Convert satellite_llt2rat pixel indices to SLC 0.5-based coordinates
-            # (first pixel center at 0.5) for remap_radar_to_geo: inv_map = (val - 0.5) / 1.0
-            # Azimuth: 0-based (first line = 0) → add 0.5
-            # Range: effectively 1-based (first sample = 1, due to GMTSAR near_range -= dr) → subtract 0.5
-            rng_b[j0:j1] = result[:, 0].astype(np.float32) - 0.5
-            azi_b[j0:j1] = result[:, 1].astype(np.float32) + 0.5
+            # satellite_llt2rat gives the 0-based line ((t - clock_start) * PRF) and range sample ((R - near_range) /
+            # dr, near_range the slant range of sample 0): the SLC coordinates as they are
+            rng_b[j0:j1] = result[:, 0].astype(np.float32)
+            azi_b[j0:j1] = result[:, 1].astype(np.float32)
             del result
-        # Filter out-of-bounds (valid pixel centers are [0.5, n-0.5])
-        out_of_bounds = (azi_b < 0.5) | (azi_b > n_azi - 0.5) | (rng_b < 0.5) | (rng_b > n_rng - 0.5)
+        # Filter out-of-bounds (valid pixel centers are [0, n-1])
+        out_of_bounds = (azi_b < 0) | (azi_b > n_azi - 1) | (rng_b < 0) | (rng_b > n_rng - 1)
         azi_b[out_of_bounds] = np.nan
         rng_b[out_of_bounds] = np.nan
         del out_of_bounds
 
-        # Step 7: ele_gmtsar of the block's valid output pixels
+        # Step 7: ele_gmtsar of the block's valid output pixels, in float64
         # Trig functions
-        lon_rad = np.float32(np.pi / 180) * lon_b
-        lat_rad = np.float32(np.pi / 180) * lat_b
+        lon_rad = np.radians(lon_b)
+        lat_rad = np.radians(lat_b)
         del lon_b, lat_b
-        sin_lat = np.sin(lat_rad, dtype=np.float32)
-        cos_lat = np.cos(lat_rad, dtype=np.float32)
-        sin_lon = np.sin(lon_rad, dtype=np.float32)
-        cos_lon = np.cos(lon_rad, dtype=np.float32)
+        sin_lat = np.sin(lat_rad)
+        cos_lat = np.cos(lat_rad)
+        sin_lon = np.sin(lon_rad)
+        cos_lon = np.cos(lon_rad)
         del lon_rad, lat_rad
 
         # Ground point ECEF
-        N = np.float32(ra) / np.sqrt(1 - np.float32(e2) * sin_lat**2)
+        N = ra / np.sqrt(1 - e2 * sin_lat**2)
         Nh = N + ele_b
         xp = Nh * cos_lat * cos_lon
         yp = Nh * cos_lat * sin_lon
-        zp = (N * np.float32(1 - e2) + ele_b) * sin_lat
+        zp = (N * (1 - e2) + ele_b) * sin_lat
         del Nh, sin_lon, cos_lon, ele_b
 
-        R_target = np.sqrt(xp**2 + yp**2 + zp**2, dtype=np.float32)
+        R_target = np.sqrt(xp**2 + yp**2 + zp**2)
         del xp, yp, zp
         # Per-point local geocentric radius (consistent across all bursts)
-        R_local = N * np.sqrt(cos_lat**2 + np.float32((1 - e2)**2) * sin_lat**2, dtype=np.float32)
+        R_local = N * np.sqrt(cos_lat**2 + (1 - e2)**2 * sin_lat**2)
         del N, sin_lat, cos_lat
         # NOTE: the look vector (GMTSAR-compatible look_E/N/U) is not computed - incidence is computed from azi/rng
         # in Batch.incidence()
@@ -3625,7 +3697,7 @@ def compute_transform_inverse(prm, dem,
         if compute_topo:
             # For topo phase: constant earth_radius (cancels in calc_drho). Subtracted in float64 because
             # flat_earth_topo_phase() adds the same float64 earth_radius back; float32(er) is up to 0.25 m off
-            ele_topo_b = (R_target.astype(np.float64) - np.float64(earth_radius)).astype(np.float32)
+            ele_topo_b = (R_target - np.float64(earth_radius)).astype(np.float32)
             # Convert to radar grid indices and round to nearest. The mask comes before the int64 cast: a NaN azi or
             # rng (out of the radar grid, or over a DEM gap) has no radar cell, and its cast is platform-defined (0 on
             # arm64, the radar cell (0, 0))
@@ -3791,14 +3863,15 @@ def compute_conversion_chunked(prm, dem_path, geometry, outdir,
     near_range = prm.get('near_range')
     rng_samp_rate = prm.get('rng_samp_rate')
     earth_radius = prm.get('earth_radius')
-    lookdir = prm.get('lookdir') if 'lookdir' in prm.df.index else 'R'
+    lookdir = prm.get('lookdir')
     a_max, r_max = prm.bounds()
     num_lines = int(a_max)
     num_rng = int(r_max)
 
-    # Radar grid coordinates
-    azi_coords = np.arange(0.5, a_max, 1, dtype=np.float32)
-    rng_coords = np.arange(0.5, r_max, 1, dtype=np.float32)
+    # Radar grid coordinates: the 0-based line and bin of every pixel centre, 0 .. n - 1 (radar cell k of the topo
+    # is centred on coordinate k)
+    azi_coords = np.arange(0, a_max, 1, dtype=np.float32)
+    rng_coords = np.arange(0, r_max, 1, dtype=np.float32)
     n_azi = len(azi_coords)
     n_rng = len(rng_coords)
 
@@ -3885,17 +3958,14 @@ def compute_conversion_chunked(prm, dem_path, geometry, outdir,
     dy = float(dy)
     dx = float(dx)
 
-    # Apply bbox crop if specified (WGS84: [lon_min, lat_min, lon_max, lat_max])
+    # Apply bbox crop if specified (WGS84: [lon_min, lat_min, lon_max, lat_max]): its densely projected edges, as the
+    # S1 transform
     if bbox is not None:
-        bbox_y, bbox_x = proj(
-            np.array([bbox[1], bbox[3]]),
-            np.array([bbox[0], bbox[2]]),
-            from_epsg=4326, to_epsg=epsg
-        )
-        y_min = max(y_min, dy * np.floor(min(bbox_y) / dy))
-        y_max = min(y_max, dy * np.ceil(max(bbox_y) / dy))
-        x_min = max(x_min, dx * np.floor(min(bbox_x) / dx))
-        x_max = min(x_max, dx * np.ceil(max(bbox_x) / dx))
+        bbox_y_min, bbox_y_max, bbox_x_min, bbox_x_max = bbox_grid_bounds(bbox, epsg, dy, dx)
+        y_min = max(y_min, bbox_y_min)
+        y_max = min(y_max, bbox_y_max)
+        x_min = max(x_min, bbox_x_min)
+        x_max = min(x_max, bbox_x_max)
         if debug:
             print(f'  bbox crop: y=[{y_min:.0f}, {y_max:.0f}], x=[{x_min:.0f}, {x_max:.0f}]')
 

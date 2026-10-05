@@ -9,7 +9,6 @@
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
 from __future__ import annotations
-from .utils_torch import serialize_gpu
 from . import utils_io,  utils_xarray
 import operator
 from types import FunctionType
@@ -26,6 +25,11 @@ if TYPE_CHECKING:
 
 # the scalar operands of the Batch operators (a complex scalar included: ph * 1j)
 _SCALARS = (int, float, complex, np.number)
+
+# the points projected on each edge of a crop() bounding box in another CRS, as the preprocessors' bbox_grid_bounds()
+# (insardev_pygmtsar utils_satellite.BBOX_EDGE_POINTS): the extreme of a curved edge between two of them is missed by
+# at most 0.06 mm for a bbox up to 1 degree wide and 2.7 mm up to 6 degrees (UTM, measured there)
+BBOX_EDGE_POINTS = 1025
 
 
 def _parse_budget(budget):
@@ -82,6 +86,34 @@ def _skip_nodata(value):
     if isinstance(value, xr.DataArray):
         return skip(value)
     return value.assign({v: skip(value[v]) for v in value.data_vars if value[v].dtype.kind in 'biu'})
+
+
+def _decimate_on_lattice(batch, var, factor_y, factor_x, dy, dx):
+    """plot()'s decimation of every burst ON ONE LATTICE: each burst keeps the pixels whose
+    index on the common grid of spacing (dy, dx) is a multiple of the factor, so the kept
+    centres of every burst lie on one grid of the display spacing (factor * spacing; for the
+    stored lattice, centre - spacing / 2 on multiples of it), whatever pixel each burst starts
+    at. Decimated from its own first pixel, a burst landed off that grid by up to half a
+    displayed pixel, and to_dataset() rounded it onto the first burst's (the Tuerkiye pair at
+    48 m: one burst drawn 12 m east). The pixel index of a centre c is
+    round((c - c0) / d) + round((c0 - d / 2) / d) from one origin c0, the first burst's first
+    centre: every burst on the grid of c0 gets the same index of the same position."""
+    da = next(iter(dict.values(batch)))[var]
+    origin = {'y': float(da.y.values[0]), 'x': float(da.x.values[0])}
+    out = {}
+    for key, ds in dict.items(batch):
+        da = ds[var]
+        sel = {}
+        for dim, f, d in (('y', factor_y, dy), ('x', factor_x, dx)):
+            if f == 1 or not da.sizes.get(dim, 0):
+                sel[dim] = slice(None, None, f)
+                continue
+            c0 = float(da[dim].values[0])
+            k = int(np.round((c0 - origin[dim]) / d)) + int(np.round((origin[dim] - d / 2) / d))
+            sel[dim] = slice((-k) % f, None, f)
+        out[key] = ds.isel(sel)
+    # a burst decimated to nothing is dropped, as isel() drops it
+    return batch._view(BatchCore._drop_empty(out))
 
 
 def _merge_tiles_for_dask(tiles, offsets, out_shape, fill_dtype, nodata=np.nan):
@@ -285,62 +317,6 @@ def _apply_gaussian_2d_for_dask(block, weight_block=None, sigmas=None, threshold
     # gaussian_numpy handles (1, y, x) -> squeeze -> process -> unsqueeze
     return gaussian_numpy(block, weight_block, sigma=sigmas, truncate=4.0, threshold=threshold,
                           device=device, pixel_sizes=pixel_sizes).astype(out_dtype)
-
-
-@serialize_gpu
-def _neighbors_kernel_2d_for_dask(data_chunk, window_y, window_x, half_y, half_x, device):
-    """Count valid neighbors for 2D data.
-
-    Defined at module level to avoid dask serialization issues with nested functions.
-    Closures capturing variables can cause memory explosions in dask workers.
-
-    Parameters
-    ----------
-    device : str
-        Device string ('cpu', 'cuda', 'mps') - converted to torch.device internally.
-    """
-    import torch
-    import numpy as np
-
-    # Convert string to torch.device
-    dev = torch.device(device)
-
-    H, W = data_chunk.shape
-    ny, nx = H - 2 * half_y, W - 2 * half_x
-    n_total_neighbors = window_y * window_x - 1
-
-    if ny <= 0 or nx <= 0:
-        return np.full((H, W), np.nan, dtype=np.float32)
-
-    data_t = torch.from_numpy(data_chunk.astype(np.float32)).to(dev)
-    valid = torch.isfinite(data_t).float()
-
-    # Neighbor mask (exclude center)
-    center_idx = (window_y // 2) * window_x + (window_x // 2)
-    neighbor_mask = torch.ones(window_y * window_x, dtype=torch.bool, device=dev)
-    neighbor_mask[center_idx] = False
-
-    # Unfold to get windows
-    window_valid = valid.unfold(0, window_y, 1).unfold(1, window_x, 1)
-    neighbors_valid = window_valid.reshape(ny, nx, -1)[:, :, neighbor_mask]
-    count = neighbors_valid.sum(dim=-1)
-
-    # Set zero neighbors to NaN (isolated/invalid pixels)
-    count = torch.where(count > 0, count, torch.full_like(count, float('nan')))
-
-    # Pad back to full size
-    result = torch.full((H, W), float('nan'), device=dev)
-    result[half_y:H - half_y, half_x:W - half_x] = count
-
-    output = result.cpu().numpy()
-
-    del data_t, valid, window_valid, neighbors_valid, result
-    if dev.type == 'mps':
-        torch.mps.empty_cache()
-    elif dev.type == 'cuda':
-        torch.cuda.empty_cache()
-
-    return output
 
 
 class BatchCore(dict):
@@ -998,14 +974,10 @@ class BatchCore(dict):
 
     @staticmethod
     def _is_core(attr) -> bool:
-        """Whether a method is core insardev's: defined here, or a module's wrapper of a
-        core method (its __wrapped__), which then takes what the core method takes."""
+        """Whether a method is core insardev's, defined here. A module adds methods of its
+        own or fills a core placeholder, and never wraps a core method."""
         fn = attr.fget if isinstance(attr, property) else attr
-        while fn is not None:
-            if (getattr(fn, '__module__', None) or '').split('.')[0] == 'insardev':
-                return True
-            fn = getattr(fn, '__wrapped__', None)
-        return False
+        return (getattr(fn, '__module__', None) or '').split('.')[0] == 'insardev'
 
     # the per-date radar geometry the scene-centre and pixelwise conversions read
     _GEOMETRY = ('radar_wavelength', 'near_range', 'rng_samp_rate', 'earth_radius', 'SC_height_start',
@@ -2194,135 +2166,6 @@ class BatchCore(dict):
         return Batch(result)
 
 
-
-    # Backward compatibility alias
-    def neighbors(
-        self,
-        window: 'float | tuple' = 40,
-        neighbors: tuple | None = None,
-        device: str = 'auto'
-    ) -> 'Batch':
-        """
-        Count valid (non-NaN) neighbors per pixel within a spatial window.
-
-        Works on any 2D spatial data (y, x). For each pixel, counts how many
-        neighbors in the window have finite values.
-
-        Parameters
-        ----------
-        window : float or tuple of float
-            Window size in METRES on the ground, one number for a square
-            or (y, x). Rounded up to an odd number of pixels per axis, since
-            the count is centred on a pixel.
-        neighbors : tuple of int or None
-            If provided, filter output: (min, max)
-            - Pixels with count < min: set to NaN
-            - Pixels with count > max: clipped to max
-            If None, return raw counts.
-        device : str
-            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'
-
-        Returns
-        -------
-        Batch
-            Valid neighbor count per pixel (float, NaN at borders)
-
-        Examples
-        --------
-        >>> # Count valid neighbours of a sparse selection
-        >>> adi = S_opt.adi()
-        >>> sparse = adi.where(adi < 0.5)
-        >>> nbrs = sparse.neighbors(window=120)
-        >>> dense_mask = nbrs >= 10
-        """
-        import torch
-        import dask.array as da
-
-        # METRES IN, PIXELS PER BURST: the window is a ground size, and the
-        # count it becomes is rounded UP to odd, because the kernel is centred
-        # on a pixel and a metre request cannot choose parity.
-        from . import utils_xarray
-        import functools
-
-        # Resolve device once and convert to string for clean serialization
-        resolved = BatchCore._get_torch_device(device)
-        device_str = resolved.type  # 'cpu', 'cuda', or 'mps'
-
-        results = {}
-
-        for burst_id, ds in self.items():
-            count_vars = {}
-            window_y, window_x = utils_xarray.meters_to_pixels(
-                window, utils_xarray.spacing_of(ds), minimum=3, odd=True,
-                name='neighbors() window')
-            half_y, half_x = window_y // 2, window_x // 2
-
-            # Validate neighbors if provided, against the count this grid gives
-            if neighbors is not None:
-                neighbors_min, neighbors_max = neighbors
-                max_possible = window_y * window_x - 1
-                if neighbors_max > max_possible:
-                    raise ValueError(
-                        f"neighbors max={neighbors_max} exceeds maximum for window ({window_y}, {window_x}): {max_possible}"
-                    )
-                if neighbors_min > neighbors_max:
-                    raise ValueError(
-                        f"neighbors min={neighbors_min} cannot exceed max={neighbors_max}"
-                    )
-
-            # Use functools.partial with module-level function to avoid closure
-            # Closures capturing variables can cause memory explosions in dask workers
-            neighbors_func = functools.partial(
-                _neighbors_kernel_2d_for_dask,
-                window_y=window_y,
-                window_x=window_x,
-                half_y=half_y,
-                half_x=half_x,
-                device=device_str
-            )
-
-            # a Dataset's variables, or a DataArray as its own one (N81)
-            for var_name, data in BatchCore._vars_of(ds).items():
-                # Skip non-spatial variables
-                if 'y' not in data.dims or 'x' not in data.dims:
-                    continue
-
-                # Handle 2D data only
-                if data.ndim != 2:
-                    continue
-
-                # Use map_overlap on input chunks as-is
-                count_da = da.map_overlap(
-                    neighbors_func,
-                    data.data,
-                    depth={0: half_y, 1: half_x},
-                    boundary='none',
-                    trim=True,
-                    dtype=np.float32,
-                )
-
-                # Apply neighbors filtering if provided
-                if neighbors is not None:
-                    neighbors_min, neighbors_max = neighbors
-                    count_da = da.clip(count_da, 0, neighbors_max)
-                    count_da = da.where(count_da >= neighbors_min, count_da, np.nan)
-
-                count_xr = xr.DataArray(
-                    count_da,
-                    dims=['y', 'x'],
-                    coords={'y': data.y, 'x': data.x},
-                    name=var_name
-                )
-
-                count_vars[var_name] = count_xr
-
-            if count_vars:
-                # a DataArray in, a DataArray out (N81)
-                results[burst_id] = BatchCore._form(ds, count_vars)
-
-        from .Batch import Batch
-        return Batch(results)
-
     def crop(self, geometry):
         """
         Crop each burst to the bounding rectangle of a geometry.
@@ -2367,12 +2210,20 @@ class BatchCore(dict):
 
         minx, miny, maxx, maxy = bounds
 
-        # Reproject bounds to batch CRS if needed
+        # Reproject bounds to batch CRS if needed: the four EDGES of the bounding box, densely
+        # (BBOX_EDGE_POINTS each, as the preprocessors' bbox_grid_bounds()), not its four corners.
+        # A lon/lat rectangle is not a rectangle in the batch CRS, and its extreme x/y can lie
+        # inside a curved edge: a parallel across a UTM central meridian bulges south of both its
+        # corners, and the corners alone lost that strip (50 m for the Mexico City notebook AOI).
         crs = self.crs
         if crs is not None and geom_crs is not None and geom_crs != crs:
-            from shapely.geometry import box
-            bbox = gpd.GeoSeries([box(minx, miny, maxx, maxy)], crs=geom_crs).to_crs(crs)
-            minx, miny, maxx, maxy = bbox.total_bounds
+            from pyproj import CRS, Transformer
+            t = np.linspace(0.0, 1.0, BBOX_EDGE_POINTS)
+            xs = np.r_[minx + (maxx - minx) * t, np.full(t.size, maxx), maxx - (maxx - minx) * t, np.full(t.size, minx)]
+            ys = np.r_[np.full(t.size, miny), miny + (maxy - miny) * t, np.full(t.size, maxy), maxy - (maxy - miny) * t]
+            xs, ys = Transformer.from_crs(CRS.from_user_input(geom_crs), CRS.from_user_input(crs),
+                                          always_xy=True).transform(xs, ys)
+            minx, miny, maxx, maxy = np.min(xs), np.min(ys), np.max(xs), np.max(ys)
 
         out = {}
         for key, ds in self.items():
@@ -5585,8 +5436,9 @@ class BatchCore(dict):
             factor_y = max(1, int(np.round(size_y / (extent[1] / rows))))
             factor_x = max(1, int(np.round(size_x / (extent[0] / cols))))
 
-            # Decimate batches BEFORE to_dataset() - much more memory efficient
-            batch_decimated = batch.isel(y=slice(None, None, factor_y), x=slice(None, None, factor_x))
+            # Decimate batches BEFORE to_dataset() - much more memory efficient - every burst on
+            # one lattice of the display spacing, so to_dataset() places each where it is
+            batch_decimated = _decimate_on_lattice(batch, polarization, factor_y, factor_x, dy, dx)
             # an integer grid's nodata is not drawn, as to_dataset() sets it
             da = _skip_nodata(batch_decimated.to_dataset()[polarization])
             if stackvar is None:
@@ -5695,8 +5547,8 @@ class BatchCore(dict):
             factor_y = max(1, int(np.round(size_y / (extent[1] / rows))))
             factor_x = max(1, int(np.round(size_x / (extent[0] / cols))))
 
-            # Decimate and convert to dataset
-            batch_decimated = batch.isel(y=slice(None, None, factor_y), x=slice(None, None, factor_x))
+            # Decimate and convert to dataset: every burst on one lattice of the display spacing
+            batch_decimated = _decimate_on_lattice(batch, pol1, factor_y, factor_x, dy, dx)
             ds_merged = batch_decimated.to_dataset()
             da_copol = ds_merged[pol1]   # Co-pol (HH or VV)
             da_xpol = ds_merged[pol2]    # Cross-pol (HV or VH)
@@ -5732,9 +5584,12 @@ class BatchCore(dict):
                                      squeeze=False)
             axes = axes.flatten()
 
-            # Get coordinate extent for imshow
-            y_min, y_max = float(da_copol.y.min()), float(da_copol.y.max())
-            x_min, x_max = float(da_copol.x.min()), float(da_copol.x.max())
+            # The image extent for imshow: the PIXEL EDGES, the outer centres -/+ half the displayed
+            # spacing (factor * spacing), as xarray's imshow draws plot() -- the centres as the
+            # extent squeezed the image by one pixel
+            half_y, half_x = 0.5 * factor_y * abs(dy), 0.5 * factor_x * abs(dx)
+            y_min, y_max = float(da_copol.y.min()) - half_y, float(da_copol.y.max()) + half_y
+            x_min, x_max = float(da_copol.x.min()) - half_x, float(da_copol.x.max()) + half_x
             img_extent = [x_min, x_max, y_max, y_min] if flip else [x_min, x_max, y_min, y_max]
 
             km_formatter = FuncFormatter(lambda v, _: f'{v/1000:.0f}')
@@ -5857,6 +5712,13 @@ class BatchCore(dict):
             raise TypeError(
                 'gaussian() takes the wavelength first now, as multilook() does. '
                 'Pass the weight by name: gaussian(wavelength, weight=...)')
+
+        # AN INHERENTLY SPATIAL FILTER: a burst without a (y, x) grid -- a point's series, an
+        # area mean -- raises the short error (N81); it raised AttributeError 'spacing' or came
+        # back unfiltered
+        for ds in self.values():
+            if not BatchCore._grids_of(ds):
+                raise BatchCore._no_grid_error(ds)
 
         # validate weight if provided: a BatchUnit (N81), a DataArray one weighting every grid,
         # a Dataset one naming every grid; a burst or a grid it lacks raises (_weight)

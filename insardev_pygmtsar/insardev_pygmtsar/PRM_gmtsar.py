@@ -153,7 +153,6 @@ class PRM_gmtsar:
             ra=self.get('equatorial_radius'),
             rc=self.get('polar_radius'),
             precise=precise,
-            lookdir=self.get('lookdir'),
             fd1=self.get('fd1'),
             fdd1=self.get('fdd1'),
             wavelength=self.get('radar_wavelength'),

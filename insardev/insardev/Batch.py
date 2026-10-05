@@ -40,9 +40,142 @@ def _ref_height_stored(ds) -> float | None:
     return float(v[np.argmax(np.abs(v))]) if v.size else 0.0
 
 
-# what Batch.incidence() reads from a transform Dataset (N81: a DataArray batch lacks it)
-_INCIDENCE_VARS = ('near_range', 'rng_samp_rate', 'earth_radius', 'SC_height_start', 'SC_height_end', 'num_lines',
-                   'azi', 'rng', 'ele')
+def _computed(ds, names) -> dict:
+    """{name: numpy values} of a burst Dataset's non-grid variables, ONE compute for the lazy ones."""
+    import dask
+    vals, = dask.compute({n: ds[n].data for n in names})
+    return {n: np.asarray(v) for n, v in vals.items()}
+
+
+def _ref_mode(values) -> tuple:
+    """(reference height, DEM mode) from a burst's ref_height values, the rule of _ref_height_stored(): NaN on
+    every date is DEM mode (height 0.0), else the finite value of largest magnitude is the flat-earth height."""
+    v = np.asarray(values, dtype=np.float64).ravel()
+    v = v[np.isfinite(v)]
+    return (float(v[np.argmax(np.abs(v))]), False) if v.size else (0.0, True)
+
+
+def _crs_wkt(ds) -> str:
+    """The CRS of a burst Dataset or DataArray as WKT."""
+    return ds.rio.crs.to_wkt()
+
+
+def _ele_midpoint(ds, key, where) -> float | None:
+    """The midpoint of the `ele` actual_range ATTRIBUTE (never the raster), None without it."""
+    if not isinstance(ds, xr.Dataset) or 'ele' not in ds.variables:
+        return None
+    rng = ds['ele'].attrs.get('actual_range')
+    if rng is None or len(rng) != 2 or not np.all(np.isfinite(np.asarray(rng, dtype=np.float64))):
+        return None
+    return 0.5 * (float(rng[0]) + float(rng[1]))
+
+
+def _stack_geometry(ds, key, where, action='Pass the stack.') -> tuple:
+    """THE GEOMETRY OF ONE BURST FROM THE STACK (or its transform() view): the per-date variables and the `ele`
+    actual_range attribute, never a raster. Returns (burst model, b_h (date, 2), b_v (date, 2), dates).
+
+    The REFERENCE date's numbers (BPR 0, N55): never a mean over the dates, never a pair's first date. Each date's
+    baseline triple is its own baseline vector to the reference satellite."""
+    from . import utils_geometry as ug
+    if not isinstance(ds, xr.Dataset) or 'date' not in ds.dims:
+        raise TypeError(f'ERROR: {where} needs the stack: burst {key} carries no per-date geometry. {action}')
+    names = ug.SCALARS + ('BPR', 'ref_height')
+    missing = [n for n in names if n not in ds.variables]
+    if missing:
+        raise KeyError(f"ERROR: {where}: burst {key} carries no {', '.join(missing)}.")
+    if not all(n in ds.variables for n in ug.TRIPLES):
+        raise ValueError(f'ERROR: {where}: burst {key}: the store predates the baseline triples. '
+                         f'Re-create it with transform().')
+    values = _computed(ds, names + ug.TRIPLES)
+    bpr = values['BPR'].astype(np.float64).ravel()
+    zero = np.flatnonzero(bpr == 0.0)
+    if zero.size:
+        iref = int(zero[0])
+    else:
+        iref = int(np.argmin(np.abs(bpr)))
+        print(f'WARNING: {where}: burst {key} has no reference date (BPR 0) in the stack: '
+              f'using {str(ds["date"].values[iref])[:10]}.', flush=True)
+    h_ref, dem_mode = _ref_mode(values['ref_height'])
+    h_attr = _ele_midpoint(ds, key, where)
+    if h_attr is None:
+        print(f'WARNING: {where}: burst {key} has no ele actual_range: the terrain height is taken as 0.', flush=True)
+        h_attr = 0.0
+    geo = ug.burst_geometry({n: values[n].ravel()[iref] for n in ug.SCALARS}, _crs_wkt(ds), h_ref, dem_mode, h_attr)
+    bh, bv = ug.date_triples({n: values[n].ravel() for n in ug.TRIPLES})
+    return geo, bh, bv, np.asarray(ds['date'].values)
+
+
+def _pair_geometry(ds, key, where, h_attr) -> tuple:
+    """THE GEOMETRY OF ONE BURST FROM THE PHASE ITSELF, the warned workaround without the stack: each pair's own
+    numbers (its first date's, as pairs() carries them), the crop polygon and the CRS, the pair triple DIFFERENCE
+    pairs() gives, and the terrain height h_attr. Returns (burst models, [(model index, 0, difference)])."""
+    from . import utils_geometry as ug
+    if not all(n in ds.variables for n in ug.TRIPLES):
+        raise ValueError(f'ERROR: {where}: burst {key}: the phase carries no pair baseline triples (the store '
+                         f'predates them). Re-create it with transform().')
+    names = ug.SCALARS + ('ref_height',)
+    missing = [n for n in names if n not in ds.variables]
+    if missing:
+        raise KeyError(f"ERROR: {where}: burst {key} carries no {', '.join(missing)}. Pass the stack: "
+                       f"x.elevation(stack).")
+    values = _computed(ds, names + ug.TRIPLES)
+    npair = int(np.size(values['baseline_start']))
+    h_ref, dem_mode = _ref_mode(values['ref_height'])
+    crs = _crs_wkt(ds)
+    geos, index, pairs = [], {}, []
+    dh, dv = ug.date_triples({n: values[n].ravel() for n in ug.TRIPLES})
+    zero = np.zeros(2)
+    for p in range(npair):
+        v = {n: (values[n].ravel()[p] if values[n].size == npair else values[n].ravel()[0]) for n in ug.SCALARS}
+        k = tuple(str(v[n]) for n in ug.SCALARS)
+        if k not in index:
+            index[k] = len(geos)
+            geos.append(ug.burst_geometry(v, crs, h_ref, dem_mode, h_attr))
+        pairs.append((index[k], (zero, zero), (dh[p], dv[p])))
+    return geos, pairs
+
+
+def _pairs_of_stack(data, key, bh, bv, dates, where) -> list:
+    """[(0, b_i, b_j)] per pair of a phase grid: each date's own triple, looked up by the pair's two dates."""
+    if 'ref' not in data.coords or 'rep' not in data.coords:
+        raise KeyError(f'ERROR: {where}: burst {key} carries no ref/rep dates of its pairs.')
+    out = []
+    for r, s in zip(np.atleast_1d(data.coords['ref'].values), np.atleast_1d(data.coords['rep'].values)):
+        i, j = Batch._ref_index(r, dates), Batch._ref_index(s, dates)
+        out.append((0, (bh[i], bv[i]), (bh[j], bv[j])))
+    return out
+
+
+def _geometry_grid(block, geo, y, x, chunks):
+    """A lazy (y, x) float32 grid of a geometry block function on the coordinates y, x in the chunks (cy, cx)."""
+    import dask.array as da
+    yc = da.from_array(np.asarray(y, np.float64), chunks=(chunks[0],))
+    xc = da.from_array(np.asarray(x, np.float64), chunks=(chunks[1],))
+    return da.blockwise(block, 'yx', yc, 'y', xc, 'x', dtype=np.float32, geo=geo)
+
+
+def _grid_chunks(ds):
+    """The (y, x) chunks of a burst's first lazy grid, one chunk without any."""
+    for v in BatchCore._vars_of(ds).values():
+        if BatchCore._is_grid(v) and v.chunks is not None:
+            d = dict(zip(v.dims, v.chunks))
+            return d['y'], d['x']
+    return (ds.sizes['y'],), (ds.sizes['x'],)
+
+
+def _elevation_grid(data, geos, pairs, joint):
+    """elevation() of one phase grid, (pair, y, x) or one pair's (y, x): lazy, the phase and its y, x only."""
+    import dask.array as da
+    from . import utils_geometry as ug
+    arr = data.data[None] if data.dims == ('y', 'x') else data.data
+    if not isinstance(arr, da.Array):
+        arr = da.from_array(np.asarray(arr), chunks=(1, -1, -1))
+    yc = da.from_array(np.asarray(data.y.values, np.float64), chunks=(arr.chunks[1],))
+    xc = da.from_array(np.asarray(data.x.values, np.float64), chunks=(arr.chunks[2],))
+    pidx = da.from_array(np.arange(arr.shape[0]), chunks=(arr.chunks[0],))
+    res = da.blockwise(ug.elevation_block, 'pyx', arr, 'pyx', pidx, 'p', yc, 'y', xc, 'x', dtype=np.float32,
+                       geos=geos, pairs=pairs, joint=joint)
+    return xr.DataArray(res[0] if data.dims == ('y', 'x') else res, dims=data.dims, coords=data.coords)
 
 
 def _ref_heights(batch, where: str | None = None) -> dict:
@@ -1014,9 +1147,9 @@ class Batch(BatchCore):
                 # and include 1D non-complex variables (e.g., per-axis metadata)
                 # the 2D grid, plus every non-gridded var whatever its rank:
                 # per-date POLYNOMIAL COEFFICIENTS are ('date', '<name>_coef'),
-                # and the old `len(dims) == 1` test dropped them, taking
-                # `incidence`, `d_drho_dh`, `baseline_model` and the orbit
-                # polynomials out of the transform view that exists to carry them
+                # and the old `len(dims) == 1` test dropped them, taking the
+                # orbit polynomials and every other per-date list out of the
+                # transform view that exists to carry them
                 real_vars = [
                     v for v in ds.data_vars
                     if ds[v].dtype.kind != 'c'
@@ -2487,56 +2620,29 @@ class Batch(BatchCore):
     def elevation_phase(self) -> "Batch":
         """Radians of phase per metre of elevation per metre of perpendicular baseline.
 
-        `4 pi / (lambda R sin(incidence))`, per pixel. Multiply by B_perp and a
-        height to get phase; divide a phase by it and B_perp to get a height.
-        One definition of the geometry, so the forward and inverse conversions
-        cannot drift apart.
+        `4 pi kN / (lambda R sin(incidence))` per pixel on the WGS84 ellipsoid, at the
+        terrain height (the midpoint of the `ele` actual_range attribute): the sensitivity
+        elevation() divides by in its one-division form, where the per-pixel
+        perpendicular baseline of a pair comes from the baseline triples. Multiply by
+        B_perp and a height to get phase; divide a phase by it and B_perp to get a height.
 
-        SLANT RANGE AND THE SINE OF THE INCIDENCE ANGLE, matching GMTSAR.
-        `sbas.c:186` computes `scale = 4 pi / wl / rng / sin(theta)` with theta
-        documented as "incidence angle of the radar wave", and `phase2topo.c`
-        returns `topo = res * rho * c * sint / ret` where `c = re + height` is
-        the satellite distance from the Earth CENTRE -- by the law of sines
-        `c*sint/ret` is sin(incidence), so that is `res * rho * sin(incidence)`,
-        the same relation inverted, and a numerical check agrees. Every `cos()`
-        in GMTSAR's geometry is
-        baseline projection (`bperp.c:151`, `B*cos(theta-alpha)`) or a look-
-        vector rotation, never elevation from phase.
+        SLANT RANGE AND THE SINE OF THE INCIDENCE ANGLE, matching GMTSAR (`sbas.c:186`,
+        `phase2topo.c`); kN is the ellipsoid normal's factor, 1 on a sphere.
 
-        This exists because `elevation()` inlined `SC_height * cos(incidence)`:
-        the satellite HEIGHT (702 227 m here) where the slant range
-        (856 485 - 860 637 m) belongs, and the cosine where the sine belongs.
-        The errors nearly cancel -- 0.818 * 1.306 = 1.068 -- so the result read
-        as plausible while biasing every height by +6.8%.
-
-        Call on a transform batch (`stack.transform()`), which carries `rng`,
-        `near_range`, `rng_samp_rate` and what `incidence()` needs.
+        READS NO RASTER: x, y and the reference date's numbers only (see incidence()).
+        Call it on the stack's transform() view: `stack.transform().elevation_phase()`.
         """
-        import numpy as np
-
-        # a transform Dataset: the radar geometry and its grids (N81)
-        BatchCore._needs_dataset(self, 'elevation_phase', ('radar_wavelength',) + _INCIDENCE_VARS,
-                                 'Call it on stack.transform().')
-        c_light = 299792458.0
-        inc_batch = self.incidence()
+        from . import utils_geometry as ug
+        BatchCore._needs_dataset(self, 'elevation_phase', ug.SCALARS, 'Call it on stack.transform().')
         out: dict[str, xr.Dataset] = {}
-        for key, tfm in self.items():
-            wavelength = tfm['radar_wavelength']
-            wavelength = float(np.asarray(wavelength.values).ravel()[0]) if hasattr(wavelength, 'values') else float(wavelength)
-            # .values, NOT .item(): a Stack is lazy, and .item() raises
-            # NotImplementedError on a dask array -- which made the pixelwise
-            # geometry unreachable from any normal Stack while the scene-centre
-            # approximation, which reads .values, always worked. Same idiom as
-            # _elevation_phase_approximate() so the two cannot drift.
-            near_range = float(np.asarray(tfm['near_range'].values).mean())
-            rng_samp_rate = float(np.asarray(tfm['rng_samp_rate'].values).mean())
-            slant_range = near_range + tfm['rng'] * (c_light / (2.0 * rng_samp_rate))
-            incidence = inc_batch[key]['incidence']
-            fac = (4.0 * np.pi / wavelength) / (slant_range * xr.ufuncs.sin(incidence))
-            res = xr.Dataset({'elevation_phase': fac.astype('float32')})
-            res.attrs = tfm.attrs
-            if 'spatial_ref' in tfm.coords:
-                res = res.assign_coords(spatial_ref=tfm.spatial_ref)
+        for key, ds in self.items():
+            geo = _stack_geometry(ds, key, 'elevation_phase()', 'Call it on stack.transform().')[0]
+            fac = _geometry_grid(ug.elevation_phase_block, geo, ds.y.values, ds.x.values, _grid_chunks(ds))
+            res = xr.Dataset({'elevation_phase': xr.DataArray(fac, dims=('y', 'x'),
+                                                              coords={'y': ds.y, 'x': ds.x})})
+            res.attrs = ds.attrs
+            if 'spatial_ref' in ds.coords:
+                res = res.assign_coords(spatial_ref=ds.spatial_ref)
             out[key] = res
         return Batch(out)
 
@@ -2552,7 +2658,8 @@ class Batch(BatchCore):
 
         WHERE THE CENTRE COMES FROM. `geometry` is the burst's exact radar
         extent as a polygon, and its four corners have known radar coordinates
-        by construction -- (0.5, 0.5) to (num_lines-0.5, num_rng_bins-0.5).
+        by construction -- (0, 0) to (num_lines-1, num_rng_bins-1), the
+        0-based line and bin of the corner pixel centres.
         Inverting that mapping turns any map coordinate into (azi, rng), so the
         centre of the geocoded grid gives the centre of what was actually
         processed. That matters because `geometry` describes the WHOLE burst
@@ -2564,10 +2671,29 @@ class Batch(BatchCore):
         the processed area rather than at the far side of the burst.
         """
         import numpy as np
+        return {key: (4.0 * np.pi / wavelength) / (slant_range * sin_inc)
+                for key, (wavelength, slant_range, sin_inc)
+                in Batch._centre_geometry_approximate(self, 'scene-centre elevation_phase()').items()}
+
+    def _incidence_approximate(self) -> dict:
+        """The incidence angle (radians) at the centre of the PROCESSED area, `{burst_id: value}`: the
+        counterpart of `_elevation_phase_approximate()`, from the same metadata-only centre and the same
+        sphere (arcsin of its sin(incidence)), equally approximate and reading NO radar grids. The
+        displacement conversions of a burst without (y, x) -- a point's series, an area mean -- use it,
+        one value per burst; gridded data take the per-pixel incidence()."""
+        import numpy as np
+        return {key: float(np.arcsin(sin_inc))
+                for key, (_, _, sin_inc) in Batch._centre_geometry_approximate(self, 'scene-centre incidence()').items()}
+
+    def _centre_geometry_approximate(self, where) -> dict:
+        """`{burst_id: (wavelength, slant range, sin(incidence))}` at the centre of the PROCESSED area, on the
+        sphere of earth_radius at ref_height: the shared geometry of `_elevation_phase_approximate()` (see there
+        for where the centre comes from) and `_incidence_approximate()`. Metadata only, NO radar grids."""
+        import numpy as np
 
         c_light = 299792458.0
         out: dict = {}
-        ref_heights = _ref_heights(self, 'scene-centre elevation_phase()')
+        ref_heights = _ref_heights(self, where)
         for key, ds in self.items():
             g = lambda n: float(np.asarray(ds[n].values).ravel().mean())
             wavelength = g('radar_wavelength')
@@ -2587,9 +2713,9 @@ class Batch(BatchCore):
                 crs = ds.rio.crs if hasattr(ds, 'rio') else None
                 px, py = _Tr.from_crs('EPSG:4326', crs, always_xy=True).transform(
                     lon[:4], lat[:4])
-                a_c = np.array([0.5, 0.5, num_lines - 0.5, num_lines - 0.5])
-                r_c = np.array([0.5, num_rng_bins - 0.5,
-                                num_rng_bins - 0.5, 0.5])
+                a_c = np.array([0.0, 0.0, num_lines - 1, num_lines - 1])
+                r_c = np.array([0.0, num_rng_bins - 1,
+                                num_rng_bins - 1, 0.0])
                 M, b = [], []
                 for x_, y_, a_, r_ in zip(px, py, a_c, r_c):
                     M.append([x_, y_, 1, 0, 0, 0, -a_ * x_, -a_ * y_]); b.append(a_)
@@ -2614,73 +2740,33 @@ class Batch(BatchCore):
                 / (2.0 * ground_dist * sat_dist), -1.0, 1.0)
             sin_inc = np.clip(
                 sat_dist * np.sin(np.arccos(cos_earth)) / slant_range, -1.0, 1.0)
-            out[key] = (4.0 * np.pi / wavelength) / (slant_range * sin_inc)
+            out[key] = (wavelength, slant_range, sin_inc)
         return out
 
     def incidence(self) -> "Batch":
-        """Compute incidence angle from azi, rng, ele, and radar geometry parameters.
+        """Incidence angle (radians) on the WGS84 ellipsoid, per pixel of the grid.
 
-        Uses spherical Earth geometry with per-pixel satellite height interpolation
-        and terrain elevation correction. Matches GMTSAR look vector results within ~0.07%.
+        READS NO RASTER (no azi, rng or ele): the satellite track is rebuilt from the
+        REFERENCE date's numbers (near_range, rng_samp_rate, earth_radius,
+        SC_height_start/end, num_lines, num_rng_bins, lookdir) and the exact crop polygon
+        `geometry`, each pixel's x, y is mapped onto it at the terrain height (the
+        midpoint of the `ele` actual_range attribute), on nodes every 128 pixels and
+        bilinear in between. Measured against the exact orbit geometry: 0.013-0.048 deg
+        median, at most 0.061 deg; at most 0.11 % in the vertical and east-west
+        projections. The value covers the whole grid: no raster masks it.
 
-        Required vars: azi, rng, ele, near_range, SC_height_start, SC_height_end,
-                       earth_radius, rng_samp_rate, num_lines
+        Call it on the stack (`stack.incidence()`) or its transform() view.
         """
-        import numpy as np
-        import rioxarray  # for .rio accessor
-
-        c = 299792458.0  # speed of light
-
-        # a transform Dataset: the radar geometry and its grids (N81)
-        BatchCore._needs_dataset(self, 'incidence', _INCIDENCE_VARS, 'Call it on stack.transform().')
-        # Get CRS from input batch
+        from . import utils_geometry as ug
+        BatchCore._needs_dataset(self, 'incidence', ug.SCALARS, 'Call it on the stack: stack.incidence().')
         crs = self.crs
-
         out: dict[str, xr.Dataset] = {}
-        for key, tfm in self.items():
-            # Get scalar parameters (mean if per-date)
-            # .values, NOT .item() -- see elevation_phase(): a Stack is lazy and
-            # .item() raises on a dask array, which put incidence() and everything
-            # built on it out of reach of any stack that had not been computed.
-            _g = lambda n: float(np.asarray(tfm[n].values).mean())
-            near_range = _g('near_range')
-            SC_height_start = _g('SC_height_start')
-            SC_height_end = _g('SC_height_end')
-            earth_radius = _g('earth_radius')
-            rng_samp_rate = _g('rng_samp_rate')
-            num_lines = _g('num_lines')
-
-            # Get per-pixel coordinates
-            azi = tfm['azi']
-            rng = tfm['rng']
-            ele = tfm['ele']
-
-            # Compute slant range to the actual elevated ground point
-            range_pixel_size = c / (2 * rng_samp_rate)
-            slant_range = near_range + rng * range_pixel_size
-
-            # Interpolate satellite height based on azimuth position
-            SC_height = SC_height_start + (SC_height_end - SC_height_start) * azi / (num_lines - 1)
-
-            # Ground at earth_radius + ele from Earth center
-            ground_dist = earth_radius + ele
-
-            # Satellite at earth_radius + SC_height from Earth center
-            sat_dist = earth_radius + SC_height
-
-            # Spherical Earth geometry: law of cosines + law of sines
-            cos_earth = (ground_dist**2 + sat_dist**2 - slant_range**2) / (2 * ground_dist * sat_dist)
-            cos_earth = xr.where(cos_earth > 1, 1, xr.where(cos_earth < -1, -1, cos_earth))
-            earth_angle = xr.ufuncs.arccos(cos_earth)
-            sin_inc = sat_dist * xr.ufuncs.sin(earth_angle) / slant_range
-            sin_inc = xr.where(sin_inc > 1, 1, xr.where(sin_inc < -1, -1, sin_inc))
-            incidence = xr.ufuncs.arcsin(sin_inc).astype('float32')
-
-            result_ds = xr.Dataset({"incidence": incidence})
-            result_ds.attrs = tfm.attrs
-            # Preserve CRS
-            if crs is not None:
-                result_ds = result_ds.rio.write_crs(crs)
+        for key, ds in self.items():
+            geo = _stack_geometry(ds, key, 'incidence()', 'Call it on the stack: stack.incidence().')[0]
+            inc = _geometry_grid(ug.incidence_block, geo, ds.y.values, ds.x.values, _grid_chunks(ds))
+            result_ds = xr.Dataset({'incidence': xr.DataArray(inc, dims=('y', 'x'), coords={'y': ds.y, 'x': ds.x})})
+            result_ds.attrs = ds.attrs
+            result_ds = result_ds.rio.write_crs(crs)
             out[key] = result_ds
         return Batch(out)
 
@@ -2780,8 +2866,7 @@ class Batch(BatchCore):
             if isinstance(tfm, xr.Dataset):
                 result_ds.attrs = tfm.attrs
             # Preserve CRS
-            if crs is not None:
-                result_ds = result_ds.rio.write_crs(crs)
+            result_ds = result_ds.rio.write_crs(crs)
             out[key] = result_ds
         return Batch(out)
 
@@ -2858,13 +2943,19 @@ class Batch(BatchCore):
         out: dict[str, xr.Dataset] = {}
         for key, phase_ds in self.items():
             disp_vars: dict[str, xr.DataArray] = {}
+            # A DATASET OPERATION APPLIES TO THE GRIDS AND NOTHING ELSE.
+            # radar_wavelength, burst ids and the rest ride along and are
+            # carried through untouched; multiplying a <U43 burst name by
+            # a float is the UFuncTypeError this prevents. A Dataset without
+            # any (y, x) grid RAISES (N81): passed through, its phase came
+            # back in radians labelled metres.
+            # A DATAARRAY IS PROCESSED AS IT IS (N81): with or without (y, x)
+            # -- a point's series, an area mean -- it is phase, converted by
+            # the same scale.
+            grids = BatchCore._grid_vars(phase_ds) if isinstance(phase_ds, xr.Dataset) else None
             # a Dataset's variables, or a DataArray as its own one (N81)
             for var_name, data in BatchCore._vars_of(phase_ds).items():
-                # A DATASET OPERATION APPLIES TO THE GRIDS AND NOTHING ELSE.
-                # radar_wavelength, burst ids and the rest ride along and are
-                # carried through untouched; multiplying a <U43 burst name by
-                # a float is the UFuncTypeError this prevents.
-                if not ('y' in data.dims and 'x' in data.dims):
+                if grids is not None and var_name not in grids:
                     disp_vars[var_name] = data
                     continue
                 disp = (data * scale).astype('float32')
@@ -2875,29 +2966,39 @@ class Batch(BatchCore):
         return Batch(out)
 
     def _displacement_component(self, transform: 'Batch | Stack', func, suffix: str = '') -> 'Batch':
-        """Internal helper to scale LOS displacement by an incidence-based function (e.g., cos/sin)."""
+        """Internal helper to scale LOS displacement by an incidence-based function (e.g., cos/sin).
+
+        The incidence is computed ON THE PHASE'S OWN GRID (its y, x and chunks) from the geometry source -- the
+        stack or its transform() view -- with no raster read and nothing reindexed (see incidence()).
+
+        A DATAARRAY WITHOUT (y, x) -- a point's series, an area mean -- is converted PER BURST by the incidence at
+        the centre of that source's processed area (_incidence_approximate(), the approximate burst-centre path of
+        the scalar height per fringe): one value per burst, the per-burst sensitivity. A Dataset without any grid
+        raises in displacement_los()."""
         import xarray as xr
-        import numpy as np
-        from .Stack import Stack
-
-        # If Stack passed, get transform from it
-        if isinstance(transform, Stack):
-            transform = transform.transform()
-
-        # Decimate transform to match phase resolution for efficiency
-        transform = Batch({k: transform[k].reindex(y=self[k].y, x=self[k].x, method='nearest')
-                           for k in self.keys() if k in transform})
+        from . import utils_geometry as ug
 
         los_batch = self.displacement_los(transform)
-        incidence_batch = transform.incidence()
 
         out: dict[str, xr.Dataset] = {}
+        # the burst-centre incidence of the bursts without (y, x), from the geometry source as it is passed
+        centre = [key for key, los_ds in los_batch.items()
+                  if isinstance(los_ds, xr.DataArray) and not BatchCore._is_grid(los_ds)]
+        for key in centre:
+            if key not in transform:
+                raise KeyError(f'Missing incidence for key: {key}')
+        centre = Batch._incidence_approximate({key: dict.__getitem__(transform, key) for key in centre}) \
+            if centre else {}
 
         for key, los_ds in los_batch.items():
-            if key not in incidence_batch:
+            if key not in transform:
                 raise KeyError(f'Missing incidence for key: {key}')
-
-            inc_da = incidence_batch[key]['incidence']
+            if key in centre:
+                comp = (los_ds / float(func(xr.DataArray(centre[key])))).astype('float32')
+                out[key] = BatchCore._form(los_ds, {suffix: comp})
+                continue
+            geo = _stack_geometry(dict.__getitem__(transform, key), key, f'displacement_{suffix}()',
+                                  f'Pass the stack: x.displacement_{suffix}(stack).')[0]
             comp_vars: dict[str, xr.DataArray] = {}
             # a Dataset's variables, or a DataArray as its own one (N81)
             los_vars = BatchCore._vars_of(los_ds)
@@ -2910,13 +3011,12 @@ class Batch(BatchCore):
                 if not ('y' in data.dims and 'x' in data.dims):
                     comp_vars[var_name] = data
                     continue
-                # align incidence to data grid
-                incidence = inc_da.reindex_like(data, method='nearest')
-                # the geometry is bent to the data's chunks, never the other way round
-                if data.chunks is not None and incidence.chunks is not None:
-                    _ch = tuple(data.chunks[-2:][('y', 'x').index(a)] for a in incidence.dims)
-                    if incidence.chunks != _ch:
-                        incidence = incidence.chunk(dict(zip(incidence.dims, _ch)))
+                # the incidence on the data's own grid and chunks: the geometry is bent to the data, never the
+                # other way round
+                chunks = (tuple(data.chunks[data.dims.index('y')]), tuple(data.chunks[data.dims.index('x')])) \
+                    if data.chunks is not None else ((data.sizes['y'],), (data.sizes['x'],))
+                inc = _geometry_grid(ug.incidence_block, geo, data.y.values, data.x.values, chunks)
+                incidence = xr.DataArray(inc, dims=('y', 'x'), coords={'y': data.y, 'x': data.x})
 
                 comp = (data / func(incidence)).astype('float32')
 
@@ -2939,9 +3039,9 @@ class Batch(BatchCore):
 
         Parameters
         ----------
-        transform : Batch or Stack
-            Transform batch providing incidence angle and mission constants,
-            or a Stack (will call .transform() internally).
+        transform : Stack or Batch
+            The stack, or its transform() view: the wavelength and the per-date
+            geometry incidence() reads, no raster.
 
         Returns
         -------
@@ -2961,9 +3061,9 @@ class Batch(BatchCore):
 
         Parameters
         ----------
-        transform : Batch or Stack
-            Transform batch providing incidence angle and mission constants,
-            or a Stack (will call .transform() internally).
+        transform : Stack or Batch
+            The stack, or its transform() view: the wavelength and the per-date
+            geometry incidence() reads, no raster.
 
         Returns
         -------
@@ -2978,17 +3078,35 @@ class Batch(BatchCore):
         import xarray as xr
         return self._displacement_component(transform, func=xr.ufuncs.sin, suffix='eastwest')
 
-    def elevation(self, transform: 'Batch | Stack', baseline: float | None = None) -> 'Batch':
-        """Compute elevation (meters) from unwrapped phase grids.
+    def elevation(self, stack: 'Stack | Batch | None' = None, baseline: float | None = None) -> 'Batch':
+        """Compute elevation (meters) from unwrapped phase grids, with the STACK.
+
+        The phase gives its values, x, y and each pair's two dates; the stack gives everything
+        that is not pairwise: each date's baseline (baseline_* and alpha_*, the baseline
+        vector to the reference satellite at the scene start and end, linear in between), the
+        REFERENCE date's numbers, the exact crop polygon, the CRS and the `ele` actual_range
+        ATTRIBUTE. NO RASTER IS READ: the satellite track is rebuilt on WGS84 from those
+        numbers and the polygon, the geometry is evaluated on nodes every 128 pixels and
+        applied in one pass. A value comes out wherever the phase is finite.
+
+        With the stack, the linearized joint solve: the exact secant of the two dates' range
+        changes with the position moved to the solved height, three steps. Flat-earth mode
+        (remove_topo_phase=False) gives the absolute height about the reference height; DEM
+        mode gives the residual height about the DEM, anchored at the actual_range midpoint.
+
+        WITHOUT THE STACK (a transform, or nothing): ONE WARNING, and the one-division form
+        from what the phase itself carries -- each pair's baseline triple difference
+        (pairs()), its own first-date numbers, polygon and CRS, and the transform's `ele`
+        actual_range attribute when one is given (else the terrain height is taken as 0).
 
         Parameters
         ----------
-        transform : Batch or Stack
-            Transform batch containing look vectors for incidence calculation,
-            or a Stack (will call .transform() internally).
-        baseline : float | None, optional
-            Perpendicular baseline in meters. If None, uses burst-specific BPR
-            from phase coordinates.
+        stack : Stack
+            The stack the pairs were made from. A transform batch (stack.transform()) or
+            None falls back to the one-division form with a WARNING.
+        baseline : None
+            Not for grids, whose baselines come from the triples; the scalar height of
+            ambiguity is stack.elevation(2*np.pi, baseline).
 
         Returns
         -------
@@ -2998,80 +3116,50 @@ class Batch(BatchCore):
         Examples
         --------
         >>> elev = unwrapped.elevation(stack)
-        >>> elev = unwrapped.elevation(stack.transform())
+        >>> elev = stack.elevation(unwrapped)
         """
-        import xarray as xr
-        import numpy as np
         from .Stack import Stack
 
-        # If Stack passed, get transform from it
-        if isinstance(transform, Stack):
-            transform = transform.transform()
-
-        ep_batch = transform.elevation_phase()
-        ref_heights = _ref_heights({k: transform[k] for k in self.keys() if k in ep_batch},
-                                   f'{type(self).__name__}.elevation()')
+        if baseline is not None:
+            raise ValueError('ERROR: elevation() of grids takes no baseline: the stack gives the triples. '
+                             'For a scalar phase use stack.elevation(2*np.pi, baseline).')
+        joint = isinstance(stack, Stack)
+        if not joint:
+            # the workaround reads the phase Dataset's own numbers, which a DataArray does not carry (N81)
+            if BatchCore._is_dataarray_batch(self):
+                raise TypeError('ERROR: elevation() without the stack needs the phase Dataset. Pass the stack: '
+                                'x.elevation(stack).')
+            print('WARNING: elevation() needs the stack: use intf.elevation(stack); using the pair baselines only.',
+                  flush=True)
         out: dict[str, xr.Dataset] = {}
 
         for key, phase_ds in self.items():
-            if key not in ep_batch:
-                raise KeyError(f'Missing geometry for key: {key}')
-
-            tfm = transform[key]
-
-            def _scalar_from_ds(ds, name: str):
-                if name in ds:
-                    var = ds[name]
-                    if var.ndim == 0:
-                        return float(var.item())
-                    return float(var.mean().item())
-                return ds.attrs.get(name)
-
-            wavelength = _scalar_from_ds(tfm, 'radar_wavelength')
-            if wavelength is None:
-                raise KeyError(f"Missing radar_wavelength in transform for burst {key}")
-
-            # Get BPR - either scalar or per-pair DataArray for broadcasting
-            if baseline is not None:
-                bpr = float(baseline)
-            elif 'BPR' in phase_ds.coords:
-                bpr = phase_ds.coords['BPR']
+            grids = {n: d for n, d in BatchCore._vars_of(phase_ds).items() if 'y' in d.dims and 'x' in d.dims}
+            if joint:
+                if key not in stack:
+                    raise KeyError(f'Missing geometry for key: {key}')
+                geo, bh, bv, dates = _stack_geometry(dict.__getitem__(stack, key), key, 'elevation()',
+                                                       'Pass the stack: x.elevation(stack).')
+                geos = [geo]
+                pairs = (_pairs_of_stack(next(iter(grids.values())), key, bh, bv, dates, 'elevation()')
+                         if grids else [])
             else:
-                raise KeyError(f"Missing baseline (BPR) for burst {key}")
-
-            # ONE geometry, from elevation_phase(): radians per metre of height
-            # per metre of baseline. This block used to inline
-            # `SC_height * cos(incidence)` -- the satellite height where the
-            # SLANT RANGE belongs and the cosine where the SINE belongs. The two
-            # errors nearly cancel (0.818 * 1.306 = 1.068), so the answer looked
-            # reasonable while every height came out 6.8% high. GMTSAR's
-            # phase2topo.c and sbas.c both use slant range and sin(incidence);
-            # see elevation_phase() for the references and the numbers.
-            fac_da = ep_batch[key]['elevation_phase']
-
-            ref_height = ref_heights[key]
+                src = dict.get(stack, key) if isinstance(stack, dict) else None
+                h_attr = _ele_midpoint(src, key, 'elevation()') if src is not None else None
+                geos, pairs = _pair_geometry(phase_ds, key, 'elevation()', 0.0 if h_attr is None else h_attr)
 
             elev_vars: dict[str, xr.DataArray] = {}
-            # a Dataset's variables, or a DataArray as its own one (N81): BPR is a
-            # coordinate of the pairs, which a DataArray carries
+            # a Dataset's variables, or a DataArray as its own one (N81): the pair dates are coordinates of the
+            # pairs, which a DataArray carries
             for var_name, data in BatchCore._vars_of(phase_ds).items():
                 # A DATASET OPERATION APPLIES TO THE GRIDS AND NOTHING ELSE.
                 # radar_wavelength, burst ids and the rest ride along and are
                 # carried through untouched; multiplying a <U43 burst name by
                 # a float is the UFuncTypeError this prevents.
-                if not ('y' in data.dims and 'x' in data.dims):
+                if var_name not in grids:
                     elev_vars[var_name] = data
                     continue
-                fac = fac_da.reindex_like(data, method='nearest')
-                # the geometry is bent to the data's chunks, never the other way round
-                if data.chunks is not None and fac.chunks is not None:
-                    _ch = tuple(data.chunks[-2:][('y', 'x').index(a)] for a in fac.dims)
-                    if fac.chunks != _ch:
-                        fac = fac.chunk(dict(zip(fac.dims, _ch)))
-
-                # phi = fac * B_perp * dh  ->  dh = phi / (fac * B_perp)
-                elev = ref_height - data / (fac * bpr)
-                elev_vars[var_name] = elev.astype('float32')
+                elev_vars[var_name] = _elevation_grid(data, geos, pairs, joint)
 
             # a DataArray in, a DataArray out (N81)
             out[key] = BatchCore._form(phase_ds, elev_vars, coords=phase_ds.coords, attrs=phase_ds.attrs)
@@ -3969,7 +4057,8 @@ class BatchComplex(BatchCore):
         model : Batch
             Output of fit3d() or fit1d(): variables `velocity`, `height`,
             `seasonal`
-            (unprefixed, one polarisation).
+            (unprefixed, one polarisation). Also a trend2d() model, and an
+            insardev_polsar trend3d() field, which its predict3d() evaluates.
         baseline : str or None
             Per-date perpendicular baseline variable. DEFAULT 'BPR', i.e. the
             topographic term is projected onto dates and the prediction is the
@@ -4009,6 +4098,13 @@ class BatchComplex(BatchCore):
         import numpy as np
         import xarray as xr
         import dask.array as da
+        # A trend3d() FIELD is insardev_polsar's measurement, recognised by what it carries: its predict3d()
+        # evaluates it at this stack's pixels
+        if BatchComplex._trend3d_field(model, list(model.keys())):
+            if vars is not None:
+                raise TypeError("predict(): `vars` are the covariates of a trend2d() "
+                                "model; a trend3d() field names none.")
+            return self._trend3d_method('predict3d', 'predict')(self, model)
         # A trend2d() MODEL is a different animal from a fit model: no
         # velocity or height, but per-date coefficients over the stack's own
         # covariates. Recognised by what it carries, evaluated per chunk.
@@ -4953,11 +5049,28 @@ class BatchComplex(BatchCore):
                 coords=coords)}, attrs=dict(ds.attrs))
         return Batch(out)
 
+    @staticmethod
+    def _trend3d_field(trend, keys) -> bool:
+        """Whether `trend` is an insardev_polsar trend3d() FIELD for every one of `keys`: its bursts' attrs
+        hold 'trend3d_cell'. A field is a measurement, not a model; predict() and detrend() hand it to the
+        module's predict3d() and detrend3d()."""
+        keys = list(keys)
+        return len(keys) > 0 and all(k in trend and 'trend3d_cell' in trend[k].attrs for k in keys)
+
+    def _trend3d_method(self, name, what):
+        """insardev_polsar's `name` (predict3d, detrend3d), which takes a trend3d() field, as the class holds it:
+        a Batch of DataArrays reaches it directly. Without the module, the common error names it."""
+        method = getattr(type(self), name, None)
+        if method is None:
+            raise ImportError(f"{what}() of a trend3d() field requires insardev_polsar extension")
+        return method
+
     def detrend(self, trend: 'Batch', vars=None) -> 'BatchComplex':
         """
         Remove a trend from EVERY pixel: `self * exp(-1j * phase)`. The trend says
-        what it is, as predict()'s model does, so the name carries no dims: today a
-        trend2d() model; detrend2d() is an alias.
+        what it is, as predict()'s model does, so the name carries no dims: a
+        trend2d() model, or an insardev_polsar trend3d() field, which its
+        detrend3d() removes; detrend2d() is an alias.
 
         The phase is predict(trend): the model's per-date coefficients over
         the stack's own covariates, evaluated per chunk -- nothing of raster
@@ -4967,12 +5080,13 @@ class BatchComplex(BatchCore):
         Parameters
         ----------
         trend : Batch
-            What trend2d() returned for this stack. It may hold FEWER dates
+            What trend2d() returned for this stack, or a trend3d() field
+            (insardev_polsar). It may hold FEWER dates
             than the stack: those dates are what comes back, since a date with
             no trend cannot be detrended.
         vars : Batch or None
             Covariates at this posting, only when the stack does not carry
-            the ones the model names.
+            the ones the model names (a trend2d() model only).
 
         Returns
         -------
@@ -4983,6 +5097,12 @@ class BatchComplex(BatchCore):
         import numpy as np
         import xarray as xr
         import dask.array as da
+        # a trend3d() FIELD, recognised by what it carries: insardev_polsar's detrend3d() removes it
+        if BatchComplex._trend3d_field(trend, self.keys()):
+            if vars is not None:
+                raise TypeError("detrend(): `vars` are the covariates of a trend2d() "
+                                "model; a trend3d() field names none.")
+            return self._trend3d_method('detrend3d', 'detrend')(self, trend)
         for key in self.keys():
             if key not in trend or 'trend2d_vars' not in trend[key].attrs:
                 raise ValueError(
@@ -6432,6 +6552,12 @@ class BatchComplex(BatchCore):
 
         if window is None:
             return self
+
+        # AN INHERENTLY SPATIAL FILTER: a burst without a (y, x) grid -- a point's series, an
+        # area mean -- raises the short error (N81), not a dask chunk error further down
+        for ds in self.values():
+            if not BatchCore._grids_of(ds):
+                raise BatchCore._no_grid_error(ds)
 
         # a BatchUnit for every burst, the shared check and messages (N81); a DataArray
         # BatchUnit weights every grid, a Dataset one names every grid

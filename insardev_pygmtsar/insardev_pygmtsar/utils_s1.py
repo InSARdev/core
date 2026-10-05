@@ -585,9 +585,10 @@ def satellite_prm(xml_path: str, tiff_path: str) -> dict:
     azi_time_interval = get_float('.//imageInformation/azimuthTimeInterval')
     prm['PRF'] = 1.0 / azi_time_interval
 
-    # Near range with GMTSAR correction (subtract 1/fs before multiplying by SOL/2)
+    # Near range: the slant range of the first sample (range sample 0), as NISAR's slantRange[0]; the radar
+    # coordinate rng is the 0-based sample, slant range near_range + rng * dr (no GMTSAR one-bin shift)
     slant_range_time = get_float('.//imageInformation/slantRangeTime')
-    prm['near_range'] = (slant_range_time - 1.0 / fs) * SOL / 2.0
+    prm['near_range'] = slant_range_time * SOL / 2.0
 
     # Ellipsoid parameters
     prm['equatorial_radius'] = get_float('.//ellipsoidSemiMajorAxis') or 6378137.0
@@ -888,7 +889,8 @@ def deramped_burst(xml_path: str, tiff_path: str, eof_path: str) -> tuple:
 
     dta = 1.0 / prf
     dts = 1.0 / prm_dict['rng_samp_rate']
-    ts0 = prm_dict['near_range'] * 2.0 / SOL + 1.0 / prm_dict['rng_samp_rate']
+    # the range time of sample 0 (slantRangeTime): near_range is the slant range of sample 0
+    ts0 = prm_dict['near_range'] * 2.0 / SOL
 
     # Compute burst center time for finding nearest Doppler/FM rate estimates
     t_brst_str = root.find('.//swathTiming/burstList/burst/azimuthTime').text

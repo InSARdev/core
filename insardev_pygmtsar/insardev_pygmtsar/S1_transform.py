@@ -12,12 +12,6 @@ from .utils_satellite import remap_radar_to_geo
 from insardev_toolkit.utils_S1 import measurement_path
 from insardev_toolkit.utils_files import exists
 
-# The GMTSAR pixel (line, bin) of the S1 radar coordinates (a, r), minus (a, r): compute_transform_inverse() stores
-# azi = line + 0.5 and rng = bin - 0.5 of SAT_llt2rat (the near_range of S1 is one bin before the first sample), so
-# the first sample is centred on (0.5, 0.5). reference_surface_topo() and flat_earth_topo_phase() evaluate GMTSAR's
-# expressions at this line and bin, the pixel the SLC is sampled at.
-S1_PIXEL_OFFSET = (-0.5, 0.5)
-
 
 def _process_date_worker(args):
     """Worker function for processing a single date in spawned subprocess.
@@ -152,9 +146,9 @@ def _compute_reramp_phase(azi_rep, rng_rep, reramp_params):
     Parameters
     ----------
     azi_rep : np.ndarray
-        Azimuth pixel coordinates (float32, 2D). Uses 0.5-based pixel centers.
+        Azimuth pixel coordinates (float32, 2D): the 0-based line of the valid region.
     rng_rep : np.ndarray
-        Range pixel coordinates (float32, 2D). Uses 0.5-based pixel centers.
+        Range pixel coordinates (float32, 2D): the 0-based range sample.
     reramp_params : dict
         Parameters from deramped_burst(): fka, fnc, ks, dta, dts, ts0, tau0, lpb, k_start.
 
@@ -176,15 +170,15 @@ def _compute_reramp_phase(azi_rep, rng_rep, reramp_params):
     lpb = reramp_params['lpb']
     k_start = reramp_params['k_start']
 
-    # Convert pixel coordinates to time coordinates
-    # azi_rep/rng_rep use 0.5-based pixel centers (first pixel at 0.5)
-    # Subtract 0.5 to get 0-based integer indices matching deramped_burst convention
+    # Convert pixel coordinates to time coordinates: azi_rep/rng_rep are the 0-based line of the valid region and
+    # range sample, so the burst line is azi_rep + k_start, the deramped_burst convention. The + 0.5 in eta is
+    # GMTSAR's burst-time centring of the deramp (utils_s1.deramped_burst), not a pixel offset
     # The same expressions in blocks of output rows, into the float32 output (no full-grid float64 temporaries)
     phase = np.empty(np.shape(azi_rep), dtype=np.float32)
     for r0 in range(0, phase.shape[0], 128):
-        azi_full = (azi_rep[r0:r0 + 128] - 0.5) + k_start
+        azi_full = azi_rep[r0:r0 + 128] + k_start
         eta = (azi_full - lpb / 2.0 + 0.5) * dta
-        tau = ts0 + (rng_rep[r0:r0 + 128] - 0.5) * dts - tau0
+        tau = ts0 + rng_rep[r0:r0 + 128] * dts - tau0
         ka = fka[0] + fka[1] * tau + fka[2] * tau**2
         kt = ka * ks / (ka - ks)
         fnct = fnc[0] + fnc[1] * tau + fnc[2] * tau**2
@@ -233,7 +227,8 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
     # int16 = 2*DN (same as old deramped_burst output), DN / scale = 2*DN → scale = 0.5
     scale = 0.5
 
-    coords = {'a': np.arange(slc_complex.shape[0]) + 0.5, 'r': np.arange(slc_complex.shape[1]) + 0.5}
+    # the 0-based line and range sample of every SLC pixel, the radar coordinates of the transform
+    coords = {'a': np.arange(slc_complex.shape[0]), 'r': np.arange(slc_complex.shape[1])}
 
     nonzero_mask = slc_complex != 0
     col_valid = nonzero_mask.sum(axis=0) > 0.8 * slc_complex.shape[0]
@@ -293,8 +288,7 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
         if not is_reference:
             topo_phase = flat_earth_topo_phase(topo, prm_rep, prm_ref, None,
                                                 baseline_params=baseline_params,
-                                                sc_height_params=sc_height_params,
-                                                pixel_offset=S1_PIXEL_OFFSET)
+                                                sc_height_params=sc_height_params)
             if tidal_dt is not None:
                 topo_phase.values += tidal_phase_radar(topo, prm_ref, tidal_dt).values
             topo_src = remap_source(topo_phase)
@@ -361,8 +355,7 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
         if not is_reference:
             phase = flat_earth_topo_phase(topo, prm_rep, prm_ref, None,
                                                        baseline_params=baseline_params,
-                                                       sc_height_params=sc_height_params,
-                                                       pixel_offset=S1_PIXEL_OFFSET)
+                                                       sc_height_params=sc_height_params)
             _timings['flat_earth_topo_phase'] = time.perf_counter() - _t0
 
             # Tidal phase correction
@@ -423,12 +416,17 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
     # to_dataframe() does not list it
     data_proj.attrs['ref_height'] = float(reference_height)
 
-    # Add baseline
+    # Add baseline: the GMTSAR baseline triples (length m, angle to the horizontal deg, at the reference scene start,
+    # centre and end) as SAT_baseline gives them, then BPR. The reference date's are 0, as its BPR and the topo
+    # phase's: SAT_baseline of a date with itself is undefined (NaN lengths from the closest-approach fit)
+    triples = ('baseline_start', 'baseline_center', 'baseline_end', 'alpha_start', 'alpha_center', 'alpha_end')
     if prm_rep is prm_ref:
         BPR = 0.0
+        data_proj.attrs.update(dict.fromkeys(triples, 0.0))
     else:
         baseline = prm_ref.SAT_baseline(prm_rep)
         BPR = baseline.get('B_perpendicular')
+        data_proj.attrs.update({name: baseline.get(name) + 0 for name in triples})
     data_proj.attrs['BPR'] = BPR + 0
 
     # Add record attributes from dict (reverse order to match transform_slc_int16)
@@ -445,24 +443,8 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
     # earth_radius stays the PRM value written above: BPR, SC_height and the topo phase are referenced to it
 
     # Replace approximate geometry with exact radar extent polygon from prm_ref
-    from insardev_pygmtsar.utils_satellite import satellite_rat2llt
-    _num_lines = prm_ref.get('num_lines')
-    _num_rng = prm_ref.get('num_rng_bins')
-    _orbit_ref = prm_ref.orbit_df
-    _corner_azi = np.array([0.5, 0.5, _num_lines - 0.5, _num_lines - 0.5], dtype=np.float64)
-    _corner_rng = np.array([0.5, _num_rng - 0.5, _num_rng - 0.5, 0.5], dtype=np.float64)
-    _clon, _clat, _ = satellite_rat2llt(
-        _corner_azi, _corner_rng,
-        _orbit_ref['clock'].values, _orbit_ref[['px','py','pz']].values,
-        _orbit_ref[['vx','vy','vz']].values,
-        86400.0 * prm_ref.get('clock_start'),
-        prm_ref.get('PRF'), prm_ref.get('near_range'), prm_ref.get('rng_samp_rate'),
-        prm_ref.get('earth_radius'), dem=None, max_iter=1, tol=1.0, n_chunks=1
-    )
-    from shapely.geometry import Polygon as _Polygon
-    _coords = list(zip(_clon.tolist(), _clat.tolist()))
-    _coords.append(_coords[0])  # close the ring
-    data_proj.attrs['geometry'] = _Polygon(_coords).wkt
+    from insardev_pygmtsar.utils_satellite import radar_extent_polygon
+    data_proj.attrs['geometry'] = radar_extent_polygon(prm_ref)
 
     # DEBUG: check what was stored
     if debug:
@@ -481,7 +463,9 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
 
     _t0 = time.perf_counter()
     shape = data_proj.re.shape
-    encoding = {var: {'chunks': shape} for var in ['re', 'im']}
+    # the Zarr array's own fill_value is the _FillValue attribute (as the NISAR SLC), so GDAL and zarr readers do not
+    # take 0, a valid value, for the fill
+    encoding = {var: {'chunks': shape, 'fill_value': int(np.iinfo(np.int16).max)} for var in ['re', 'im']}
     data_proj.to_zarr(
         store=os.path.join(outdir, burst_name),
         mode='w',
@@ -694,7 +678,7 @@ class S1_transform(S1_align):
             _centroid = record.geometry.iloc[0].centroid
             burst_epsg = epsg if epsg is not None else get_utm_epsg(_centroid.y, _centroid.x)
             dem = get_dem_wgs84ellipsoid(self.DEM, record.geometry.iloc[0], datum=self.dem_datum())
-            topo, transform = compute_transform_inverse(prm_ref_main, dem, scale_factor=1/dem_vertical_accuracy, epsg=burst_epsg, resolution=resolution, bbox=bbox, compute_topo=remove_topo_phase, n_jobs=n_jobs_inner, debug=debug)
+            topo, transform = compute_transform_inverse(prm_ref_main, dem, self.DEM, scale_factor=1/dem_vertical_accuracy, epsg=burst_epsg, resolution=resolution, bbox=bbox, compute_topo=remove_topo_phase, n_jobs=n_jobs_inner, debug=debug)
             del dem
 
             # Save transform to zarr
@@ -704,7 +688,7 @@ class S1_transform(S1_align):
                 # flat-earth reference: the WGS84 ellipsoid at reference_height per radar pixel, referenced to the
                 # PRM scalar earth_radius like the DEM topo (a constant height on a per-line sphere drifted across range)
                 from .utils_satellite import reference_surface_topo
-                topo = reference_surface_topo(prm_ref_main, topo, reference_height, pixel_offset=S1_PIXEL_OFFSET)
+                topo = reference_surface_topo(prm_ref_main, topo, reference_height)
             # Drop ele - not needed for geocoding
             transform = transform.drop_vars('ele')
 
@@ -804,14 +788,14 @@ class S1_transform(S1_align):
             _centroid = record.geometry.iloc[0].centroid
             burst_epsg = epsg if epsg is not None else get_utm_epsg(_centroid.y, _centroid.x)
             dem = get_dem_wgs84ellipsoid(self.DEM, record.geometry.iloc[0], datum=self.dem_datum())
-            topo, transform = compute_transform_inverse(prm_ref_main, dem, scale_factor=1/dem_vertical_accuracy, epsg=burst_epsg, resolution=resolution, bbox=bbox, compute_topo=remove_topo_phase, n_jobs=n_jobs_inner, debug=debug)
+            topo, transform = compute_transform_inverse(prm_ref_main, dem, self.DEM, scale_factor=1/dem_vertical_accuracy, epsg=burst_epsg, resolution=resolution, bbox=bbox, compute_topo=remove_topo_phase, n_jobs=n_jobs_inner, debug=debug)
             del dem
 
             save_transform(transform, outdir, scale_factor=1/dem_vertical_accuracy)
 
             if not remove_topo_phase:
                 from .utils_satellite import reference_surface_topo
-                topo = reference_surface_topo(prm_ref_main, topo, reference_height, pixel_offset=S1_PIXEL_OFFSET)
+                topo = reference_surface_topo(prm_ref_main, topo, reference_height)
             transform = transform.drop_vars('ele')
 
             # Pre-compute SC_height and topo_llt caches
@@ -1016,8 +1000,9 @@ class S1_transform(S1_align):
         if topo is None:
             xdim = prm_ref.get('num_rng_bins')
             ydim = prm_ref.get('num_patches') * prm_ref.get('num_valid_az')
-            azis = np.arange(0.5, ydim, 1)
-            rngs = np.arange(0.5, xdim, 1)
+            # the 0-based line and range sample of every pixel centre, 0 .. n - 1
+            azis = np.arange(0, ydim, 1)
+            rngs = np.arange(0, xdim, 1)
             topo = xr.DataArray(np.zeros((len(azis), len(rngs)), dtype=np.float32),
                                 dims=['a', 'r'],
                                 coords={'a': azis, 'r': rngs}).rename('topo')

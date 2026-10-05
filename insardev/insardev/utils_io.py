@@ -25,6 +25,16 @@ import numpy as np
 # the group attribute save() writes the data variable order in, and open() reads and removes
 _DATA_VARS_ATTR = '__data_vars__'
 
+
+def _zarr_fill_value(da):
+    """The Zarr fill_value of an array save() writes, the same for a dask and a numpy array and for the first save
+    and a re-save: NaN for float and complex (0 is a valid value, never a fill value); None otherwise: zarr's own
+    default (0 for an integer array, False, '')."""
+    kind = np.dtype(da.dtype).kind
+    if kind in 'fc':
+        return np.nan
+    return None
+
 def _store_path_to_kvstore(store_path, storage_options=None):
     """Convert filesystem path to TensorStore kvstore spec."""
     import os
@@ -288,6 +298,7 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
                 da_xr = ds[var_name]
                 # Get dimension names for zarr v3 metadata
                 dim_names = list(da_xr.dims)
+                fill_value = _zarr_fill_value(da_xr)
                 if hasattr(da_xr.data, 'dask'):
                     chunks = da_xr.data.chunksize
                     z = ds_grp.create_array(
@@ -297,7 +308,7 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
                         dtype=da_xr.dtype,
                         dimension_names=dim_names,
                         overwrite=True,
-                        fill_value=np.nan if (np.issubdtype(da_xr.dtype, np.floating) or np.issubdtype(da_xr.dtype, np.complexfloating)) else 0,
+                        fill_value=0 if fill_value is None else fill_value,
                     )
                     # THE VARIABLE'S OWN ATTRIBUTES: the metadata pass below
                     # drops every data_var and writes coordinates only, so a
@@ -318,13 +329,15 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
                     else:
                         targets.append(z)
                 else:
-                    # Non-dask array - write directly with dimension_names
+                    # Non-dask array - write directly with dimension_names; the same Zarr fill_value
+                    # as a dask one (_zarr_fill_value), never zarr's default 0
                     _z = ds_grp.create_array(
                         var_name,
                         data=np.asarray(da_xr.data),
                         chunks=da_xr.shape,
                         dimension_names=dim_names,
-                        overwrite=True
+                        overwrite=True,
+                        **({} if fill_value is None else {'fill_value': fill_value}),
                     )
                     if da_xr.attrs:
                         _z.attrs.update({k: v for k, v in da_xr.attrs.items()})
@@ -444,7 +457,8 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
         else:
             ds_clean.to_zarr(store=grp_store, mode='a', consolidated=True, zarr_format=3)
 
-    del sources, targets, grp_info, idx_3d, idx_2d
+    # idx_3d / idx_2d exist only when there were dask arrays to write: a numpy-backed batch has none
+    del sources, targets, grp_info
     pbar.close()
 
     # consolidate metadata for the groups in the store

@@ -19,7 +19,7 @@ def _radar_boxes(azi, rng, mask, n_azi, n_rng, budget, tile=64):
     """Split an output chunk into blocks whose radar-coordinate bounding box holds at most budget cells.
 
     azi, rng are the reference radar coordinates of the chunk's pixels (cell k of the radar grid is centred on
-    coordinate k + 0.5), mask the pixels that need the phase. The extents are taken per tile x tile pixels once; a
+    coordinate k, the 0-based line and bin), mask the pixels that need the phase. The extents are taken per tile x tile pixels once; a
     block of tiles is halved along the output axis that makes its larger half's box smaller, until the box fits.
     Returns (y0, y1, x0, x1, a0, a1, r0, r1) per block: the output pixels and the radar cells for linear
     interpolation at them.
@@ -43,8 +43,8 @@ def _radar_boxes(azi, rng, mask, n_azi, n_rng, budget, tile=64):
         if not np.isfinite(amin):
             return None
         amax, rmin, rmax = a_hi[y0:y1, x0:x1].max(), r_lo[y0:y1, x0:x1].min(), r_hi[y0:y1, x0:x1].max()
-        return (max(0, int(np.floor(amin - 0.5))), min(n_azi, int(np.floor(amax - 0.5)) + 2),
-                max(0, int(np.floor(rmin - 0.5))), min(n_rng, int(np.floor(rmax - 0.5)) + 2))
+        return (int(np.floor(amin)), min(n_azi, int(np.floor(amax)) + 2),
+                int(np.floor(rmin)), min(n_rng, int(np.floor(rmax)) + 2))
 
     def cells(b):
         return 0 if b is None else (b[1] - b[0]) * (b[3] - b[2])
@@ -138,9 +138,9 @@ def _process_chunk_nisar(iy, ix, chunk_y, chunk_x, n_y, n_x,
                           row_slice=slice(azi_min, azi_max),
                           col_slice=slice(rng_min, rng_max))
 
-    # Local coordinates in the SLC chunk, the maps of cv2.remap: for NISAR the transform's azi/rng are the 0-based
+    # Local coordinates in the SLC chunk, the maps of cv2.remap: the transform's azi/rng are the 0-based
     # pixel-centre line and bin (zeroDopplerTime[i] and slantRange[j] are the centres of line i and bin j), the
-    # coordinates cv2.remap reads, so no S1-style 0.5 shift (float32 minus a whole line or bin: exact)
+    # coordinates cv2.remap reads, so no 0.5 shift, as S1 (float32 minus a whole line or bin: exact)
     azi_local = azi_chunk - azi_min
     rng_local = rng_chunk - rng_min
     del azi_chunk, rng_chunk
@@ -222,12 +222,13 @@ def _process_chunk_nisar(iy, ix, chunk_y, chunk_x, n_y, n_x,
             topo_scale = topo_root['topo'].attrs.get('scale_factor', 1.0)
             topo_fill = topo_root['topo'].attrs.get('_FillValue', 2147483647)
         else:
-            # No topo: the radar grid of compute_conversion_chunked(), cell k centred on coordinate k + 0.5
+            # No topo: the radar grid of compute_conversion_chunked(), cell k centred on coordinate k (the 0-based
+            # line and bin)
             from .utils_satellite import reference_surface_topo
             topo_store = topo_root = None
             topo_n_azi, topo_n_rng = radar_shape
-            grid_a = np.arange(topo_n_azi, dtype=np.float64) + 0.5
-            grid_r = np.arange(topo_n_rng, dtype=np.float64) + 0.5
+            grid_a = np.arange(topo_n_azi, dtype=np.float64)
+            grid_r = np.arange(topo_n_rng, dtype=np.float64)
 
         # Reconstruct PRM objects from dicts; the reference one with its orbit for the tide
         prm_rep = PRM()
@@ -419,14 +420,14 @@ def _transform_slc_int16_nisar_chunked(outdir, conversion_dir, prm_rep, prm_ref,
     topo_path = os.path.join(conversion_dir, 'topo')
     # the radar grid of compute_conversion_chunked(), for the reference surface of remove_topo_phase=False
     a_max, r_max = prm_ref.bounds()
-    radar_shape = (len(np.arange(0.5, a_max, 1, dtype=np.float32)), len(np.arange(0.5, r_max, 1, dtype=np.float32)))
-    # The tide of the repeat dates at fixed nodes of that whole radar grid (cell k centred on k + 0.5), once per date:
-    # every block of every chunk interpolates the same nodes
+    radar_shape = (len(np.arange(0, a_max, 1, dtype=np.float32)), len(np.arange(0, r_max, 1, dtype=np.float32)))
+    # The tide of the repeat dates at fixed nodes of that whole radar grid (cell k centred on k, the 0-based line and
+    # bin), once per date: every block of every chunk interpolates the same nodes
     tide_nodes = None
     if tidal_dt is not None and baseline_params is not None:
         from .utils_satellite import tidal_phase_nodes
-        tide_nodes = tidal_phase_nodes(prm_ref, tidal_dt, (np.arange(radar_shape[0], dtype=np.float64) + 0.5,
-                                                           np.arange(radar_shape[1], dtype=np.float64) + 0.5))
+        tide_nodes = tidal_phase_nodes(prm_ref, tidal_dt, (np.arange(radar_shape[0], dtype=np.float64),
+                                                           np.arange(radar_shape[1], dtype=np.float64)))
 
     # Set scale - NISAR L-band has small amplitudes, use 1e-04 like GMTSAR
     # to avoid quantization to zero (with scale=0.5, ~60% of pixels become zero)
@@ -516,21 +517,26 @@ def _transform_slc_int16_nisar_chunked(outdir, conversion_dir, prm_rep, prm_ref,
     # so to_dataframe() does not list it
     attrs['ref_height'] = float('nan') if remove_topo_phase else float(reference_height)
 
-    # Add baseline BPR (this is the cutoff point for to_dataframe)
+    # the GMTSAR baseline triples (length m, angle to the horizontal deg, at the reference scene start, centre and
+    # end) as SAT_baseline gives them, then BPR (this is the cutoff point for to_dataframe). The reference date's
+    # are 0, as its BPR: SAT_baseline of a date with itself is undefined (NaN lengths from the closest-approach fit)
+    triples = ('baseline_start', 'baseline_center', 'baseline_end', 'alpha_start', 'alpha_center', 'alpha_end')
     if prm_rep is prm_ref:
         BPR = 0.0
+        attrs.update(dict.fromkeys(triples, 0.0))
     else:
         baseline = prm_ref.SAT_baseline(prm_rep)
         BPR = baseline.get('B_perpendicular')
+        attrs.update({name: _convert_value(baseline.get(name) + 0) for name in triples})
     attrs['BPR'] = BPR + 0
 
     # === User-facing attributes AFTER BPR (for Stack.to_dataframe) ===
     # These appear in to_dataframe() output after reversal
 
-    # Add geometry from record
-    if 'geometry' in record_dict:
-        geom_val = record_dict['geometry']
-        attrs['geometry'] = geom_val.wkt if hasattr(geom_val, 'wkt') else str(geom_val)
+    # The exact radar extent polygon of the scene (the crop) from prm_ref, as S1 stores it; the catalogue record
+    # carries the whole frame
+    from .utils_satellite import radar_extent_polygon
+    attrs['geometry'] = radar_extent_polygon(prm_ref)
 
     # Add pathNumber (from track)
     if 'track' in attrs:

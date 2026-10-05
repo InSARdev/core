@@ -457,7 +457,8 @@ class PRM(datagrid, PRM_gmtsar):
         assert re.shape == (ydim, xdim), f'Originated re shape ({ydim},{xdim}), but got {re.shape}'
         assert im.shape == (ydim, xdim), f'Originated im width ({ydim},{xdim}), but got {im.shape}'
 
-        coords = {'a': np.arange(ydim) + 0.5, 'r': np.arange(xdim) + 0.5}
+        # the 0-based line and range sample of every pixel, the radar coordinates of both missions
+        coords = {'a': np.arange(ydim), 'r': np.arange(xdim)}
         re = xr.DataArray(re, coords=coords, dims=['a', 'r']).rename('re')
         im = xr.DataArray(im, coords=coords, dims=['a', 'r']).rename('im')
         return xr.merge([re, im])

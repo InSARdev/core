@@ -422,6 +422,10 @@ class Stack(BatchComplex):
     trend2d.__doc__ = BatchComplex.trend2d.__doc__
 
     def predict(self, model, baseline: 'str | None' = 'BPR', ref=None, vars=None) -> 'Batch':
+        # an insardev_polsar trend3d() FIELD is evaluated by its predict3d() at the stack's pixels and elevation,
+        # as stack.predict3d(field) does: `ele` is on the stack, BatchComplex(self) leaves it out
+        if BatchComplex._trend3d_field(model, list(model.keys())):
+            return BatchComplex.predict(self, model, baseline=baseline, ref=ref, vars=vars)
         # the data is BatchComplex(self); a trend2d() model's covariates come from stack.transform()
         data = BatchComplex(self)
         if vars is None and all('trend2d_vars' in model[k].attrs for k in model):
@@ -2106,7 +2110,7 @@ DEFOMAX_CYCLE  {defomax}
         # Get unique orbit/path combinations and assign colors
         unique_orbit_paths = sorted(df['orbit_path'].unique())
         n = len(unique_orbit_paths)
-        colormap = matplotlib.cm.get_cmap(cmap, n)
+        colormap = matplotlib.colormaps.get_cmap(cmap).resampled(n)
         color_map = {op: colormap(i) for i, op in enumerate(unique_orbit_paths)}
 
         if ax is None:
@@ -2343,12 +2347,17 @@ DEFOMAX_CYCLE  {defomax}
         return Batch(out)
 
     def incidence(self) -> Batch:
-        """Compute incidence angle for each burst via linear polynomial fit."""
+        """Incidence angle (radians) of each burst's grid, from the stack's per-date numbers and the crop polygon,
+        no raster read (see Batch.incidence())."""
         return self.transform().incidence()
 
     def _elevation_phase_approximate(self) -> dict:
         """`{burst_id: value}` at the burst centre. See Batch."""
         return Batch._elevation_phase_approximate(self)
+
+    def _incidence_approximate(self) -> dict:
+        """`{burst_id: incidence (radians)}` at the burst centre. See Batch."""
+        return Batch._incidence_approximate(self)
 
     def median(self, window):
         """A box MEDIAN filter over the grid, the robust twin of gaussian().
@@ -2474,6 +2483,12 @@ DEFOMAX_CYCLE  {defomax}
         pipelines (phasediff, unwrap, etc.). Use stack.adi() after
         optimize2().compute() to get ADI values.
         """
+        # Import implementation from insardev_polsar
+        try:
+            from insardev_polsar.adi2 import optimize2 as _optimize2_impl
+        except ImportError:
+            raise ImportError("optimize2() requires insardev_polsar extension")
+
         # Detect polarizations
         sample_ds = next(iter(self.values()))
         if 'VV' in sample_ds.data_vars and 'VH' in sample_ds.data_vars:
@@ -2482,12 +2497,6 @@ DEFOMAX_CYCLE  {defomax}
             pols = ['HH', 'HV']
         else:
             raise ValueError("Dual-pol data required (VV+VH or HH+HV)")
-
-        # Import implementation from insardev_polsar
-        try:
-            from insardev_polsar.adi2 import optimize2 as _optimize2_impl
-        except ImportError:
-            raise ImportError("optimize2() requires insardev_polsar extension. Install it first.")
 
         # Get dual-pol subset as BatchComplex
         batch_complex = self[pols]
@@ -2540,6 +2549,9 @@ DEFOMAX_CYCLE  {defomax}
         >>> adi = stack.adi2()
         >>> ps_mask = adi[['VV']] < 0.4
         """
+        # a placeholder until insardev_polsar adds BatchComplex.adi2()
+        if not hasattr(BatchComplex, 'adi2'):
+            raise ImportError("adi2() requires insardev_polsar extension")
         sample_ds = next(iter(self.values()))
         if 'VV' in sample_ds.data_vars and 'VH' in sample_ds.data_vars:
             pols = ['VV', 'VH']
@@ -2583,57 +2595,6 @@ DEFOMAX_CYCLE  {defomax}
         # Get as BatchComplex and call adi()
         batch_complex = self[complex_vars]
         return batch_complex.adi(device)
-
-    def neighbors(
-        self,
-        window: 'float | tuple' = 40,
-        neighbors: tuple | None = None,
-        valid_threshold: float = 0.5,
-        device: str = 'auto'
-    ) -> Batch:
-        """
-        Count valid neighbors per pixel within a spatial window.
-
-        NOTE: Requires insardev_polsar extension.
-
-        Wrapper that calls BatchComplex.neighbors() on complex variables.
-        Useful for estimating pixel density before running similarity().
-
-        Parameters
-        ----------
-        window : float or tuple of float
-            Window size in METRES on the ground, one number for a square
-            or (y, x). Rounded up to an odd number of pixels per axis.
-        neighbors : tuple of int or None
-            If provided, filter output: (min, max)
-            - Pixels with count < min: set to NaN
-            - Pixels with count > max: clipped to max
-        valid_threshold : float
-            Minimum fraction of dates with valid data.
-        device : str
-            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'
-
-        Returns
-        -------
-        Batch
-            Valid neighbor count per pixel
-
-        Examples
-        --------
-        >>> counts = stack.neighbors(window=120)
-        >>> dense_mask = counts >= 10
-        """
-        # Get complex variables
-        sample_ds = next(iter(self.values()))
-        complex_vars = [v for v in sample_ds.data_vars
-                        if sample_ds[v].dtype.kind == 'c' and 'date' in sample_ds[v].dims]
-
-        if not complex_vars:
-            raise ValueError("No complex time-series data found")
-
-        # Get as BatchComplex and call neighbors()
-        batch_complex = self[complex_vars]
-        return batch_complex.neighbors(window, neighbors, valid_threshold, device)
 
     def to_vtk(self, path: str, data: BatchCore | dict | None = None,
                transform: Batch | None = None, overlay: "xr.DataArray" | None = None, mask: bool = True):
@@ -3897,9 +3858,11 @@ DEFOMAX_CYCLE  {defomax}
             'radar_wavelength', 'near_range',
             'SC_height_start', 'SC_height_end', 'earth_radius',
             'rng_samp_rate', 'num_lines',
-            'num_rng_bins',  # insardev_ecef: bilinear interpolation of incidence/elevation corners
+            'num_rng_bins',  # the far edge of the crop polygon: elevation(), incidence() rebuild the track from it
             # Baseline
             'BPR', 'BPT', 'B_perpendicular', 'B_parallel',
+            # the GMTSAR baseline triples per date (m, deg), pairs() gives the pair's by vector difference
+            'baseline_start', 'baseline_center', 'baseline_end', 'alpha_start', 'alpha_center', 'alpha_end',
             # Reference height for elevation computation
             'ref_height',
         }
@@ -4569,7 +4532,10 @@ DEFOMAX_CYCLE  {defomax}
         -------
         Batches
             Batches containing [BatchComplex(ref), BatchComplex(rep)]
-            with 'pair' dimension and ref/rep date coordinates.
+            with 'pair' dimension and ref/rep date coordinates. The pair
+            coordinates BPR (rep - ref) and, when the store has them, the
+            baseline triples baseline_start/center/end (m) and
+            alpha_start/center/end (deg): the baseline vector rep - ref.
 
         Examples
         --------
@@ -4626,6 +4592,26 @@ DEFOMAX_CYCLE  {defomax}
         # these DataArrays, as they are (N81): assign_coords() takes it directly.
         bpr = Batch({k: data2[k]['BPR'] - data1[k]['BPR'] for k in data1.keys()})
 
+        # THE GMTSAR BASELINE TRIPLES the same way, rep - ref, as VECTORS: each date's baseline (length m, angle to
+        # the horizontal deg, at the reference scene start, centre and end) to its horizontal and vertical
+        # components, the difference, back to length and angle -- the baseline between the two dates. Not the
+        # difference of the lengths or of the angles. A store without them (made before them) gets none
+        triples = {}
+        for k in data1.keys():
+            if not all(f'{p}_{n}' in data1[k].data_vars for p in ('baseline', 'alpha')
+                       for n in ('start', 'center', 'end')):
+                continue
+            vec = {}
+            for n in ('start', 'center', 'end'):
+                hv = []
+                for d in (data1[k], data2[k]):
+                    b = np.asarray(d[f'baseline_{n}'].values, dtype=np.float64)
+                    a = np.radians(np.asarray(d[f'alpha_{n}'].values, dtype=np.float64))
+                    hv.append((b * np.cos(a), b * np.sin(a)))
+                vec[n] = (hv[1][0] - hv[0][0], hv[1][1] - hv[0][1])
+            triples[k] = {f'baseline_{n}': ('pair', np.hypot(*vec[n])) for n in vec}
+            triples[k].update({f'alpha_{n}': ('pair', np.degrees(np.arctan2(vec[n][1], vec[n][0]))) for n in vec})
+
         # EACH BURST ITS OWN ref/rep (N121): a burst's dates are its own startTimes, seconds apart
         # between bursts. The first burst's for every burst broke each per-burst match of pairs to
         # dates (rmse() of a per-date solution raised KeyError on multi-burst stores)
@@ -4640,7 +4626,8 @@ DEFOMAX_CYCLE  {defomax}
                 if 'startTime' in ds.data_vars:
                     earlier = xr.DataArray(ref_values[k] <= rep_values[k], dims='pair')
                     ds = ds.assign(startTime=xr.where(earlier, data1[k]['startTime'], data2[k]['startTime']))
-                out[k] = ds.assign_coords(ref=('pair', ref_values[k]), rep=('pair', rep_values[k]))
+                out[k] = ds.assign_coords(ref=('pair', ref_values[k]), rep=('pair', rep_values[k]),
+                                          **triples.get(k, {}))
             # BPR per burst from its Batch, as before
             return type(batch)(out).assign_coords(BPR=('pair', bpr))
 
@@ -4650,7 +4637,11 @@ DEFOMAX_CYCLE  {defomax}
         return Batches([ref_batch, rep_batch])
 
     def elevation(self, phase: Batch | float | list | "np.ndarray", baseline: float | None = None, transform: Batch | None = None) -> "Batch | float | np.ndarray":
-        """Compute elevation (meters) from unwrapped phase grids in radar coordinates.
+        """Compute elevation (meters) from unwrapped phase grids, or the height of a scalar phase.
+
+        Grids: stack.elevation(phase) is phase.elevation(stack) -- the stack gives each date's
+        baseline triple, the reference date's numbers, the crop polygon, the CRS and the `ele`
+        actual_range attribute, and no raster is read (see Batch.elevation()).
 
         Parameters
         ----------
@@ -4658,10 +4649,10 @@ DEFOMAX_CYCLE  {defomax}
             Unwrapped phase grids (e.g., output of unwrap2d()), or a scalar/array
             of phase values for quick height-per-fringe calculations.
         baseline : float | None, optional
-            Perpendicular baseline in meters. Required when phase is scalar/array.
-            If ``None`` and phase is Batch, use the burst-specific ``BPR``.
+            Perpendicular baseline in meters, for a scalar/array phase only (required there):
+            the height of ambiguity is stack.elevation(2*np.pi, baseline).
         transform : Batch | None, optional
-            Transform batch containing look vectors; its `.incidence()` is used.
+            For a scalar/array phase only: the transform whose burst-centre geometry converts it.
             If ``None``, defaults to ``self.transform()``.
 
         Returns
@@ -4723,65 +4714,14 @@ DEFOMAX_CYCLE  {defomax}
                 return round(float(elev), 3)
             return np.round(elev, 3)
 
-        # Default to self.transform() when called on Stack and transform not provided
-        if transform is None:
-            transform = self.transform()
-        ep_batch = transform.elevation_phase()
-        from .Batch import _ref_heights
-        ref_heights = _ref_heights({k: transform[k] for k in phase.keys() if k in ep_batch}, 'Stack.elevation()')
-        out: dict[str, xr.Dataset] = {}
-
-        for key, phase_ds in phase.items():
-            if key not in ep_batch:
-                raise KeyError(f'Missing geometry for key: {key}')
-
-            tfm = transform[key]
-
-            def _scalar_from_ds(ds, name: str):
-                if name in ds:
-                    var = ds[name]
-                    if var.ndim == 0:
-                        return float(var.item())
-                    # For per-date variables, return mean value
-                    return float(var.mean().item())
-                return ds.attrs.get(name)
-
-            wavelength = _scalar_from_ds(tfm, 'radar_wavelength')
-            if wavelength is None:
-                raise KeyError(f"Missing radar_wavelength in transform for burst {key}")
-
-            # Get BPR - either scalar or per-pair DataArray for broadcasting
-            if baseline is not None:
-                bpr = float(baseline)
-            elif 'BPR' in phase_ds.coords:
-                # Use BPR as DataArray to broadcast correctly across pairs
-                bpr = phase_ds.coords['BPR']
-            else:
-                raise KeyError(f"Missing baseline (BPR) for burst {key}")
-
-            fac_da = ep_batch[key]['elevation_phase']
-
-            ref_height = ref_heights[key]
-
-            elev_vars: dict[str, xr.DataArray] = {}
-            for var_name, data in phase_ds.data_vars.items():
-                fac_da_i = fac_da.reindex_like(data, method='nearest')
-                # the geometry is bent to the data's chunks, never the other way round
-                if data.chunks is not None and fac_da_i.chunks is not None:
-                    _ch = tuple(data.chunks[-2:][('y', 'x').index(a)] for a in fac_da_i.dims)
-                    if fac_da_i.chunks != _ch:
-                        fac_da_i = fac_da_i.chunk(dict(zip(fac_da_i.dims, _ch)))
-
-                # ONE geometry, from elevation_phase(). This inlined
-                # SC_height * cos(incidence): the satellite height where the
-                # slant range belongs and the cosine where the sine belongs.
-                # phi = fac * B_perp * dh  ->  dh = phi / (fac * B_perp)
-                elev = ref_height - data / (fac_da_i * bpr)
-                elev_vars[var_name] = elev.astype('float32')
-
-            out[key] = xr.Dataset(elev_vars, coords=phase_ds.coords, attrs=phase_ds.attrs)
-
-        return Batch(out)
+        # GRIDS TAKE THE STACK ITSELF: their baselines are the triples, their geometry the stack's numbers
+        if baseline is not None or transform is not None:
+            raise ValueError('ERROR: elevation() of grids takes no baseline or transform: the stack gives them. '
+                             'Use stack.elevation(phase).')
+        # ONE conversion, Batch.elevation(): the grids are converted and every other variable (the burst names
+        # the unwrapped phase carries) passes through (N81); a Batch of DataArrays is converted directly. This
+        # loop used to be a copy without the grid filter, and raised TypeError on the burst names.
+        return Batch.elevation(phase, self)
 
     def displacement_los(self, phase: Batch, transform: Batch = None) -> Batch:
         """Compute line-of-sight displacement (meters) from unwrapped phase.
@@ -4790,70 +4730,38 @@ DEFOMAX_CYCLE  {defomax}
         mission wavelength and needs no radar geometry, so the implementation
         lives on Batch and Stack only supplies the default transform.
         """
+        self._unwrapped_phase(phase, 'displacement_los')
+        # Batch.displacement_los() has no None default: resolve it here.
+        if transform is None:
+            transform = self.transform()
+        return phase.displacement_los(transform)
+
+    @staticmethod
+    def _unwrapped_phase(phase, what):
+        """The phase the displacement conversions take: unwrapped, a Batch."""
         if isinstance(phase, BatchWrap):
             raise TypeError(
-                'displacement_los() requires unwrapped phase (Batch), got BatchWrap. '
+                f'{what}() requires unwrapped phase (Batch), got BatchWrap. '
                 'Use unwrap3d() or unwrap2d() first to unwrap the phase.'
             )
         if not isinstance(phase, Batch):
             raise TypeError(
                 f'phase must be Batch (unwrapped phase), got {type(phase).__name__}.'
             )
-        # Batch.displacement_los() has no None default: resolve it here.
-        if transform is None:
-            transform = self.transform()
-        return phase.displacement_los(transform)
 
     def _displacement_component(self, phase: Batch, transform: Batch = None, func=None, suffix: str = '') -> Batch:
-        """Internal helper to scale LOS displacement by an incidence-based function (e.g., cos/sin)."""
-        import xarray as xr
-        import numpy as np
+        """Internal helper to scale LOS displacement by an incidence-based function (e.g., cos/sin).
 
-        # Default to self.transform() when not provided, decimated to match phase resolution
-        tfm_is_default = transform is None
+        Delegates like displacement_los(): ONE conversion, Batch._displacement_component(), which converts the
+        grids, passes every other variable through (N81) and takes a Batch of DataArrays directly, so
+        stack.displacement_vertical(phase) is phase.displacement_vertical(stack). This used to be a copy without
+        the grid filter, and raised TypeError on the burst names an unwrapped phase carries."""
+        self._unwrapped_phase(phase, 'displacement_los')
+        # the stack itself is the geometry source when no transform is given; the Batch method computes the
+        # incidence on the phase's own grid, reading no raster
         if transform is None:
-            transform = self.transform()
-
-        # Decimate default transform to match input phase resolution for efficiency
-        if tfm_is_default and transform is not None:
-            transform = Batch({k: transform[k].reindex(y=phase[k].y, x=phase[k].x, method='nearest')
-                               for k in phase.keys() if k in transform})
-
-        los_batch = self.displacement_los(phase, transform)
-        incidence_batch = transform.incidence()
-
-        out: dict[str, xr.Dataset] = {}
-
-        for key, los_ds in los_batch.items():
-            if key not in incidence_batch:
-                raise KeyError(f'Missing incidence for key: {key}')
-
-            inc_da = incidence_batch[key]['incidence']
-            comp_vars: dict[str, xr.DataArray] = {}
-
-            for var_name, data in los_ds.data_vars.items():
-                # align incidence to data grid
-                incidence = inc_da.reindex_like(data, method='nearest')
-                # the geometry is bent to the data's chunks, never the other way round
-                if data.chunks is not None and incidence.chunks is not None:
-                    _ch = tuple(data.chunks[-2:][('y', 'x').index(a)] for a in incidence.dims)
-                    if incidence.chunks != _ch:
-                        incidence = incidence.chunk(dict(zip(incidence.dims, _ch)))
-
-                comp = (data / func(incidence)).astype('float32')
-
-                if len(los_ds.data_vars) == 1:
-                    name = suffix
-                elif var_name.endswith('_los'):
-                    name = var_name[:-4] + f'_{suffix}'
-                else:
-                    name = f'{var_name}_{suffix}'
-
-                comp_vars[name] = comp
-
-            out[key] = xr.Dataset(comp_vars, coords=los_ds.coords, attrs=los_ds.attrs)
-
-        return Batch(out)
+            transform = self
+        return phase._displacement_component(transform, func=func, suffix=suffix)
 
     def displacement_vertical(self, phase: Batch, transform: Batch = None) -> Batch:
         """Compute vertical displacement (meters) from unwrapped phase and incidence."""
