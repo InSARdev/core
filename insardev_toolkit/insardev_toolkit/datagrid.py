@@ -130,6 +130,110 @@ class datagrid:
         return da_spatial.assign_attrs(coordinates='spatial_ref')
 
     @staticmethod
+    def reproject(da, crs, resampling='nearest', chunks=2048):
+        """
+        Reproject a 2D grid to the CRS crs lazily, on the grid of rio.reproject(crs): as rio.reproject() but block by
+        block, where rio.reproject() reads the whole grid and warps it in memory.
+
+        One dask task per output block warps the input blocks under it (the block's bounds in the input CRS, densified,
+        and one input pixel more), assembled, with rasterio.warp.reproject(), as odc-geo's dask reprojection does. The
+        warp is GDAL's, with its approximate transformer of 0.125 pixel, so a few pixels near the input pixel edges
+        can take the neighbour rio.reproject() takes on its own split of the grid. The result is lazy: every compute
+        that uses it warps its blocks again, and .compute() keeps the grid in memory.
+
+        Parameters
+        ----------
+        da : xarray.DataArray
+            2D grid with a CRS (rio.crs), dask-backed: its blocks are the inputs of the output blocks.
+        crs : int, str or CRS
+            Output CRS.
+        resampling : str, optional
+            rasterio.enums.Resampling name. Default 'nearest'.
+        chunks : int, optional
+            Output block size on both axes. Default 2048.
+
+        Returns
+        -------
+        xarray.DataArray
+            The lazy (y, x) grid with its CRS and nodata, NaN (0 for an integer grid) without an input nodata.
+
+        Examples
+        --------
+        land = Tiles().reproject(Tiles().open('land.vrt'), stack.crs)
+        """
+        import numpy as np
+        import dask.array as dask_array
+        import xarray as xr
+        import rioxarray
+        import rasterio.warp
+        from uuid import uuid4
+        from affine import Affine
+        from dask.highlevelgraph import HighLevelGraph
+        from rasterio.enums import Resampling
+
+        if not hasattr(da.data, 'dask'):
+            da = da.chunk(chunks)
+        src_crs = da.rio.crs
+        src_transform = da.rio.transform()
+        ny, nx = da.shape
+        # THE DTYPE, NOT THE GRID, in the task function below: `da` in its closure was pickled with every task, a
+        # grid in memory included (1.9 MB of source gave a 1.9 MB function)
+        dtype = da.dtype
+        nodata = da.rio.nodata
+        if nodata is None:
+            nodata = np.nan if np.issubdtype(dtype, np.floating) else 0
+        # the grid of rio.reproject(crs)
+        dst_transform, width, height = rasterio.warp.calculate_default_transform(src_crs, crs, nx, ny, *da.rio.bounds())
+        method = getattr(Resampling, resampling)
+        data = da.data
+        ychunks, xchunks = data.chunks
+        yedges, xedges = np.cumsum((0,) + ychunks), np.cumsum((0,) + xchunks)
+        out_y = tuple(min(chunks, height - i) for i in range(0, height, chunks))
+        out_x = tuple(min(chunks, width - i) for i in range(0, width, chunks))
+        name = f'reproject-{uuid4().hex}'
+        keys = data.__dask_keys__()
+
+        def warp(window, block_transform, shape, *blocks):
+            (r0, r1), (c0, c1), rows, cols = window
+            grid = np.block([[blocks[i * len(cols) + j] for j in range(len(cols))] for i in range(len(rows))])
+            # the assembled input blocks start at the first block's row and column
+            source = grid[r0 - yedges[rows[0]]:r1 - yedges[rows[0]], c0 - xedges[cols[0]]:c1 - xedges[cols[0]]]
+            out = np.full(shape, nodata, dtype=dtype)
+            rasterio.warp.reproject(np.ascontiguousarray(source), out, src_transform=src_transform * Affine.translation(c0, r0),
+                                    src_crs=src_crs, dst_transform=block_transform, dst_crs=crs, resampling=method,
+                                    src_nodata=nodata, dst_nodata=nodata)
+            return out
+
+        dsk = {}
+        inverse = ~src_transform
+        for i, (y0, by) in enumerate(zip(np.cumsum((0,) + out_y[:-1]), out_y)):
+            for j, (x0, bx) in enumerate(zip(np.cumsum((0,) + out_x[:-1]), out_x)):
+                block_transform = dst_transform * Affine.translation(x0, y0)
+                left, top = block_transform * (0, 0)
+                right, bottom = block_transform * (bx, by)
+                # the block's bounds in the input CRS, densified along its edges, one input pixel wider
+                w, s, e, n = rasterio.warp.transform_bounds(crs, src_crs, min(left, right), min(bottom, top),
+                                                            max(left, right), max(bottom, top), densify_pts=21)
+                cols_f, rows_f = zip(*(inverse * (x, y) for x, y in ((w, n), (e, n), (w, s), (e, s))))
+                r0, r1 = max(0, int(np.floor(min(rows_f))) - 1), min(ny, int(np.ceil(max(rows_f))) + 1)
+                c0, c1 = max(0, int(np.floor(min(cols_f))) - 1), min(nx, int(np.ceil(max(cols_f))) + 1)
+                if r1 <= r0 or c1 <= c0:
+                    # no input under the block
+                    dsk[(name, i, j)] = (np.full, (by, bx), nodata, dtype)
+                    continue
+                rows = [k for k in range(len(ychunks)) if yedges[k] < r1 and yedges[k + 1] > r0]
+                cols = [k for k in range(len(xchunks)) if xedges[k] < c1 and xedges[k + 1] > c0]
+                deps = [keys[r][c] for r in rows for c in cols]
+                dsk[(name, i, j)] = (warp, ((r0, r1), (c0, c1), rows, cols), block_transform, (by, bx), *deps)
+        graph = HighLevelGraph.from_collections(name, dsk, dependencies=(data,))
+        out = dask_array.Array(graph, name, chunks=(out_y, out_x), dtype=dtype)
+        # the pixel centres of the output grid
+        xs = (dst_transform * (np.arange(width) + 0.5, np.full(width, 0.5)))[0]
+        ys = (dst_transform * (np.full(height, 0.5), np.arange(height) + 0.5))[1]
+        result = xr.DataArray(out, coords={'y': ys, 'x': xs}, dims=('y', 'x'), name=da.name, attrs=da.attrs)
+        return result.rio.write_crs(crs).rio.write_nodata(nodata)
+
+    @staticmethod
     def get_bounds(geometry, epsg=4326):
         import geopandas as gpd
         import xarray as xr

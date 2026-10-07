@@ -11,6 +11,7 @@ from .S1_align import S1_align
 from .utils_satellite import remap_radar_to_geo
 from insardev_toolkit.utils_S1 import measurement_path
 from insardev_toolkit.utils_files import exists
+from insardev_toolkit.utils_pool import release_workers
 
 
 def _process_date_worker(args):
@@ -462,10 +463,13 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
     data_proj = data_proj.drop_vars(['x', 'y'])
 
     _t0 = time.perf_counter()
+    from insardev_toolkit.utils_chunks import zarr_chunk_shape
     shape = data_proj.re.shape
     # the Zarr array's own fill_value is the _FillValue attribute (as the NISAR SLC), so GDAL and zarr readers do not
     # take 0, a valid value, for the fill
-    encoding = {var: {'chunks': shape, 'fill_value': int(np.iinfo(np.int16).max)} for var in ['re', 'im']}
+    # the chunks of zarr_chunk_shape(), as insardev_ecef writes them: a burst as one chunk made every reader take
+    # the whole burst for any part of it
+    encoding = {var: {'chunks': zarr_chunk_shape(shape), 'fill_value': int(np.iinfo(np.int16).max)} for var in ['re', 'im']}
     data_proj.to_zarr(
         store=os.path.join(outdir, burst_name),
         mode='w',
@@ -541,7 +545,7 @@ class S1_transform(S1_align):
             geocoding and alignment (satellite_llt2rat) workers, which share it inside a burst or date worker
             (each of W concurrent workers takes n_jobs // W, at least 1). None or -1 (default): all cores.
         scheduler : str, optional
-            The parallel scheduler to use: 'loky' (default, multiprocessing), 'threads' (threading),
+            The parallel scheduler to use: 'loky' (default, multiprocessing), 'threading',
             or 'sequential' (no parallelism, lowest memory usage). Default is None which uses 'loky'.
         debug : bool, optional
             Whether to print debug information.
@@ -869,7 +873,7 @@ class S1_transform(S1_align):
         if n_jobs == 1 and scheduler is None:
             scheduler = 'sequential'
             print(f'NOTE: n_jobs=1, auto-selecting scheduler="sequential" for lowest memory usage.')
-            print(f'      Use scheduler="loky" or "threads" to override if needed.')
+            print(f'      Use scheduler="loky" or "threading" to override if needed.')
 
         n_bursts = len(refreps)
         # n_dates is total dates, n_rep_dates is repeat dates only (excluding reference)
@@ -880,7 +884,7 @@ class S1_transform(S1_align):
         if debug and scheduler is None:
             scheduler = 'sequential'
 
-        # Determine scheduler: 'sequential', 'threads', or 'loky' (default)
+        # Determine scheduler: 'sequential', 'threading', or 'loky' (default)
         if n_bursts >= n_rep_dates or scheduler == 'sequential':
             # More bursts than repeat dates: parallelize across bursts
             # e.g., 1000 bursts × 2 dates → burst-parallel
@@ -901,6 +905,8 @@ class S1_transform(S1_align):
 
         # Consolidate zarr metadata for the target directory
         self.consolidate_metadata(target)
+        # the idle joblib workers keep their memory: stop them, the next parallel step starts its own
+        release_workers()
 
     def transform_slc_int16(self,
                             outdir: str,

@@ -115,6 +115,25 @@ def _zarr_block(layout, *parts):
     block = cut[0][0] if ny == 1 and nx == 1 else np.block(cut)
     return block[np.newaxis] if lead else block
 
+def _nearest_indices(source_coords, target_coords):
+    """Find indices in source_coords nearest to target_coords."""
+    # Handle descending coordinates (e.g., y going north to south)
+    descending = len(source_coords) > 1 and source_coords[0] > source_coords[-1]
+    if descending:
+        source_coords = source_coords[::-1]
+    indices = np.searchsorted(source_coords, target_coords)
+    indices = np.clip(indices, 0, len(source_coords) - 1)
+    # Check if previous index is closer
+    prev_indices = np.clip(indices - 1, 0, len(source_coords) - 1)
+    prev_diff = np.abs(source_coords[prev_indices] - target_coords)
+    curr_diff = np.abs(source_coords[indices] - target_coords)
+    indices = np.where(prev_diff < curr_diff, prev_indices, indices)
+    # Convert back to original order if descending
+    if descending:
+        indices = len(source_coords) - 1 - indices
+    return indices
+
+
 @_numba.njit(nogil=True, cache=True, inline='always')
 def _median_select(buf, k, n):
     """The k-th smallest of buf[:n], in place. Quickselect, no allocation."""
@@ -1880,14 +1899,22 @@ DEFOMAX_CYCLE  {defomax}
 
     @staticmethod
     @serialize_gpu
-    def _psfunction_torch(amplitudes, device='auto', debug=False):
+    def _psfunction_stream(chunks, device='auto', debug=False):
         """
-        Compute PS function using PyTorch for GPU acceleration.
+        Compute the PS function of a spatial block from its per-date SLC chunks, streaming the dates as the ADI
+        kernel does. The task holds the block's SLC chunks (its input) but no concatenated or derived copy of all
+        dates: only per-date and per-tile temporaries.
+
+        The first pass computes the mean intensity of every date over the block, to normalize every date to the mean
+        of all dates. The second pass accumulates the normalized intensity per spatial tile with Welford's running
+        mean and variance:
+
+            psfunction = mean_intensity / (2 * std_intensity)
 
         Parameters
         ----------
-        amplitudes : np.ndarray
-            3D array of shape (n_dates, height, width) containing amplitude values.
+        chunks : list of np.ndarray
+            Complex SLC chunks of the block, each of shape (height, width, n) with the dates on the last axis.
         device : str
             Device to use ('auto', 'mps', 'cuda', 'cpu').
         debug : bool
@@ -1898,59 +1925,58 @@ DEFOMAX_CYCLE  {defomax}
         np.ndarray
             2D array of shape (height, width) containing PS function values.
         """
+        import math
         import torch
         import numpy as np
+        from .utils_dask import get_dask_chunk_size_mb
 
         # Select device using shared helper
         dev = Stack._get_torch_device(device)
 
         if debug:
-            print(f'DEBUG: _psfunction_torch using device={dev}')
+            print(f'DEBUG: _psfunction_stream using device={dev}')
 
-        n_dates, height, width = amplitudes.shape
+        height, width = chunks[0].shape[:2]
+        dates = [(chunk, t) for chunk in chunks for t in range(chunk.shape[-1])]
 
-        # Convert to intensity (|z|^2) and move to device
-        intensity = torch.from_numpy(amplitudes.astype(np.float32) ** 2).to(dev)
-
-        # Compute mean intensity per date for normalization
-        # Shape: (n_dates,)
-        mean_intensity_per_date = intensity.nanmean(dim=(1, 2))
-
-        # Global mean across all dates
-        global_mean = mean_intensity_per_date.nanmean()
-
+        # First pass: mean intensity (|z|^2) of every date over the block
+        date_means = np.full(len(dates), np.nan, dtype=np.float32)
+        for i, (chunk, t) in enumerate(dates):
+            intensity = np.abs(chunk[..., t]).astype(np.float32) ** 2
+            if np.isfinite(intensity).any():
+                date_means[i] = np.nanmean(intensity)
         # Normalize each date: intensity * (global_mean / date_mean)
-        # Reshape for broadcasting: (n_dates, 1, 1)
-        norm_factor = global_mean / mean_intensity_per_date
-        norm_factor = norm_factor.view(n_dates, 1, 1)
-        intensity_norm = intensity * norm_factor
+        global_mean = np.nanmean(date_means) if np.isfinite(date_means).any() else np.nan
+        norm_factors = global_mean / date_means
 
-        # Compute mean and std across date dimension
-        # Use masked operations to handle NaN
-        mean_amp = intensity_norm.nanmean(dim=0)  # (height, width)
+        # Second pass per tile; a tile holds about 6 float32 arrays within half of the Dask chunk size
+        tile_side = int(math.sqrt(max(256, get_dask_chunk_size_mb() * 1024 * 1024 // 2 // (6 * 4))))
+        tile_h, tile_w = min(tile_side, height), min(tile_side, width)
 
-        # PyTorch nanstd - compute manually since not built-in
-        # std = sqrt(E[(x - mean)^2])
-        diff = intensity_norm - mean_amp.unsqueeze(0)
-        # Count non-NaN values
-        valid_mask = ~torch.isnan(intensity_norm)
-        n_valid = valid_mask.sum(dim=0).float()
-        n_valid = torch.clamp(n_valid, min=1)  # Avoid division by zero
-
-        # Variance with Bessel's correction (n-1)
-        variance = torch.where(
-            valid_mask, diff ** 2, torch.tensor(0.0, device=dev)
-        ).sum(dim=0) / (n_valid - 1).clamp(min=1)
-        std_amp = torch.sqrt(variance)
-
-        # PS function: mean / (2 * std)
-        psf = mean_amp / (2 * std_amp)
-
-        # Handle invalid values (inf, nan)
-        psf = torch.where(torch.isfinite(psf), psf, torch.tensor(float('nan'), device=dev))
-
-        # Move back to CPU and convert to numpy
-        result = psf.cpu().numpy()
+        result = np.full((height, width), np.nan, dtype=np.float32)
+        for y0 in range(0, height, tile_h):
+            for x0 in range(0, width, tile_w):
+                y1, x1 = min(y0 + tile_h, height), min(x0 + tile_w, width)
+                count = torch.zeros((y1 - y0, x1 - x0), device=dev)
+                mean = torch.zeros_like(count)
+                m2 = torch.zeros_like(count)
+                for (chunk, t), factor in zip(dates, norm_factors):
+                    if not np.isfinite(factor):
+                        continue
+                    intensity = (np.abs(chunk[y0:y1, x0:x1, t]).astype(np.float32) ** 2) * factor
+                    value = torch.from_numpy(np.ascontiguousarray(intensity)).to(dev)
+                    valid = torch.isfinite(value)
+                    count += valid.to(count.dtype)
+                    delta = torch.where(valid, value - mean, 0.0)
+                    mean += delta / count.clamp(min=1)
+                    m2 += torch.where(valid, delta * (value - mean), 0.0)
+                # Variance with Bessel's correction (n-1)
+                std = torch.sqrt(m2 / (count - 1).clamp(min=1))
+                # PS function: mean / (2 * std), invalid values (inf, nan) as nan
+                psf = torch.where(count > 0, mean, float('nan')) / (2 * std)
+                psf = torch.where(torch.isfinite(psf), psf, float('nan'))
+                result[y0:y1, x0:x1] = psf.cpu().numpy()
+                del count, mean, m2, std, psf
 
         # Cleanup GPU memory
         if dev.type == 'mps':
@@ -1970,6 +1996,9 @@ DEFOMAX_CYCLE  {defomax}
             psfunction = mean_intensity / (2 * std_intensity)
 
         Higher values indicate more stable scatterers (consistent backscatter).
+
+        The result depends on the processing chunk size, because each chunk is the spatial context of the
+        PS detection; tune it with load().chunk2d(...).
 
         Parameters
         ----------
@@ -2019,6 +2048,9 @@ DEFOMAX_CYCLE  {defomax}
         if debug:
             print(f"DEBUG: psfunction using device={device}, allow_rechunk={allow_rechunk}, dask.config['array.chunk-size']={dask_chunk_mb} MB")
 
+        print('NOTE: psfunction() takes each processing chunk as its spatial context: tune the chunk size with load().chunk2d(...).',
+              flush=True)
+
         results = {}
         note_printed = False  # Only print NOTE once for first burst
         for key, ds in self.items():
@@ -2038,39 +2070,24 @@ DEFOMAX_CYCLE  {defomax}
             if debug:
                 print(f'DEBUG: psfunction for {key}: shape={slc_data.shape}, chunks={slc_data.chunks}')
 
-            # Merge dates dim, keep input spatial chunks as-is.
-            slc_data = slc_data.chunk({'date': -1})
+            # Stream the date chunks of every spatial block, as adi() does: the dates are not merged into one chunk
+            def make_blockwise(dev, dbg):
+                def psf_block(chunks):
+                    return Stack._psfunction_stream(chunks, device=dev, debug=dbg)
 
-            # Create wrapper that captures device and debug
-            def make_wrapper(dev, dbg):
-                def process_wrapper(slc_chunk):
-                    """Process spatial chunk: (chunk_y, chunk_x, n_dates) -> (chunk_y, chunk_x)
+                def psf_blockwise(slc):
+                    # input_core_dims=[['date']] moves date to the last axis
+                    return dask.array.blockwise(psf_block, 'yx', slc, 'yxd', concatenate=False,
+                                                dtype=np.float32, meta=np.empty((0, 0), dtype=np.float32))
+                return psf_blockwise
 
-                    Note: input_core_dims=[['date']] moves date to last axis.
-                    """
-                    # Transpose to (n_dates, chunk_y, chunk_x) for _psfunction_torch
-                    slc_transposed = np.moveaxis(slc_chunk, -1, 0)
-                    # Compute amplitude |z|
-                    amplitudes = np.abs(slc_transposed)
-                    # Compute PS function using PyTorch
-                    psf_values = Stack._psfunction_torch(amplitudes, device=dev, debug=dbg)
-                    return psf_values.astype(np.float32)
-                return process_wrapper
-
-            wrapper = make_wrapper(device, debug)
-
-            # Use xr.apply_ufunc with dask='parallelized' for lazy execution
             # Core dim is 'date' (reduction), chunked dims are y, x
-            # Note: input_core_dims moves 'date' to last axis, wrapper transposes back
-            # Provide explicit meta to avoid ComplexWarning when dask infers
-            # output type from complex input (we intentionally convert to real)
             psf_da = xr.apply_ufunc(
-                wrapper,
+                make_blockwise(device, debug),
                 slc_data,
                 input_core_dims=[['date']],
                 output_core_dims=[[]],
-                dask='parallelized',
-                dask_gufunc_kwargs={'meta': np.array((), dtype=np.float32)},
+                dask='allowed',
             )
 
             # Assign name to match SLC variable
@@ -2625,6 +2642,13 @@ DEFOMAX_CYCLE  {defomax}
 
         # Export just topography with image overlay (like PyGMTSAR export_vtk)
         stack.to_vtk('gmap', data=None, overlay=gmap)
+
+        Notes
+        -----
+        With ``data=None`` the topography at each overlay node is the NEAREST pixel of the transform's ``ele``, burst
+        by burst; where bursts overlap the first burst with a valid value gives it. At the overlay's spacing this differs
+        from an interpolation by the elevation change within half a pixel; for more precision downsample the transform's
+        elevation to the overlay's grid.
         """
         import os
         import numpy as np
@@ -2643,18 +2667,29 @@ DEFOMAX_CYCLE  {defomax}
             if tfm is None:
                 raise ValueError("transform is required when data=None")
 
-            # Get topography at native resolution
-            topo_merged = tfm[['ele']].to_dataset()
-            topo_da = topo_merged['ele'] if 'ele' in topo_merged else None
-            if topo_da is None:
-                raise ValueError("transform must contain 'ele' variable")
-
-            # Interpolate elevation to overlay grid (preserves image quality)
             ov = overlay
             if 'band' not in ov.dims:
                 ov = ov.expand_dims('band')
-            # Interpolate elevation to match overlay coordinates
-            topo_da = topo_da.interp(y=ov.y, x=ov.x, method='linear')
+            # THE ELEVATION AT THE OVERLAY'S NODES, BURST BY BURST: each burst gives its nearest pixel at the overlay
+            # nodes inside it, as the data path below decimates the transform to the data grid. Merged at native
+            # resolution and interpolated down, a 914 x 946 overlay of NisarLB took its 720M elevation pixels through a
+            # merge and a rechunk (45.8 s at 2 CPUs). Where bursts overlap the first gives the value: they share the DEM.
+            bursts = [ds for ds in dict.values(tfm) if 'ele' in ds]
+            if not bursts:
+                raise ValueError("transform must contain 'ele' variable")
+            oy, ox = ov.y.values, ov.x.values
+            z = np.full((len(oy), len(ox)), np.nan, dtype=np.float32)
+            for ds in bursts:
+                ys, xs = ds.y.values, ds.x.values
+                iy = np.nonzero((oy >= min(ys[0], ys[-1])) & (oy <= max(ys[0], ys[-1])))[0]
+                ix = np.nonzero((ox >= min(xs[0], xs[-1])) & (ox <= max(xs[0], xs[-1])))[0]
+                if not len(iy) or not len(ix):
+                    continue
+                values = np.asarray(ds['ele'].isel(y=_nearest_indices(ys, oy[iy]), x=_nearest_indices(xs, ox[ix])).values,
+                                    dtype=np.float32)
+                block = z[np.ix_(iy, ix)]
+                z[np.ix_(iy, ix)] = np.where(np.isnan(block), values, block)
+            topo_da = xr.DataArray(z, coords={'y': oy, 'x': ox}, dims=('y', 'x'), name='ele')
 
             if mask:
                 # Mask by finite values in overlay
@@ -2722,24 +2757,6 @@ DEFOMAX_CYCLE  {defomax}
             if tfm_is_default:
                 # Decimate each burst's transform to match corresponding input burst
                 # Use index-based nearest neighbor selection (much faster than reindex)
-                def _nearest_indices(source_coords, target_coords):
-                    """Find indices in source_coords nearest to target_coords."""
-                    # Handle descending coordinates (e.g., y going north to south)
-                    descending = len(source_coords) > 1 and source_coords[0] > source_coords[-1]
-                    if descending:
-                        source_coords = source_coords[::-1]
-                    indices = np.searchsorted(source_coords, target_coords)
-                    indices = np.clip(indices, 0, len(source_coords) - 1)
-                    # Check if previous index is closer
-                    prev_indices = np.clip(indices - 1, 0, len(source_coords) - 1)
-                    prev_diff = np.abs(source_coords[prev_indices] - target_coords)
-                    curr_diff = np.abs(source_coords[indices] - target_coords)
-                    indices = np.where(prev_diff < curr_diff, prev_indices, indices)
-                    # Convert back to original order if descending
-                    if descending:
-                        indices = len(source_coords) - 1 - indices
-                    return indices
-
                 decimated = {}
                 for k in target.keys():
                     if k not in tfm:
@@ -3660,19 +3677,13 @@ DEFOMAX_CYCLE  {defomax}
 
         sources: [(read, disk chunks)] of _zarr_complex_source() / _zarr_array_source().
 
-        THE SAME KEYS IN EVERY GRAPH: one reader task per disk chunk, one task per output block that cuts it from the
-        disk chunks it overlaps, and dask fuses neither (_UnfusedTask). Built as readers, a concatenate and a rechunk,
-        dask fused them differently in each graph where a disk chunk feeds two blocks (a pygmtsar transform chunked
-        2402 x 8192 against 2402 x 6013 blocks): a graph reading one block made a key an alias of a fused task, while
-        the scheduler still held that key as a plain task among the inputs of a computed result, kept its old
-        dependencies (dask issue 9888), and failed with KeyError, an AssertionError on a TaskState, or hung.
+        One reader task per disk chunk, and one task per output block that cuts it from the disk chunks it overlaps.
         """
         import uuid
         import numpy as np
         import dask.array as da
-        from dask._task_spec import TaskRef
+        from dask._task_spec import Task, TaskRef
         from dask.highlevelgraph import HighLevelGraph
-        from .utils_dask import _UnfusedTask
 
         name = f'{label}-{uuid.uuid4().hex}'
         oy, ox = (np.cumsum((0,) + tuple(c)).tolist() for c in chunks)
@@ -3698,12 +3709,12 @@ DEFOMAX_CYCLE  {defomax}
                             key = (rname, iy, ix)
                             if key not in layer:
                                 func, args, kwargs = read(iy, ix, (dy[iy + 1] - dy[iy], dx[ix + 1] - dx[ix]))
-                                layer[key] = _UnfusedTask(key, func, *args, **kwargs)
+                                layer[key] = Task(key, func, *args, **kwargs)
                             parts.append(TaskRef(key))
                     key = (name, d, by, bx) if lead else (name, by, bx)
                     layout = (len(ys), len(xs), tuple((a, b) for _, a, b in ys), tuple((a, b) for _, a, b in xs),
                               bool(lead))
-                    layer[key] = _UnfusedTask(key, _zarr_block, layout, *parts)
+                    layer[key] = Task(key, _zarr_block, layout, *parts)
         out_chunks = (((1,) * len(sources),) if lead else ()) + tuple(tuple(c) for c in chunks)
         graph = HighLevelGraph.from_collections(name, layer, dependencies=())
         return da.Array(graph, name, chunks=out_chunks, dtype=dtype,
@@ -3823,6 +3834,7 @@ DEFOMAX_CYCLE  {defomax}
         from shapely import wkt
         import os
         from insardev_toolkit import progressbar_joblib
+        from insardev_toolkit.utils_pool import release_workers
         from tqdm.auto import tqdm
         import joblib
         import warnings
@@ -4033,6 +4045,8 @@ DEFOMAX_CYCLE  {defomax}
             with progressbar_joblib.progressbar_joblib(tqdm(desc='Loading Dataset...'.ljust(25), total=len(groups))) as progress_bar:
                 dss = joblib.Parallel(n_jobs=-1, backend='loky')\
                     (joblib.delayed(store_open_group_delayed)(zarr_path, group) for group in groups)
+            # the idle joblib workers keep their memory: stop them, the next parallel step starts its own
+            release_workers()
             for note in dict.fromkeys(note for _, _, notes in dss for note in notes):
                 print(note, flush=True)
             # list of key - dataset converted to dict and appended to the existing dict
@@ -4369,13 +4383,18 @@ DEFOMAX_CYCLE  {defomax}
                 dd_counts.append(da_module.sum(da_module.isfinite(dd_dask)))
                 dd_keys.append((d_rep, k))
 
-        # Single dask.compute() call — parallel across workers, returns only scalars
+        # One dask.compute() call per overlap pair, its double differences of every repeat date, returning only
+        # scalars: a pair needs the overlap strips of its two bursts, and one call for all pairs held most of the
+        # stack in the workers at once
         print('WARNING: Stack.align() is not lazy: it computes the burst overlaps of the stack now; '
               'later changes to the input stack do not reach its corrections.', flush=True)
-        all_scalars = dask.compute(*dd_sums, *dd_counts)
         n = len(dd_keys)
-        sums = all_scalars[:n]
-        counts = all_scalars[n:]
+        sums, counts = [None] * n, [None] * n
+        for k in range(len(overlap_pairs)):
+            idx = [i for i, (_, kk) in enumerate(dd_keys) if kk == k]
+            values = dask.compute(*[dd_sums[i] for i in idx], *[dd_counts[i] for i in idx])
+            for j, i in enumerate(idx):
+                sums[i], counts[i] = values[j], values[len(idx) + j]
 
         dd_stats = {}
         for i, key in enumerate(dd_keys):

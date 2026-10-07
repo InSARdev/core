@@ -343,7 +343,8 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
                         _z.attrs.update({k: v for k, v in da_xr.attrs.items()})
 
     # Write dask arrays to zarr in memory-controlled batches.
-    # Each batch slice is optimized (dask.optimize culls unused keys).
+    # Each batch slice goes to da.store as built; the scheduler optimizes (and culls) the merged graph of the arrays
+    # stored together.
     if sources:
         if _client is not None:
             n_workers = max(len(_client.nthreads()), 1)
@@ -391,8 +392,9 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
 
         if idx_3d:
             if dim0_merged:
-                # 1D chunks: single pass, scheduler pipelines optimally
-                arrays = list(dask.optimize(*[sources[i] for i in idx_3d]))
+                # 1D chunks: single pass, scheduler pipelines optimally. The arrays go to da.store as built, as the
+                # 2D ones above: dask.optimize by hand computed a layer feeding several variables once per variable
+                arrays = [sources[i] for i in idx_3d]
                 store_arr = da.store(arrays, [targets[i] for i in idx_3d],
                                     lock=_lock, compute=False)
                 if _client is not None:
@@ -417,7 +419,7 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
                 pbar.total = (n_pairs + batch_pairs - 1) // batch_pairs
                 for k in range(0, n_pairs, batch_pairs):
                     k_end = min(k + batch_pairs, n_pairs)
-                    arrays = list(dask.optimize(*[sources[i][k:k_end] for i in idx_3d]))
+                    arrays = [sources[i][k:k_end] for i in idx_3d]
                     store_arr = da.store(arrays, [targets[i] for i in idx_3d],
                                          lock=_lock, compute=False,
                                          regions=[(slice(k, k_end),)] * len(arrays))

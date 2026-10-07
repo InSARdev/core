@@ -9,6 +9,7 @@
 # ----------------------------------------------------------------------------
 from .Nisar_slc import Nisar_slc
 from .PRM import PRM
+from insardev_toolkit.utils_pool import release_workers
 
 
 # re-centring passes after the first measurement of an accepted xcorr patch
@@ -439,6 +440,9 @@ class Nisar_align(Nisar_slc):
 
         # Recompute Doppler with earth_radius
         prm_rep.calc_dop_orb(earth_radius, inplace=True, debug=debug)
+
+        # the idle joblib workers of the SAT_llt2rat and xcorr steps keep their memory: stop them
+        release_workers()
 
         return prm_rep, slc_data, None  # No reramp_params for Nisar
 

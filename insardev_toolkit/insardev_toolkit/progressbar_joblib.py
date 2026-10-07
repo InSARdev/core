@@ -50,6 +50,10 @@ class progressbar_joblib:
         joblib.parallel.BatchCompletionCallBack = TqdmBatchCompletionCallback
         try:
             yield tqdm_object
+            # joblib runs the tasks in this process without the batch callbacks when it has one worker (n_jobs=1
+            # or the sequential backend): the bar counts the tasks that are done
+            if tqdm_object.total is not None and tqdm_object.n < tqdm_object.total:
+                tqdm_object.update(n=tqdm_object.total - tqdm_object.n)
         finally:
             joblib.parallel.BatchCompletionCallBack = old_batch_callback
             tqdm_object.close()

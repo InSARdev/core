@@ -346,6 +346,9 @@ class Tiles(datagrid, progressbar_joblib):
                                  f'that name exists')
         os.makedirs(tiles_dir, exist_ok=True)
 
+        from .HTTP import download_jobs
+        from .utils_pool import release_workers
+        n_jobs = download_jobs(n_jobs)
         if n_jobs is None or debug == True:
             print ('Note: sequential joblib processing is applied when "n_jobs" is None or "debug" is True.')
             joblib_backend = 'sequential'
@@ -363,6 +366,8 @@ class Tiles(datagrid, progressbar_joblib):
                                      min_rate, min_rate_window, debug, crs)\
                                     for x, y in cells)
 
+            # the idle joblib workers keep their memory: stop them, the next parallel step starts its own
+            release_workers()
             missing = sorted(r[1] for r in results if r[0] == 'missing')
             failed = [r for r in results if r[0] == 'failed']
             if missing:
@@ -415,13 +420,13 @@ class Tiles(datagrid, progressbar_joblib):
         # set CRS and spatial dimensions for rioxarray compatibility
         return self.spatial_ref(da, 4326)
 
-    def open(self, filename):
+    def open(self, filename, crs=None):
         """
         Open a downloaded grid lazily, with its CRS set for rioxarray: 'dem.vrt' with the tiles next to it, or a
         merged 'dem.nc' downloaded before. A 'dem.nc' that the download replaced by 'dem.vrt' is read from the VRT.
 
-        land = Tiles().open('land.vrt')
-        landmask = np.isfinite(land.rio.reproject(stack.crs))
+        land = Tiles().open('land.vrt', crs=stack.crs)
+        landmask = np.isfinite(land)
 
         The vertical datum the file declares (its compound CRS) is the CF geoid_name attribute of the grid. The
         grid keeps the file as its source attribute: utils_geoid.dem_datum() of the grid is the datum of the file,
@@ -432,7 +437,9 @@ class Tiles(datagrid, progressbar_joblib):
         geoid = utils_tiles.vertical_datum_name(utils_tiles.declared_crs(filename))
         if geoid is not None:
             da.attrs['geoid_name'] = geoid
-        return self.spatial_ref(da, 4326)
+        da = self.spatial_ref(da, 4326)
+        # crs: the grid in that CRS, lazily, on the grid of rio.reproject(crs) (reproject())
+        return da if crs is None else self.reproject(da, crs)
 
     def download_landmask(self, geometry, filename=None, product='1s', skip_exist=True, n_jobs=8, retries=30,
                           timeout_second=3, min_rate='100KB', min_rate_window=60, debug=False):
@@ -602,7 +609,8 @@ class Tiles(datagrid, progressbar_joblib):
         skip_exist : bool, optional
             If True, keeps the tiles already downloaded. Default is True.
         n_jobs : int, optional
-            The number of concurrent download jobs. Default is 8.
+            The number of concurrent download jobs, at most two per CPU this process may use (a larger number is
+            capped, with a note). Default is 8.
         retries : int, optional
             Download attempts per tile. Default is 30.
         timeout_second : float, optional

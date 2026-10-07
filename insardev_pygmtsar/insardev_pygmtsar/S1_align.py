@@ -9,6 +9,7 @@
 # ----------------------------------------------------------------------------
 from .S1_gmtsar import S1_gmtsar
 from .PRM import PRM
+from insardev_toolkit.utils_pool import release_workers
 import numpy as np
 
 
@@ -208,5 +209,8 @@ class S1_align(S1_gmtsar):
 
         # Recompute Doppler with earth_radius
         prm_rep.calc_dop_orb(earth_radius, inplace=True, debug=debug)
+
+        # the idle joblib workers of the SAT_llt2rat calls keep their memory: stop them
+        release_workers()
 
         return prm_rep, slc_data, reramp_params

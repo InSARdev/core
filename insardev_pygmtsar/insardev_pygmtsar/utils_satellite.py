@@ -2508,11 +2508,10 @@ def save_transform(transform, outdir, scale_factor=2.0):
             trans_int[_c].attrs['actual_range'] = [float(np.nanmin(_v)),
                                                    float(np.nanmax(_v))]
 
-    # Use 8192 chunk size for memory-efficient reading
-    CHUNK_SIZE = 8192
+    # the chunks of zarr_chunk_shape(), the SLC's on the same grid, as insardev_ecef writes them
+    from insardev_toolkit.utils_chunks import zarr_chunk_shape
     n_y, n_x = transform.y.size, transform.x.size
-    chunk_y = min(CHUNK_SIZE, n_y)
-    chunk_x = min(CHUNK_SIZE, n_x)
+    chunk_y, chunk_x = zarr_chunk_shape((n_y, n_x))
 
     all_vars = ['rng', 'azi', 'ele'] + [v for v in ['look_E', 'look_N', 'look_U'] if v in trans_int]
     # _FillValue is set as an attribute above; the Zarr array's own fill_value is the same sentinel (as the NISAR
@@ -3778,7 +3777,6 @@ def compute_conversion_chunked(prm, dem_path, geometry, outdir,
                                epsg=None,
                                resolution=(16.0, 4.0),
                                bbox=None,
-                               chunk=(8192, 8192),
                                compute_topo=True,
                                n_jobs=-1,
                                debug=False,
@@ -3815,8 +3813,6 @@ def compute_conversion_chunked(prm, dem_path, geometry, outdir,
         Target EPSG code. If None, auto-detect UTM zone.
     resolution : tuple[float, float], optional
         Output resolution (dy, dx) in meters. Default is (16.0, 4.0).
-    chunk : tuple[int, int], optional
-        Tile size (y, x) for chunked processing. Default is (8192, 8192).
     compute_topo : bool, optional
         If True, compute topo array in radar coords. Default is True.
     n_jobs : int, optional
@@ -3984,8 +3980,10 @@ def compute_conversion_chunked(prm, dem_path, geometry, outdir,
 
     # Step 2: Pre-create zarr arrays (lazy - no memory allocation)
     fill_value = np.iinfo(np.int32).max
-    chunk_y, chunk_x = chunk
-    zarr_chunks = (min(chunk_y, n_y), min(chunk_x, n_x))
+    # the stored chunks of the S1 rule (zarr_chunk_shape: at most 32 MiB of complex64, about equal) and a processing
+    # chunk of 2 x 2 of them (grid_chunks): no small stripe at the end, and the workers write whole zarr chunks
+    from insardev_toolkit.utils_chunks import grid_chunks
+    zarr_chunks, (chunk_y, chunk_x) = grid_chunks((n_y, n_x))
     # Topo chunks of 1024 x 1024 cells: the chunk workers read the radar box of each part of their output chunk,
     # which is far smaller than a processing tile and rarely aligned to it
     topo_chunk = 1024

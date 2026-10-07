@@ -50,7 +50,8 @@ class EOF(progressbar_joblib):
         scenes : list or pandas.DataFrame
             List of scene identifiers or a DataFrame containing scenes for which the orbits are to be downloaded.
         n_jobs : int, optional
-            The number of concurrent download jobs. Default is 8.
+            The number of concurrent download jobs, at most two per CPU this process may use (a larger number is
+            capped, with a note). Default is 8.
         joblib_backend : str, optional
             The backend for parallel processing. Default is 'loky'.
         skip_exist : bool, optional
@@ -280,6 +281,9 @@ class EOF(progressbar_joblib):
                   f'their restituted orbits (RESORB) are kept.')
             return True
 
+        from .HTTP import download_jobs
+        from .utils_pool import release_workers
+        n_jobs = download_jobs(n_jobs)
         # download orbits index files and detect the orbits.
         # joblib reads the class file from disk,
         # and to allow modification of orbit_offset_* on the fly, add them to the arguments
@@ -292,6 +296,8 @@ class EOF(progressbar_joblib):
                                     orbit_offset_start=EOF.orbit_offset_start,
                                     orbit_offset_end=EOF.orbit_offset_end,
                                     precise=scene.precise) for scene in df.itertuples())
+        # the idle joblib workers keep their memory: stop them, the next parallel step starts its own
+        release_workers()
         # nothing is downloaded yet: the dates with a scene without an orbit lack it
         if skip_unreachable(outcomes, df, df[~df.precise], 'the check for the precise orbits (POEORB)'):
             return None
@@ -319,6 +325,8 @@ class EOF(progressbar_joblib):
                                     url=orbit.url + orbit.orbit,
                                     request=f'The orbit file {orbit.orbit} for {orbit.mission} on {orbit.date}')
                                     for orbit in orbits.itertuples())
+        # the idle joblib workers keep their memory: stop them, the next parallel step starts its own
+        release_workers()
         # the dates whose files are not on disk now; those with a scene without an orbit lack it
         missing = dates[[not exists(os.path.join(basedir, os.path.splitext(name)[0])) for name in dates.orbit]]
         if skip_unreachable(outcomes, missing, missing[~missing.precise],

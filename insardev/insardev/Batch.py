@@ -1105,11 +1105,20 @@ def _horn_gradient_2d_for_dask(block, dy=1.0, dx=1.0):
     return out[None] if flat else out
 
 
-def _apply_goldstein_2d_for_dask(phase_block, corr_block, psize=32, threshold=0.5, device='cpu'):
+def _apply_goldstein_2d_for_dask(phase_block, corr_block, psize=32, threshold=0.5, device='cpu', halo=None,
+                                 block_info=None):
     """Module-level function for Goldstein filter map_overlap operation.
 
     Defined at module level to avoid dask serialization issues with nested functions.
     Handles both 2D (y, x) and 3D (1, y, x) blocks - _goldstein() handles squeeze/unsqueeze.
+
+    THE PATCH GRID BELONGS TO THE WHOLE ARRAY, NOT TO THE BLOCK. The patches sit at multiples of half a patch counted
+    from pixel 0 of the array, so every pixel is filtered by the same patches whatever the dask chunks are. A block
+    starts at (chunk start - halo), halo is the overlap depth map_overlap was given (goldstein() passes it here, so
+    the two cannot drift apart), and the rows and columns before its first patch of the array grid are overlap that
+    map_overlap trims: the filter leaves them out (skip). block_info locates the block in the OVERLAPPED array, where
+    an inner chunk edge has grown by halo on both sides, so the block starts at location - 2 * halo * chunk index.
+    block_info is None only for dask's zero-size probe of the output type.
 
     Parameters
     ----------
@@ -1117,21 +1126,31 @@ def _apply_goldstein_2d_for_dask(phase_block, corr_block, psize=32, threshold=0.
         Complex array from dask, shape (y, x) or (1, y, x)
     corr_block : np.ndarray
         Real array from dask, shape (y, x) or (1, y, x)
-    psize : int or dict
-        Patch size for the filter
+    psize : dict
+        Patch size {'y': ..., 'x': ...} for the filter
     threshold : float
         Minimum fraction of valid pixels
     device : str
         PyTorch device
+    halo : tuple of int
+        The overlap depth (y, x) of the map_overlap that cut this block.
+    block_info : dict
+        Supplied by dask.
 
     Returns
     -------
     np.ndarray
         Filtered complex array with same shape as input
     """
+    skip = (0, 0)
+    if block_info is not None:
+        info = block_info[0]
+        py, px = psize['y'], psize['x']
+        skip = tuple((2 * h * i - loc[0]) % (p // 2)
+                     for loc, i, h, p in zip(info['array-location'][-2:], info['chunk-location'][-2:], halo, (py, px)))
     # _goldstein handles (1, y, x) -> squeeze -> process -> unsqueeze
     return BatchComplex._goldstein(phase_block, corr_block, psize=psize,
-                                   threshold=threshold, device=device)
+                                   threshold=threshold, device=device, skip=skip)
 
 
 class Batch(BatchCore):
@@ -3398,18 +3417,8 @@ class BatchWrap(BatchCore):
             for v, da_ in carry.items():
                 out[key][v] = da_
 
-        #print ('wrap _agg self.chunks', self.chunks)
-        #return type(self)(out).chunk(self.chunks)
-        #print ('wrap _agg self.chunks', self.chunks)
-        # filter out collapsed dimensions
-        sample = next(iter(out.values()), None)
-        dims = (sample.dims or []) if hasattr(sample, 'dims') else []
-        chunks = {d: size for d, size in self.chunks.items() if d in dims}
-        #print ('wrap chunks', chunks)
-        result = type(self)(out)
-        if chunks:
-            return result.chunk(chunks)
-        return result
+        # each burst back in its own chunks, along the dims its result still has
+        return self._restored(out)
 
     def coarsen(self, window: dict[str, int], **kwargs) -> Batch:
         """
@@ -3430,9 +3439,6 @@ class BatchWrap(BatchCore):
             coarsened by `window`, then reduced by `.mean()` (or whichever
             `func` you chose).
         """
-        #print ('wrap coarsen')
-        chunks = self.chunks
-        #print ('self.chunks', chunks)
         out = {}
         # produce unified grid and chunks for all datasets in the batch
         for key, ds in self.items():
@@ -3446,16 +3452,19 @@ class BatchWrap(BatchCore):
                     ds2 = ds2.assign({v: ds[v] for v in meta})
             else:
                 ds2 = xr.ufuncs.exp(1j * ds.astype('float32'))
-            # align each dimension
+            # align each dimension to the coarse grid
             for dim, factor in window.items():
                 start = utils_xarray.coarsen_start(ds2, dim, factor)
-                #print ('start', start)
                 if start is not None:
-                    # rechunk to the original chunk sizes
-                    ds2 = ds2.isel({dim: slice(start, None)}).chunk(chunks)
-                    # or allow a bit different chunks for coarsening
-                    #ds2 = ds2.isel({dim: slice(start, None)})
-            # coarsen
+                    ds2 = ds2.isel({dim: slice(start, None)})
+            # a burst with fewer samples than a window along a dimension has no full cell: it is dropped, as
+            # BatchCore.coarsen() drops it (patch 0007)
+            if any(ds2.sizes.get(dim, factor) < factor for dim, factor in window.items()):
+                continue
+            # blocks of whole windows, as BatchCore.coarsen()
+            sizes = BatchCore._window_chunks(ds2, window)
+            if sizes:
+                ds2 = ds2.chunk(sizes)
             out[key] = ds2.coarsen(window, **kwargs)
 
         # wrap=False since these are DatasetCoarsen objects, not actual data
@@ -3930,17 +3939,42 @@ class BatchComplex(BatchCore):
                 if npix == 0:
                     e = np.empty(0, np.complex64).reshape(shape)
                     return np.stack([e, e, e, e], axis=0)
+                _budget = get_dask_chunk_size_mb()
+                # the pixels go in batches of a quarter of the chunk size (8 bytes
+                # per date and pixel, complex64), each value as from the whole
+                # block (pixels are independent): the task holds its input and
+                # arrays of a batch, none of the block's size
+                _step = max(1, int(_budget * 2**20 // 4 // (nd * 8)))
+                _batches = [slice(j, min(j + _step, npix))
+                            for j in range(0, npix, _step)]
+
+                def _unit(cols, rot=None):
+                    # the normalised phasors of the pixels cols, rotated by rot
+                    # per date; a NaN on any date refuses the pixel, a zero
+                    # date drops out of every sum and of n, and an all-zero
+                    # series is NaN
+                    Zc = Z[:, cols]
+                    A = np.abs(Zc)
+                    ok = np.isfinite(A) & (A > 0)
+                    U = np.where(ok, Zc / np.where(ok, A, 1.0), 0)
+                    if rot is not None:
+                        U = (U * rot).astype(np.complex64)
+                    # an index set of pixels (Z[:, cols]) comes out F-contiguous;
+                    # _3d_arc_fit gets the C-contiguous array it always got
+                    return np.ascontiguousarray(U), A, ok
+
                 # input gate: resultant length of the normalised phasors, which
                 # a constant scatterer phase leaves unchanged
-                _A = np.abs(Z)
-                # a NaN on any date refuses the pixel; a zero date drops out of
-                # every sum and of n, and an all-zero series is NaN
-                _finite = np.isfinite(_A).all(axis=0)
-                _ok = np.isfinite(_A) & (_A > 0)
-                _U = np.where(_ok, Z / np.where(_ok, _A, 1.0), 0)
-                _nok = np.maximum(_ok.sum(axis=0), 1)
-                g0 = np.abs(_U.sum(axis=0)) / _nok
-                _budget = get_dask_chunk_size_mb()
+                _finite = np.empty(npix, dtype=bool)
+                _nok = np.empty(npix, dtype=np.int64)
+                g0 = np.empty(npix)
+                for _b in _batches:
+                    _U, _A, _ok = _unit(_b)
+                    _finite[_b] = np.isfinite(_A).all(axis=0)
+                    _nok[_b] = np.maximum(_ok.sum(axis=0), 1)
+                    g0[_b] = np.abs(_U.sum(axis=0)) / _nok[_b]
+                    del _U, _A, _ok
+                _rot = None
                 # block screen: fit the top share of the finite pixels by raw
                 # resultant (so their own rate and DEM error stay out), average
                 # their residual phasors per date, rotate every series by that
@@ -3950,7 +3984,7 @@ class BatchComplex(BatchCore):
                                   kind='stable')[:_k]
                 _ref = _ref[_finite[_ref]]
                 if len(_ref):
-                    _Ur = np.ascontiguousarray(_U[:, _ref])
+                    _Ur = _unit(_ref)[0]
                     _, _hr, _vr = _3d_arc_fit(
                         _Ur, _h, _t, _m, max_dh=_mh, max_dv=_mv, step_dh=_sh,
                         step_dv=_sv, budget=_budget, max_seasonal=0.0)[:3]
@@ -3967,15 +4001,17 @@ class BatchComplex(BatchCore):
                         # a date no reference holds gets angle 0, so it is not
                         # rotated
                         _c = np.angle(_R.mean(axis=1))
-                        _U = (_U * np.exp(-1j * _c)[:, None]).astype(np.complex64)
-                        g0 = np.abs(_U.sum(axis=0)) / _nok
+                        _rot = np.exp(-1j * _c)[:, None]
+                        for _b in _batches:
+                            g0[_b] = np.abs(_unit(_b, _rot)[0].sum(axis=0)) / _nok[_b]
                 sel = np.nonzero(_finite & (g0 >= _thr))[0]
                 # only pixels at or above the gate are fitted for output
                 vel = np.full(npix, np.nan, np.float64)
                 hgt = np.full(npix, np.nan, np.float64)
                 gam = np.full(npix, np.nan, np.float32)
-                if len(sel):
-                    Us = np.ascontiguousarray(_U[:, sel])
+                for _a in range(0, len(sel), _step):
+                    _cols = sel[_a:_a + _step]
+                    Us = _unit(_cols, _rot)[0]
                     # NaN beyond either bound or with no non-zero date; the
                     # batching budget is the dask chunk size
                     g_, h_, v_ = _3d_arc_fit(
@@ -3984,9 +4020,10 @@ class BatchComplex(BatchCore):
                     if _h is None:
                         # no baseline: the height is 0 by model, not unassessed
                         h_ = np.where(np.isfinite(v_), 0.0, np.nan)
-                    vel[sel] = v_
-                    hgt[sel] = h_
-                    gam[sel] = g_
+                    vel[_cols] = v_
+                    hgt[_cols] = h_
+                    gam[_cols] = g_
+                    del Us
                 # publish the pair sign that displacement_los() converts: a
                 # per-date series runs opposite to a pair, so the rate is
                 # negated. The height keeps its sign; its per-date +h*e2p_d
@@ -3994,7 +4031,8 @@ class BatchComplex(BatchCore):
                 vel = -vel
                 # rmse = sqrt(-2 ln gamma * n/(n-p)): n non-zero dates, p
                 # parameters spent
-                nok = np.maximum((np.abs(Z) > 0).sum(axis=0), 1)
+                nok = np.concatenate([np.maximum((np.abs(Z[:, _b]) > 0).sum(axis=0), 1)
+                                      for _b in _batches])
                 npar = 2 + (0 if _h is None else 1)
                 infl = nok / np.maximum(nok - npar, 1)
                 Rres = np.clip(gam.astype(np.float64), 1e-9, 1.0)
@@ -6436,7 +6474,7 @@ class BatchComplex(BatchCore):
 
     @staticmethod
     @serialize_gpu
-    def _goldstein(phase_np, corr_np, psize=32, threshold=0.5, device='auto'):
+    def _goldstein(phase_np, corr_np, psize=32, threshold=0.5, device='auto', skip=(0, 0)):
         """
         Apply Goldstein adaptive filter.
 
@@ -6456,6 +6494,9 @@ class BatchComplex(BatchCore):
             Default 0.5 means at least 50% of pixels must be valid.
         device : str, optional
             PyTorch device: 'auto', 'cuda', 'mps', or 'cpu'.
+        skip : tuple of int
+            (rows, columns) at the start of the block that no patch covers: the patch grid starts there (NaN
+            before it). For a block of a larger array, whose patch grid belongs to the whole array.
 
         Returns
         -------
@@ -6500,10 +6541,10 @@ class BatchComplex(BatchCore):
         dev = BatchCore._get_torch_device(device)
 
         if dev.type == 'cpu':
-            result = goldstein_numpy(phase_np, corr_np, psize_y, psize_x, threshold=threshold)
+            result = goldstein_numpy(phase_np, corr_np, psize_y, psize_x, threshold=threshold, skip=skip)
         else:
             import torch
-            result = goldstein_pytorch(phase_np, corr_np, psize_y, psize_x, dev, threshold=threshold)
+            result = goldstein_pytorch(phase_np, corr_np, psize_y, psize_x, dev, threshold=threshold, skip=skip)
             if dev.type == 'mps':
                 torch.mps.empty_cache()
             elif dev.type == 'cuda':
@@ -6518,6 +6559,10 @@ class BatchComplex(BatchCore):
         """
         Apply Goldstein adaptive filter to each dataset in the batch.
 
+        The patches sit at multiples of half a patch counted from pixel 0 of each burst's grid, so the result
+        depends on the filter window and on the burst's grid, and does not depend on the dask chunks (up to float
+        rounding). It does depend on cropping the burst: a crop starts its own patch grid.
+
         Parameters
         ----------
         corr : BatchUnit
@@ -6529,7 +6574,7 @@ class BatchComplex(BatchCore):
 
             The pixel count it becomes is rounded DOWN to even per axis: the
             filter weight is a mirrored quadrant, so odd patches have no
-            weight.
+            weight. A patch longer than a burst raises ValueError, at the call.
         threshold : float, optional
             Minimum fraction of valid (non-NaN) pixels required to process a patch.
             Default 0.5 means at least 50% of pixels must be valid.
@@ -6573,17 +6618,10 @@ class BatchComplex(BatchCore):
         else:
             window_m = window
 
-        # Resolve device ONCE here, not in every task
-        if device == 'auto':
-            resolved_device = BatchCore._get_torch_device(device, debug=debug)
-            device = resolved_device.type  # 'cpu', 'cuda', or 'mps' as string
-
-        # Apply Goldstein filter to each dataset
-        result = {}
+        # THE PATCH OF EVERY BURST, CHECKED BEFORE ANYTHING IS BUILT.
+        windows = {}
         for k in self.keys():
             ds = self[k]
-            corr_ds = corr[k]
-            filtered_vars = {}
             _wy, _wx = utils_xarray.meters_to_pixels(
                 window_m, utils_xarray.spacing_of(ds), minimum=4,
                 name='goldstein() window')
@@ -6599,6 +6637,25 @@ class BatchComplex(BatchCore):
                 raise ValueError(
                     f'goldstein() window {window_m} m is under four pixels per '
                     f'axis on burst {k} after rounding down to even')
+            # A patch longer than the burst has no room in it: the crop is too small
+            if window['y'] > ds.sizes['y'] or window['x'] > ds.sizes['x']:
+                raise ValueError(
+                    f"goldstein() window {window_m} m is {window['y']} x {window['x']} pixels, longer than burst {k} "
+                    f"of {ds.sizes['y']} x {ds.sizes['x']} pixels: crop a larger area or use a shorter window")
+            windows[k] = window
+
+        # Resolve device ONCE here, not in every task
+        if device == 'auto':
+            resolved_device = BatchCore._get_torch_device(device, debug=debug)
+            device = resolved_device.type  # 'cpu', 'cuda', or 'mps' as string
+
+        # Apply Goldstein filter to each dataset
+        result = {}
+        for k in self.keys():
+            ds = self[k]
+            corr_ds = corr[k]
+            filtered_vars = {}
+            window = windows[k]
 
             # Process each complex data variable in the dataset; a DataArray burst is
             # its own one (N81)
@@ -6616,9 +6673,11 @@ class BatchComplex(BatchCore):
                             f"Data should already have pair=1 chunks from load()."
                         )
 
-                    # Calculate overlap depth: window//2 + 2 (PyGMTSAR formula)
-                    depth_y = window['y'] // 2 + 2
-                    depth_x = window['x'] // 2 + 2
+                    # Overlap depth: the patch size. Every patch that touches a pixel of the chunk, at its place
+                    # on the grid of the whole array, then lies inside the block (a patch is `window` long and
+                    # starts at a multiple of half of it). The depth is handed to _apply_goldstein_2d_for_dask as halo.
+                    depth_y = window['y']
+                    depth_x = window['x']
 
                     if debug:
                         print(f'DEBUG: goldstein map_overlap depth=({depth_y}, {depth_x})')
@@ -6635,6 +6694,7 @@ class BatchComplex(BatchCore):
                         psize=window,
                         threshold=threshold,
                         device=device,
+                        halo=(depth_y, depth_x),
                     )
 
                     filtered_vars[var_name] = xr.DataArray(
@@ -7194,19 +7254,7 @@ class Batches(tuple):
                 intf = intf * phase.iexp(-1)
 
         if wavelength is not None:
-            # THE FILTERED INTERFEROGRAM IS SHARED by the phase and the correlation, and each
-            # block of the product spans every pair: both are read through unfused tasks, so
-            # every graph built on either -- the phase, the correlation, one pair of a merge
-            # -- defines the filter's chain and the keys on it the same way (dask 9888)
-            from .utils_dask import unfused
-
-            def _unfused(v):
-                if isinstance(v, xr.DataArray):
-                    return v.copy(data=unfused(v.data))
-                return v.assign({n: v[n].copy(data=unfused(v[n].data)) for n in BatchCore._grid_vars(v)})
-            intf = intf._view({k: _unfused(v) for k, v in dict.items(intf)})
             intf_look = intf.gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold, device=device)
-            intf_look = intf_look._view({k: _unfused(v) for k, v in dict.items(intf_look)})
             intensity_ref = ref.power().gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold, device=device)
             intensity_rep = rep.power().gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold, device=device)
             del ref, rep

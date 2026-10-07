@@ -885,76 +885,23 @@ def _held_chunk(block):
     return block
 
 
-class _HeldTask(_Task):
-    """The task of one held chunk (hold_persisted). It is NEVER FUSED into the chain that
-    reads it: fused, it went into a different chain in each graph (one reader in an angle,
-    two in an align), so the same downstream key -- the key of data another compute still
-    holds -- became an alias of a different fused task in the next graph. The scheduler
-    keeps the known key's old dependencies (dask issue 9888), and the compute failed with
-    KeyError ('held-sub-sub-...'), an AssertionError on a TaskState, or hung. Unfused, a
-    chain built on computed data starts above this task in every graph, as it did on the
-    Futures before the hold."""
-    __slots__ = ()
-
-    @property
-    def block_fusion(self) -> bool:
-        return True
-
-
-class _UnfusedTask(_Task):
-    """A task that dask never fuses with its neighbours, so its key names the same task in every graph
-    (Stack._zarr_dask: the zarr readers of Stack.load(); see _HeldTask for the same failure)."""
-    __slots__ = ()
-
-    @property
-    def block_fusion(self) -> bool:
-        return True
-
-
-def _unfused_block(block):
-    """Identity task that reads one block of a shared array (see unfused)."""
-    return block
-
-
-def unfused(arr):
+def culled_array_optimize(dsk, keys, **kwargs):
     """
-    The same dask array, each block read by a task dask never fuses (_UnfusedTask).
+    dask's array optimization, then the graph culled to the requested keys (set as dask's array_optimize when insardev
+    is imported).
 
-    FOR AN ARRAY TWO RESULTS SHARE: the Gaussian-filtered interferogram, which both the
-    phase and the correlation of interferogram() read. In a graph of the phase alone,
-    the filter was fused into the phase's chain and the phase's key became an alias of
-    that fused task; in a graph of both, the filter stayed apart and the same key was
-    one task over it. The scheduler, still holding the key from one computation (the
-    unwrapped phase), kept its old definition for the next (dask issue 9888, 'different
-    run_spec' on 'sub-...'). The same for the interferogram product under the filter:
-    one block spans every pair, and a graph of one pair fused it into that pair's chain.
-    Read through here, the consumers build on the same unfused keys in every graph, so
-    every graph defines them the same way.
-
-    Parameters
-    ----------
-    arr : dask.array.Array
-        Any dask array; anything else is returned as is.
-
-    Returns
-    -------
-    dask.array.Array
-        Same chunks, dtype and data.
+    THE OPTIMIZED GRAPH CARRIES TASKS NO REQUESTED KEY DEPENDS ON: the low-level fusion and the slice rewriting after
+    it leave them (117 of 1134 in a point series of GoldenValley's mix()), and the scheduler does not cull a graph that
+    comes as an expression. When one of them was a key a graph before still registered -- a da.stack block of
+    predict(), plain there and an alias of a fused task here -- the scheduler linked it to a dependency it never
+    created, and the graph update failed with KeyError, now and then: the orphans depend on the order dask fuses in.
+    Culled, every key of the graph is one a requested key needs, and the scheduler walks them all (dask issue 9888).
     """
-    import dask.array as da
-    from dask.base import tokenize
+    from dask.array.optimization import optimize
     from dask.core import flatten
-    from dask._task_spec import TaskRef
-    from dask.highlevelgraph import HighLevelGraph
-    if not isinstance(arr, da.Array):
-        return arr
-    name = f'unfused-{tokenize(arr.name)}'
-    layer = {}
-    for key in flatten(arr.__dask_keys__()):
-        out = (name,) + tuple(key[1:])
-        layer[out] = _UnfusedTask(out, _unfused_block, TaskRef(key))
-    graph = HighLevelGraph.from_collections(name, layer, dependencies=[arr])
-    return da.Array(graph, name, chunks=arr.chunks, dtype=arr.dtype, meta=arr._meta)
+    from dask._task_spec import cull
+    out = optimize(dsk, keys, **kwargs)
+    return cull(out, list(flatten(keys))) if isinstance(out, dict) else out
 
 
 def hold_persisted(arr):
@@ -969,8 +916,6 @@ def hold_persisted(arr):
     that takes its Future as an argument; the argument survives any conversion, so the
     chunk stays on the cluster while any product still needs it. The {key: Future} layer
     is kept below it for futures_of() and for checks that look for Futures in the graph.
-    The reading task is never fused (_HeldTask), so every graph gives the keys built on it
-    the same task.
 
     Parameters
     ----------
@@ -996,7 +941,7 @@ def hold_persisted(arr):
     layer = {}
     for k, f in futures.items():
         k2 = (name,) + tuple(k[1:])
-        layer[k2] = _HeldTask(k2, _held_chunk, f)
+        layer[k2] = _Task(k2, _held_chunk, f)
     hlg = HighLevelGraph({arr.name: futures, name: layer}, {arr.name: set(), name: {arr.name}})
     return da.Array(hlg, name, chunks=arr.chunks, dtype=arr.dtype, meta=arr._meta)
 

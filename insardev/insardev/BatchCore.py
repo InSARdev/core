@@ -289,12 +289,22 @@ def _dissolve_raw_for_dask(current_arr, current_y, current_x,
 
 
 def _apply_gaussian_2d_for_dask(block, weight_block=None, sigmas=None, threshold=0.5,
-                                 device='cpu', pixel_sizes=None, out_dtype=np.float32):
+                                 device='cpu', pixel_sizes=None, out_dtype=np.float32,
+                                 grid=None, halo=None, block_info=None):
     """
     Module-level function for gaussian map_overlap operation.
 
     Defined at module level to avoid dask serialization issues with nested functions.
     Handles both 2D (y, x) and 3D (1, y, x) blocks - gaussian_numpy() handles squeeze/unsqueeze.
+
+    THE DECIMATION GRID BELONGS TO THE WHOLE ARRAY, NOT TO THE BLOCK (a filter that decimates, see
+    utils_gaussian.decimation_plan). The decimation cells sit at multiples of `grid` pixels counted from pixel 0 of
+    the array, so every pixel is filtered through the same cells whatever the dask chunks are. A block starts at
+    (chunk start - halo), halo is the overlap depth map_overlap was given (gaussian() passes it here, so the two
+    cannot drift apart), and the rows and columns before its first cell of the array grid are overlap that
+    map_overlap trims: gaussian_numpy leaves them out (skip). block_info locates the block in the OVERLAPPED array,
+    where an inner chunk edge has grown by halo on both sides, so the block starts at location - 2 * halo * chunk
+    index. block_info is None only for dask's zero-size probe of the output type.
 
     Parameters
     ----------
@@ -312,11 +322,22 @@ def _apply_gaussian_2d_for_dask(block, weight_block=None, sigmas=None, threshold
         Pixel sizes (dy, dx) in meters
     out_dtype : np.dtype
         Output dtype
+    grid : tuple of int or None
+        The decimation cell (y, x) in pixels, None when the filter does not decimate
+    halo : tuple of int
+        The overlap depth (y, x) of the map_overlap that cut this block
+    block_info : dict
+        Supplied by dask.
     """
     from .utils_gaussian import gaussian_numpy
+    skip = (0, 0)
+    if grid is not None and block_info is not None:
+        info = block_info[0]
+        skip = tuple((2 * h * i - loc[0]) % g
+                     for loc, i, h, g in zip(info['array-location'][-2:], info['chunk-location'][-2:], halo, grid))
     # gaussian_numpy handles (1, y, x) -> squeeze -> process -> unsqueeze
     return gaussian_numpy(block, weight_block, sigma=sigmas, truncate=4.0, threshold=threshold,
-                          device=device, pixel_sizes=pixel_sizes).astype(out_dtype)
+                          device=device, pixel_sizes=pixel_sizes, skip=skip).astype(out_dtype)
 
 
 class BatchCore(dict):
@@ -1899,7 +1920,7 @@ class BatchCore(dict):
         --------
         # Apply binary land mask, downloaded as tiles with a VRT index by Tiles().download_landmask(AOI, 'land.vrt')
         from insardev_toolkit import Tiles
-        land = np.isfinite(Tiles().open('land.vrt').rio.reproject(intf.crs))
+        land = np.isfinite(Tiles().open('land.vrt', crs=intf.crs))
         masked_intf = intf.mask(land)
 
         # Mask by AOI polygon
@@ -3008,6 +3029,45 @@ class BatchCore(dict):
     def transpose(self, *dims, **kw):
         return type(self)({k: ds.transpose(*dims, **kw) for k, ds in self.items()})
 
+    def _chunk_each(self, specs: dict):
+        """This batch with each burst rechunked by ITS OWN spec, {burst: chunks} as chunk() takes them (chunk() of that burst
+        alone); a burst without a spec is kept."""
+        out = {}
+        for key, ds in dict.items(self):
+            spec = specs.get(key)
+            out[key] = dict.__getitem__(self._view({key: ds}).chunk(spec), key) if spec else ds
+        return self._view(out)
+
+    def _restored(self, out: dict):
+        """The results `out` of a reduction of this batch, each burst given back its OWN exact input chunks: along every dim
+        its result keeps, a variable has the chunk tuple of the same variable of that burst's input (a stored edge block stays
+        the stored one, so a later mix with the input's grid needs no rechunk). A result that already has them gets no
+        rechunk. The dims of a coarsen() window are not given back: that result is in coarse units and already in the blocks
+        of whole windows coarsen() made, the input's blocks scaled by the window. The reference is each burst's own input,
+        never the first burst's: a burst of ten blocks was cut into hundreds by a small first one."""
+        batch = type(self)(out)
+        restored = {}
+        for key, res in dict.items(batch):
+            obj = dict.__getitem__(self, key)
+            # a coarsen() object holds the burst in its .obj
+            coarsened = not isinstance(obj, (xr.Dataset, xr.DataArray))
+            windows = obj.windows if coarsened else ()
+            inputs = BatchCore._vars_of(obj.obj if coarsened else obj)
+            fixed = {}
+            for name, var in BatchCore._vars_of(res).items():
+                have, want = var.variable.chunksizes, inputs[name].variable.chunksizes if name in inputs else {}
+                # the dims the variable keeps, in the blocks of its input
+                chunks = {d: want[d] for d in have if d in want and d not in windows and want[d] != have[d]}
+                if chunks:
+                    fixed[name] = var.chunk(chunks)
+            if not fixed:
+                restored[key] = res
+            elif isinstance(res, xr.DataArray):
+                restored[key] = next(iter(fixed.values()))
+            else:
+                restored[key] = res.assign(fixed)
+        return self._view(restored)
+
     def _agg(self, name: str, dim=None, **kwargs):
         """
         Internal helper for aggregation methods.
@@ -3037,14 +3097,8 @@ class BatchCore(dict):
             if hasattr(obj, 'attrs') and hasattr(out[key], 'attrs'):
                 out[key].attrs = obj.attrs
 
-        # filter out collapsed dimensions
-        sample = next(iter(out.values()), None)
-        dims = (sample.dims or []) if hasattr(sample, 'dims') else []
-        chunks = {d: size for d, size in self.chunks.items() if d in dims}
-        result = type(self)(out)
-        if chunks:
-            return result.chunk(chunks)
-        return result
+        # each burst back in its own chunks, along the dims its result still has
+        return self._restored(out)
 
     def mean(self, dim=None, **kwargs):
         return self._agg("mean", dim=dim, **kwargs)
@@ -3419,6 +3473,35 @@ class BatchCore(dict):
     #         for k, ds in self.items()
     #     })
 
+    @staticmethod
+    def _largest_blocks(ds, dims, grids=False) -> dict[str, tuple[int, int]]:
+        """{dim: (largest block, most blocks)} of ONE burst, over its dask variables that have the dim (grids=True: its (y, x)
+        grids only, not the per-pair or per-date metadata next to them).
+
+        The reference of a burst is its OWN blocks: bursts of one batch have different chunks (a crop leaves each
+        a different partial first block) and the variables of one burst can be chunked differently, so neither the
+        first burst nor ds.chunksizes (it raises on inconsistent chunks) can be the reference."""
+        out = {}
+        for var in BatchCore._vars_of(ds).values():
+            if grids and not BatchCore._is_grid(var):
+                continue
+            # the variable's own data: DataArray.chunksizes reads its coordinates too and raises on inconsistent ones
+            for dim, blocks in var.variable.chunksizes.items():
+                if dim in dims:
+                    largest, count = out.get(dim, (0, 0))
+                    out[dim] = (max(largest, max(blocks)), max(count, len(blocks)))
+        return out
+
+    @staticmethod
+    def _window_chunks(ds, window: dict[str, int]) -> dict[str, int]:
+        """{dim: block size} for coarsen() of one burst: whole windows, near the burst's own largest block of each
+        coarsened dimension that has more than one block (_largest_blocks). A dimension in one block keeps it."""
+        sizes = {}
+        for dim, (largest, count) in BatchCore._largest_blocks(ds, window).items():
+            if count > 1:
+                sizes[dim] = max(window[dim], int(round(largest / window[dim])) * window[dim])
+        return sizes
+
     def coarsen(self, window: dict[str, int], **kwargs) -> Batch:
         """
         Coarsen each DataSet in the batch by integer factors and align the 
@@ -3438,25 +3521,29 @@ class BatchCore(dict):
             coarsened by `window`, then reduced by `.mean()` (or whichever
             `func` you chose).
         """
-        chunks = self.chunks
         out = {}
-        # produce unified grid and chunks for all datasets in the batch
         for key, ds in self.items():
-            # align each dimension
+            # align each dimension to the coarse grid
             for dim, factor in window.items():
                 start = utils_xarray.coarsen_start(ds, dim, factor)
-                #print ('start', start)
                 if start is not None:
-                    # rechunk to the original chunk sizes
-                    ds = ds.isel({dim: slice(start, None)}).chunk(chunks)
-                    # or allow a bit different chunks for coarsening
-                    #ds = ds.isel({dim: slice(start, None)})
-            # coarsen and revert original chunks
+                    ds = ds.isel({dim: slice(start, None)})
+            # a burst with fewer samples than a window along a dimension has no full cell: it is dropped, as
+            # _drop_empty() drops one a selection left without samples (coarsened, it raised in dask)
+            if any(ds.sizes.get(dim, factor) < factor for dim, factor in window.items()):
+                continue
+            # BLOCKS OF WHOLE WINDOWS, sized from the burst's OWN largest block: each block coarsens on its own. Rechunked
+            # to the first burst's first block -- partial after a sel() -- every variable of every burst went into small
+            # blocks, and a block that was not whole windows made dask split it again for xarray's reshape (Mexico City's
+            # downsample(100) of 28 pairs: 98,616 tasks)
+            sizes = BatchCore._window_chunks(ds, window)
+            if sizes:
+                ds = ds.chunk(sizes)
             out[key] = ds.coarsen(window, **kwargs)
 
         return type(self)(out)
 
-    def chunk(self, chunks, p2p=False):
+    def chunk(self, chunks):
         """
         Rechunk the data in each burst dataset.
 
@@ -3466,12 +3553,6 @@ class BatchCore(dict):
             Chunk specification. If 'auto', uses chunk size 1 for first dimension
             (date/pair) and uniform chunking for spatial dimensions (y, x). An int
             is one size for every dim, as in xarray: -1 is one chunk.
-        p2p : bool
-            Use P2P (peer-to-peer) rechunk for constant-memory rechunking.
-            Creates a materialization barrier that breaks shared upstream
-            dependencies. Useful when switching from space mode (pair=1)
-            to time mode (pair=-1) after operations with shared task graphs
-            like interferogram(). Default False.
 
         Returns
         -------
@@ -3485,22 +3566,8 @@ class BatchCore(dict):
 
         >>> # Auto: date=1, y/x=uniform based on dask.config['array.chunk-size']
         >>> batch.chunk('auto')
-
-        >>> # P2P rechunk: space→time mode with materialization barrier
-        >>> batch.chunk({'pair': -1, 'y': 256, 'x': 256}, p2p=True)
         """
-        import dask
         from .utils_dask import rechunk2d
-
-        # P2P rechunk context: constant memory, acts as materialization barrier
-        if p2p:
-            ctx = dask.config.set({
-                "array.rechunk.method": "p2p",
-                "optimization.fuse.active": False,
-            })
-        else:
-            from contextlib import nullcontext
-            ctx = nullcontext()
 
         def rechunk(arr, dims):
             """one spatial variable rechunked; `dims` are the dims of its burst"""
@@ -3529,28 +3596,27 @@ class BatchCore(dict):
                 var_chunks = {d: c for d, c in var_chunks.items() if d in arr.dims or d not in dims}
             return arr.chunk(var_chunks)
 
-        with ctx:
-            # Only chunk spatial variables (y, x dims), leave non-spatial as-is
-            result = {}
-            for k, ds in self.items():
-                if isinstance(ds, xr.DataArray):
-                    # a Batch of DataArrays: the DataArray itself, when it is spatial
-                    spatial = ds.ndim in (2, 3) and ds.dims[-2:] == ('y', 'x')
-                    result[k] = rechunk(ds, ds.dims) if spatial else ds
+        # Only chunk spatial variables (y, x dims), leave non-spatial as-is
+        result = {}
+        for k, ds in self.items():
+            if isinstance(ds, xr.DataArray):
+                # a Batch of DataArrays: the DataArray itself, when it is spatial
+                spatial = ds.ndim in (2, 3) and ds.dims[-2:] == ('y', 'x')
+                result[k] = rechunk(ds, ds.dims) if spatial else ds
+                continue
+            rechunked_vars = {}
+            for var in ds.data_vars:
+                arr = ds[var]
+                # Only touch spatial variables
+                if not (arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x')):
                     continue
-                rechunked_vars = {}
-                for var in ds.data_vars:
-                    arr = ds[var]
-                    # Only touch spatial variables
-                    if not (arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x')):
-                        continue
-                    rechunked_vars[var] = rechunk(arr, ds.dims)
-                if rechunked_vars:
-                    ds = ds.assign(rechunked_vars)
-                result[k] = ds
+                rechunked_vars[var] = rechunk(arr, ds.dims)
+            if rechunked_vars:
+                ds = ds.assign(rechunked_vars)
+            result[k] = ds
         return type(self)(result)
 
-    def chunk2d(self, budget=None, chunks=1, p2p=False):
+    def chunk2d(self, budget=None, chunks=1):
         """
         Rechunk for pair-based (2D) processing: dim-0=chunks, spatial dims sized to budget.
 
@@ -3565,8 +3631,6 @@ class BatchCore(dict):
         chunks : int
             Chunk size for the first (pair/date) dimension. Default 1.
             Use -1 to merge all into one chunk.
-        p2p : bool
-            Use P2P rechunk for constant-memory rechunking. Default False.
 
         Returns
         -------
@@ -3585,10 +3649,8 @@ class BatchCore(dict):
 
         target_mb = _parse_budget(budget) if budget is not None else None
 
-        ctx = dask.config.set({
-            "array.rechunk.method": "p2p" if p2p else "tasks",
-            **({"optimization.fuse.active": False} if p2p else {}),
-        })
+        # the tasks rechunk: under a client, dask picks p2p for a large one by itself
+        ctx = dask.config.set({"array.rechunk.method": "tasks"})
 
         with ctx:
             result = {}
@@ -3626,15 +3688,7 @@ class BatchCore(dict):
                         var_chunks = {arr.dims[0]: chunks, 'y': optimal['y'], 'x': optimal['x']}
                     else:
                         var_chunks = {'y': optimal['y'], 'x': optimal['x']}
-                    rechunked = arr.chunk(var_chunks)
-                    if hasattr(rechunked.data, 'dask'):
-                        # Full fusion only when graph has enough layers for linear chains.
-                        # Rechunk-only graphs (≤3 layers) have no fusible chains —
-                        # skip expensive ensure_dict + fuse_linear (22s on 1M keys, 0% reduction).
-                        n_layers = len(rechunked.data.__dask_graph__().layers)
-                        with dask.config.set({'optimization.fuse.active': n_layers > 3}):
-                            (rechunked.data,) = dask.optimize(rechunked.data)
-                    rechunked_vars[var] = rechunked
+                    rechunked_vars[var] = arr.chunk(var_chunks)
                 if isinstance(ds, xr.DataArray):
                     ds = rechunked_vars[ds.name]
                 elif rechunked_vars:
@@ -3642,7 +3696,7 @@ class BatchCore(dict):
                 result[k] = ds
         return type(self)(result)
 
-    def chunk1d(self, budget=None, chunks=-1, p2p=False):
+    def chunk1d(self, budget=None, chunks=-1):
         """
         Rechunk for date-based (1D) processing: dim-0=chunks, spatial dims sized to budget.
 
@@ -3657,8 +3711,6 @@ class BatchCore(dict):
             Chunk size for the first (pair/date) dimension. Default -1 (all).
             Use e.g. 20 for partial merge — much faster rechunk/snapshot
             while still grouping pairs for efficient sequential reads.
-        p2p : bool
-            Use P2P rechunk for constant-memory rechunking. Default False.
 
         Returns
         -------
@@ -3677,10 +3729,8 @@ class BatchCore(dict):
 
         target_mb = _parse_budget(budget) if budget is not None else None
 
-        ctx = dask.config.set({
-            "array.rechunk.method": "p2p" if p2p else "tasks",
-            **({"optimization.fuse.active": False} if p2p else {}),
-        })
+        # the tasks rechunk: under a client, dask picks p2p for a large one by itself
+        ctx = dask.config.set({"array.rechunk.method": "tasks"})
 
         with ctx:
             result = {}
@@ -3714,12 +3764,7 @@ class BatchCore(dict):
                         var_chunks = {arr.dims[0]: chunks, 'y': optimal['y'], 'x': optimal['x']}
                     else:
                         var_chunks = {'y': optimal['y'], 'x': optimal['x']}
-                    rechunked = arr.chunk(var_chunks)
-                    if hasattr(rechunked.data, 'dask'):
-                        n_layers = len(rechunked.data.__dask_graph__().layers)
-                        with dask.config.set({'optimization.fuse.active': n_layers > 3}):
-                            (rechunked.data,) = dask.optimize(rechunked.data)
-                    rechunked_vars[var] = rechunked
+                    rechunked_vars[var] = arr.chunk(var_chunks)
                 if isinstance(ds, xr.DataArray):
                     ds = rechunked_vars[ds.name]
                 elif rechunked_vars:
@@ -4029,7 +4074,9 @@ class BatchCore(dict):
         intfs.coarsen({'y':2, 'x':2}, boundary='trim').mean()
 
         If the requested spacing rounds to one pixel per axis -- the data is
-        already at, or coarser than, it -- returns the input unchanged.
+        already at, or coarser than, it -- returns the input unchanged. A burst
+        with fewer pixels than one cell along y or x has no full cell and is
+        left out of the result, as sel() leaves out a burst it emptied.
         """
         if isinstance(new_spacing, (int, float)):
             new_spacing = (new_spacing, new_spacing)
@@ -4041,21 +4088,6 @@ class BatchCore(dict):
         if debug:
             print (f'DEBUG: cell size in meters: y={dy:.1f}, x={dx:.1f} -> y={new_spacing[0]:.1f}, x={new_spacing[1]:.1f}')
 
-        # Compute output chunk budget: input first chunk × 8 bytes / coarsen factors.
-        # This preserves the same spatial granularity (chunk count) after coarsening.
-        from .utils_dask import rechunk2d
-        sample_ds = next(iter(self.values()))
-        if hasattr(sample_ds, 'obj'):
-            sample_ds = sample_ds.obj
-        output_budget_mb = None
-        # a Dataset's variables, or a DataArray as its own one (N81)
-        for arr in BatchCore._vars_of(sample_ds).values():
-            if arr.ndim >= 2 and arr.dims[-2:] == ('y', 'x') and hasattr(arr.data, 'chunks'):
-                cy0 = arr.data.chunks[-2][0]
-                cx0 = arr.data.chunks[-1][0]
-                output_budget_mb = cy0 * cx0 * 8 / (1024 * 1024) / yscale / xscale
-                break
-
         # Coarsen the (y, x) planes only. .mean() over the whole Dataset would
         # also hit the 1D radar metadata -- and 'burst' is a STRING, so it dies
         # with "could not convert string to float". The metadata is re-attached
@@ -4063,7 +4095,14 @@ class BatchCore(dict):
         # wavelength that grid was measured at.
         meta_keys = {}
         spatial = {}
+        # The output chunk budget of each burst: ITS OWN largest input block x 8 bytes / coarsen factors, so the
+        # output keeps the spatial granularity (chunk count) of its input. The first burst, a crop's remnant, is no
+        # reference for the others: its small shape made every burst's output blocks tiny.
+        budgets = {}
         for key, ds in self.items():
+            blocks = BatchCore._largest_blocks(ds, ('y', 'x'))
+            if len(blocks) == 2:
+                budgets[key] = blocks['y'][0] * blocks['x'][0] * 8 / (1024 * 1024) / yscale / xscale
             if isinstance(ds, xr.DataArray):
                 # a DataArray is its own grid and carries no metadata (N81)
                 meta_keys[key] = None
@@ -4073,6 +4112,10 @@ class BatchCore(dict):
                  if not (ds[v].ndim >= 2 and tuple(ds[v].dims[-2:]) == ('y', 'x'))]
             meta_keys[key] = ds[m] if m else None
             spatial[key] = ds[[v for v in ds.data_vars if v not in m]]
+        # coarsen() leaves out a burst smaller than one cell; when every burst is, there is nothing to return
+        if all(ds.sizes['y'] < yscale or ds.sizes['x'] < xscale for ds in self.values()):
+            raise ValueError(f'ERROR: downsample({new_spacing[0]:g}, {new_spacing[1]:g}): every burst is smaller than one '
+                             f'cell of {yscale} x {xscale} pixels. Use a smaller spacing.')
         result = type(self)(spatial).coarsen(
             {'y': yscale, 'x': xscale}, boundary='trim').mean()
         for key in list(result.keys()):
@@ -4083,18 +4126,14 @@ class BatchCore(dict):
                     {v: md[v] for v in md.data_vars})
                 result[key].attrs = attrs
 
-        # Rechunk output to preserve input spatial granularity
-        if output_budget_mb is not None:
-            sample_ds = next(iter(result.values()))
-            for arr in BatchCore._vars_of(sample_ds).values():
-                if arr.ndim >= 2 and arr.dims[-2:] == ('y', 'x') and hasattr(arr.data, 'chunks'):
-                    y_size, x_size = arr.shape[-2], arr.shape[-1]
-                    optimal = rechunk2d((y_size, x_size), element_bytes=8,
-                                       target_mb=output_budget_mb)
-                    result = result.chunk({'y': optimal['y'], 'x': optimal['x']})
-                    break
-
-        return result
+        # Rechunk each burst's output to preserve its input spatial granularity (the budgets above)
+        from .utils_dask import rechunk2d
+        specs = {}
+        for key, ds in dict.items(result):
+            if key in budgets:
+                optimal = rechunk2d((ds.sizes['y'], ds.sizes['x']), element_bytes=8, target_mb=budgets[key])
+                specs[key] = {'y': optimal['y'], 'x': optimal['x']}
+        return result._chunk_each(specs)
 
     def save(self, store: str, storage_options: dict[str, str] | None = None,
                 caption: str | None = 'Saving...', debug=False):
@@ -4418,20 +4457,11 @@ class BatchCore(dict):
                       f"x=[{bx.min():.1f}, {bx.max():.1f}] ({len(by)}×{len(bx)} pixels)")
 
         # Build result for each polarization: ONE TASK PER OUTPUT BLOCK, and one per tile it
-        # reads, on the inputs' own blocks, that dask never fuses (_UnfusedTask) -- the same
-        # keys, naming the same tasks, in every graph (as Stack._zarr_dask()). Read through
-        # to_delayed(optimize_graph=False), an input was not Blockwise-fused in a
-        # to_dataset() graph and was in every other: the interferogram product ref *
-        # conj(rep) was mul(getitem, conjugate) here and one fused task of the two getitems
-        # elsewhere. The scheduler, still holding that key among the inputs of a computed
-        # result, kept its old dependencies (dask issue 9888), and to_vtk() failed now and
-        # then with KeyError or 'missing keys'. Now an input's blocks are read as they are
-        # computed anywhere, and nothing here fuses into them.
-        # The merge functions are module level (_tile_for_dask, _merge_parts_for_dask).
+        # reads, on the inputs' own blocks. The merge functions are module level
+        # (_tile_for_dask, _merge_parts_for_dask).
         from dask.base import tokenize
-        from dask._task_spec import TaskRef
+        from dask._task_spec import Task, TaskRef
         from dask.highlevelgraph import HighLevelGraph
-        from .utils_dask import _UnfusedTask
 
         def _overlap(edges, lo, hi):
             """[(chunk, start, stop within it)] of the chunks the range [lo, hi) overlaps."""
@@ -4546,15 +4576,15 @@ class BatchCore(dict):
                                 for iy, py0, py1 in _overlap(ey, by0, by1):
                                     for ix, px0, px1 in _overlap(ex, bx0, bx1):
                                         key = (tname, s_idx, yi, xi, len(parts))
-                                        layer[key] = _UnfusedTask(key, _tile_for_dask,
-                                                                  TaskRef((arr.name,) + lead + (iy, ix)),
-                                                                  s_local, py0, py1, px0, px1)
+                                        layer[key] = Task(key, _tile_for_dask,
+                                                          TaskRef((arr.name,) + lead + (iy, ix)),
+                                                          s_local, py0, py1, px0, px1)
                                         parts.append(TaskRef(key))
                                         offsets.append((y_off + ey[iy] + py0 - by0, x_off + ex[ix] + px0 - bx0))
 
                         key = (name, s_idx, yi, xi)
-                        layer[key] = _UnfusedTask(key, _merge_parts_for_dask, tuple(offsets), out_shape,
-                                                  fill_dtype, nodata, *parts)
+                        layer[key] = Task(key, _merge_parts_for_dask, tuple(offsets), out_shape,
+                                          fill_dtype, nodata, *parts)
 
             graph = HighLevelGraph.from_collections(name, layer, dependencies=arrays)
             data = da.Array(graph, name, chunks=((1,) * n_stack, y_sizes, x_sizes), dtype=fill_dtype,
@@ -5673,6 +5703,12 @@ class BatchCore(dict):
         """
         2D (yx) Gaussian kernel smoothing (multilook) on each dataset in this Batch.
 
+        A wavelength large against the 67 m processing resolution is filtered on a decimated grid (about 134 m and
+        up on the CPU, 1600 m and up on a GPU). The decimation cells sit at multiples of the decimation step counted
+        from pixel 0 of each burst's grid, so the result depends on the wavelength and on the burst's grid, and does
+        not depend on the dask chunks (up to float rounding). It does depend on cropping the burst: a crop starts its
+        own decimation grid.
+
         Parameters
         ----------
         wavelength : float
@@ -5682,7 +5718,8 @@ class BatchCore(dict):
             second behind an optional weight, so `gaussian(200)` bound 200 to
             the weight and every caller had to write `wavelength=`. Omitted, it
             once left sigma None and the kernel returned the input untouched:
-            a filter that silently did nothing, by default.
+            a filter that silently did nothing, by default. A filter that
+            reaches farther than a burst is long raises ValueError, at the call.
         weight : BatchUnit or None
             A Batch of 2D DataArrays, one per key, matching this Batch's keys.
             If None, no weighting is applied.
@@ -5750,6 +5787,26 @@ class BatchCore(dict):
             resolved_device = BatchCore._get_torch_device(device, debug=debug)
             device = resolved_device.type  # 'cpu', 'cuda', or 'mps' as string
 
+        # The decimation the kernel applies (None: direct filtering): it sets the overlap depth and the grid of the
+        # blocks below
+        from .utils_gaussian import decimation_plan
+        plan = decimation_plan(sigmas, (dy, dx), BatchCore._get_torch_device(device).type)
+
+        # THE OVERLAP DEPTH OF THE FILTER (pixels, y and x; truncate=4.0 is used in gaussian_numpy). A decimating filter
+        # takes the depth that makes a block's results those of the whole array and works on the decimation grid of the
+        # whole array (_apply_gaussian_2d_for_dask)
+        truncate = 4.0
+        if plan is None:
+            depth_y, depth_x = int(np.ceil(sigmas[0] * truncate)), int(np.ceil(sigmas[1] * truncate))
+        else:
+            depth_y, depth_x = plan['halo']
+        # A filter that reaches farther than a burst is long has no room in it: the crop is too small
+        for key, ds in self.items():
+            if depth_y > ds.sizes['y'] or depth_x > ds.sizes['x']:
+                raise ValueError(
+                    f"gaussian() wavelength {wavelength:g} m reaches {depth_y} x {depth_x} pixels, farther than burst {key} "
+                    f"of {ds.sizes['y']} x {ds.sizes['x']} pixels: crop a larger area or use a shorter wavelength")
+
         out = {}
         # loop over each key
         for key, ds in self.items():
@@ -5779,10 +5836,9 @@ class BatchCore(dict):
                 if data_arr.ndim == 3 and dask_data.chunks[0][0] != 1:
                     dask_data = dask_data.rechunk({0: 1})
 
-                # Calculate overlap depth from sigmas (truncate=4.0 is used in gaussian_numpy)
-                truncate = 4.0
-                depth_y = int(np.ceil(sigmas[0] * truncate)) if sigmas is not None else 0
-                depth_x = int(np.ceil(sigmas[1] * truncate)) if sigmas is not None else 0
+                # the decimation grid of the whole array (_apply_gaussian_2d_for_dask) when the filter decimates
+                grid = plan['scale'] if plan is not None else None
+                overlap_kw = dict(grid=grid, halo=(depth_y, depth_x))
 
                 if debug:
                     if data_arr.ndim == 3:
@@ -5809,7 +5865,7 @@ class BatchCore(dict):
                                 dtype=out_dtype,
                                 sigmas=sigmas, threshold=threshold,
                                 device=device, pixel_sizes=(dy, dx),
-                                out_dtype=out_dtype)
+                                out_dtype=out_dtype, **overlap_kw)
                             slices.append(result_slice)
                         result_dask = da.stack(slices, axis=0)
                     elif weight_dask is not None:
@@ -5829,7 +5885,7 @@ class BatchCore(dict):
                             dtype=out_dtype,
                             sigmas=sigmas, threshold=threshold,
                             device=device, pixel_sizes=(dy, dx),
-                            out_dtype=out_dtype)
+                            out_dtype=out_dtype, **overlap_kw)
                     else:
                         # No weight: single map_overlap on 3D data
                         result_dask = da.map_overlap(
@@ -5839,7 +5895,7 @@ class BatchCore(dict):
                             dtype=out_dtype, weight_block=None,
                             sigmas=sigmas, threshold=threshold,
                             device=device, pixel_sizes=(dy, dx),
-                            out_dtype=out_dtype)
+                            out_dtype=out_dtype, **overlap_kw)
                 else:
                     # 2D data (y, x)
                     depth_2d = {0: depth_y, 1: depth_x}
@@ -5855,7 +5911,7 @@ class BatchCore(dict):
                             dtype=out_dtype,
                             sigmas=sigmas, threshold=threshold,
                             device=device, pixel_sizes=(dy, dx),
-                            out_dtype=out_dtype)
+                            out_dtype=out_dtype, **overlap_kw)
                     else:
                         result_dask = da.map_overlap(
                             _apply_gaussian_2d_for_dask,
@@ -5864,7 +5920,7 @@ class BatchCore(dict):
                             dtype=out_dtype, weight_block=None,
                             sigmas=sigmas, threshold=threshold,
                             device=device, pixel_sizes=(dy, dx),
-                            out_dtype=out_dtype)
+                            out_dtype=out_dtype, **overlap_kw)
 
                 new_vars[var] = xr.DataArray(
                     result_dask,

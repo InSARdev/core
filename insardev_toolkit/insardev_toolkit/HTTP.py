@@ -630,6 +630,28 @@ def fetch(url: str, session=None, headers=None, magic=None, retries: int = 30, t
             time.sleep(timeout_second)
 
 
+def download_jobs(n_jobs):
+    """
+    The parallel downloads to run for `n_jobs`: at most two per CPU this process may use. Each download unpacks its
+    data in its own process, so more of them than that hold memory and gain nothing: 8 on one CPU took 1 GiB of a
+    2 GB container. A cap is noted. None, 1 and joblib's negative counts are returned as they are.
+    """
+    import os
+    if n_jobs is None or n_jobs <= 1:
+        return n_jobs
+    if hasattr(os, 'process_cpu_count'):
+        cpus = os.process_cpu_count()
+    elif hasattr(os, 'sched_getaffinity'):
+        cpus = len(os.sched_getaffinity(0))
+    else:
+        cpus = os.cpu_count()
+    limit = 2 * max(1, cpus or 1)
+    if n_jobs > limit:
+        print(f'NOTE: {n_jobs} parallel downloads capped at {limit}, two per CPU.')
+        return limit
+    return n_jobs
+
+
 def download(url: str, dst: str, retries: int = 30, timeout_second: float = 3, timeout=(10, 300),
              min_rate='100KB', min_rate_window: float = 60):
     """

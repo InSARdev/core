@@ -8,66 +8,14 @@
 # See the LICENSE file in the insardev_pygmtsar directory for license terms.
 # ----------------------------------------------------------------------------
 from .Nisar_align import Nisar_align
+# the split of an output chunk into blocks by the radar box of their pixels (shared with insardev_ecef)
+from insardev_toolkit.utils_chunks import radar_boxes as _radar_boxes
+from insardev_toolkit.utils_pool import release_workers
 
 
 def _process_chunk_nisar_worker(args):
     """Wrapper for ProcessPoolExecutor - unpacks tuple and calls _process_chunk_nisar."""
     return _process_chunk_nisar(*args)
-
-
-def _radar_boxes(azi, rng, mask, n_azi, n_rng, budget, tile=64):
-    """Split an output chunk into blocks whose radar-coordinate bounding box holds at most budget cells.
-
-    azi, rng are the reference radar coordinates of the chunk's pixels (cell k of the radar grid is centred on
-    coordinate k, the 0-based line and bin), mask the pixels that need the phase. The extents are taken per tile x tile pixels once; a
-    block of tiles is halved along the output axis that makes its larger half's box smaller, until the box fits.
-    Returns (y0, y1, x0, x1, a0, a1, r0, r1) per block: the output pixels and the radar cells for linear
-    interpolation at them.
-    """
-    import numpy as np
-
-    n_y, n_x = azi.shape
-    ty, tx = -(-n_y // tile), -(-n_x // tile)
-
-    def reduce(arr, fill, op):
-        full = np.full((ty * tile, tx * tile), fill, dtype=np.float32)
-        full[:n_y, :n_x] = np.where(mask, arr, fill)
-        return op(full.reshape(ty, tile, tx, tile), axis=(1, 3))
-
-    a_lo, a_hi = reduce(azi, np.inf, np.min), reduce(azi, -np.inf, np.max)
-    r_lo, r_hi = reduce(rng, np.inf, np.min), reduce(rng, -np.inf, np.max)
-
-    def box(t):
-        y0, y1, x0, x1 = t
-        amin = a_lo[y0:y1, x0:x1].min()
-        if not np.isfinite(amin):
-            return None
-        amax, rmin, rmax = a_hi[y0:y1, x0:x1].max(), r_lo[y0:y1, x0:x1].min(), r_hi[y0:y1, x0:x1].max()
-        return (int(np.floor(amin)), min(n_azi, int(np.floor(amax)) + 2),
-                int(np.floor(rmin)), min(n_rng, int(np.floor(rmax)) + 2))
-
-    def cells(b):
-        return 0 if b is None else (b[1] - b[0]) * (b[3] - b[2])
-
-    blocks = []
-    stack = [((0, ty, 0, tx), box((0, ty, 0, tx)))]
-    while stack:
-        t, b = stack.pop()
-        if b is None:
-            continue
-        y0, y1, x0, x1 = t
-        if cells(b) <= budget or (y1 - y0 < 2 and x1 - x0 < 2):
-            blocks.append((y0 * tile, min(y1 * tile, n_y), x0 * tile, min(x1 * tile, n_x)) + b)
-            continue
-        halves = []
-        if y1 - y0 >= 2:
-            ym = (y0 + y1) // 2
-            halves.append([((y0, ym, x0, x1), box((y0, ym, x0, x1))), ((ym, y1, x0, x1), box((ym, y1, x0, x1)))])
-        if x1 - x0 >= 2:
-            xm = (x0 + x1) // 2
-            halves.append([((y0, y1, x0, xm), box((y0, y1, x0, xm))), ((y0, y1, xm, x1), box((y0, y1, xm, x1)))])
-        stack.extend(min(halves, key=lambda h: max(cells(h[0][1]), cells(h[1][1]))))
-    return blocks
 
 
 def _process_chunk_nisar(iy, ix, chunk_y, chunk_x, n_y, n_x,
@@ -119,36 +67,10 @@ def _process_chunk_nisar(iy, ix, chunk_y, chunk_x, n_y, n_x,
         azi_chunk = (azi_orig + ashift + stretch_a * rng_orig + a_stretch_a * azi_orig).astype(np.float32)
         del azi_orig, rng_orig
 
-    # Find SLC read bounds (with margin for interpolation)
+    # The pixels with radar coordinates; nothing to read for an empty chunk
     valid_mask = np.isfinite(azi_chunk) & np.isfinite(rng_chunk)
     if not valid_mask.any():
         return  # Empty chunk
-
-    margin = 10  # pixels margin for interpolation
-    azi_min = max(0, int(np.floor(np.nanmin(azi_chunk))) - margin)
-    azi_max = min(num_lines, int(np.ceil(np.nanmax(azi_chunk))) + margin)
-    rng_min = max(0, int(np.floor(np.nanmin(rng_chunk))) - margin)
-    rng_max = min(num_rng_bins, int(np.ceil(np.nanmax(rng_chunk))) + margin)
-
-    if azi_max <= azi_min or rng_max <= rng_min:
-        return  # Empty chunk
-
-    # Read SLC chunk from HDF5
-    slc_chunk = nisar_slc(h5_path, pol=pol, frequency=frequency,
-                          row_slice=slice(azi_min, azi_max),
-                          col_slice=slice(rng_min, rng_max))
-
-    # Local coordinates in the SLC chunk, the maps of cv2.remap: the transform's azi/rng are the 0-based
-    # pixel-centre line and bin (zeroDopplerTime[i] and slantRange[j] are the centres of line i and bin j), the
-    # coordinates cv2.remap reads, so no 0.5 shift, as S1 (float32 minus a whole line or bin: exact)
-    azi_local = azi_chunk - azi_min
-    rng_local = rng_chunk - rng_min
-    del azi_chunk, rng_chunk
-
-    # Geocode SLC chunk
-    slc_re = slc_chunk.real.astype(np.float32)
-    slc_im = slc_chunk.imag.astype(np.float32)
-    del slc_chunk
 
     # The azimuth spectrum of the RSLC is centred on its Doppler centroid f (about 0.63 cycles per line), not on 0,
     # and LANCZOS4 passes only a band around 0: the lines are demodulated with the date's f (doppler, one value for
@@ -157,49 +79,84 @@ def _process_chunk_nisar(iy, ix, chunk_y, chunk_x, n_y, n_x,
     # same values in any chunk (an f per chunk and a carrier from the chunk's first line made the SLC depend on the
     # chunk size)
     assert doppler is not None, 'ERROR: the Doppler centroid of the date is required'
-    carrier = (2 * np.pi * doppler) * np.arange(azi_min, azi_max, dtype=np.float64)
-    cos_k, sin_k = np.cos(carrier).astype(np.float32)[:, None], np.sin(carrier).astype(np.float32)[:, None]
-    del carrier
-    for r0 in range(0, slc_re.shape[0], 512):
-        re_, im_ = slc_re[r0:r0 + 512], slc_im[r0:r0 + 512]
-        c_, s_ = cos_k[r0:r0 + 512], sin_k[r0:r0 + 512]
-        # times exp(-i carrier): re c + im s, im c - re s, in place (one temporary block at a time)
-        t_ = re_ * s_
-        re_ *= c_
-        re_ += im_ * s_
-        im_ *= c_
-        im_ -= t_
-        del re_, im_, c_, s_, t_
-    del cos_k, sin_k
 
-    proj_re = cv2.remap(slc_re, rng_local, azi_local,
-                        interpolation=cv2.INTER_LANCZOS4,
-                        borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
-    proj_im = cv2.remap(slc_im, rng_local, azi_local,
-                        interpolation=cv2.INTER_LANCZOS4,
-                        borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
-    del slc_re, slc_im, rng_local
+    # Geocode the SLC block by block of the output chunk, each with the SLC box of its pixels plus the margin for the
+    # interpolation (at most as many cells as the chunk has pixels, as the topo below): the box of a whole chunk can
+    # span most of the swath, and its SLC copies of every parallel chunk worker would not fit in memory. With the
+    # carriers at the absolute scene line every output pixel gets the values of one SLC read of the whole chunk
+    margin = 10  # pixels margin for interpolation
+    proj_re = np.full(azi_chunk.shape, np.nan, dtype=np.float32)
+    proj_im = np.full(azi_chunk.shape, np.nan, dtype=np.float32)
+    for by0, by1, bx0, bx1, box_a0, box_a1, box_r0, box_r1 in _radar_boxes(
+            azi_chunk, rng_chunk, valid_mask, num_lines, num_rng_bins, chunk_y * chunk_x):
+        azi_min, azi_max = max(0, box_a0 - margin), min(num_lines, box_a1 + margin)
+        rng_min, rng_max = max(0, box_r0 - margin), min(num_rng_bins, box_r1 + margin)
+        if azi_max <= azi_min or rng_max <= rng_min:
+            continue  # the block's pixels are outside of the scene: they stay NaN
 
-    # Restore the carrier exp(2 pi i f azi) at the exact output position (the scene line azi_local + azi_min, exact
-    # in float64), in row blocks
-    for r0 in range(0, proj_re.shape[0], 512):
-        phase = (2 * np.pi * doppler) * (azi_local[r0:r0 + 512].astype(np.float64) + azi_min)
-        cos_c, sin_c = np.cos(phase).astype(np.float32), np.sin(phase).astype(np.float32)
-        re_, im_ = proj_re[r0:r0 + 512], proj_im[r0:r0 + 512]
-        re_[:], im_[:] = re_ * cos_c - im_ * sin_c, re_ * sin_c + im_ * cos_c
-        del phase, cos_c, sin_c, re_, im_
+        # Read the block's SLC box from HDF5
+        slc_chunk = nisar_slc(h5_path, pol=pol, frequency=frequency,
+                              row_slice=slice(azi_min, azi_max),
+                              col_slice=slice(rng_min, rng_max))
+
+        # Local coordinates in the SLC box, the maps of cv2.remap: the transform's azi/rng are the 0-based
+        # pixel-centre line and bin (zeroDopplerTime[i] and slantRange[j] are the centres of line i and bin j), the
+        # coordinates cv2.remap reads, so no 0.5 shift, as S1 (float32 minus a whole line or bin: exact)
+        azi_local = azi_chunk[by0:by1, bx0:bx1] - azi_min
+        rng_local = rng_chunk[by0:by1, bx0:bx1] - rng_min
+
+        # Geocode SLC box
+        slc_re = slc_chunk.real.astype(np.float32)
+        slc_im = slc_chunk.imag.astype(np.float32)
+        del slc_chunk
+
+        carrier = (2 * np.pi * doppler) * np.arange(azi_min, azi_max, dtype=np.float64)
+        cos_k, sin_k = np.cos(carrier).astype(np.float32)[:, None], np.sin(carrier).astype(np.float32)[:, None]
+        del carrier
+        for r0 in range(0, slc_re.shape[0], 512):
+            re_, im_ = slc_re[r0:r0 + 512], slc_im[r0:r0 + 512]
+            c_, s_ = cos_k[r0:r0 + 512], sin_k[r0:r0 + 512]
+            # times exp(-i carrier): re c + im s, im c - re s, in place (one temporary block at a time)
+            t_ = re_ * s_
+            re_ *= c_
+            re_ += im_ * s_
+            im_ *= c_
+            im_ -= t_
+            del re_, im_, c_, s_, t_
+        del cos_k, sin_k
+
+        block_re = cv2.remap(slc_re, rng_local, azi_local,
+                             interpolation=cv2.INTER_LANCZOS4,
+                             borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
+        block_im = cv2.remap(slc_im, rng_local, azi_local,
+                             interpolation=cv2.INTER_LANCZOS4,
+                             borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
+        del slc_re, slc_im, rng_local
+
+        # Restore the carrier exp(2 pi i f azi) at the exact output position (the scene line azi_local + azi_min,
+        # exact in float64), in row blocks
+        for r0 in range(0, block_re.shape[0], 512):
+            phase = (2 * np.pi * doppler) * (azi_local[r0:r0 + 512].astype(np.float64) + azi_min)
+            cos_c, sin_c = np.cos(phase).astype(np.float32), np.sin(phase).astype(np.float32)
+            re_, im_ = block_re[r0:r0 + 512], block_im[r0:r0 + 512]
+            re_[:], im_[:] = re_ * cos_c - im_ * sin_c, re_ * sin_c + im_ * cos_c
+            del phase, cos_c, sin_c, re_, im_
+        proj_re[by0:by1, bx0:bx1] = block_re
+        proj_im[by0:by1, bx0:bx1] = block_im
+        del azi_local, block_re, block_im
+    del azi_chunk, rng_chunk
 
     # cv2.remap doesn't reliably produce NaN when map values are NaN
     # Explicitly mask pixels where transform was fill (azi/rng was NaN)
     proj_re[~valid_mask] = np.nan
     proj_im[~valid_mask] = np.nan
-    del azi_local, valid_mask
+    del valid_mask
 
     # Apply topo/tidal phase if needed: the flat-earth and topographic phase of flat_earth_topo_phase() and the
     # tide of tidal_phase_radar() on the radar-coordinate topo, geocoded (linear) at each pixel's REFERENCE radar
     # coordinates -- the transform, not the repeat coordinates of the alignment above -- like S1. Block by block of
-    # the output chunk, each with the radar box of its pixels (at most an eighth of a chunk of cells), after the SLC
-    # arrays are gone: the box of a whole chunk spans the full swath and would not fit in memory.
+    # the output chunk, each with the radar box of its pixels (at most as many cells as the chunk has pixels), after
+    # the SLC arrays are gone: the box of a whole chunk spans the full swath and would not fit in memory.
     # remove_topo_phase=False removes the flat earth alone, like S1: the topo is the WGS84 ellipsoid at
     # reference_height of reference_surface_topo(), its nodes on the whole radar grid (radar_shape), so each
     # block holds the whole-grid values; the tide as well
@@ -248,7 +205,7 @@ def _process_chunk_nisar(iy, ix, chunk_y, chunk_x, n_y, n_x,
         need = np.isfinite(azi_ref) & np.isfinite(rng_ref) & np.isfinite(proj_re)
 
         for by0, by1, bx0, bx1, topo_azi_min, topo_azi_max, topo_rng_min, topo_rng_max in _radar_boxes(
-                azi_ref, rng_ref, need, topo_n_azi, topo_n_rng, chunk_y * chunk_x // 8):
+                azi_ref, rng_ref, need, topo_n_azi, topo_n_rng, chunk_y * chunk_x):
             if topo_root is not None:
                 # Read only the block we need with proper fill handling
                 topo_raw = topo_root['topo'][topo_azi_min:topo_azi_max, topo_rng_min:topo_rng_max]
@@ -327,7 +284,7 @@ def _transform_slc_int16_nisar_chunked(outdir, conversion_dir, prm_rep, prm_ref,
                                         remove_tidal_phase=True,
                                         remove_topo_phase=True,
                                         h5_path=None, pol=None, frequency=None,
-                                        chunk=(8192, 8192), n_jobs=None, debug=False,
+                                        n_jobs=None, debug=False,
                                         reference_height=0.0):
     """
     Transform Nisar SLC to geocoded int16 zarr using chunked I/O.
@@ -339,7 +296,8 @@ def _transform_slc_int16_nisar_chunked(outdir, conversion_dir, prm_rep, prm_ref,
     ----------
     n_jobs : int, optional
         Number of parallel chunk workers. None or -1 (default): all cores.
-        Each worker holds one chunk: lower n_jobs or chunk to use less RAM.
+        Each worker holds one processing chunk, 2 x 2 zarr chunks of at most 32 MiB of complex64 (grid_chunks):
+        lower n_jobs to use less RAM.
     reference_height : float, optional
         With remove_topo_phase=False: the height of the WGS84 ellipsoid whose flat-earth phase is removed.
     """
@@ -438,8 +396,10 @@ def _transform_slc_int16_nisar_chunked(outdir, conversion_dir, prm_rep, prm_ref,
     zarr_path = os.path.join(outdir, os.path.basename(scene_name))
     os.makedirs(zarr_path, exist_ok=True)
 
-    chunk_y, chunk_x = chunk
-    zarr_chunks = (min(chunk_y, n_y), min(chunk_x, n_x))
+    # the stored chunks of the S1 rule (zarr_chunk_shape: at most 32 MiB of complex64, about equal) and a processing
+    # chunk of 2 x 2 of them (grid_chunks): no small stripe at the end, and the workers write whole zarr chunks
+    from insardev_toolkit.utils_chunks import grid_chunks
+    zarr_chunks, (chunk_y, chunk_x) = grid_chunks((n_y, n_x))
     store = zarr.storage.LocalStore(zarr_path)
     root = zarr.group(store=store, zarr_format=3, overwrite=True)
 
@@ -487,6 +447,9 @@ def _transform_slc_int16_nisar_chunked(outdir, conversion_dir, prm_rep, prm_ref,
     from concurrent.futures import ProcessPoolExecutor
 
     _t0_chunks = time.perf_counter()
+    # the joblib workers of the alignment (the SAT_llt2rat and xcorr workers of this date) stay alive in loky's
+    # reusable executor and hold memory the chunk workers need: stop them, the next joblib step starts its own
+    release_workers()
     with ProcessPoolExecutor(max_workers=n_jobs, mp_context=mp.get_context('spawn'),
                              max_tasks_per_child=1) as executor:
         list(executor.map(_process_chunk_nisar_worker, chunk_args))
@@ -627,7 +590,7 @@ class Nisar_transform(Nisar_align):
                   frequency: str | None = None,
                   epsg: str | int | None = 'auto',
                   resolution: tuple[int, int] = (8, 16),
-                  chunk: tuple[int, int] = (8192, 8192),
+                  chunk: tuple[int, int] | None = None,
                   remove_topo_phase: bool = True,
                   remove_tidal_phase: bool = True,
                   reference_height: float | None = None,
@@ -661,8 +624,9 @@ class Nisar_transform(Nisar_align):
             Geocoding is always enabled: epsg=0 (radar coordinates) is not supported and raises ValueError.
         resolution : tuple[int, int], optional
             The resolution to use in meters per pixel.
-        chunk : tuple[int, int], optional
-            Processing chunk size (y, x) in pixels. Default is (8192, 8192).
+        chunk : None, optional
+            Not used, kept for backward compatibility (a WARNING is printed when it is set). The stored chunks
+            are those of the S1 rule and a worker processes 2 x 2 of them; rechunk a loaded stack with chunk2d().
         remove_topo_phase : bool, optional
             Remove the topographic phase from SLC data for interferometric processing. Set to False
             when creating a DEM from interferograms so the topo phase remains: the flat-earth phase of the
@@ -698,7 +662,8 @@ class Nisar_transform(Nisar_align):
         n_jobs : int, optional
             Number of parallel workers of every internal step: the geocoding tiles, the alignment
             (SAT_llt2rat and xcorr) and the SLC chunks. None or -1 (default): all cores.
-            Each chunk worker holds one chunk: lower n_jobs or chunk to use less RAM.
+            Each chunk worker holds one processing chunk, 2 x 2 zarr chunks of at most 32 MiB of complex64 (the
+            S1 rule): lower n_jobs to use less RAM.
         scheduler : str, optional
             Not used for NISAR (kept for API compatibility).
         tmpdir : str, optional
@@ -717,6 +682,10 @@ class Nisar_transform(Nisar_align):
         from insardev_toolkit.utils_files import exists
 
         warnings.filterwarnings('ignore', message='.*Consolidated metadata.*', category=UserWarning)
+
+        if chunk is not None:
+            print(f'WARNING: chunk={chunk} is ignored: the stored chunks follow the S1 rule (at most 32 MiB '
+                  f'of complex64) and a worker processes 2 x 2 of them.')
 
         # radar-coordinate output (epsg=0) is not supported: geocoding is always enabled
         if epsg is not None and not isinstance(epsg, str) and epsg == 0:
@@ -846,7 +815,7 @@ class Nisar_transform(Nisar_align):
                     prm_ref_main, self.DEM, record.geometry.iloc[0], outdir,
                     scale_factor=1 / dem_vertical_accuracy,
                     epsg=scene_epsg, resolution=resolution, bbox=bbox,
-                    chunk=chunk, compute_topo=remove_topo_phase,
+                    compute_topo=remove_topo_phase,
                     n_jobs=n_jobs, debug=debug, datum=self.dem_datum()
                 )
 
@@ -917,7 +886,7 @@ class Nisar_transform(Nisar_align):
                         remove_tidal_phase=remove_tidal_phase,
                         remove_topo_phase=remove_topo_phase,
                         h5_path=h5_path, pol=pol, frequency=self.frequency,
-                        chunk=chunk, n_jobs=n_jobs, debug=debug,
+                        n_jobs=n_jobs, debug=debug,
                         reference_height=reference_height
                     )
             finally:
@@ -953,3 +922,5 @@ class Nisar_transform(Nisar_align):
             self.consolidate_metadata(target)
         finally:
             self.frequency = original_frequency
+        # the idle joblib workers keep their memory: stop them, the next parallel step starts its own
+        release_workers()

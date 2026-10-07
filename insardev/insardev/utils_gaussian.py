@@ -228,15 +228,57 @@ def _get_torch_device(device='auto', debug=False):
     return Batch._get_torch_device(device, debug)
 
 
+# GMTSAR constant: the half-gain wavelength is 5.3 sigma
+GAUSSIAN_CUTOFF = 5.3
+
+
+def decimation_plan(sigma, pixel_sizes, device_type, truncate=4.0, resolution=67.0):
+    """
+    The decimation gaussian_numpy() applies to a filter of `sigma` pixels (y, x), or None when it filters directly.
+
+    Decimation (PyGMTSAR approach) triggers when the decimation scales are above 1 and the wavelength over the
+    resolution is above 2 on the CPU (wavelength > ~134 m: decimation is always faster there) or above 24 on a GPU
+    (~1600 m: direct filtering is fast for smaller kernels).
+
+    Returns a dict:
+      scale   (scale_y, scale_x): the decimation cell in pixels
+      sigma_aa, sigma_dec: the sigmas (y, x) of the anti-aliasing filter (pixels) and of the main filter (cells)
+      halo    (y, x): the overlap depth in pixels a block needs for its results to be those of the whole array. A
+              pixel depends on the cells within the main filter reach of its cell, each of them on the pixels of
+              the cell and the anti-aliasing reach beyond; the cell grid starts up to scale - 1 pixels inside the
+              block and the last cell of the block may be cut by the same amount (see `skip` of gaussian_numpy).
+    """
+    import numpy as np
+
+    if pixel_sizes is None:
+        return None
+    sigma = np.asarray(sigma, dtype=np.float64)
+    dy, dx = pixel_sizes
+    scale_y = int(np.round(resolution / dy))
+    scale_x = int(np.round(resolution / dx))
+    # Recover wavelength from sigma: wavelength = sigma * cutoff * pixel_size
+    wavelength = sigma[0] * GAUSSIAN_CUTOFF * dy
+    if not (scale_y > 1 and scale_x > 1 and wavelength / resolution > (2 if device_type == 'cpu' else 24)):
+        return None
+    # AA sigma from resolution wavelength (same for both dimensions like PyGMTSAR)
+    sigma_aa = (resolution / GAUSSIAN_CUTOFF / dy, resolution / GAUSSIAN_CUTOFF / dx)
+    # wavelength_dec = sqrt(wavelength^2 - resolution^2); after coarsen, pixel sizes become (dy*scale_y, dx*scale_x)
+    wavelength_dec = np.sqrt(wavelength**2 - resolution**2)
+    sigma_dec = (wavelength_dec / GAUSSIAN_CUTOFF / (dy * scale_y), wavelength_dec / GAUSSIAN_CUTOFF / (dx * scale_x))
+    halo = tuple(int(s * (np.ceil(sd * truncate) + 2) + np.ceil(sa * truncate))
+                 for s, sd, sa in zip((scale_y, scale_x), sigma_dec, sigma_aa))
+    return dict(scale=(scale_y, scale_x), sigma_aa=sigma_aa, sigma_dec=sigma_dec, halo=halo)
+
+
 @_serialize_gpu
 def gaussian_numpy(data_np, weight_np=None, sigma=None, truncate=4.0, threshold=0.5, device='auto',
-                   pixel_sizes=None, resolution=67.0):
+                   pixel_sizes=None, resolution=67.0, skip=(0, 0)):
     """
     2D Gaussian convolution with separable kernels.
 
     Uses scipy.ndimage for CPU (memory-efficient) and PyTorch for GPU.
     Supports complex values, weights, and NaN handling.
-    For large sigmas with pixel_sizes provided, automatically decimates like PyGMTSAR.
+    For large sigmas with pixel_sizes provided, automatically decimates like PyGMTSAR (see decimation_plan()).
 
     Parameters
     ----------
@@ -255,9 +297,12 @@ def gaussian_numpy(data_np, weight_np=None, sigma=None, truncate=4.0, threshold=
     pixel_sizes : tuple of floats, optional
         Pixel sizes (dy, dx) in meters. Required for decimation.
     resolution : float, optional
-        Processing resolution in meters for decimation (default 67.0).
-        Decimation triggers when scales > 1 and wavelength/resolution > 3.
-        With 67m, common 200m wavelength uses direct filtering (200/67=2.98).
+        Processing resolution in meters for decimation (default 67.0). See decimation_plan() for when it triggers.
+    skip : tuple of int, optional
+        (rows, columns) at the start of the block before the first decimation cell: the decimation grid starts at
+        that row and column, the rows and columns before them are filled by replication and are meant to be trimmed.
+        Used for a block of a larger array, whose decimation grid belongs to the whole array. It has no effect
+        without decimation. Default (0, 0).
 
     Returns
     -------
@@ -297,49 +342,33 @@ def gaussian_numpy(data_np, weight_np=None, sigma=None, truncate=4.0, threshold=
     # Get device
     dev = _get_torch_device(device)
 
-    # GMTSAR constant
-    cutoff = 5.3
-
     # Check if decimation needed (PyGMTSAR approach with fixed resolution)
-    if pixel_sizes is not None:
-        dy, dx = pixel_sizes
-        scale_y = int(np.round(resolution / dy))
-        scale_x = int(np.round(resolution / dx))
-        # Recover wavelength from sigma: wavelength = sigma * cutoff * pixel_size
-        wavelength = sigma[0] * cutoff * dy
-    else:
-        scale_y = scale_x = 1
-        wavelength = None
+    plan = decimation_plan(sigma, pixel_sizes, dev.type, truncate, resolution)
+    if plan is not None:
+        scale_y, scale_x = plan['scale']
+        sigma_aa, sigma_dec = plan['sigma_aa'], plan['sigma_dec']
 
-    # Decimate when scales > 1 and wavelength large enough (PyGMTSAR approach)
-    # CPU: wavelength/resolution > 2 (i.e. wavelength > ~134m) - decimation always faster
-    # GPU: wavelength/resolution > 24 (~1600m) - direct filtering is fast for smaller kernels
-    use_decimation = (scale_y > 1 and scale_x > 1 and wavelength is not None
-                      and wavelength / resolution > (2 if dev.type == 'cpu' else 24))
-    if use_decimation:
         # Complex input on the GPU decimation path: the rest of this branch works
         # in float32 and would drop the imaginary part. A Gaussian is linear, so
         # filtering the parts separately is exact.
         if is_complex and dev.type != 'cpu':
             kw = dict(weight_np=weight_np, sigma=sigma, truncate=truncate,
                       threshold=threshold, device=device, pixel_sizes=pixel_sizes,
-                      resolution=resolution)
+                      resolution=resolution, skip=skip)
             re_ = gaussian_numpy(np.ascontiguousarray(data_np.real), **kw)
             im_ = gaussian_numpy(np.ascontiguousarray(data_np.imag), **kw)
-            return (re_ + 1j * im_).astype(np.complex64)
+            result = (re_ + 1j * im_).astype(np.complex64)
+            # the (1, y, x) block was squeezed above: it comes back as it came
+            return result[np.newaxis, ...] if squeeze else result
 
+        # THE DECIMATION GRID BELONGS TO THE WHOLE ARRAY, NOT TO THE BLOCK: the cells start at row sy and column sx of
+        # the block (the block of a larger array starts inside a cell of the array's grid), the rows and columns
+        # before them are filled by replication below and are overlap that the caller trims
         original_shape = data_np.shape
-
-        # AA sigma from resolution wavelength (same for both dimensions like PyGMTSAR)
-        sigma_aa = (resolution / cutoff / dy, resolution / cutoff / dx)
-
-        # wavelength_dec = sqrt(wavelength^2 - resolution^2)
-        wavelength_dec = np.sqrt(wavelength**2 - resolution**2)
-
-        # After coarsen, pixel sizes become (dy*scale_y, dx*scale_x)
-        dy_dec = dy * scale_y
-        dx_dec = dx * scale_x
-        sigma_dec = (wavelength_dec / cutoff / dy_dec, wavelength_dec / cutoff / dx_dec)
+        sy, sx = skip
+        data_np = data_np[sy:, sx:]
+        if weight_np is not None:
+            weight_np = weight_np[sy:, sx:]
 
         if dev.type == 'cpu':
             # CPU path: numpy operations
@@ -367,10 +396,10 @@ def gaussian_numpy(data_np, weight_np=None, sigma=None, truncate=4.0, threshold=
             result = np.repeat(result_dec, scale_y, axis=0)
             del result_dec
             result = np.repeat(result, scale_x, axis=1)
-            pad_y = original_shape[0] - result.shape[0]
-            pad_x = original_shape[1] - result.shape[1]
-            if pad_y > 0 or pad_x > 0:
-                result = np.pad(result, ((0, pad_y), (0, pad_x)), mode='edge')
+            pad_y = original_shape[0] - sy - result.shape[0]
+            pad_x = original_shape[1] - sx - result.shape[1]
+            if sy or sx or pad_y > 0 or pad_x > 0:
+                result = np.pad(result, ((sy, pad_y), (sx, pad_x)), mode='edge')
         else:
             # GPU path: keep data on GPU throughout, avoid CPU transfers
             import torch
@@ -431,10 +460,10 @@ def gaussian_numpy(data_np, weight_np=None, sigma=None, truncate=4.0, threshold=
             del t_result
 
             # Pad to original shape (keep 4D for F.pad)
-            pad_y = original_shape[0] - t_up.shape[2]
-            pad_x = original_shape[1] - t_up.shape[3]
-            if pad_y > 0 or pad_x > 0:
-                t_up = F.pad(t_up, (0, pad_x, 0, pad_y), mode='replicate')
+            pad_y = original_shape[0] - sy - t_up.shape[2]
+            pad_x = original_shape[1] - sx - t_up.shape[3]
+            if sy or sx or pad_y > 0 or pad_x > 0:
+                t_up = F.pad(t_up, (sx, pad_x, sy, pad_y), mode='replicate')
             result = t_up.squeeze().cpu().numpy()
             del t_up
 

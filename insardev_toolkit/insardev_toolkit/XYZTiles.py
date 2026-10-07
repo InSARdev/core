@@ -276,7 +276,8 @@ class XYZTiles(datagrid, progressbar_joblib):
             The URL template of the tile map service. The placeholders {x}, {y}, {z} should be present in the URL.
             Default is Google Satellite Hybrid 'https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}'.
         n_jobs : int, optional
-            The number of concurrent download jobs. Default is 8.
+            The number of concurrent download jobs, at most two per CPU this process may use (a larger number is
+            capped, with a note). Default is 8.
         skip_exist : bool, optional
             If True, keeps the tiles already downloaded. Default is True.
         fill_value : int, optional
@@ -342,6 +343,9 @@ class XYZTiles(datagrid, progressbar_joblib):
             tiles_dir = os.path.splitext(filename)[0]
         os.makedirs(tiles_dir, exist_ok=True)
 
+        from .HTTP import download_jobs
+        from .utils_pool import release_workers
+        n_jobs = download_jobs(n_jobs)
         joblib_backend = 'sequential' if n_jobs is None or debug else None
 
         try:
@@ -357,6 +361,8 @@ class XYZTiles(datagrid, progressbar_joblib):
                                      min_rate_window, debug)\
                                     for x, y in cells)
 
+            # the idle joblib workers keep their memory: stop them, the next parallel step starts its own
+            release_workers()
             missing = sorted(r[1] for r in results if r[0] == 'missing')
             failed = [r for r in results if r[0] == 'failed']
             if missing:

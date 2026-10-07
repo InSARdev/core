@@ -627,7 +627,8 @@ class ASF(progressbar_joblib):
         session : asf_search.ASFSession, optional
             Authenticated session. Created automatically if None.
         n_jobs : int or None, optional
-            Parallel download jobs. None uses mission-specific defaults (S1: 8, NISAR: 2).
+            Parallel download jobs, at most two per CPU this process may use (a larger number is capped, with a
+            note). None uses mission-specific defaults (S1: 8, NISAR: 4).
         joblib_backend : str, optional
             Backend for parallel processing. Default 'loky' (multiprocessing, faster on Colab).
         skip_exist : bool, optional
@@ -1043,6 +1044,9 @@ class ASF(progressbar_joblib):
             else:
                 pattern_to_fullburstid[pattern] = full_burst_id
 
+        from .HTTP import download_jobs
+        from .utils_pool import release_workers
+        n_jobs = download_jobs(n_jobs)
         if n_jobs is None or debug == True:
             print ('Note: sequential joblib processing is applied when "n_jobs" is None or "debug" is True.')
             joblib_backend = 'sequential'
@@ -1071,6 +1075,8 @@ class ASF(progressbar_joblib):
             statuses = joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(download_burst_with_retry)\
                                     (result, basedir, session, retries=retries, timeout_second=timeout_second) for result in results)
 
+        # the idle joblib workers keep their memory: stop them, the next parallel step starts its own
+        release_workers()
         failed_count = statuses.count(False)
         if failed_count > 0:
             raise Exception(f'Bursts downloading failed for {failed_count} items.')
@@ -2268,7 +2274,9 @@ class ASF(progressbar_joblib):
         # Unified download path - only backend differs for debug/sequential mode
         import joblib
         backend = 'sequential' if (n_jobs == 1 or debug) else 'loky'
-        effective_n_jobs = 1 if backend == 'sequential' else n_jobs
+        from .HTTP import download_jobs
+        from .utils_pool import release_workers
+        effective_n_jobs = 1 if backend == 'sequential' else download_jobs(n_jobs)
 
         def download_aligned_block(gid, offsets_str, total_size):
             """Download aligned 25x25km block via multi-offset API."""
@@ -2444,6 +2452,8 @@ class ASF(progressbar_joblib):
                             pbar.update(size)
                             block_data[off] = data
 
+                # the idle joblib workers keep their memory: stop them, the next parallel step starts its own
+                release_workers()
                 # Write file for this pol immediately
                 out_name = f"NSR_{track:03d}_{frame:03d}_{datetime_str}_{pol}.h5"
                 out_path = os.path.join(out_dir, out_name)

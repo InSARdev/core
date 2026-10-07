@@ -600,7 +600,8 @@ class CDSE(progressbar_joblib):
         session : requests.Session, optional
             Authenticated session.
         n_jobs : int, optional
-            Parallel download jobs (default 8).
+            Parallel download jobs, at most two per CPU this process may use (a larger number is capped, with a
+            note). Default is 4.
         joblib_backend : str, optional
             Joblib backend (default 'loky').
         skip_exist : bool, optional
@@ -978,6 +979,9 @@ class CDSE(progressbar_joblib):
                         return False
                 time.sleep(timeout_second)
 
+        from .HTTP import download_jobs
+        from .utils_pool import release_workers
+        n_jobs = download_jobs(n_jobs)
         if n_jobs is None or debug:
             print('Note: sequential processing applied when n_jobs is None or debug is True.')
             # Simple loop with tqdm for sequential/debug mode
@@ -1002,6 +1006,8 @@ class CDSE(progressbar_joblib):
                     for result in results
                 )
 
+        # the idle joblib workers keep their memory: stop them, the next parallel step starts its own
+        release_workers()
         failed_count = sum(1 for s in statuses if s is False)
         if failed_count > 0:
             raise Exception(f'Bursts downloading failed for {failed_count} items.')
