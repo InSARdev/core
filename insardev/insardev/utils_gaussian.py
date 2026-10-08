@@ -412,13 +412,17 @@ def gaussian_numpy(data_np, weight_np=None, sigma=None, truncate=4.0, threshold=
                 k = torch.exp(-0.5 * (x / s) ** 2)
                 return k / k.sum()
 
-            # Helper: separable Gaussian convolution on GPU
-            def gpu_gaussian(t_data, sig):
+            # Helper: separable Gaussian convolution on GPU. A weight multiplies the valid mask, as on the CPU
+            # (nanconvolve2d_gaussian_numpy): a NaN weight counts as 0, and the output is NaN where the weighted
+            # denominator is under 1e-10 (without a weight, where it is not above the threshold)
+            def gpu_gaussian(t_data, sig, t_weight=None):
                 ky = make_kernel_1d(sig[0], truncate).view(1, 1, -1, 1)
                 kx = make_kernel_1d(sig[1], truncate).view(1, 1, 1, -1)
                 pad_y, pad_x = ky.shape[2] // 2, kx.shape[3] // 2
                 # Valid mask and weighted convolution
                 valid = (~torch.isnan(t_data)).float()
+                if t_weight is not None:
+                    valid = valid * t_weight.nan_to_num(0.0)
                 t_data = t_data.nan_to_num(0.0)
                 t = (t_data * valid).unsqueeze(0).unsqueeze(0)
                 t = F.pad(t, (0, 0, pad_y, pad_y), mode='replicate')
@@ -430,14 +434,16 @@ def gaussian_numpy(data_np, weight_np=None, sigma=None, truncate=4.0, threshold=
                 w = F.conv2d(w, ky)
                 w = F.pad(w, (pad_x, pad_x, 0, 0), mode='replicate')
                 denom = F.conv2d(w, kx).squeeze()
-                return torch.where(denom > threshold, numer / (denom + 1e-10), torch.nan)
+                keep = denom > (threshold if t_weight is None else 1e-10)
+                return torch.where(keep, numer / (denom + 1e-10), torch.nan)
 
-            # Convert to GPU tensor
+            # Convert to GPU tensors
             t_data = torch.from_numpy(data_np.astype(np.float32)).to(dev)
+            t_wgt = None if weight_np is None else torch.from_numpy(weight_np.astype(np.float32)).to(dev)
 
-            # 1. AA filter (GPU)
-            t_aa = gpu_gaussian(t_data, sigma_aa)
-            del t_data
+            # 1. AA filter (GPU), weighted as on the CPU; the main filter below works on the decimated result, unweighted
+            t_aa = gpu_gaussian(t_data, sigma_aa, t_wgt)
+            del t_data, t_wgt
 
             # 2. Coarsen with avg_pool2d (GPU)
             ny_trim = (t_aa.shape[0] // scale_y) * scale_y

@@ -441,6 +441,7 @@ class Stack(BatchComplex):
     trend2d.__doc__ = BatchComplex.trend2d.__doc__
 
     def predict(self, model, baseline: 'str | None' = 'BPR', ref=None, vars=None) -> 'Batch':
+        BatchCore._require_model(model, 'predict')
         # an insardev_polsar trend3d() FIELD is evaluated by its predict3d() at the stack's pixels and elevation,
         # as stack.predict3d(field) does: `ele` is on the stack, BatchComplex(self) leaves it out
         if BatchComplex._trend3d_field(model, list(model.keys())):
@@ -1557,11 +1558,17 @@ DEFOMAX_CYCLE  {defomax}
             corr_ds = corr[key] if corr is not None else None
 
             result_vars = {}
+            # THE (y, x) GRIDS ONLY (N151): the per-pair metadata the Dataset carries (burst, radar_wavelength, geometry, ...)
+            # are no phase and are carried as every method carries them; they were taken for phases, and each one cost a
+            # compute of its pair coordinates at the call (2160 of them, 28 s) and came back as 1-D garbage that raises
             for var in phase_ds.data_vars:
-                if var == 'spatial_ref':
+                if var == 'spatial_ref' or not BatchCore._is_grid(phase_ds[var]):
                     continue
 
                 phase_da = phase_ds[var]
+                # the burst's OWN coordinates, as they are: `.chunk()` below turns the coordinates of a numpy-backed
+                # variable into dask arrays, and reading them back for the result was a compute each
+                coords = phase_da.coords
                 if isinstance(corr_ds, xr.DataArray):
                     # a DataArray corr weights every grid as it is (N81)
                     corr_da = corr_ds if BatchCore._is_grid(phase_da) else None
@@ -1574,14 +1581,6 @@ DEFOMAX_CYCLE  {defomax}
                         phase_da = phase_da.chunk({'pair': 1})
                     if corr_da is not None and not isinstance(corr_da.data, dask.array.Array):
                         corr_da = corr_da.chunk({'pair': 1})
-
-                # Save non-dimension coords along pair (ref, rep, BPR) for output
-                pair_coords = {}
-                if 'pair' in phase_da.dims:
-                    for k, v in phase_da.coords.items():
-                        if k != 'pair' and hasattr(v, 'dims') and v.dims == ('pair',):
-                            vals = v.values if hasattr(v, 'values') else v
-                            pair_coords[k] = ('pair', vals)
 
                 # Create wrapper that captures defomax and debug
                 def make_wrapper(defomax_val, debug_val):
@@ -1623,17 +1622,11 @@ DEFOMAX_CYCLE  {defomax}
                         meta=meta,
                     )
 
-                unwrap_da = xr.DataArray(
+                result_vars[var] = xr.DataArray(
                     result_dask,
                     dims=phase_da.dims,
-                    coords=phase_da.coords
+                    coords=coords
                 )
-
-                # Restore pair coords
-                if pair_coords:
-                    unwrap_da = unwrap_da.assign_coords(**pair_coords)
-
-                result_vars[var] = unwrap_da
 
             result_ds = xr.Dataset(Stack._carry_meta(phase_ds, result_vars))
             result_ds.attrs = phase_ds.attrs
@@ -4383,15 +4376,23 @@ DEFOMAX_CYCLE  {defomax}
                 dd_counts.append(da_module.sum(da_module.isfinite(dd_dask)))
                 dd_keys.append((d_rep, k))
 
-        # One dask.compute() call per overlap pair, its double differences of every repeat date, returning only
-        # scalars: a pair needs the overlap strips of its two bursts, and one call for all pairs held most of the
-        # stack in the workers at once
+        # ONE OVERLAP PAIR PER DASK WORKER in each dask.compute(), its double differences of every repeat date, returning
+        # only scalars: a pair needs the overlap strips of its two bursts. One call for all pairs held most of the stack in
+        # the workers at once, and one call per pair left all the workers but one idle (Türkiye 2023, 76 bursts: 2.2 s
+        # against 15.5 s). Batches of the worker count (user, 2026-10-07: "when we have say 8 workers its reasonable to
+        # process 8 at once (overlaps differ by size but maybe we can ignore it)"); without a Client, one pair at a time.
         print('WARNING: Stack.align() is not lazy: it computes the burst overlaps of the stack now; '
               'later changes to the input stack do not reach its corrections.', flush=True)
+        from distributed import get_client
+        try:
+            n_workers = max(len(get_client().nthreads()), 1)
+        except ValueError:
+            n_workers = 1
         n = len(dd_keys)
         sums, counts = [None] * n, [None] * n
-        for k in range(len(overlap_pairs)):
-            idx = [i for i, (_, kk) in enumerate(dd_keys) if kk == k]
+        for first in range(0, len(overlap_pairs), n_workers):
+            batch = set(range(first, min(first + n_workers, len(overlap_pairs))))
+            idx = [i for i, (_, kk) in enumerate(dd_keys) if kk in batch]
             values = dask.compute(*[dd_sums[i] for i in idx], *[dd_counts[i] for i in idx])
             for j, i in enumerate(idx):
                 sums[i], counts[i] = values[j], values[len(idx) + j]
@@ -4697,10 +4698,11 @@ DEFOMAX_CYCLE  {defomax}
             def _scalar_from_ds(ds, name: str):
                 if name in ds:
                     var = ds[name]
+                    # .values, not .item(): the numbers of a lazily opened store are dask arrays, which have no item()
                     if var.ndim == 0:
-                        return float(var.item())
+                        return float(var.values)
                     # For per-date variables, return mean value
-                    return float(var.mean().item())
+                    return float(var.mean().values)
                 return ds.attrs.get(name)
 
             wavelength = _scalar_from_ds(tfm, 'radar_wavelength')

@@ -989,9 +989,35 @@ class BatchCore(dict):
                     if attr is not None:
                         if isinstance(attr, (FunctionType, property)) and \
                                 (name in BatchCore._DA_AS_DATASETS or not BatchCore._is_core(attr)):
-                            return getattr(BatchCore._as_datasets(self, name), name)
+                            routed = getattr(BatchCore._as_datasets(self, name), name)
+                            if name in BatchCore._DA_AS_DATASETS or not isinstance(attr, FunctionType):
+                                return routed
+
+                            # A MODULE METHOD gives its result in core's form (N133): one (y, x) grid per burst comes back
+                            # as the DataArray, as core's own methods return it (_form), not as a one-variable Dataset
+                            def call(*args, **kwargs):
+                                return BatchCore._as_dataarrays(routed(*args, **kwargs))
+                            call.__name__, call.__doc__ = name, routed.__doc__
+                            return call
                         break
         return dict.__getattribute__(self, name)
+
+    @staticmethod
+    def _as_dataarrays(result):
+        """What a module method returned for a Batch of DataArrays, in core's form (N133, _form): a Batch whose every
+        burst is a Dataset of ONE (y, x) grid comes back as the grids' DataArrays, named as the grids are. Anything else
+        (several variables, a burst without a grid, not a Batch) is returned as it is."""
+        if not isinstance(result, BatchCore) or not len(result):
+            return result
+        out = {}
+        for k, ds in dict.items(result):
+            if not isinstance(ds, xr.Dataset) or len(ds.data_vars) != 1:
+                return result
+            (name, da), = ds.data_vars.items()
+            if not BatchCore._is_grid(da):
+                return result
+            out[k] = da.rename(name)
+        return result._view(out)
 
     @staticmethod
     def _is_core(attr) -> bool:
@@ -1013,6 +1039,13 @@ class BatchCore(dict):
         if isinstance(first, xr.DataArray):
             raise TypeError(f"ERROR: {what}() needs the Dataset ({', '.join(names)}), which "
                             f"x['{first.name}'] does not carry. {action}")
+
+    @staticmethod
+    def _require_model(model, what):
+        """predict() and mix() take the Batch a fit returned: None (the name of a fit that did not run, or an
+        argument left out) raises the short error here, not an AttributeError or a TypeError of `in None`."""
+        if model is None:
+            raise TypeError(f'ERROR: {what}() needs a model, got None. Pass what fit1d(), fit3d() or trend2d() returned.')
 
     @staticmethod
     def _needs_vars(batch, what, names, action='Call it on the Dataset batch x.'):
@@ -2834,7 +2867,7 @@ class BatchCore(dict):
         
         # Get target dimension size from first dataset
         first_ds = next(iter(self.values()))
-        target_size = first_ds.dims[list(coords.values())[0][0]]
+        target_size = first_ds.sizes[list(coords.values())[0][0]]
         
         # Process coordinates
         processed_coords = {name: process_coord(coord) for name, coord in coords.items()}
@@ -3028,15 +3061,6 @@ class BatchCore(dict):
 
     def transpose(self, *dims, **kw):
         return type(self)({k: ds.transpose(*dims, **kw) for k, ds in self.items()})
-
-    def _chunk_each(self, specs: dict):
-        """This batch with each burst rechunked by ITS OWN spec, {burst: chunks} as chunk() takes them (chunk() of that burst
-        alone); a burst without a spec is kept."""
-        out = {}
-        for key, ds in dict.items(self):
-            spec = specs.get(key)
-            out[key] = dict.__getitem__(self._view({key: ds}).chunk(spec), key) if spec else ds
-        return self._view(out)
 
     def _restored(self, out: dict):
         """The results `out` of a reduction of this batch, each burst given back its OWN exact input chunks: along every dim
@@ -3493,13 +3517,24 @@ class BatchCore(dict):
         return out
 
     @staticmethod
-    def _window_chunks(ds, window: dict[str, int]) -> dict[str, int]:
-        """{dim: block size} for coarsen() of one burst: whole windows, near the burst's own largest block of each
-        coarsened dimension that has more than one block (_largest_blocks). A dimension in one block keeps it."""
+    def _window_chunks(ds, window: dict[str, int]) -> dict[str, tuple]:
+        """{dim: block sizes} for coarsen() of one burst: the burst's OWN blocks of each coarsened dimension that has more
+        than one block, their boundaries moved up to whole windows (N148: the input's blocks, scaled by the window, and no
+        more of them). The blocks of a dimension are the ones of its variable with the most blocks (_largest_blocks says how
+        many); a block that is not whole windows made dask split it again for xarray's reshape. The first block starts at
+        the window grid (coarsen() trims to it first), so every boundary is a multiple of the window or the end; two blocks
+        smaller than a window merge. A dimension in one block keeps it."""
         sizes = {}
-        for dim, (largest, count) in BatchCore._largest_blocks(ds, window).items():
-            if count > 1:
-                sizes[dim] = max(window[dim], int(round(largest / window[dim])) * window[dim])
+        for dim, (_, count) in BatchCore._largest_blocks(ds, window).items():
+            if count < 2:
+                continue
+            blocks = next(b for v in BatchCore._vars_of(ds).values() for d, b in v.variable.chunksizes.items()
+                          if d == dim and len(b) == count)
+            n, w = int(sum(blocks)), int(window[dim])
+            inner = sorted({-(-int(b) // w) * w for b in np.cumsum(blocks)[:-1]} - {0})
+            inner = [b for b in inner if b < n]
+            if inner:
+                sizes[dim] = tuple(int(s) for s in np.diff([0] + inner + [n]))
         return sizes
 
     def coarsen(self, window: dict[str, int], **kwargs) -> Batch:
@@ -4008,7 +4043,7 @@ class BatchCore(dict):
                        if 'y' in sample[v].dims and 'x' in sample[v].dims]
         frames = []
         for key, ds in self.items():
-            for idx in range(ds.dims[dim]):
+            for idx in range(ds.sizes[dim]):
                 # Extract 2D slice for this date/pair
                 ds_slice = ds[spatial_vars].isel({dim: idx})
                 df_slice = ds_slice.to_dataframe().reset_index()
@@ -4095,14 +4130,7 @@ class BatchCore(dict):
         # wavelength that grid was measured at.
         meta_keys = {}
         spatial = {}
-        # The output chunk budget of each burst: ITS OWN largest input block x 8 bytes / coarsen factors, so the
-        # output keeps the spatial granularity (chunk count) of its input. The first burst, a crop's remnant, is no
-        # reference for the others: its small shape made every burst's output blocks tiny.
-        budgets = {}
         for key, ds in self.items():
-            blocks = BatchCore._largest_blocks(ds, ('y', 'x'))
-            if len(blocks) == 2:
-                budgets[key] = blocks['y'][0] * blocks['x'][0] * 8 / (1024 * 1024) / yscale / xscale
             if isinstance(ds, xr.DataArray):
                 # a DataArray is its own grid and carries no metadata (N81)
                 meta_keys[key] = None
@@ -4126,14 +4154,10 @@ class BatchCore(dict):
                     {v: md[v] for v in md.data_vars})
                 result[key].attrs = attrs
 
-        # Rechunk each burst's output to preserve its input spatial granularity (the budgets above)
-        from .utils_dask import rechunk2d
-        specs = {}
-        for key, ds in dict.items(result):
-            if key in budgets:
-                optimal = rechunk2d((ds.sizes['y'], ds.sizes['x']), element_bytes=8, target_mb=budgets[key])
-                specs[key] = {'y': optimal['y'], 'x': optimal['x']}
-        return result._chunk_each(specs)
+        # THE OUTPUT CHUNKS ARE coarsen()'s: each burst's own input chunks scaled by the window, whole windows (N148). They
+        # used to be rechunked here to a budget, and a size no chunk divides evenly (a prime) fell to 64-px chunks,
+        # many times more of them than the input had
+        return result
 
     def save(self, store: str, storage_options: dict[str, str] | None = None,
                 caption: str | None = 'Saving...', debug=False):
@@ -5131,15 +5155,17 @@ class BatchCore(dict):
             for data_var in data_vars:
                 da = merged[data_var]
 
-                if 'pair' in da.dims:
-                    n_pairs = da.sizes['pair']
+                # ONE LAYER PER SLICE of the stack dimension, named by what it is: a pair by its two dates, a date by itself
+                # (N147: a date dimension reached as_vtk() whole, which takes (y, x) or (band, y, x))
+                stackdim = 'pair' if 'pair' in da.dims else 'date' if 'date' in da.dims else None
+                if stackdim is not None:
                     export_items = []
-                    for i in range(n_pairs):
-                        da_slice = da.isel(pair=i)
-                        if 'pair' in da_slice.dims:
-                            da_slice = da_slice.squeeze('pair', drop=True)
-                        pair_label = _format_pair(da, i)
-                        export_items.append((pair_label, da_slice))
+                    for i in range(da.sizes[stackdim]):
+                        da_slice = da.isel({stackdim: i})
+                        if stackdim in da_slice.dims:
+                            da_slice = da_slice.squeeze(stackdim, drop=True)
+                        label = _format_pair(da, i) if stackdim == 'pair' else _format_dt(da['date'].values[i])
+                        export_items.append((label, da_slice))
                 else:
                     export_items = [(None, da)]
 

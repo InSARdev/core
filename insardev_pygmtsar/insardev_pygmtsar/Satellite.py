@@ -134,56 +134,71 @@ class Satellite(progressbar_joblib, datagrid):
 
         # bursts are keyed by fullBurstID and burst, scenes by sceneId and scene
         group_level, record_level = self.df.index.names[0], self.df.index.names[2]
+        unit = 'scenes' if group_level.lower().startswith('scene') else 'bursts'
+        # the groups to compute and the groups without orbits, found first: one progress bar over all the groups
+        # and one NOTE per call (a line per group only for an error)
+        todo, missing = [], []
         for group, records in self.df.groupby(level=group_level):
             dates = records.startTime.dt.date
             # the polarizations share the acquisition, so one record per date is enough
             firsts = records[~dates.duplicated()]
             if 'orbit' in firsts.columns and firsts.orbit.isnull().any():
-                print(f'NOTE: {group} misses orbits, its baselines are undefined.')
+                missing.append(group)
                 continue
-
             names = list(firsts.index.get_level_values(record_level))
             name_dates = list(dates[~dates.duplicated()])
             # the file holding the orbit of each record: the orbit file (Sentinel-1) or the scene (Nisar)
             sources = dict(zip(names, firsts['orbit' if 'orbit' in firsts.columns else 'path']))
+            todo.append((group, records, dates, names, name_dates, sources))
+        if missing:
+            print(f'NOTE: {len(missing)} of {len(missing) + len(todo)} {unit} miss orbits, '
+                  f'their baselines are undefined: {", ".join(missing)}.')
 
-            prms = {}
-            def prm_of(name):
-                if name not in prms:
-                    prms[name], _, _ = self.align_ref(name, debug=debug, return_slc=False)
-                return prms[name]
+        origins = {}
+        if todo:
+            with tqdm(desc='Computing Baselines'.ljust(25), total=sum(len(t[3]) for t in todo)) as pbar:
+                for group, records, dates, names, name_dates, sources in todo:
+                    prms = {}
+                    def prm_of(name):
+                        if name not in prms:
+                            prms[name], _, _ = self.align_ref(name, debug=debug, return_slc=False)
+                        return prms[name]
 
-            # the origin is the first date and never moves: it only shifts the whole scale,
-            # so moving it would hide a defect instead of reporting one
-            origin, origin_date = names[0], name_dates[0]
-            values = {}
-            with tqdm(desc='Computing Baselines'.ljust(25), total=len(names)) as pbar:
-                for name, date in zip(names, name_dates):
-                    if name == origin:
-                        values[date] = 0.0
-                    else:
-                        # the inputs are read outside the try: an empty or missing file (EmptyFileError,
-                        # FileNotFoundError, any OSError) or any other read error raises, it is no unsolved baseline
-                        prm_origin, prm_name = prm_of(origin), prm_of(name)
-                        try:
-                            value = float(prm_origin.SAT_baseline(prm_name).get('B_perpendicular'))
-                        except (ValueError, IndexError) as e:
-                            # the orbits do not solve it: SAT_baseline raises ValueError for a missing orbit or a
-                            # repeat orbit that does not cover the reference, IndexError for an orbit without state
-                            # vectors. Every date is a valid reference, so an unsolved baseline is a
-                            # defect and not a property of the data. Only this one is left out.
-                            print(f'ERROR: {group} baseline of {date} is unsolved: {e}')
+                    # the origin is the first date and never moves: it only shifts the whole scale,
+                    # so moving it would hide a defect instead of reporting one
+                    origin, origin_date = names[0], name_dates[0]
+                    origins.setdefault(origin_date, []).append(group)
+                    values = {}
+                    for name, date in zip(names, name_dates):
+                        if name == origin:
+                            values[date] = 0.0
                         else:
-                            # an invalid value (an orbit with NaN state vectors gives NaN) raises
-                            if not np.isfinite(value):
-                                raise ValueError(f'ERROR: {group} baseline of {date} is {value}. Check the orbits in '
-                                                 f'{sources[origin]} and {sources[name]}, and download the '
-                                                 f'invalid file again.')
-                            values[date] = value
-                    pbar.update(1)
+                            # the inputs are read outside the try: an empty or missing file (EmptyFileError,
+                            # FileNotFoundError, any OSError) or any other read error raises, it is no unsolved baseline
+                            prm_origin, prm_name = prm_of(origin), prm_of(name)
+                            try:
+                                value = float(prm_origin.SAT_baseline(prm_name).get('B_perpendicular'))
+                            except (ValueError, IndexError) as e:
+                                # the orbits do not solve it: SAT_baseline raises ValueError for a missing orbit or a
+                                # repeat orbit that does not cover the reference, IndexError for an orbit without state
+                                # vectors. Every date is a valid reference, so an unsolved baseline is a
+                                # defect and not a property of the data. Only this one is left out.
+                                print(f'ERROR: {group} baseline of {date} is unsolved: {e}')
+                            else:
+                                # an invalid value (an orbit with NaN state vectors gives NaN) raises
+                                if not np.isfinite(value):
+                                    raise ValueError(f'ERROR: {group} baseline of {date} is {value}. Check the orbits in '
+                                                     f'{sources[origin]} and {sources[name]}, and download the '
+                                                     f'invalid file again.')
+                                values[date] = value
+                        pbar.update(1)
+                    BPRs[records.index] = [values.get(date, np.nan) for date in dates]
 
-            print(f'NOTE: {group} baselines are measured from {origin_date}.')
-            BPRs[records.index] = [values.get(date, np.nan) for date in dates]
+        if len(origins) == 1:
+            print(f'NOTE: baselines are measured from {next(iter(origins))}.')
+        elif origins:
+            parts = '; '.join(f'{date} ({", ".join(groups)})' for date, groups in sorted(origins.items()))
+            print(f'NOTE: baselines are measured from the first date of each {unit[:-1]}: {parts}.')
 
         return BPRs
 
@@ -398,6 +413,11 @@ class Satellite(progressbar_joblib, datagrid):
         dict
             A dictionary mapping ref_id -> (ref_list, rep_list) where each list
             contains tuples of record indices.
+
+        Raises
+        ------
+        ValueError
+            No group has both the reference date and another date (one date scanned).
         """
         records = self.to_dataframe(ref=ref)
 
@@ -411,6 +431,12 @@ class Satellite(progressbar_joblib, datagrid):
         for rec in recs_rep.itertuples():
             reps_dict.setdefault(rec.Index[0], []).append(rec.Index)
 
+        # only the pairs with both reference and repeat records
+        pairs = {key: (refs_dict[key], reps_dict[key]) for key in refs_dict if key in reps_dict}
+        if not pairs:
+            raise ValueError(f'ERROR: no repeat date: the records with the reference date {ref} have no other date. '
+                             f'Scan at least one more date.')
+
         for key in refs_dict:
             if key not in reps_dict:
                 print(f'NOTE: {key} has no repeat records, ignore.')
@@ -418,8 +444,7 @@ class Satellite(progressbar_joblib, datagrid):
             if key not in refs_dict:
                 print(f'NOTE: {key} has no reference records, ignore.')
 
-        # Return only pairs with both reference and repeat records
-        return {key: (refs_dict[key], reps_dict[key]) for key in refs_dict if key in reps_dict}
+        return pairs
 
     def julian_to_datetime(self, julian_timestamp: float) -> pd.Timestamp:
         """

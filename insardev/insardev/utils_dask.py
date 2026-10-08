@@ -803,20 +803,22 @@ def _find_optimal_chunk_pair(
     input_aspect = max(y_size / x_size, x_size / y_size)
     max_aspect = max(4, min(input_aspect, 16))
 
-    best_score = float('inf')
+    # THE BUDGET COMES FIRST (N148). A chunk within 80-120 % of the budget wins over any uniform one below it: the last
+    # chunk of a dimension may be partial, as no size divides a prime evenly and the uniform choice then fell to the 64-px
+    # floor, 25 times below the budget. Among the chunks within the budget window the score decides (uniformity,
+    # counts, shape); when the aspect limit leaves none, the limit goes: the budget is the contract, the shape is a taste.
+    # An array that cannot fill the budget (the 16384 cap, a thin array) gets the chunk closest to it.
+    near = 0.8 * pixel_budget
+    pairs = [(cy, cx) for cy in valid_y for cx in valid_x if cy * cx <= max_pixels]
+    near_pairs = [p for p in pairs if p[0] * p[1] >= near]
+    pool = [p for p in near_pairs if max(p[0] / p[1], p[1] / p[0]) <= max_aspect] or near_pairs
     best_result = None
-
-    for cy in valid_y:
-        for cx in valid_x:
-            if cy * cx > max_pixels:
-                continue
-            aspect = max(cy / cx, cx / cy)
-            if aspect > max_aspect:
-                continue
-            score = _compute_chunk_score(cy, cx, y_size, x_size, pixel_budget)
-            if score < best_score:
-                best_score = score
-                best_result = {'y': cy, 'x': cx}
+    if pool:
+        cy, cx = min(pool, key=lambda p: _compute_chunk_score(p[0], p[1], y_size, x_size, pixel_budget))
+        best_result = {'y': cy, 'x': cx}
+    elif pairs:
+        cy, cx = max(pairs, key=lambda p: (p[0] * p[1], -_compute_chunk_score(p[0], p[1], y_size, x_size, pixel_budget)))
+        best_result = {'y': cy, 'x': cx}
 
     if best_result is None:
         cy = min(y_size, max_chunk)

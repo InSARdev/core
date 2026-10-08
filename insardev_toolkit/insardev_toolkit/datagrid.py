@@ -8,6 +8,22 @@
 # See the LICENSE file in the insardev_toolkit directory for license terms.
 # ----------------------------------------------------------------------------
 
+import threading
+
+_MEM_ENV = threading.local()
+
+
+def _mem_open_env():
+    """The rasterio Env of this thread that lets GDAL open a MEM connection string (GDAL 3.10 and later refuse it
+    otherwise), entered ONCE per thread and kept: entering one around every warp costs about 10 microseconds, a few percent
+    of a small block's warp. Its only option is that one, set for this thread only."""
+    if getattr(_MEM_ENV, 'env', None) is None:
+        import rasterio
+        env = rasterio.Env(GDAL_MEM_ENABLE_OPEN='YES')
+        env.__enter__()
+        _MEM_ENV.env = env
+
+
 class datagrid:
     import numpy as np
 
@@ -169,11 +185,13 @@ class datagrid:
         from uuid import uuid4
         from affine import Affine
         from dask.highlevelgraph import HighLevelGraph
+        from rasterio.crs import CRS
         from rasterio.enums import Resampling
 
         if not hasattr(da.data, 'dask'):
             da = da.chunk(chunks)
         src_crs = da.rio.crs
+        dst_crs = CRS.from_user_input(crs)
         src_transform = da.rio.transform()
         ny, nx = da.shape
         # THE DTYPE, NOT THE GRID, in the task function below: `da` in its closure was pickled with every task, a
@@ -192,16 +210,35 @@ class datagrid:
         out_x = tuple(min(chunks, width - i) for i in range(0, width, chunks))
         name = f'reproject-{uuid4().hex}'
         keys = data.__dask_keys__()
+        gdal_type = {'uint8': 'Byte', 'int8': 'Int8', 'uint16': 'UInt16', 'int16': 'Int16', 'uint32': 'UInt32', 'int32': 'Int32',
+                     'uint64': 'UInt64', 'int64': 'Int64', 'float32': 'Float32', 'float64': 'Float64',
+                     'complex64': 'CFloat32', 'complex128': 'CFloat64'}.get(np.dtype(dtype).name)
+        if gdal_type is None:
+            raise TypeError(f'reproject() does not support the grid dtype {dtype}: convert it to a numeric type, e.g. astype("uint8").')
+
+        def mem_string(array, transform):
+            """The GDAL connection string of a C-contiguous 2D numpy array wrapped as a MEM dataset, with its transform."""
+            h, w = array.shape
+            return (f'MEM:::DATAPOINTER={array.ctypes.data},PIXELS={w},LINES={h},BANDS=1,DATATYPE={gdal_type},'
+                    f'GEOTRANSFORM={"/".join(repr(float(v)) for v in transform.to_gdal())}')
 
         def warp(window, block_transform, shape, *blocks):
             (r0, r1), (c0, c1), rows, cols = window
             grid = np.block([[blocks[i * len(cols) + j] for j in range(len(cols))] for i in range(len(rows))])
             # the assembled input blocks start at the first block's row and column
-            source = grid[r0 - yedges[rows[0]]:r1 - yedges[rows[0]], c0 - xedges[cols[0]]:c1 - xedges[cols[0]]]
+            source = np.ascontiguousarray(grid[r0 - yedges[rows[0]]:r1 - yedges[rows[0]], c0 - xedges[cols[0]]:c1 - xedges[cols[0]]])
             out = np.full(shape, nodata, dtype=dtype)
-            rasterio.warp.reproject(np.ascontiguousarray(source), out, src_transform=src_transform * Affine.translation(c0, r0),
-                                    src_crs=src_crs, dst_transform=block_transform, dst_crs=crs, resampling=method,
-                                    src_nodata=nodata, dst_nodata=nodata)
+            # Both grids are GDAL MEM datasets that WRAP the arrays (no copy) and carry their transform from the moment
+            # they are opened (the connection string), passed to rasterio.warp.reproject as bands. Given numpy arrays,
+            # rasterio builds a MemoryDataset itself, which reads its transform before it has one, warns by design and
+            # silences the warning with warnings.catch_warnings(): not thread-safe, so with 2 or more threads per worker
+            # the warning escapes. No lock and no warning filter: nothing here warns, and the warps run in parallel.
+            _mem_open_env()
+            with rasterio.open(mem_string(source, src_transform * Affine.translation(c0, r0)), 'r+') as src, \
+                    rasterio.open(mem_string(out, block_transform), 'r+') as dst:
+                src.crs, dst.crs = src_crs, dst_crs
+                rasterio.warp.reproject(rasterio.band(src, 1), rasterio.band(dst, 1), resampling=method,
+                                        src_nodata=nodata, dst_nodata=nodata)
             return out
 
         dsk = {}

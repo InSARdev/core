@@ -1874,7 +1874,8 @@ def satellite_baseline(orbit_df1: "pd.DataFrame", orbit_df2: "pd.DataFrame",
         dr = c / (2.0 * rng_samp_rate)
         rc = earth_radius + SC_height
         ra = earth_radius
-        far_range = near_range + dr * num_rng_bins
+        # range bin k lies at near_range + dr * k, k = 0 .. num_rng_bins - 1: the far range is the last bin
+        far_range = near_range + dr * (num_rng_bins - 1)
 
         # Look angle at mid-range (average of near and far)
         arg1 = (near_range**2 + rc**2 - ra**2) / (2.0 * near_range * rc)
@@ -2536,51 +2537,6 @@ def save_transform(transform, outdir, scale_factor=2.0):
             for x0 in range(0, n_x, chunk_x):
                 arr[y0:y0 + chunk_y, x0:x0 + chunk_x] = _scaled_int32(src[y0:y0 + chunk_y, x0:x0 + chunk_x],
                                                                       scale, fill_value)
-
-
-def save_topo(topo, outdir, scale_factor=2.0):
-    """Save topo DataArray to zarr with int32 encoding.
-
-    Parameters
-    ----------
-    topo : xarray.DataArray
-        Topo array in radar coordinates (a, r).
-    outdir : str
-        Output directory for the zarr store.
-    scale_factor : float, optional
-        Scale factor for encoding. Default is 2.0.
-    """
-    import xarray as xr
-    import os
-
-    if topo is None:
-        return
-
-    fill_value = np.iinfo(np.int32).max
-
-    # Scale elevation values
-    scaled = (scale_factor * topo).round()
-    finite_mask = np.isfinite(scaled)
-    int_data = scaled.fillna(0).astype(np.int32)
-    int_data = int_data.where(finite_mask, fill_value)
-    int_data.attrs['scale_factor'] = 1/scale_factor
-    int_data.attrs['add_offset'] = 0
-
-    # Use 8192 chunk size for memory-efficient reading
-    CHUNK_SIZE = 8192
-    n_a, n_r = topo.a.size, topo.r.size
-    chunk_a = min(CHUNK_SIZE, n_a)
-    chunk_r = min(CHUNK_SIZE, n_r)
-
-    ds = xr.Dataset({'topo': int_data})
-    encoding = {'topo': {'chunks': (chunk_a, chunk_r), '_FillValue': fill_value}}
-    ds.to_zarr(
-        store=os.path.join(outdir, 'topo'),
-        mode='w',
-        zarr_format=3,
-        consolidated=True,
-        encoding=encoding
-    )
 
 
 def load_topo(outdir):
@@ -3602,7 +3558,8 @@ def compute_transform_inverse(prm, dem, dem_path,
     inv_azi = np.full((n_y, n_x), np.nan, dtype=np.float32)
     inv_rng = np.full((n_y, n_x), np.nan, dtype=np.float32)
     inv_ele = np.full((n_y, n_x), np.nan, dtype=np.float32)
-    # NOTE: look_E/N/U arrays commented out - incidence is computed from azi/rng in Batch.incidence()
+    # NOTE: no look_E/N/U arrays: Batch.incidence() rebuilds the incidence from the stack's reference numbers and the
+    # burst geometry, it reads no azi, rng or ele
     if compute_topo:
         # the elevation of every pixel, scattered to its nearest radar cell
         scatter = _CellScatter(n_azi * n_rng)
@@ -3683,8 +3640,8 @@ def compute_transform_inverse(prm, dem, dem_path,
         # Per-point local geocentric radius (consistent across all bursts)
         R_local = N * np.sqrt(cos_lat**2 + (1 - e2)**2 * sin_lat**2)
         del N, sin_lat, cos_lat
-        # NOTE: the look vector (GMTSAR-compatible look_E/N/U) is not computed - incidence is computed from azi/rng
-        # in Batch.incidence()
+        # NOTE: the look vector (GMTSAR-compatible look_E/N/U) is not computed: Batch.incidence() rebuilds the
+        # incidence from the stack's reference numbers and the burst geometry, it reads no azi, rng or ele
 
         # Step 8: scatter to the output grids (the block's rows, in the row-major order of its mask)
         inv_azi[r0:r1][blk_mask] = azi_b
@@ -3747,7 +3704,8 @@ def compute_transform_inverse(prm, dem, dem_path,
         ele_gmtsar_full = np.broadcast_to(np.float32(np.nan), (n_azi, n_rng))
 
     # Build dataset
-    # NOTE: look_E/N/U removed - incidence is computed from azi/rng in Batch.incidence()
+    # NOTE: no look_E/N/U: Batch.incidence() rebuilds the incidence from the stack's reference numbers and the burst
+    # geometry, it reads no azi, rng or ele
     trans = xr.Dataset({
         'rng': xr.DataArray(inv_rng, coords={'y': out_y, 'x': out_x}, dims=['y', 'x']),
         'azi': xr.DataArray(inv_azi, coords={'y': out_y, 'x': out_x}, dims=['y', 'x']),
@@ -3962,6 +3920,8 @@ def compute_conversion_chunked(prm, dem_path, geometry, outdir,
         y_max = min(y_max, bbox_y_max)
         x_min = max(x_min, bbox_x_min)
         x_max = min(x_max, bbox_x_max)
+        if y_max <= y_min or x_max <= x_min:
+            raise ValueError(f'ERROR: bbox {list(bbox)} does not overlap the scene footprint')
         if debug:
             print(f'  bbox crop: y=[{y_min:.0f}, {y_max:.0f}], x=[{x_min:.0f}, {x_max:.0f}]')
 

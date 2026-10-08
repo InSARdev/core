@@ -26,6 +26,22 @@ import numpy as np
 _DATA_VARS_ATTR = '__data_vars__'
 
 
+def _json_attrs(attrs):
+    """The attributes of a variable as Python types, for the JSON a Zarr array holds: a numpy scalar (np.float32,
+    np.int16, np.bool_) as its Python value, an array as a list, a list or tuple and a dict element by element."""
+    def cast(v):
+        if isinstance(v, np.generic):
+            return v.item()
+        if isinstance(v, np.ndarray):
+            return v.tolist()
+        if isinstance(v, (list, tuple)):
+            return [cast(x) for x in v]
+        if isinstance(v, dict):
+            return {k: cast(x) for k, x in v.items()}
+        return v
+    return {k: cast(v) for k, v in attrs.items()}
+
+
 def _zarr_fill_value(da):
     """The Zarr fill_value of an array save() writes, the same for a dask and a numpy array and for the first save
     and a re-save: NaN for float and complex (0 is a valid value, never a fill value); None otherwise: zarr's own
@@ -315,7 +331,7 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
                     # variable that is not stamped here loses them -- and
                     # actual_range among them, which a reader needs.
                     if da_xr.attrs:
-                        z.attrs.update({k: v for k, v in da_xr.attrs.items()})
+                        z.attrs.update(_json_attrs(da_xr.attrs))
                     sources.append(da_xr.data)
                     if not is_store_object:
                         # ANY rank, not just 3D: TensorStore serialises
@@ -340,7 +356,7 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
                         **({} if fill_value is None else {'fill_value': fill_value}),
                     )
                     if da_xr.attrs:
-                        _z.attrs.update({k: v for k, v in da_xr.attrs.items()})
+                        _z.attrs.update(_json_attrs(da_xr.attrs))
 
     # Write dask arrays to zarr in memory-controlled batches.
     # Each batch slice goes to da.store as built; the scheduler optimizes (and culls) the merged graph of the arrays

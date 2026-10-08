@@ -28,7 +28,7 @@ def _ref_height_stored(ds) -> float | None:
     where they give a residual height -- NaN reads as 0.0, the value the elevation arithmetic always used there.
     Older stores carry 0.0 in DEM mode, and older ecef flat-mode stores 0 on the reference date and the height on
     the repeat dates: the value of largest magnitude is the height in every case. None when the Dataset stores no
-    ref_height at all: callers go through _ref_heights() or _ref_height(), which warn.
+    ref_height at all: callers go through _ref_heights(), which warns.
     """
     if 'ref_height' in ds:
         v = np.asarray(ds['ref_height'].values, dtype=np.float64).ravel()
@@ -70,12 +70,24 @@ def _ele_midpoint(ds, key, where) -> float | None:
     return 0.5 * (float(rng[0]) + float(rng[1]))
 
 
-def _stack_geometry(ds, key, where, action='Pass the stack.') -> tuple:
+def _warn_no_actual_range(where, keys) -> None:
+    """ONE WARNING per call naming the bursts of an old store that carry no `ele` actual_range (the terrain height
+    is taken as 0): the callers of _stack_geometry() collect the bursts and call this once after their loop."""
+    if keys:
+        print(f"WARNING: {where}: burst(s) {', '.join(str(k) for k in keys)} carry no ele actual_range: "
+              f"the terrain height is taken as 0.", flush=True)
+
+
+def _stack_geometry(ds, key, where, action, no_range) -> tuple:
     """THE GEOMETRY OF ONE BURST FROM THE STACK (or its transform() view): the per-date variables and the `ele`
     actual_range attribute, never a raster. Returns (burst model, b_h (date, 2), b_v (date, 2), dates).
 
     The REFERENCE date's numbers (BPR 0, N55): never a mean over the dates, never a pair's first date. Each date's
-    baseline triple is its own baseline vector to the reference satellite."""
+    baseline triple is its own baseline vector to the reference satellite. A stack without its reference date
+    raises (N137): the geometry has no date to be the reference.
+
+    `no_range` is the caller's list: a burst without an `ele` actual_range is appended to it (the terrain height
+    is taken as 0) and the caller warns ONCE with _warn_no_actual_range() after its loop."""
     from . import utils_geometry as ug
     if not isinstance(ds, xr.Dataset) or 'date' not in ds.dims:
         raise TypeError(f'ERROR: {where} needs the stack: burst {key} carries no per-date geometry. {action}')
@@ -89,16 +101,14 @@ def _stack_geometry(ds, key, where, action='Pass the stack.') -> tuple:
     values = _computed(ds, names + ug.TRIPLES)
     bpr = values['BPR'].astype(np.float64).ravel()
     zero = np.flatnonzero(bpr == 0.0)
-    if zero.size:
-        iref = int(zero[0])
-    else:
-        iref = int(np.argmin(np.abs(bpr)))
-        print(f'WARNING: {where}: burst {key} has no reference date (BPR 0) in the stack: '
-              f'using {str(ds["date"].values[iref])[:10]}.', flush=True)
+    if not zero.size:
+        raise ValueError(f'ERROR: {where}: burst {key} has no reference date (BPR 0) in the stack. '
+                         f'Keep the reference date when selecting dates.')
+    iref = int(zero[0])
     h_ref, dem_mode = _ref_mode(values['ref_height'])
     h_attr = _ele_midpoint(ds, key, where)
     if h_attr is None:
-        print(f'WARNING: {where}: burst {key} has no ele actual_range: the terrain height is taken as 0.', flush=True)
+        no_range.append(key)
         h_attr = 0.0
     geo = ug.burst_geometry({n: values[n].ravel()[iref] for n in ug.SCALARS}, _crs_wkt(ds), h_ref, dem_mode, h_attr)
     bh, bv = ug.date_triples({n: values[n].ravel() for n in ug.TRIPLES})
@@ -169,7 +179,10 @@ def _elevation_grid(data, geos, pairs, joint):
     from . import utils_geometry as ug
     arr = data.data[None] if data.dims == ('y', 'x') else data.data
     if not isinstance(arr, da.Array):
-        arr = da.from_array(np.asarray(arr), chunks=(1, -1, -1))
+        # a computed (numpy) phase: one pair per chunk, and (y, x) in the library chunk budget, not the full grid
+        from .utils_dask import rechunk2d
+        c = rechunk2d(arr.shape[-2:], arr.dtype.itemsize)
+        arr = da.from_array(np.asarray(arr), chunks=(1, c['y'], c['x']))
     yc = da.from_array(np.asarray(data.y.values, np.float64), chunks=(arr.chunks[1],))
     xc = da.from_array(np.asarray(data.x.values, np.float64), chunks=(arr.chunks[2],))
     pidx = da.from_array(np.arange(arr.shape[0]), chunks=(arr.chunks[0],))
@@ -194,11 +207,6 @@ def _ref_heights(batch, where: str | None = None) -> dict:
               f'height. That is right for a DEM-mode stack (remove_topo_phase=True) and wrong by the reference '
               f'height for a flat-earth one (remove_topo_phase=False).', flush=True)
     return {key: 0.0 if h is None else h for key, h in heights.items()}
-
-
-def _ref_height(ds, where: str | None = None) -> float:
-    """_ref_heights() of one burst Dataset: it warns on every call that finds no ref_height."""
-    return _ref_heights({'': ds}, where)['']
 
 
 def _trend2d_accumulate_for_dask(data_blk, *args, stats=None, n_vars=0,
@@ -2400,6 +2408,7 @@ class Batch(BatchCore):
         import pandas as pd
         import xarray as xr
 
+        BatchCore._require_model(model, 'predict')
         # radar_wavelength and the radar geometry are the Dataset's (N81)
         BatchCore._needs_dataset(self, 'predict', BatchCore._GEOMETRY)
         out = {}
@@ -2611,6 +2620,7 @@ class Batch(BatchCore):
         >>> disp  = phase.mix(model)
         >>> disp.displacement_los(stack.transform())
         """
+        BatchCore._require_model(model, 'mix')
         # predict() reads the Dataset's radar geometry (N81)
         BatchCore._needs_dataset(self, 'mix', BatchCore._GEOMETRY)
         for key, ds in self.items():
@@ -2654,8 +2664,9 @@ class Batch(BatchCore):
         from . import utils_geometry as ug
         BatchCore._needs_dataset(self, 'elevation_phase', ug.SCALARS, 'Call it on stack.transform().')
         out: dict[str, xr.Dataset] = {}
+        no_range: list = []
         for key, ds in self.items():
-            geo = _stack_geometry(ds, key, 'elevation_phase()', 'Call it on stack.transform().')[0]
+            geo = _stack_geometry(ds, key, 'elevation_phase()', 'Call it on stack.transform().', no_range)[0]
             fac = _geometry_grid(ug.elevation_phase_block, geo, ds.y.values, ds.x.values, _grid_chunks(ds))
             res = xr.Dataset({'elevation_phase': xr.DataArray(fac, dims=('y', 'x'),
                                                               coords={'y': ds.y, 'x': ds.x})})
@@ -2663,6 +2674,7 @@ class Batch(BatchCore):
             if 'spatial_ref' in ds.coords:
                 res = res.assign_coords(spatial_ref=ds.spatial_ref)
             out[key] = res
+        _warn_no_actual_range('elevation_phase()', no_range)
         return Batch(out)
 
     def _elevation_phase_approximate(self) -> dict:
@@ -2723,33 +2735,28 @@ class Batch(BatchCore):
             num_rng_bins = g('num_rng_bins')
             sc_height = 0.5 * (g('SC_height_start') + g('SC_height_end'))
 
+            # The stack's burst `geometry` and CRS are the stored numbers of every real product: there is no
+            # fallback to a burst centre (N138: none of 66 real calls on the pygmtsar and ecef stores reached one)
             rng_c = num_rng_bins / 2.0
-            try:
-                from shapely import wkt as _wkt
-                from pyproj import Transformer as _Tr
-                poly = _wkt.loads(str(np.asarray(ds['geometry'].values).ravel()[0]))
-                lon, lat = (np.asarray(v) for v in poly.exterior.coords.xy)
-                crs = ds.rio.crs if hasattr(ds, 'rio') else None
-                px, py = _Tr.from_crs('EPSG:4326', crs, always_xy=True).transform(
-                    lon[:4], lat[:4])
-                a_c = np.array([0.0, 0.0, num_lines - 1, num_lines - 1])
-                r_c = np.array([0.0, num_rng_bins - 1,
-                                num_rng_bins - 1, 0.0])
-                M, b = [], []
-                for x_, y_, a_, r_ in zip(px, py, a_c, r_c):
-                    M.append([x_, y_, 1, 0, 0, 0, -a_ * x_, -a_ * y_]); b.append(a_)
-                    M.append([0, 0, 0, x_, y_, 1, -r_ * x_, -r_ * y_]); b.append(r_)
-                h = np.linalg.solve(np.asarray(M, float), np.asarray(b, float))
-                xc = 0.5 * (float(ds.x.min()) + float(ds.x.max()))
-                yc = 0.5 * (float(ds.y.min()) + float(ds.y.max()))
-                den = h[6] * xc + h[7] * yc + 1.0
-                cand = (h[3] * xc + h[4] * yc + h[5]) / den
-                if np.isfinite(cand) and 0.0 <= cand <= num_rng_bins:
-                    rng_c = float(cand)
-            except Exception:
-                # no `geometry`, no CRS, or a degenerate polygon: the burst
-                # centre still answers, just less well on a cropped stack
-                pass
+            from shapely import wkt as _wkt
+            from pyproj import Transformer as _Tr
+            poly = _wkt.loads(str(np.asarray(ds['geometry'].values).ravel()[0]))
+            lon, lat = (np.asarray(v) for v in poly.exterior.coords.xy)
+            px, py = _Tr.from_crs('EPSG:4326', ds.rio.crs, always_xy=True).transform(lon[:4], lat[:4])
+            a_c = np.array([0.0, 0.0, num_lines - 1, num_lines - 1])
+            r_c = np.array([0.0, num_rng_bins - 1,
+                            num_rng_bins - 1, 0.0])
+            M, b = [], []
+            for x_, y_, a_, r_ in zip(px, py, a_c, r_c):
+                M.append([x_, y_, 1, 0, 0, 0, -a_ * x_, -a_ * y_]); b.append(a_)
+                M.append([0, 0, 0, x_, y_, 1, -r_ * x_, -r_ * y_]); b.append(r_)
+            h = np.linalg.solve(np.asarray(M, float), np.asarray(b, float))
+            xc = 0.5 * (float(ds.x.min()) + float(ds.x.max()))
+            yc = 0.5 * (float(ds.y.min()) + float(ds.y.max()))
+            den = h[6] * xc + h[7] * yc + 1.0
+            cand = (h[3] * xc + h[4] * yc + h[5]) / den
+            if np.isfinite(cand) and 0.0 <= cand <= num_rng_bins:
+                rng_c = float(cand)
 
             slant_range = near_range + rng_c * (c_light / (2.0 * rng_samp_rate))
             ground_dist = earth_radius + ref_heights[key]
@@ -2780,13 +2787,15 @@ class Batch(BatchCore):
         BatchCore._needs_dataset(self, 'incidence', ug.SCALARS, 'Call it on the stack: stack.incidence().')
         crs = self.crs
         out: dict[str, xr.Dataset] = {}
+        no_range: list = []
         for key, ds in self.items():
-            geo = _stack_geometry(ds, key, 'incidence()', 'Call it on the stack: stack.incidence().')[0]
+            geo = _stack_geometry(ds, key, 'incidence()', 'Call it on the stack: stack.incidence().', no_range)[0]
             inc = _geometry_grid(ug.incidence_block, geo, ds.y.values, ds.x.values, _grid_chunks(ds))
             result_ds = xr.Dataset({'incidence': xr.DataArray(inc, dims=('y', 'x'), coords={'y': ds.y, 'x': ds.x})})
             result_ds.attrs = ds.attrs
             result_ds = result_ds.rio.write_crs(crs)
             out[key] = result_ds
+        _warn_no_actual_range('incidence()', no_range)
         return Batch(out)
 
     def aspect(self) -> "Batch":
@@ -3009,6 +3018,7 @@ class Batch(BatchCore):
         centre = Batch._incidence_approximate({key: dict.__getitem__(transform, key) for key in centre}) \
             if centre else {}
 
+        no_range: list = []
         for key, los_ds in los_batch.items():
             if key not in transform:
                 raise KeyError(f'Missing incidence for key: {key}')
@@ -3017,10 +3027,12 @@ class Batch(BatchCore):
                 out[key] = BatchCore._form(los_ds, {suffix: comp})
                 continue
             geo = _stack_geometry(dict.__getitem__(transform, key), key, f'displacement_{suffix}()',
-                                  f'Pass the stack: x.displacement_{suffix}(stack).')[0]
+                                  f'Pass the stack: x.displacement_{suffix}(stack).', no_range)[0]
             comp_vars: dict[str, xr.DataArray] = {}
             # a Dataset's variables, or a DataArray as its own one (N81)
             los_vars = BatchCore._vars_of(los_ds)
+            # the naming counts the GRIDS: the radar metadata a Dataset carries are not results (N133)
+            n_grids = sum(1 for d in los_vars.values() if "y" in d.dims and "x" in d.dims)
 
             for var_name, data in los_vars.items():
                 # A DATASET OPERATION APPLIES TO THE GRIDS AND NOTHING ELSE.
@@ -3039,7 +3051,7 @@ class Batch(BatchCore):
 
                 comp = (data / func(incidence)).astype('float32')
 
-                if len(los_vars) == 1:
+                if n_grids == 1:
                     name = suffix
                 elif var_name.endswith('_los'):
                     name = var_name[:-4] + f'_{suffix}'
@@ -3051,6 +3063,7 @@ class Batch(BatchCore):
             # a DataArray in, a DataArray out (N81), named as a one-variable Dataset names it
             out[key] = BatchCore._form(los_ds, comp_vars, coords=los_ds.coords, attrs=los_ds.attrs)
 
+        _warn_no_actual_range(f'displacement_{suffix}()', no_range)
         return Batch(out)
 
     def displacement_vertical(self, transform: 'Batch | Stack') -> 'Batch':
@@ -3148,9 +3161,8 @@ class Batch(BatchCore):
             if BatchCore._is_dataarray_batch(self):
                 raise TypeError('ERROR: elevation() without the stack needs the phase Dataset. Pass the stack: '
                                 'x.elevation(stack).')
-            print('WARNING: elevation() needs the stack: use intf.elevation(stack); using the pair baselines only.',
-                  flush=True)
         out: dict[str, xr.Dataset] = {}
+        no_range: list = []
 
         for key, phase_ds in self.items():
             grids = {n: d for n, d in BatchCore._vars_of(phase_ds).items() if 'y' in d.dims and 'x' in d.dims}
@@ -3158,7 +3170,7 @@ class Batch(BatchCore):
                 if key not in stack:
                     raise KeyError(f'Missing geometry for key: {key}')
                 geo, bh, bv, dates = _stack_geometry(dict.__getitem__(stack, key), key, 'elevation()',
-                                                       'Pass the stack: x.elevation(stack).')
+                                                       'Pass the stack: x.elevation(stack).', no_range)
                 geos = [geo]
                 pairs = (_pairs_of_stack(next(iter(grids.values())), key, bh, bv, dates, 'elevation()')
                          if grids else [])
@@ -3183,6 +3195,11 @@ class Batch(BatchCore):
             # a DataArray in, a DataArray out (N81)
             out[key] = BatchCore._form(phase_ds, elev_vars, coords=phase_ds.coords, attrs=phase_ds.attrs)
 
+        # AFTER THE LOOP, which is where the errors of the bursts are raised: an old phase raises first, without the WARNING
+        if not joint:
+            print('WARNING: elevation() needs the stack: use intf.elevation(stack); using the pair baselines only.',
+                  flush=True)
+        _warn_no_actual_range('elevation()', no_range)
         return Batch(out)
 
     def stl(self, freq: str = 'W', periods: int = 52, robust: bool = False) -> 'Batch':
@@ -4136,6 +4153,7 @@ class BatchComplex(BatchCore):
         import numpy as np
         import xarray as xr
         import dask.array as da
+        BatchCore._require_model(model, 'predict')
         # A trend3d() FIELD is insardev_polsar's measurement, recognised by what it carries: its predict3d()
         # evaluates it at this stack's pixels
         if BatchComplex._trend3d_field(model, list(model.keys())):
@@ -4374,6 +4392,7 @@ class BatchComplex(BatchCore):
         >>> # smooth model for comparison -- same convention, no noise:
         >>> stack.predict(model=model, baseline=None)
         """
+        BatchCore._require_model(model, 'mix')
         if baseline:
             # the height term reads the Dataset's baselines and radar geometry (N81); a
             # Dataset without them raises too: the height term was dropped, silently
@@ -5012,7 +5031,13 @@ class BatchComplex(BatchCore):
             # a covariate in the thousands cancel to a few radians -- and
             # handed on as float32, the precision the raster always had
             _dc = data.chunks[0]
-            kd = da.from_array(np.asarray(mds['intercept'].values, np.float64),
+            # THE MODEL'S NUMBERS IN ONE COMPUTE: `intercept` and every `slope_<var>` are views of ONE lazy fit, and
+            # asked for one by one each `.values` ran the whole fit again (4 runs for 3 covariates, and the line of a
+            # date that did not resolve printed 4 times)
+            import dask
+            _need = ['intercept'] + [f'slope_{v}' for v in names]
+            _num = dict(zip(_need, dask.compute(*[mds[n].data for n in _need])))
+            kd = da.from_array(np.asarray(_num['intercept'], np.float64),
                                chunks=(_dc,))
             phi = kd[:, None, None]
             src = vars[key] if vars is not None else ds
@@ -5066,7 +5091,7 @@ class BatchComplex(BatchCore):
                 if cd.chunks != _ch:
                     cd = cd.rechunk(_ch)
                 gd = da.from_array(
-                    np.asarray(mds[f'slope_{v}'].values, np.float64),
+                    np.asarray(_num[f'slope_{v}'], np.float64),
                     chunks=(_dc,))
                 _v = cd
                 if _d == ('y',):
