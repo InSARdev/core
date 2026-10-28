@@ -172,7 +172,7 @@ class PRM_gmtsar:
 
         return result if result.shape[0] > 1 else result.ravel()
 
-    def SAT_baseline(self, other: "PRM", debug: bool = False) -> "PRM":
+    def SAT_baseline(self, other: "PRM", debug: bool = False, *, search_half_window: float = None) -> "PRM":
         """
         Compute the satellite baseline between two acquisitions.
 
@@ -185,6 +185,10 @@ class PRM_gmtsar:
             PRM object for the secondary image.
         debug : bool, optional
             If True, print debug information. Default is False.
+        search_half_window : float, optional
+            Closest-approach search half window in s (see satellite_baseline). Sentinel-1 callers pass half the repeat
+            burst's duration, NISAR callers half the repeat granule's duration (nisar_granule_half_window).
+            None: SEARCH_HALF_WINDOW (1.5 s).
 
         Returns
         -------
@@ -198,7 +202,7 @@ class PRM_gmtsar:
         """
         import time
         from .PRM import PRM
-        from .utils_satellite import satellite_baseline
+        from .utils_satellite import satellite_baseline, SEARCH_HALF_WINDOW
 
         if not isinstance(other, PRM):
             raise ValueError('Argument "other" should be PRM class instance')
@@ -207,6 +211,9 @@ class PRM_gmtsar:
             raise ValueError("No orbit data attached to reference PRM.")
         if other.orbit_df is None:
             raise ValueError("No orbit data attached to secondary PRM.")
+
+        if search_half_window is None:
+            search_half_window = SEARCH_HALF_WINDOW
 
         start_time = time.perf_counter()
 
@@ -231,7 +238,8 @@ class PRM_gmtsar:
             nrows_rep=int(other.get('nrows')) if 'nrows' in other.df.index else None,
             prf_rep=other.get('PRF') if 'PRF' in other.df.index else None,
             # required, never defaulted: a missing look side would silently mirror a left-looking baseline
-            lookdir=self.get('lookdir')
+            lookdir=self.get('lookdir'),
+            search_half_window=search_half_window
         )
 
         elapsed = time.perf_counter() - start_time

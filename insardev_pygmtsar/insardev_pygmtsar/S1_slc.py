@@ -28,8 +28,8 @@ class S1_slc(Satellite):
         ----------
         datadir : str
             The directory containing the data files.
-        DEMfilename : str, optional
-            The filename of the DEM file.
+        DEM : str, xarray.DataArray or xarray.Dataset, optional
+            The filename of the DEM file, or the DEM grid.
         
         Returns
         -------
@@ -74,10 +74,14 @@ class S1_slc(Satellite):
                 #print('meta', meta)
                 # the files of the burst that the processing reads; an empty one raises
                 exists(os.path.join(meta_dir, meta))
+                ann = self.parse_annotation(os.path.join(meta_dir, meta))
+                # an annotation of another subswath in this folder (the IW2 annotation that the downloader stores in an IW1
+                # or IW3 folder) is auxiliary, not a burst of the folder
+                if ann['swath'] != prefix.split('_')[2]:
+                    continue
                 measurement_path(os.path.join(self.datadir, prefix, 'measurement'), os.path.splitext(meta)[0])
                 for sub in ('calibration', 'noise'):
                     exists(os.path.join(self.datadir, prefix, sub, meta))
-                ann = self.parse_annotation(os.path.join(meta_dir, meta))
                 start_time = datetime.strptime(ann['startTime'], '%Y-%m-%dT%H:%M:%S.%f')
                 # validate startTime matches burst name date (detect corrupted XML from parallel download race condition)
                 burst_name = os.path.splitext(meta)[0]

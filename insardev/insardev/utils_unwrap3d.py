@@ -53,7 +53,6 @@ def _unwrap3d_dates_kernel(phi, ok, i1, i2, wgt, tyr, max_iter, search,
     n_dates, n_pix = phi.shape
     out = np.full((n_dates, n_pix), np.nan, dtype=np.float64)
     n_pairs = i1.shape[0]
-    TWO_PI = 2.0 * np.pi
     # Serial on purpose: dask parallelises across blocks, and every other numba
     # kernel here is serial for the same reason. A parallel=True kernel called
     # from a multi-threaded dask worker trips numba's workqueue layer --
@@ -113,7 +112,7 @@ def _unwrap3d_dates_kernel(phi, ok, i1, i2, wgt, tyr, max_iter, search,
                     dt = tyr[bb] - tyr[aa]
                     if dt > 1e-9 and dt <= dtcut:
                         dif = phi[bb, px] - phi[aa, px]
-                        dif = dif - TWO_PI * np.floor((dif + np.pi) / TWO_PI)
+                        dif = dif - 2 * np.pi * np.floor((dif + np.pi) / (2 * np.pi))
                         rate[nd1] = dif / dt
                         nd1 += 1
                 if nd1 >= 3:
@@ -128,7 +127,7 @@ def _unwrap3d_dates_kernel(phi, ok, i1, i2, wgt, tyr, max_iter, search,
         for _tr in range(n_trend):
             for d in range(n_dates):
                 phid[d] = phi[d, px] - vhat * tyr[d]
-                phid[d] = phid[d] - TWO_PI * np.floor((phid[d] + np.pi) / TWO_PI)
+                phid[d] = phid[d] - 2 * np.pi * np.floor((phid[d] + np.pi) / (2 * np.pi))
             # at most one date can be dropped per attempt, and dropping stops
             # at min_dates, so that bound IS the iteration bound -- no separate
             # max_drop knob to disagree with it
@@ -144,10 +143,10 @@ def _unwrap3d_dates_kernel(phi, ok, i1, i2, wgt, tyr, max_iter, search,
                         nn[d] = 0.0
                     else:
                         dif = phid[d] - phid[prev]
-                        dif = dif - TWO_PI * np.floor((dif + np.pi) / TWO_PI)
+                        dif = dif - 2 * np.pi * np.floor((dif + np.pi) / (2 * np.pi))
                         run = run + dif
-                        nn[d] = np.rint((run - phid[d]) / TWO_PI)
-                        run = phid[d] + TWO_PI * nn[d]
+                        nn[d] = np.rint((run - phid[d]) / (2 * np.pi))
+                        run = phid[d] + 2 * np.pi * nn[d]
                     prev = d
                 # coordinate descent on the integers
                 for _it in range(max_iter):
@@ -168,7 +167,7 @@ def _unwrap3d_dates_kernel(phi, ok, i1, i2, wgt, tyr, max_iter, search,
                                     continue
                                 na = cand if a == d else nn[a]
                                 nb2 = cand if b == d else nn[b]
-                                r = (phid[a] - phid[b]) + TWO_PI * (na - nb2)
+                                r = (phid[a] - phid[b]) + 2 * np.pi * (na - nb2)
                                 acc += wgt[p] * abs(r)
                             if acc < best - 1e-12:
                                 best = acc; bn = cand
@@ -177,7 +176,7 @@ def _unwrap3d_dates_kernel(phi, ok, i1, i2, wgt, tyr, max_iter, search,
                     if not changed:
                         break
                 for d in range(n_dates):
-                    Phi[d] = phid[d] + TWO_PI * nn[d]
+                    Phi[d] = phid[d] + 2 * np.pi * nn[d]
                 # Which date is unrecoverable? Ask its SHORTEST intervals, which
                 # make no assumption about the trajectory: each near partner p
                 # independently predicts d's integer from the wrapped difference,
@@ -198,8 +197,8 @@ def _unwrap3d_dates_kernel(phi, ok, i1, i2, wgt, tyr, max_iter, search,
                         if abs(tyr[q] - tyr[d]) > short_yr:
                             continue
                         dif = phid[d] - phid[q]
-                        dif = dif - TWO_PI * np.floor((dif + np.pi) / TWO_PI)
-                        pred[nc] = np.rint((Phi[q] + dif - phid[d]) / TWO_PI)
+                        dif = dif - 2 * np.pi * np.floor((dif + np.pi) / (2 * np.pi))
+                        pred[nc] = np.rint((Phi[q] + dif - phid[d]) / (2 * np.pi))
                         nc += 1
                     if nc < 3:
                         continue
@@ -232,7 +231,7 @@ def _unwrap3d_dates_kernel(phi, ok, i1, i2, wgt, tyr, max_iter, search,
             sN = 0.0; sx = 0.0; sy = 0.0; sxx = 0.0; sxy = 0.0
             for d in range(n_dates):
                 if okp[d]:
-                    yv = phid[d] + TWO_PI * nn[d] + vhat * tyr[d]
+                    yv = phid[d] + 2 * np.pi * nn[d] + vhat * tyr[d]
                     sN += 1.0; sx += tyr[d]; sy += yv
                     sxx += tyr[d] * tyr[d]; sxy += tyr[d] * yv
             den = sN * sxx - sx * sx
@@ -266,7 +265,7 @@ def _unwrap3d_dates_kernel(phi, ok, i1, i2, wgt, tyr, max_iter, search,
                 prevd = d
         if dtf > 1e29:
             continue
-        spac = TWO_PI / dtf
+        spac = 2 * np.pi / dtf
         if np.abs(vhat) >= 0.5 * spac:
             continue
         # Reference the series to its first surviving date, so it starts at 0.
@@ -279,11 +278,11 @@ def _unwrap3d_dates_kernel(phi, ok, i1, i2, wgt, tyr, max_iter, search,
         base = 0.0
         for d in range(n_dates):
             if okp[d]:
-                base = phid[d] + TWO_PI * nn[d] + vhat * tyr[d]
+                base = phid[d] + 2 * np.pi * nn[d] + vhat * tyr[d]
                 break
         for d in range(n_dates):
             if okp[d]:
-                out[d, px] = -(phid[d] + TWO_PI * nn[d] + vhat * tyr[d] - base)
+                out[d, px] = -(phid[d] + 2 * np.pi * nn[d] + vhat * tyr[d] - base)
     return out
 
 

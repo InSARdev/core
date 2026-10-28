@@ -157,11 +157,15 @@ def _pairs_of_stack(data, key, bh, bv, dates, where) -> list:
 
 
 def _geometry_grid(block, geo, y, x, chunks):
-    """A lazy (y, x) float32 grid of a geometry block function on the coordinates y, x in the chunks (cy, cx)."""
+    """A lazy (y, x) float32 grid of a geometry block function on the coordinates y, x in the chunks (cy, cx).
+
+    The blocks get their GLOBAL pixel indices (arange of the whole grid, chunked like y and x) and the whole axes:
+    the geometry nodes are the global ones, so the result does not depend on the chunks."""
     import dask.array as da
-    yc = da.from_array(np.asarray(y, np.float64), chunks=(chunks[0],))
-    xc = da.from_array(np.asarray(x, np.float64), chunks=(chunks[1],))
-    return da.blockwise(block, 'yx', yc, 'y', xc, 'x', dtype=np.float32, geo=geo)
+    gy = da.from_array(np.arange(len(y)), chunks=(chunks[0],))
+    gx = da.from_array(np.arange(len(x)), chunks=(chunks[1],))
+    return da.blockwise(block, 'yx', gy, 'y', gx, 'x', dtype=np.float32, geo=geo,
+                        ycoord=np.asarray(y, np.float64), xcoord=np.asarray(x, np.float64))
 
 
 def _grid_chunks(ds):
@@ -183,11 +187,13 @@ def _elevation_grid(data, geos, pairs, joint):
         from .utils_dask import rechunk2d
         c = rechunk2d(arr.shape[-2:], arr.dtype.itemsize)
         arr = da.from_array(np.asarray(arr), chunks=(1, c['y'], c['x']))
-    yc = da.from_array(np.asarray(data.y.values, np.float64), chunks=(arr.chunks[1],))
-    xc = da.from_array(np.asarray(data.x.values, np.float64), chunks=(arr.chunks[2],))
+    # the blocks get their GLOBAL pixel indices and the whole axes (the nodes are the global ones, see _geometry_grid)
+    gy = da.from_array(np.arange(arr.shape[1]), chunks=(arr.chunks[1],))
+    gx = da.from_array(np.arange(arr.shape[2]), chunks=(arr.chunks[2],))
     pidx = da.from_array(np.arange(arr.shape[0]), chunks=(arr.chunks[0],))
-    res = da.blockwise(ug.elevation_block, 'pyx', arr, 'pyx', pidx, 'p', yc, 'y', xc, 'x', dtype=np.float32,
-                       geos=geos, pairs=pairs, joint=joint)
+    res = da.blockwise(ug.elevation_block, 'pyx', arr, 'pyx', pidx, 'p', gy, 'y', gx, 'x', dtype=np.float32,
+                       geos=geos, pairs=pairs, joint=joint,
+                       ycoord=np.asarray(data.y.values, np.float64), xcoord=np.asarray(data.x.values, np.float64))
     return xr.DataArray(res[0] if data.dims == ('y', 'x') else res, dims=data.dims, coords=data.coords)
 
 
@@ -1327,9 +1333,9 @@ class Batch(BatchCore):
         >>> # modelled displacement per date, unwrapped
         >>> disp  = stack.predict(model=model).displacement_los(stack.transform())
         >>> # remove the modelled ground motion, keeping topography
-        >>> ground = stack * stack.predict(model=model).iexp(-1)
+        >>> ground = stack.complex() * stack.predict(model=model).iexp(-1)
         >>> # remove the whole model, topography included
-        >>> resid  = stack * stack.predict(model=model, baseline='BPR').iexp(-1)
+        >>> resid  = stack.complex() * stack.predict(model=model, baseline='BPR').iexp(-1)
         """
         import numpy as np
         import xarray as xr
@@ -1754,6 +1760,9 @@ class Batch(BatchCore):
 
             phase_da_ref = grids[pols[0]]
             phase_shape = phase_da_ref.shape[-2:]
+            if min(phase_shape) < 3:
+                raise ValueError(f"trend2d() needs a burst grid of at least 3 x 3 pixels, burst '{key}' is {phase_shape[0]} x {phase_shape[1]}.")
+            if not result and degree: print("NOTE: Batch.trend2d() computes its feature statistics eagerly.")
             phase_dy = float(phase_da_ref.y.diff('y')[0])
             phase_dx = float(phase_da_ref.x.diff('x')[0])
 
@@ -2798,6 +2807,31 @@ class Batch(BatchCore):
         _warn_no_actual_range('incidence()', no_range)
         return Batch(out)
 
+    def look(self) -> "Batch":
+        """Look azimuth (degrees, clockwise from geodetic north, satellite to target, in [0, 360)) per pixel of the grid.
+
+        READS NO RASTER, as incidence(): the satellite position on each pixel's zero-Doppler line comes from the orbit numbers
+        of the REFERENCE date and the exact crop polygon, at the terrain height (the midpoint of the `ele` actual_range), on
+        nodes every 128 pixels and bilinear in between (in its sine and cosine, no wrap at 0 and 360). It is the orbit
+        geometry, not the polygon heading. A decimated transform() gives the look on its own decimated grid.
+
+        Call it on the stack (`stack.look()`) or its transform() view.
+        """
+        from . import utils_geometry as ug
+        BatchCore._needs_dataset(self, 'look', ug.SCALARS, 'Call it on the stack: stack.look().')
+        crs = self.crs
+        out: dict[str, xr.Dataset] = {}
+        no_range: list = []
+        for key, ds in self.items():
+            geo = _stack_geometry(ds, key, 'look()', 'Call it on the stack: stack.look().', no_range)[0]
+            look = _geometry_grid(ug.look_block, geo, ds.y.values, ds.x.values, _grid_chunks(ds))
+            result_ds = xr.Dataset({'look': xr.DataArray(look, dims=('y', 'x'), coords={'y': ds.y, 'x': ds.x})})
+            result_ds.attrs = ds.attrs
+            result_ds = result_ds.rio.write_crs(crs)
+            out[key] = result_ds
+        _warn_no_actual_range('look()', no_range)
+        return Batch(out)
+
     def aspect(self) -> "Batch":
         """Terrain slope and aspect from `ele`, by the Horn (1981) 3 x 3 kernel.
 
@@ -3261,6 +3295,11 @@ class BatchWrap(BatchCore):
         """A result keeps the class when it is float phase (BatchCore._as_class)."""
         return dtype.kind == 'f'
 
+    def _like(self, mapping):
+        """A BatchWrap over `mapping` WITHOUT the wrap: the angle of a complex mean is in (-pi, pi] already, and a wrap
+        would only move +pi to -pi (BatchCore._restored, downsample)."""
+        return type(self)(mapping, wrap=False)
+
     @staticmethod
     def wrap(data):
         """Wrap the (y, x) planes to [-pi, pi]; leave everything else alone.
@@ -3289,6 +3328,10 @@ class BatchWrap(BatchCore):
         return np.mod(data + np.pi, 2 * np.pi) - np.pi
 
     def trend2d(self, *args, **kwargs):
+        for key, ds in self.items():
+            ny, nx = ds.sizes.get('y', 3), ds.sizes.get('x', 3)
+            if min(ny, nx) < 3:
+                raise ValueError(f"trend2d() needs a burst grid of at least 3 x 3 pixels, burst '{key}' is {ny} x {nx}.")
         raise TypeError(
             "trend2d() does not support wrapped phase (BatchWrap). "
             "Use BatchComplex for complex phase fitting, or unwrap first for real polynomial fitting."
@@ -3299,6 +3342,8 @@ class BatchWrap(BatchCore):
     # arithmetic is. `w + w` doubled radar_wavelength and `w * 2` raised on the
     # burst strings before.
     def __add__(self, other: Batch):
+        if BatchCore._is_stack(other):
+            return NotImplemented
         import operator as _operator
         if isinstance(other, _SCALARS):
             return self._result({k: BatchCore._binary_vars(v, other, _operator.add) for k, v in self.items()})
@@ -3307,6 +3352,8 @@ class BatchWrap(BatchCore):
                            for k in keys})
 
     def __sub__(self, other: Batch):
+        if BatchCore._is_stack(other):
+            return NotImplemented
         import xarray as xr
         import operator as _operator
         # SUBTRACT THE GRIDS, CARRY THE REST. A whole-Dataset `ds - val` reaches
@@ -3322,6 +3369,8 @@ class BatchWrap(BatchCore):
                            for k in self.keys()})
 
     def __mul__(self, other: Batch):
+        if BatchCore._is_stack(other):
+            return NotImplemented
         import operator as _operator
         if isinstance(other, _SCALARS):
             return self._result({k: BatchCore._binary_vars(v, other, _operator.mul) for k, v in self.items()})
@@ -3330,10 +3379,14 @@ class BatchWrap(BatchCore):
                            for k in keys})
 
     def __rmul__(self, other):
+        if BatchCore._is_stack(other):
+            return NotImplemented
         # scalar * batch  → map scalar * each dataset
         return self._result({k: BatchCore._binary_vars(v, other, lambda a, b: b * a) for k, v in self.items()})
 
     def __truediv__(self, other: Batch):
+        if BatchCore._is_stack(other):
+            return NotImplemented
         import operator as _operator
         if isinstance(other, _SCALARS):
             return self._result({k: BatchCore._binary_vars(v, other, _operator.truediv) for k, v in self.items()})
@@ -3434,8 +3487,9 @@ class BatchWrap(BatchCore):
             for v, da_ in carry.items():
                 out[key][v] = da_
 
-        # each burst back in its own chunks, along the dims its result still has
-        return self._restored(out)
+        # each burst back in its own chunks, along the dims its result still has. The angle of every name but var and std is in
+        # (-pi, pi] already (no wrap); var and std are not phase and keep the wrap
+        return self._restored(out, wrap=name in ('var', 'std'))
 
     def coarsen(self, window: dict[str, int], **kwargs) -> Batch:
         """
@@ -3860,7 +3914,7 @@ class BatchComplex(BatchCore):
         Examples
         --------
         >>> model = stack.fit1d()
-        >>> noise = stack * stack.predict(model, baseline='BPR').iexp(sign=1)
+        >>> noise = stack.complex() * stack.predict(model, baseline='BPR').iexp(sign=1)
         """
         import dask.array as da
         import numpy as np
@@ -4101,7 +4155,7 @@ class BatchComplex(BatchCore):
         The scatterer's constant phase is NOT part of the model: fit3d() profiles
         it out by rotation rather than gauging it to an epoch, so the prediction
         is correct up to one constant per pixel. That is what you want for
-        removal -- `stack * predict(model).iexp(sign=1)` cancels the modelled
+        removal -- `stack.complex() * predict(model).iexp(sign=1)` cancels the modelled
         part and leaves the constant, which no interferometric measurement
         determines. SIGN=1, not the default: the prediction is published as
         master*conj(date), the same radians displacement_los() converts, and
@@ -4144,8 +4198,8 @@ class BatchComplex(BatchCore):
         Examples
         --------
         >>> model  = stack.fit3d()
-        >>> ground = stack * stack.predict(model=model, baseline=None).iexp(sign=1)
-        >>> resid  = stack * stack.predict(model=model).iexp(sign=1)
+        >>> ground = stack.complex() * stack.predict(model=model, baseline=None).iexp(sign=1)
+        >>> resid  = stack.complex() * stack.predict(model=model).iexp(sign=1)
         >>> # modelled displacement per date, unwrapped (no height term):
         >>> disp = (stack.predict(model=model, baseline=None)
         ...              .displacement_los(stack.transform()))
@@ -4165,6 +4219,7 @@ class BatchComplex(BatchCore):
         # velocity or height, but per-date coefficients over the stack's own
         # covariates. Recognised by what it carries, evaluated per chunk.
         if all('trend2d_vars' in model[k].attrs for k in model):
+            print("NOTE: BatchComplex.predict() computes the trend2d() model's numbers eagerly.")
             return self._trend2d_predict(model, vars=vars)
         if vars is not None:
             raise TypeError("predict(): `vars` are the covariates of a trend2d() "
@@ -4279,7 +4334,7 @@ class BatchComplex(BatchCore):
                 # the one convention.
                 #
                 # REMOVAL THEREFORE ROTATES THE OTHER WAY:
-                #     residual = stack * predict(model).iexp(sign=+1)
+                #     residual = stack.complex() * predict(model).iexp(sign=+1)
                 # iexp() defaults to exp(-1j*phase), which is the removal
                 # direction for the raw SLC phase this no longer returns.
                 phi = vel * float(t[i])
@@ -4334,7 +4389,7 @@ class BatchComplex(BatchCore):
         Returns the model's displacement carrying the residual the data actually
         has, instead of the smooth curve predict() draws through it:
 
-            resid = stack * predict(model, baseline).iexp(sign=1)
+            resid = stack.complex() * predict(model, baseline).iexp(sign=1)
             mix   = predict(model, baseline=None) - angle(resid * conj(mean_date(resid)))
 
         NOTHING IS UNWRAPPED HERE, and that is the point rather than an omission.
@@ -4520,13 +4575,14 @@ class BatchComplex(BatchCore):
             own when left out. Not used when the covariates come as a Batch.
         range : float
             How much of gradient space the accumulator can represent, radians
-            across each variable's extent. Default None self-sizes: 128
-            cycles at one variable -- an order of magnitude beyond any
-            physical trend, for a grid of about a thousand numbers -- and 16
-            and 8 cycles at two and three, where the grid is cells**k and
-            width costs real memory. The answer does not depend on it (the
-            same fit on a grid twice the size returns the same numbers); it
-            only has to be big enough, and the fit says so if it ever is not.
+            across each variable's extent. Default None self-sizes: 128 pi
+            radians (64 cycles) at one variable -- an order of magnitude
+            beyond any physical trend, for a grid of about a thousand numbers
+            -- and 16 pi and 8 pi radians (8 and 4 cycles) at two and three,
+            where the grid is cells**k and width costs real memory. A wider
+            range can land a weak date's fit on another lobe, so the default
+            is the intended setting; a date whose trend walks out of the range
+            comes back NaN with coherence 0, and the fit says so.
             Leave it alone.
         union : bool
             False (default) fits each burst on its own pixels, so overlapping
@@ -4629,6 +4685,8 @@ class BatchComplex(BatchCore):
             # the caller left it
             data_dask = data_da.data
             nd = data_da.sizes['date']
+            if min(data_dask.shape[-2:]) < 3:
+                raise ValueError(f"trend2d() needs a burst grid of at least 3 x 3 pixels, burst '{key}' is {data_dask.shape[-2]} x {data_dask.shape[-1]}.")
 
             tds = vars[key]
             # a map coordinate is constant along the other axis, so it
@@ -4716,12 +4774,13 @@ class BatchComplex(BatchCore):
         # THE GRID SIZES ITSELF. `range` is only how much of gradient space
         # the accumulator can represent, and the cost of representing more is
         # a longer vector -- linear in cells at one variable -- so the default
-        # is deliberately absurd: 128 cycles across the covariate's extent at
-        # k=1, an order of magnitude beyond any physical trend, for a grid of
-        # ~a thousand numbers per date. Only at two and three variables does
-        # width cost real memory (the grid is cells**k), so there the default
-        # falls back to 16 and 8 cycles and the one message that can ask for
-        # more still exists. Nobody should ever need to set this.
+        # is deliberately absurd: 128 pi radians (64 cycles) across the
+        # covariate's extent at k=1, an order of magnitude beyond any physical
+        # trend, for a grid of ~a thousand numbers per date. Only at two and
+        # three variables does width cost real memory (the grid is cells**k),
+        # so there the default falls back to 16 pi and 8 pi radians (8 and 4
+        # cycles) and the one message that can ask for more still exists.
+        # Nobody should ever need to set this.
         if range is None:
             range = {1: 128, 2: 16, 3: 8}.get(k, 8) * np.pi
         _cells = int(np.ceil(2 * float(range) / np.pi))
@@ -5036,6 +5095,7 @@ class BatchComplex(BatchCore):
             # date that did not resolve printed 4 times)
             import dask
             _need = ['intercept'] + [f'slope_{v}' for v in names]
+            # NOTE: prints through BatchComplex.predict and BatchComplex.detrend
             _num = dict(zip(_need, dask.compute(*[mds[n].data for n in _need])))
             kd = da.from_array(np.asarray(_num['intercept'], np.float64),
                                chunks=(_dc,))
@@ -5171,6 +5231,7 @@ class BatchComplex(BatchCore):
                 raise ValueError(
                     f"detrend(): no trend2d() model for burst '{key}' -- "
                     f"pass what trend2d() returned for this stack.")
+        print("NOTE: BatchComplex.detrend() computes the trend2d() model's numbers eagerly.")
         pred = self._trend2d_predict(trend, vars=vars)
         res = {}
         for key, ds in self.items():
@@ -5202,6 +5263,10 @@ class BatchComplex(BatchCore):
     def detrend2d(self, trend: 'Batch', vars=None) -> 'BatchComplex':
         """Alias of detrend(), for code that names the dims: prints a WARNING and calls
         detrend(trend, vars), which reads what the trend is (user, 2026-10-01)."""
+        for key, ds in self.items():
+            ny, nx = ds.sizes.get('y', 3), ds.sizes.get('x', 3)
+            if min(ny, nx) < 3:
+                raise ValueError(f"detrend2d() needs a burst grid of at least 3 x 3 pixels, burst '{key}' is {ny} x {nx}.")
         print('WARNING: detrend2d() calls detrend(). Use detrend(trend).')
         return self.detrend(trend, vars=vars)
 
@@ -5610,7 +5675,6 @@ class BatchComplex(BatchCore):
         stack holding these bursts, computed once by a caller that loops over
         bursts; None computes it here.
         """
-        import os as _os
         import numpy as np
         import xarray as xr
         import dask as _dask
@@ -5631,31 +5695,10 @@ class BatchComplex(BatchCore):
         # contradict it.
         budget_mb = get_dask_chunk_size_mb()
 
-        # THE CLUSTER STATES THE SHAPE, as the per-burst path reads it
-        _slots = 1
-        _cores = None
-        try:
-            from dask.distributed import get_client as _gc
-            _winfo = _gc().scheduler_info().get('workers', {})
-            if _winfo:
-                _slots = len(_winfo)
-                _decl = [w.get('resources', {}).get('cpu') for w in
-                         _winfo.values()]
-                _decl = [d for d in _decl if d]
-                if _decl:
-                    _cores = int(max(_decl))
-        except (ValueError, ImportError):
-            pass
-        # THE DECLARED CORES FIRST, the process's own count only without them:
-        # os.process_cpu_count() is new in Python 3.13, and asking it before
-        # the cluster failed on 3.11/3.12 even with the cores declared.
-        if _cores is None:
-            if not hasattr(_os, 'process_cpu_count'):
-                raise RuntimeError(
-                    "fit3d() cannot count the CPU cores. Use Python 3.13+, or "
-                    "declare the cores in the Dask cluster init: Client(..., "
-                    "resources={'cpu': N}) with N the machine's CPU cores.")
-            _cores = max(1, _os.process_cpu_count() or 1)
+        # THE CLUSTER STATES THE SHAPE, as the per-burst path reads it: the
+        # declared cores first, the process's own count only without them
+        from .utils_dask import cluster_cores
+        _slots, _cores = cluster_cores()
         _threads = max(1, _cores // max(1, _slots))
         _width = _slots
         if chain is None:
@@ -6150,22 +6193,15 @@ class BatchComplex(BatchCore):
                 res[v] = ds[v]
         return res
 
-    def real(self, **kwargs):
-        """
-        Return the real part of each complex data variable,
-        producing a Batch of real-valued Datasets.
-        The grids only: the metadata passes through unchanged.
-        """
-        return Batch({key: BatchComplex._grids_map(ds, lambda da: da.real, **kwargs) for key, ds in self.items()})
+    @property
+    def real(self):
+        """The real part of the grids as a Batch of real-valued Datasets; the metadata passes through unchanged."""
+        return Batch({key: BatchComplex._grids_map(ds, lambda da: da.real) for key, ds in self.items()})
 
-    def imag(self, **kwargs):
-        """
-        Return the imaginary part of each complex data variable,
-        producing a Batch of real-valued Datasets.
-        The grids only: imag() of the metadata set radar_wavelength to 0 and
-        the burst id to '' before.
-        """
-        return Batch({key: BatchComplex._grids_map(ds, lambda da: da.imag, **kwargs) for key, ds in self.items()})
+    @property
+    def imag(self):
+        """The imaginary part of the grids as a Batch of real-valued Datasets; the metadata passes through unchanged."""
+        return Batch({key: BatchComplex._grids_map(ds, lambda da: da.imag) for key, ds in self.items()})
 
     def abs(self, **kwargs):
         return Batch(self.map_da(lambda da: xr.ufuncs.abs(da), **kwargs))
@@ -6839,7 +6875,7 @@ class Batches(tuple):
 
     def snapshot(self, store: str | None = None, storage_options: dict[str, str] | None = None,
                  caption: str | None = None,
-                 debug: bool = False, **kwargs):
+                 debug: bool = False, overwrite: bool = True, **kwargs):
         """Save or open a Batches snapshot.
 
         When called on a Batches with data, saves all batches to Zarr store.
@@ -6855,6 +6891,8 @@ class Batches(tuple):
             Progress bar caption.
         debug : bool
             Print debug information.
+        overwrite : bool
+            True (default) replaces an existing store; False keeps a complete one and returns it opened.
 
         Returns
         -------
@@ -6877,7 +6915,7 @@ class Batches(tuple):
         else:
             result = utils_io.snapshot(*self, store=store, storage_options=storage_options,
                                        caption=caption or 'Snapshotting...',
-                                       debug=debug, wrapper=Batches)
+                                       debug=debug, overwrite=overwrite, wrapper=Batches)
 
         if isinstance(result, Batches):
             return result
@@ -7494,7 +7532,7 @@ class Batches(tuple):
         """
         Convert phase to line-of-sight displacement (meters).
 
-        Applies Batch.displacement_los() to the first element.
+        Applies Batch.displacement_los(transform) to the first element.
 
         Parameters
         ----------

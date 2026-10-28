@@ -21,7 +21,6 @@ _A = 6378137.0
 _E2 = 6.69438002290341574957e-3
 
 _PI = np.pi
-_PI2 = 2.0 * np.pi
 _RAD = 180.0 / np.pi  # degrees per radian
 _DEG2RAD = np.pi / 180.0
 
@@ -163,10 +162,10 @@ def _getghar(mjd, fmjd):
     ghad = 280.460618375040 + 360.98564736628620 * d
     i = int(ghad / 360.0)
     ghar = (ghad - i * 360.0) / _RAD
-    while ghar > _PI2:
-        ghar -= _PI2
+    while ghar > 2 * np.pi:
+        ghar -= 2 * np.pi
     while ghar < 0.0:
-        ghar += _PI2
+        ghar += 2 * np.pi
     return ghar
 
 

@@ -143,7 +143,7 @@ class NCubeVTK:
             # that's more correct way, only totally black pixels ignored
             #zeromask = (~np.all(image.values==0,axis=0)).astype(float)
             # that's a magic for better borders
-            zeromask = np.any(ds[band_mask].values==0,axis=0)
+            zeromask = np.any(dataset[band_mask].values==0,axis=0)
             mask = nanmask | zeromask | znanmask
         elif band_mask is not None:
             # mask NaNs

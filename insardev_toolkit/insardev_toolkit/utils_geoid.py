@@ -579,6 +579,49 @@ def _tensor(grid, lat, lon):
     return out
 
 
+def geoid_coefficients(datum=DEFAULT_DATUM):
+    """
+    Cubic B-spline coefficients of the bundled geoid grid at its native nodes, lazy: the caller crops and computes.
+
+    geoid_height() evaluates the spline as the 4 x 4 weighted sum of these coefficients around a point. Nothing is read
+    here, and computing a crop reads only the blocks of BLOCK nodes it touches, each with the MARGIN nodes around it
+    that make its coefficients exact. No point, no interpolation, and nothing of the whole grid is computed here.
+
+    Parameters
+    ----------
+    datum : str or int, optional
+        'EGM2008' (default) or 'EGM96'; see geoid_height().
+
+    Returns
+    -------
+    xarray.DataArray
+        float64 coefficients with dims (lat, lon), dask-backed. Index 0 of lat is -90 and index 0 of lon is -180, the
+        grid step apart; the longitude is periodic, so a column past the last one is the first one again.
+
+    Examples
+    --------
+    c = geoid_coefficients('EGM2008')                                   # lazy: nothing is read
+    patch = c.isel(lat=slice(435, 443), lon=slice(320, 328)).values    # an 8 x 8 patch: one block is read
+    """
+    import xarray as xr
+    import dask.array as da
+    name = datum_name(datum)
+    grid = _geoid_grid(name)
+
+    def block(x, block_info=None):
+        # one block of nodes: its window starts one node before it, as _points() reads it
+        (i0, i1), (j0, j1) = block_info[None]['array-location']
+        coef = _coefficients(_geoid_grid(name), i0 - 1, i0 - 1 + BLOCK + 3, j0 - 1, j0 - 1 + BLOCK + 3)
+        return coef[1:1 + i1 - i0, 1:1 + j1 - j0]
+
+    # the blocks of a lazy array of the grid's shape: the zeros are not computed, only the block location is used
+    template = da.zeros((grid.nlat, grid.nlon), chunks=BLOCK, dtype=np.float64)
+    coef = da.map_blocks(block, template, dtype=np.float64, meta=np.empty((0, 0), dtype=np.float64))
+    lat = np.asarray(grid.grid.lat, dtype=np.float64)
+    lon = np.asarray(grid.grid.lon, dtype=np.float64)[:grid.nlon]
+    return xr.DataArray(coef, dims=('lat', 'lon'), coords={'lat': lat, 'lon': lon})
+
+
 def geoid_height(lat, lon, datum=DEFAULT_DATUM, grid=False):
     """
     Geoid height N above the WGS84 ellipsoid, in metres: ellipsoidal height = DEM height + N.

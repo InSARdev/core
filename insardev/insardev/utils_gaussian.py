@@ -11,7 +11,6 @@
 
 from .utils_torch import serialize_gpu as _serialize_gpu
 
-
 @_serialize_gpu
 def nanconvolve2d_gaussian_pytorch(data_np, weight_np=None, sigma=None, truncate=4.0, threshold=0.5, device='cpu'):
     """
@@ -119,7 +118,6 @@ def nanconvolve2d_gaussian_pytorch(data_np, weight_np=None, sigma=None, truncate
     return result
 
 
-import cv2 as _cv2
 
 
 def nanconvolve2d_gaussian_numpy(data_np, weight_np=None, sigma=None, truncate=4.0, threshold=0.5):
@@ -147,6 +145,7 @@ def nanconvolve2d_gaussian_numpy(data_np, weight_np=None, sigma=None, truncate=4
         Convolved array (float32) with same shape as input.
     """
     import numpy as np
+    import cv2 as _cv2
 
     if sigma is None:
         return data_np

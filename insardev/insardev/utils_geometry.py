@@ -12,16 +12,20 @@
 incidence() read the phase, its x and y, and per-burst numbers only -- never azi, rng or ele.
 
 PER-BURST NUMBERS (one date's: the stack's REFERENCE date): near_range, rng_samp_rate, earth_radius,
-SC_height_start/end, num_lines, num_rng_bins, radar_wavelength, lookdir, ref_height, the exact radar-extent polygon
+SC_height_start/end, num_lines, num_rng_bins, radar_wavelength, PRF, lookdir, ref_height, the exact radar-extent polygon
 `geometry` (of the crop, N116), the CRS, and the midpoint of the `ele` actual_range ATTRIBUTE (h_attr).
 
 MAPPING x, y -> radar, a satellite track rebuilt on WGS84 from those numbers and the polygon only:
   corners T_k (k = 0 near-early, 1 far-early, 2 far-late, 3 near-late) are the polygon's vertices, computed on the
   earth_radius sphere: T = WGS84(lat, lon, h_T) with |T| = earth_radius;
-  zero-Doppler planes at lines 0 and L - 1 through the Earth centre and that line's near and far corners;
+  zero-Doppler planes n . x = c at lines 0 and L - 1 through that line's near and far corners: the satellite position Rs s (s
+  on the plane through the Earth centre and the corners, normal t) is moved along t by the length k (T_near . s - Rs),
+  k = v_r / v, and normalised to the new s; n . s = v_r / |V| (|V| = sqrt(v^2 + v_r^2), v_r = (SC_height_end -
+  SC_height_start) PRF / (L - 1), v = sqrt(GM / Rs)), n in span(t, e2) with e2 normal to T_far - T_near and t, c = n . T_near;
   the sub-satellite direction s on each plane at the Earth angle beta from the near corner,
       cos beta = (Rs^2 + |T_near|^2 - rho_n^2) / (2 Rs |T_near|),  Rs = earth_radius + SC_height at that line;
-  a ground point G = WGS84(lat, lon, h): w = G.n0 / (G.n0 - G.n3), line = w (L - 1), s = slerp(s0, s3, w),
+  a ground point G = WGS84(lat, lon, h): a_i = G.n_i - c_i (i = 0, 3), w = a0 / (a0 - a3), line = w (L - 1),
+      s = slerp(s0, s3, w),
       rho = |G - (earth_radius + SC_height(line)) s|.
   (lat, lon) from x, y by pyproj at nodes every STEP pixels; everything per pair is bilinear between the nodes and
   applied in ONE numba pass.
@@ -44,6 +48,8 @@ C_LIGHT = 299792458.0
 A_WGS = 6378137.0
 F_WGS = 1.0 / 298.257223563
 E2_WGS = F_WGS * (2.0 - F_WGS)
+# the WGS84 gravitational parameter: the orbital speed sqrt(GM / Rs) of the satellite track
+GM_WGS = 3.986004418e14
 # node spacing (pixels): the geometry and the per-pair divisor at nodes, bilinear in between (node error measured
 # <= 9.3e-6 relative at 128 px)
 STEP = 128
@@ -52,7 +58,7 @@ JOINT_DELTA = 250.0
 JOINT_NITER = 3
 # the per-burst numbers the geometry reads (one date's)
 SCALARS = ('near_range', 'rng_samp_rate', 'earth_radius', 'SC_height_start', 'SC_height_end', 'num_lines',
-           'num_rng_bins', 'radar_wavelength', 'lookdir', 'geometry')
+           'num_rng_bins', 'radar_wavelength', 'lookdir', 'geometry', 'PRF')
 TRIPLES = ('baseline_start', 'baseline_center', 'baseline_end', 'alpha_start', 'alpha_center', 'alpha_end')
 
 
@@ -88,7 +94,7 @@ def burst_geometry(values: dict, crs: str, h_ref: float, dem_mode: bool, h_attr:
     from shapely import wkt
     g = lambda n: float(values[n])
     P = dict(near=g('near_range'), dr=C_LIGHT / (2.0 * g('rng_samp_rate')), Re=g('earth_radius'),
-             hs=g('SC_height_start'), he=g('SC_height_end'), L=g('num_lines'), NR=g('num_rng_bins'),
+             hs=g('SC_height_start'), he=g('SC_height_end'), L=g('num_lines'), NR=g('num_rng_bins'), PRF=g('PRF'),
              lam=g('radar_wavelength'))
     P['k4'] = 4.0 * np.pi / P['lam']
     P['side'] = 1.0 if str(values['lookdir']).upper().startswith('R') else -1.0
@@ -106,8 +112,13 @@ def burst_geometry(values: dict, crs: str, h_ref: float, dem_mode: bool, h_attr:
 
 
 def _track(P, lat, lon):
-    """The satellite track: the zero-Doppler plane normals n0, n3 at lines 0 and L - 1, the sub-satellite
-    directions s0, s3 and their angle Om, from the polygon corners (radians) and the per-burst numbers."""
+    """The satellite track from the polygon corners (radians) and the per-burst numbers. For each end line (0, L - 1), t is the
+    unit normal of the plane through the Earth centre and the near and far corners (signed along s3 - s0). The sub-satellite
+    direction s (angle beta from the near corner on that plane) gives the position Rs s, which is moved along t by the length
+    k (T_near . s - Rs), k = v_r / v, and normalised: s = unit(Rs s + k (T_near . s - Rs) t). The zero-Doppler plane n . x = c
+    through the near and far corners has n = cos(ph) t + sin(ph) e2 (e2 normal to T_far - T_near and t) with
+    n . s = k / sqrt(1 + k^2) = v_r / |V|, and c = n . T_near. The satellite is not on its plane: Rs s is 43.2 m (Gastein)
+    and 46.4 m (Turkiye) off it (measured). Om is the angle between s0 and s3."""
     Re = P['Re']
     h = np.zeros(4)
     for _ in range(4):
@@ -116,35 +127,63 @@ def _track(P, lat, lon):
     # the corner pixel centres: bins 0 and NR - 1 (near_range is the range of sample 0)
     rn = P['near']
     L = P['L']
+    vr = (P['he'] - P['hs']) * P['PRF'] / (L - 1.0)
     out = {}
+    Rs = {}
     for tag, iN, iF, a in (('0', 0, 1, 0.0), ('3', 3, 2, L - 1.0)):
-        Rs = Re + P['hs'] + (P['he'] - P['hs']) * a / (L - 1.0)
+        Rs[tag] = Re + P['hs'] + (P['he'] - P['hs']) * a / (L - 1.0)
         tN, tF = _unit(T[iN]), _unit(T[iF])
         RN = np.linalg.norm(T[iN])
         n = _unit(np.cross(tN, tF))
         e = _unit(tF - np.dot(tF, tN) * tN)
-        bn = np.arccos((Rs * Rs + RN * RN - rn * rn) / (2 * Rs * RN))
+        bn = np.arccos((Rs[tag] * Rs[tag] + RN * RN - rn * rn) / (2 * Rs[tag] * RN))
         out['n' + tag] = n
         out['s' + tag] = np.cos(bn) * tN - np.sin(bn) * e
     d = out['s3'] - out['s0']
-    out['n0'] = out['n0'] * np.sign(np.dot(out['n0'], d))
-    out['n3'] = out['n3'] * np.sign(np.dot(out['n3'], d))
+    for tag, iN, iF in (('0', 0, 1), ('3', 3, 2)):
+        t = out['n' + tag] * np.sign(np.dot(out['n' + tag], d))
+        k = vr / np.sqrt(GM_WGS / Rs[tag])
+        s = _unit(Rs[tag] * out['s' + tag] + k * (np.dot(T[iN], out['s' + tag]) - Rs[tag]) * t)
+        out['s' + tag] = s
+        # the normal in the plane through the corners' line (normal to T_far - T_near), with N . s = v_r / |V|
+        e2 = _unit(np.cross(T[iF] - T[iN], t))
+        kp = k / np.sqrt(1.0 + k * k)
+        A_, B_ = np.dot(t, s), np.dot(e2, s)
+        R_ = np.hypot(A_, B_)
+        ph = [np.arctan2(B_, A_) - np.arccos(kp / R_), np.arctan2(B_, A_) + np.arccos(kp / R_)]
+        ph = min(ph, key=lambda p: abs(np.angle(np.exp(1j * p))))
+        out['n' + tag] = np.cos(ph) * t + np.sin(ph) * e2
+        out['c' + tag] = np.dot(out['n' + tag], T[iN])
     out['Om'] = float(np.arccos(np.dot(out['s0'], out['s3'])))
     return out
 
 
 def _radar(P, G):
-    """(line, rho) of ECEF ground points G (..., 3) on the track."""
-    a0 = G @ P['n0']
-    a3 = G @ P['n3']
+    """(line, rho, sat) of ECEF ground points G (..., 3) on the track: the line, the range and the satellite position (..., 3)."""
+    a0 = G @ P['n0'] - P['c0']
+    a3 = G @ P['n3'] - P['c3']
     w = a0 / (a0 - a3)
     L = P['L']
     line = w * (L - 1.0)
     Om = P['Om']
     s = (np.sin((1.0 - w) * Om)[..., None] * P['s0'] + np.sin(w * Om)[..., None] * P['s3']) / np.sin(Om)
     Rs = P['Re'] + P['hs'] + (P['he'] - P['hs']) * line / (L - 1.0)
-    rho = np.linalg.norm(G - Rs[..., None] * s, axis=-1)
-    return line, rho
+    sat = Rs[..., None] * s
+    rho = np.linalg.norm(G - sat, axis=-1)
+    return line, rho, sat
+
+
+def look_azimuth(P, lat, lon, hg):
+    """The look azimuth (degrees, clockwise from geodetic north, in [0, 360)) of the line of sight from the satellite of the burst P
+    to the points (lat, lon in radians) at the heights hg (m, WGS84): the satellite is taken on the zero-Doppler line of each point."""
+    G = _geo2ecef(lat, lon, np.broadcast_to(np.asarray(hg, np.float64), np.shape(lat)))
+    _, _, S = _radar(P, G)
+    d = G - S
+    sl, cl = np.sin(lat), np.cos(lat)
+    so, co = np.sin(lon), np.cos(lon)
+    de = -so * d[..., 0] + co * d[..., 1]
+    dn = -sl * co * d[..., 0] - sl * so * d[..., 1] + cl * d[..., 2]
+    return np.mod(np.degrees(np.arctan2(de, dn)), 360.0)
 
 
 def date_triples(baseline: dict) -> tuple:
@@ -165,7 +204,7 @@ class _Pix:
 
     def __init__(self, P, lat, lon, hg):
         G = _geo2ecef(lat, lon, np.broadcast_to(np.asarray(hg, np.float64), np.shape(lat)))
-        line, self.rho = _radar(P, G)
+        line, self.rho, _ = _radar(P, G)
         self.P = P
         self.f = line / (P['L'] - 1.0)
         self.hg = np.broadcast_to(np.asarray(hg, np.float64), self.rho.shape)
@@ -255,13 +294,25 @@ def _interp_w(nodes, n):
     return j, w
 
 
-def _node_latlon(P, yc, xc):
-    ny, nx = np.size(yc), np.size(xc)
-    iy = _nodes(ny, STEP)
-    ix = _nodes(nx, STEP)
-    Yn, Xn = np.meshgrid(np.asarray(yc, np.float64)[iy], np.asarray(xc, np.float64)[ix], indexing='ij')
+def _node_latlon(P, gy, gx, ycoord, xcoord):
+    """The nodes of a block of global pixel indices gy, gx (consecutive) of the grid whose whole axes are ycoord, xcoord.
+
+    The nodes are the GLOBAL multiples of STEP and the grid's last pixel, so a block's nodes do not depend on its
+    chunking. The block takes the nodes that bracket it (the last at or before its first pixel, the first after its
+    last one, and at least two): their local positions (global index minus the block's first) are returned, so a
+    local position may be negative or past the block. Returns (local y positions, local x positions, lat, lon)."""
+    spans = []
+    for k, g0, g1 in ((_nodes(np.size(ycoord), STEP), gy[0], gy[-1]), (_nodes(np.size(xcoord), STEP), gx[0], gx[-1])):
+        if k.size > 1:
+            # the last node at or before g0 (at least the second to last: the last pixel needs a segment), up to the first after g1
+            lo = min(int(np.searchsorted(k, g0, side='right')) - 1, k.size - 2)
+            hi = min(int(np.searchsorted(k, g1, side='right')), k.size - 1)
+            k = k[lo:hi + 1]
+        spans.append(k)
+    ky, kx = spans
+    Yn, Xn = np.meshgrid(np.asarray(ycoord, np.float64)[ky], np.asarray(xcoord, np.float64)[kx], indexing='ij')
     lat, lon = _latlon(P['crs'], Xn, Yn)
-    return iy, ix, lat, lon
+    return ky - gy[0], kx - gx[0], lat, lon
 
 
 def _upsample_x(Kc, ix, nx):
@@ -343,8 +394,10 @@ _warmup_numba_cache()
 
 
 # ------------------------------------------------------------------------------------------------ blocks
-def elevation_block(ph, pidx, yc, xc, *, geos, pairs, joint):
-    """One phase block (npair, ny, nx) -> elevation, from the phase and the block's y, x only.
+def elevation_block(ph, pidx, gy, gx, *, geos, pairs, joint, ycoord, xcoord):
+    """One phase block (npair, ny, nx) -> elevation, from the phase and the block's GLOBAL pixel indices gy, gx (its
+    place in the whole grid, whose axes are ycoord, xcoord): the nodes are the global ones, so the result does not
+    depend on the block.
 
     geos: the per-burst models (burst_geometry()); pairs: per pair of the variable (geometry index, b_i, b_j),
     b = (b_h nodes, b_v nodes), the dates' own triples (joint) or 0 and the pair difference (one division).
@@ -354,7 +407,7 @@ def elevation_block(ph, pidx, yc, xc, *, geos, pairs, joint):
     sel = [pairs[int(p)] for p in np.asarray(pidx).ravel()]
     ny, nx = ph.shape[-2:]
     P0 = geos[sel[0][0]]
-    iy, ix, lat, lon = _node_latlon(P0, yc, xc)
+    iy, ix, lat, lon = _node_latlon(P0, gy, gx, ycoord, xcoord)
     cache = {}
 
     def pix(g, h):
@@ -394,16 +447,29 @@ def elevation_block(ph, pidx, yc, xc, *, geos, pairs, joint):
                            np.asarray(A0, np.float32), out)
 
 
-def incidence_block(yc, xc, *, geo):
-    """The incidence (radians) of a (y, x) block at the terrain height h_attr, from its y, x only."""
-    ny, nx = np.size(yc), np.size(xc)
-    iy, ix, lat, lon = _node_latlon(geo, yc, xc)
+def incidence_block(gy, gx, *, geo, ycoord, xcoord):
+    """The incidence (radians) of a (y, x) block at the terrain height h_attr, from its global pixel indices gy, gx
+    and the whole axes ycoord, xcoord."""
+    ny, nx = np.size(gy), np.size(gx)
+    iy, ix, lat, lon = _node_latlon(geo, gy, gx, ycoord, xcoord)
     return _bilinear(_Pix(geo, lat, lon, geo['h_attr']).inc, iy, ix, ny, nx)
 
 
-def elevation_phase_block(yc, xc, *, geo):
+def look_block(gy, gx, *, geo, ycoord, xcoord):
+    """The look azimuth (degrees, in [0, 360)) of a (y, x) block at the terrain height h_attr, from its global pixel indices gy, gx
+    and the whole axes ycoord, xcoord: the azimuth on the nodes, bilinear in its sine and cosine (no wrap at 0 and 360)."""
+    ny, nx = np.size(gy), np.size(gx)
+    iy, ix, lat, lon = _node_latlon(geo, gy, gx, ycoord, xcoord)
+    a = np.radians(look_azimuth(geo, lat, lon, geo['h_attr']))
+    s = _bilinear(np.sin(a), iy, ix, ny, nx)
+    c = _bilinear(np.cos(a), iy, ix, ny, nx)
+    return np.mod(np.degrees(np.arctan2(s, c)), 360.0)
+
+
+def elevation_phase_block(gy, gx, *, geo, ycoord, xcoord):
     """k4 kN / (rho sin th) of a (y, x) block at the terrain height h_attr: radians of phase per metre of height
-    per metre of perpendicular baseline, the one-division sensitivity elevation() divides by."""
-    ny, nx = np.size(yc), np.size(xc)
-    iy, ix, lat, lon = _node_latlon(geo, yc, xc)
+    per metre of perpendicular baseline, the one-division sensitivity elevation() divides by. The block is given by
+    its global pixel indices gy, gx and the whole axes ycoord, xcoord."""
+    ny, nx = np.size(gy), np.size(gx)
+    iy, ix, lat, lon = _node_latlon(geo, gy, gx, ycoord, xcoord)
     return _bilinear(_Pix(geo, lat, lon, geo['h_attr']).tan_fac(geo['h_attr'])[0], iy, ix, ny, nx)

@@ -654,7 +654,6 @@ def _trend2d_read_kernel(Sr, Si, k, M, cells, w, g, kg):
     """The contraction of trend2d_read(), ONE pass over the grid: the last axis
     is contracted against the phasors and against their derivative together, so
     the value and its k derivatives share the walk through the cells."""
-    two_pi = 2.0 * np.pi
     pr = np.empty((k, M))
     pi = np.empty((k, M))
     dr = np.empty((k, M))
@@ -669,10 +668,10 @@ def _trend2d_read_kernel(Sr, Si, k, M, cells, w, g, kg):
         ti = 0.0
         for c in range(M):
             am = (c - w) / cells - 0.5
-            ang = -two_pi * g[a] * am
+            ang = -(2 * np.pi) * g[a] * am
             cr = np.cos(ang)
             sn = np.sin(ang)
-            f = two_pi * am
+            f = 2 * np.pi * am
             pr[a, c] = cr
             pi[a, c] = sn
             # e * (-2 pi i am)
@@ -774,7 +773,6 @@ def _trend2d_read_kernel(Sr, Si, k, M, cells, w, g, kg):
 def _trend2d_resolution_kernel(H, M, cells, w, kg, n, reach, step, level):
     """Walk the sampling's own transform along ONE variable until it falls to
     `level` of its value at zero or turns back up into its own lobes."""
-    two_pi = 2.0 * np.pi
     prev = 1.0
     steps = int(reach / step)
     for i in range(1, steps + 1):
@@ -784,7 +782,7 @@ def _trend2d_resolution_kernel(H, M, cells, w, kg, n, reach, step, level):
         kr = 0.0
         ki = 0.0
         for c in range(M):
-            ang = -two_pi * g * ((c - w) / cells - 0.5)
+            ang = -(2 * np.pi) * g * ((c - w) / cells - 0.5)
             cr = np.cos(ang)
             sn = np.sin(ang)
             ar += H[c] * cr
@@ -978,7 +976,6 @@ def trend2d_fit(acc, cells, k, axes=(), maxiter=1000, tol=1e-10, degree=1):
     kg = trend2d_kernel(cells)
     kgr = np.ascontiguousarray(kg.real, dtype=np.float64)
     reach = trend2d_reach(cells)
-    two_pi = 2 * np.pi
 
     g = np.full((nd, k), np.nan)
     c = np.full(nd, np.nan)
@@ -1012,7 +1009,7 @@ def trend2d_fit(acc, cells, k, axes=(), maxiter=1000, tol=1e-10, degree=1):
             for b in range(a, k):
                 m2[a, b] = m2[b, a] = m2f[d, p]
                 p += 1
-        Xg = (two_pi ** 2) * (m2 - np.outer(m1[d], m1[d]) / n[d])
+        Xg = ((2 * np.pi) ** 2) * (m2 - np.outer(m1[d], m1[d]) / n[d])
 
         # THE CONSTANT IS CLOSED FORM, never a free parameter: for any g the
         # best constant is angle(T(g)) and the objective is then just |T(g)|.
@@ -1107,7 +1104,7 @@ def trend2d_fit(acc, cells, k, axes=(), maxiter=1000, tol=1e-10, degree=1):
                     for b in range(a, k):
                         m2h[a, b] = m2h[b, a] = tot_h[pp]
                         pp += 1
-                Xh = (two_pi ** 2) * (m2h - np.outer(m1h, m1h) / nh)
+                Xh = ((2 * np.pi) ** 2) * (m2h - np.outer(m1h, m1h) / nh)
                 r = _trend2d_ascend(Sh, cells, k, g[d], kg, Xh, nh, reach,
                                     maxiter, tol)
                 if r is None:
@@ -1586,6 +1583,7 @@ def _compute_feature_stats(var_dask_list, degree):
         to_compute.append(da.nanmean(masked))
         to_compute.append(da.nanstd(masked))
 
+    # NOTE: prints through Batch.trend2d
     results = dask.compute(*to_compute)
     feature_mean = np.array([float(results[2 * i]) for i in range(n_vars)],
                             dtype=np.float64)

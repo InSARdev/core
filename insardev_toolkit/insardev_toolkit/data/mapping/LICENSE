@@ -1,0 +1,129 @@
+References and verbatim quotes of the sources of the tables in this folder. The texts are quoted as published; no statement is made here about the terms.
+
+1. vmf3_grid.m, lines 1 to 55, quoted as published. Source: https://vmf.geo.tuwien.ac.at/codes/ (file https://vmf.geo.tuwien.ac.at/codes/vmf3_grid.m, fetched 2026-10-22, 94058 bytes, SHA-256 8da9a4d296bd1160953e56fd0f2e9d20b9bb8c3f30b41ce81c9629d4a6eb2206).
+----- begin quote: vmf3_grid.m lines 1 to 55 -----
+function [ mfh , mfw , zhd , zwd , VMF3_grid_file ] = vmf3_grid ( indir_VMF3_grid, indir_orography , VMF3_grid_file , mjd , lat , lon , h_ell , zd , grid_res )
+%
+% vmf3_grid.m
+%
+% This routine determines mapping functions plus zenith delays from the
+% gridded VMF3 files, as available from:
+% http://vmf.geo.tuwien.ac.at/trop_products/GRID/
+%
+% On the temporal scale, the values from the two surrounding NWM epochs are
+% linearly interpolated to the respective mjd.
+% In the horizontal, a bilinear interpolation is done for the mapping 
+% function coefficients as well as for the zenith delays. In the vertical, 
+% on the one hand the height correction by Niell (1996) is applied in order 
+% to "lift" the hydrostatic mapping function from zero height to h_ell; on
+% the other hand, specific formulae as suggested by Kouba (2008) are 
+% applied in order to "lift" the zenith delays from the respective heights 
+% of the grid points (orography_ell) to that of the desired location. 
+% All input quantities have to be scalars!
+%
+% Reference for VMF3:
+% Landskron, D. & Böhm, J. J Geod (2017). https://doi.org/10.1007/s00190-017-1066-2
+%
+% Reference for conversion of mapping functions:
+% Niell, A.E. (1996), Global mapping functions for the atmosphere delay at 
+% 310 radio wavelengths. J. Geophys. Res., 101, 3227-3246
+% 
+% Reference for conversion of zenith delays:
+% Kouba, J. (2008), Implementation and testing of the gridded Vienna 
+% Mapping Function 1 (VMF1). J. Geodesy, Vol. 82:193-205, 
+% DOI: 10.1007/s00190-007-0170-0
+%
+%
+% INPUT:
+%         o indir_VMF3_grid ... input directory where the yearly subdivided VMF3 gridded files are stored
+%         o indir_orography ... input directory where the orography_ell file in the respective resolution is stored
+%         o VMF3_grid_file .... cell containing filenames, VMF3 data and the orography, which is always passed with the function; must be set to '[]' by the user in the initial run
+%         o mjd ............... modified Julian date
+%         o lat ............... ellipsoidal latitude (radians)
+%         o lon ............... ellipsoidal longitude (radians)
+%         o h_ell ............. ellipsoidal height (m)
+%         o zd ................ zenith distance (radians)
+%         o grid_res........... grid resolution (°) (possible: 1 or 5)
+%
+% OUTPUT:
+%         o mfh ............... hydrostatic mapping function, valid at h_ell
+%         o mfw ............... wet mapping function, valid at h_ell
+%         o zhd ............... zenith hydrostatic delay (m), valid at h_ell
+%         o zwd ............... zenith wet delay (m), valid at h_ell
+%         o VMF3_grid_file: ... cell containing filenames, VMF3 data and the orography, which is always passed with the function; must be set to '[]' by the user in the initial run
+%
+% -------------------------------------------------------------------------
+%
+% written by Daniel Landskron (2018/01/31)
+%
+% =========================================================================
+----- end quote -----
+
+2. gmf.f, lines 1 to 26, quoted as published. Source: https://vmf.geo.tuwien.ac.at/codes/ (file https://vmf.geo.tuwien.ac.at/codes/gmf.f, fetched 2026-10-22, 10810 bytes, SHA-256 1d73070ea3bf4943c87252389abda64f8e59e0b0c4682517dbde01554cdc4f5a).
+----- begin quote: gmf.f lines 1 to 26 -----
+      subroutine gmf (dmjd,dlat,dlon,dhgt,zd,gmfh,gmfw)
+
+C     This subroutine determines the Global Mapping Functions GMF (former name was gmf.f_hu)
+C
+C     Reference: Boehm, J., A.E. Niell, P. Tregoning, H. Schuh (2006), 
+C     Global Mapping Functions (GMF): A new empirical mapping function based on numerical weather model data,
+C     Geoph. Res. Letters, Vol. 33, L07304, doi:10.1029/2005GL025545.
+C
+C     input data
+C     ----------
+C     dmjd: modified julian date
+C     dlat: ellipsoidal latitude in radians
+C     dlon: longitude in radians
+C     dhgt: height in m
+C     zd:   zenith distance in radians
+C
+C     output data
+C     -----------
+C     gmfh: hydrostatic mapping function
+C     gmfw: wet mapping function
+C
+C     Johannes Boehm, 2005 August 30
+C
+C     ref 2006 Aug. 14: recursions for Legendre polynomials (O. Montenbruck)
+C     ref 2011 Jul. 21: latitude -> ellipsoidal latitude (J. Boehm)
+C
+----- end quote -----
+
+3. VMF Data Server Terms of Use, quoted word for word. Source: https://vmf.geo.tuwien.ac.at/terms.html (fetched 2026-10-22).
+----- begin quote: terms.html -----
+Terms of Use
+
+The use of all products provided on this server is free of charge. If you wish to use these products, please cite as:
+
+re3data.org: VMF Data Server; editing status 2020-12-14; re3data.org - Registry of Research Data Repositories.
+http://doi.org/10.17616/R3RD2H
+
+All atmospheric products (delay models, ray-traced delays, atmospheric pressure loading corrections) are based on Numerical Weather Models from the ECMWF. You are kindly requested to acknowledge the ECMWF when using atmospheric products provided on this server.
+
+Products based on ECMWF operational and ERA-Interim data
+
+Non-valid ECMWF products are governed by the Creative Commons 4.0 licence (CC BY 4.0). Non-valid data refers to any data with a verification time more than 24 hours in the past. In case of the VMF Data Server, this applies to troposphere delay models based on operational and ERA-Interim Numerical Weather Models as well as atmospheric pressure loading corrections. These products may be used commercially, subject to attribution.
+
+Products based on ECMWF forecast data
+
+ECMWF forecast data is not governed by the CC BY 4.0 licence, but underlies a separate licence agreement. Hence, troposphere delay models provided on this server, that are based on ECMWF forecast data, are password protected and for non-commercial, scientific use only. Please contact vmf@tuwien.ac.at, if you require access to any forecast products. Mind that the password is changed quarterly. Forecast products from past years are open access and underlie the same terms as operational products.
+
+Disclaimer
+
+Contents and products on this server are provided without warranty of any kind. We do not accept any responsibility for accuracy or completeness of information contained on this website. However, we strive to provide true and complete information as well as uninterrupted time series of tropospheric products.
+----- end quote -----
+
+4. TU Wien licence guideline, referenced, not quoted:
+https://www.tuwien.at/en/research/rti-support/research-data/info-and-guidelines/licenses
+
+5. Publications of the two models, as cited in the sources.
+Boehm et al. (2006), GMF, cited in gmf.f lines 5 to 7:
+----- begin quote: gmf.f lines 5 to 7 -----
+C     Reference: Boehm, J., A.E. Niell, P. Tregoning, H. Schuh (2006), 
+C     Global Mapping Functions (GMF): A new empirical mapping function based on numerical weather model data,
+C     Geoph. Res. Letters, Vol. 33, L07304, doi:10.1029/2005GL025545.
+----- end quote -----
+Landskron and Boehm (2018), VMF3, cited in vmf3_grid.m line 21:
+----- begin quote: vmf3_grid.m line 21 -----
+% Landskron, D. & Böhm, J. J Geod (2017). https://doi.org/10.1007/s00190-017-1066-2
+----- end quote -----

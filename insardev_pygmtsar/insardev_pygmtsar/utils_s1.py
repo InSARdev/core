@@ -11,6 +11,7 @@
 Sentinel-1 utility functions to replace GMTSAR binaries.
 Pure Python implementations without disk I/O or external binaries.
 """
+import math
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
@@ -22,19 +23,19 @@ _DOY_CUM = (0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334)
 
 
 def _ydf_to_iso(ydf: float) -> str:
-    """`year.day_fraction` (GMTSAR's SC_clock format) as an ISO-8601 timestamp.
+    """`SC_clock` value (year * 1000 + 0-based day + day fraction) as an ISO-8601 timestamp.
 
-    Only used to bracket a text search, so the seconds are truncated rather than
-    rounded -- widening the window by under a second either way is harmless when
-    an exact numeric test follows. A window across Jan 1 runs below day 0 of the
-    scene year (or past Dec 31), so the year is the nearest thousand.
+    Only used to bracket a text search and to name a time in an error. The seconds are rounded to the millisecond
+    before the text is formed, so a whole second is shown as that second: the float step of the value is about 2e-5 s,
+    and rounding to the microsecond still showed the second before for about half of the whole seconds of a day.
+    A window across Jan 1 runs below day 0 of the scene year (or past Dec 31), so the year is the nearest thousand.
     """
     import math
     from datetime import datetime, timedelta
     year = int(math.floor(ydf / 1000.0 + 0.5))
     rest = ydf - year * 1000
     jd = math.floor(rest)
-    sec = (rest - jd) * 86400.0
+    sec = round((rest - jd) * 86400.0, 3)
     dt = datetime(year, 1, 1) + timedelta(days=jd, seconds=sec)
     return dt.strftime('%Y-%m-%dT%H:%M:%S.%f')
 
@@ -42,6 +43,19 @@ def _ydf_to_iso(ydf: float) -> str:
 def _jan1_days(year0: int, year: int) -> int:
     """Days from Jan 1 of year0 to Jan 1 of year: the day count of year0 carried into a neighbouring year."""
     return (datetime(int(year), 1, 1) - datetime(int(year0), 1, 1)).days
+
+
+def _sc_clock_whole_second(year: int, clock: float) -> float:
+    """`SC_clock` value of a clock in days: year * 1000 + 0-based day + whole seconds of the day / 86400.
+
+    The seconds of the day are rounded to 1e-6 s and then floored, so the value is exact to the second by design:
+    use it to extract the year and the day, never for timing. The fraction of a second comes only from clock_start
+    and clock_stop. The day is floor(clock); a clock past the day end counts on, as clock_stop does, and a second
+    of day that rounds up to 86400 counts on to the next midnight.
+    """
+    day = math.floor(clock)
+    seconds = math.floor(round((clock - day) * 86400.0, 6))
+    return year * 1000 + day + seconds / 86400.0
 
 
 def _aztime_seconds(dt, day0) -> float:
@@ -56,8 +70,9 @@ def _aztime_seconds(dt, day0) -> float:
 
 def orbit_window(start: float, stop: float) -> tuple:
     """
-    The time the orbit of a burst is read for, (t1, t2): its first to last line, start and stop as
-    year.day_fraction (SC_clock_start, SC_clock_stop), extended by 1400 s (about 23 minutes) on each side.
+    The time the orbit of a burst is read for, (t1, t2): its first to last line, start and stop as SC_clock values
+    (SC_clock_start, SC_clock_stop: year * 1000 + 0-based day, whole seconds), extended by 1400 s (about 23 minutes)
+    on each side. The ends of the window are whole seconds; the 1400 s margin is far larger than that second.
     """
     return start - 1400.0 / 86400.0, stop + 1400.0 / 86400.0
 
@@ -80,13 +95,14 @@ def satellite_orbit(xml_path: str, t1: float, t2: float, burst: tuple = None) ->
     xml_path : str
         Path to orbit EOF XML file (e.g., S1A_OPER_AUX_POEORB_*.EOF)
     t1 : float
-        Start time as year.day_fraction (e.g., 2015.021 + seconds/86400)
-        This is GMTSAR's SC_clock_start format
+        Start time as an SC_clock value: year * 1000 + 0-based day + day fraction (e.g., 2015020.5 is 2015, day 20
+        counted from 0, 12:00)
+        This is the SC_clock_start format (orbit_window gives it from SC_clock_start, extended by 1400 s)
     t2 : float
-        End time as year.day_fraction
-        This is GMTSAR's SC_clock_stop format
+        End time as an SC_clock value (year * 1000 + 0-based day + day fraction)
+        This is the SC_clock_stop format
     burst : tuple, optional
-        (name, start, stop) of the burst the orbit is read for, start and stop as year.day_fraction:
+        (name, start, stop) of the burst the orbit is read for, start and stop as SC_clock values:
         the state vectors must cover this time, and the error names the burst and its date.
 
     Raises
@@ -155,7 +171,7 @@ def check_orbit_file(xml_path: str, bursts: list) -> None:
     xml_path : str
         Path to orbit EOF XML file.
     bursts : list
-        (name, start, stop) of each burst, start and stop as year.day_fraction (SC_clock_start, SC_clock_stop).
+        (name, start, stop) of each burst, start and stop as SC_clock values (SC_clock_start, SC_clock_stop).
 
     Raises
     ------
@@ -171,7 +187,9 @@ def check_orbit_file(xml_path: str, bursts: list) -> None:
                                      max(windows[i][1] for i in group), bursts[group[0]])
         for i in group:
             t1, t2 = windows[i]
-            error = _eof_error(xml_path, df[(ydf >= t1) & (ydf <= t2)], t1, t2, bursts[i])
+            # whole milliseconds: a state vector exactly on the window edge is kept, as <= and >= mean
+            ms = np.round(ydf * 86400000.0)
+            error = _eof_error(xml_path, df[(ms >= round(t1 * 86400000.0)) & (ms <= round(t2 * 86400000.0))], t1, t2, bursts[i])
             if error is not None:
                 raise error
 
@@ -279,8 +297,9 @@ def _eof_state_vectors(xml_path: str, t1: float, t2: float, burst: tuple = None)
         else:
             ydf = year0 * 1000 + (jd + _jan1_days(year0, year)) + sec / 86400.0
 
-        # Filter by time range
-        if ydf < t1 or ydf > t2:
+        # Filter by time range, on whole milliseconds: a state vector exactly on the window edge is kept (<= and >=)
+        ms = round(ydf * 86400000.0)
+        if ms < round(t1 * 86400000.0) or ms > round(t2 * 86400000.0):
             continue
 
         # Extract position and velocity
@@ -678,12 +697,12 @@ def satellite_prm(xml_path: str, tiff_path: str) -> dict:
     if k_start is not None:
         prm['clock_start'] += k_start / prm['PRF'] / 86400.0
 
-    # SC_clock includes year offset (year * 1000)
-    prm['SC_clock_start'] = prm['clock_start'] + year * 1000
+    # SC_clock: year * 1000 + day and whole seconds only (never for timing, see _sc_clock_whole_second)
+    prm['SC_clock_start'] = _sc_clock_whole_second(year, prm['clock_start'])
 
     # Stop times
     prm['clock_stop'] = prm['clock_start'] + prm['num_lines'] / prm['PRF'] / 86400.0
-    prm['SC_clock_stop'] = prm['clock_stop'] + year * 1000
+    prm['SC_clock_stop'] = _sc_clock_whole_second(year, prm['clock_stop'])
 
     return prm
 

@@ -7,8 +7,14 @@
 #
 # See the LICENSE file in the insardev_pygmtsar directory for license terms.
 # ----------------------------------------------------------------------------
+# Accuracy note: the S1 phase follows the simplified GMTSAR model and is evaluated at the
+# pixel the geocoding uses (half-pixel fix). Against the exact geometry it keeps a floor of
+# 0.007-0.047 rad in magnitude over the pairs measured (mean about -0.047 rad on the Turkiye
+# case), and a seam jump between bursts of up to -0.052 rad was seen on one of three ~46 m
+# Gastein pairs. The causes are the approximations of the model (2-D triangle, baseline time
+# axis, Bx term, orbit curvature), not a defect of the port; it is not an error to fix.
 from .S1_align import S1_align
-from .utils_satellite import remap_radar_to_geo
+from .utils_satellite import remap_radar_to_geo, s1_burst_half_window as _burst_half_window
 from insardev_toolkit.utils_S1 import measurement_path
 from insardev_toolkit.utils_files import exists
 from insardev_toolkit.utils_pool import release_workers
@@ -36,105 +42,106 @@ def _process_date_worker(args):
     from insardev_pygmtsar.PRM import PRM
     from insardev_pygmtsar.utils_s1 import make_burst
 
-    # Suppress zarr v3 consolidated metadata warnings in worker
-    warnings.filterwarnings('ignore', message='.*Consolidated metadata.*', category=UserWarning)
+    # zarr v3 consolidated metadata warnings: call-scoped (the sequential scheduler runs this in the caller)
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', message='.*Consolidated metadata.*', category=UserWarning)
 
-    burst_name = burst_item[-1]
+        burst_name = burst_item[-1]
 
-    # Reconstruct prm_ref from dataframe
-    prm_ref = PRM()
-    for name, row in prm_ref_df.iterrows():
-        prm_ref.set(**{name: row['value']})
-    prm_ref.orbit_df = prm_ref_orbit_df
+        # Reconstruct prm_ref from dataframe
+        prm_ref = PRM()
+        for name, row in prm_ref_df.iterrows():
+            prm_ref.set(**{name: row['value']})
+        prm_ref.orbit_df = prm_ref_orbit_df
 
-    # Load burst data
-    if is_reference:
-        # Reference: deramped SLC for symmetric geocoding (no alignment offsets)
-        from insardev_pygmtsar.utils_s1 import deramped_burst as deramped_burst_func
-        _, _, slc, reramp_params = deramped_burst_func(xml_file, tiff_file, orbit_file)
-        prm = prm_ref
-        baseline_params = None
-    else:
-        # Repeat: compute alignment offsets + load deramped SLC
-        from insardev_pygmtsar.utils_s1 import deramped_burst
-        earth_radius = prm_ref.get('earth_radius')
+        # Load burst data
+        if is_reference:
+            # Reference: deramped SLC for symmetric geocoding (no alignment offsets)
+            from insardev_pygmtsar.utils_s1 import deramped_burst as deramped_burst_func
+            _, _, slc, reramp_params = deramped_burst_func(xml_file, tiff_file, orbit_file)
+            prm = prm_ref
+            baseline_params = None
+        else:
+            # Repeat: compute alignment offsets + load deramped SLC
+            from insardev_pygmtsar.utils_s1 import deramped_burst
+            earth_radius = prm_ref.get('earth_radius')
 
-        # First get PRM without SLC to compute offsets
-        prm_rep_temp, orbit_df_temp = make_burst(xml_file, tiff_file, orbit_file, debug=debug)
-        prm_rep_temp.orbit_df = orbit_df_temp
+            # First get PRM without SLC to compute offsets
+            prm_rep_temp, orbit_df_temp = make_burst(xml_file, tiff_file, orbit_file, debug=debug)
+            prm_rep_temp.orbit_df = orbit_df_temp
 
-        # Compute time offset
-        t1, prf = prm_rep_temp.get('clock_start', 'PRF')
-        t2 = prm_rep_temp.get('clock_start')
-        nl = int((t2 - t1) * prf * 86400.0 + 0.2)
+            # Compute time offset
+            t1, prf = prm_rep_temp.get('clock_start', 'PRF')
+            t2 = prm_rep_temp.get('clock_start')
+            nl = int((t2 - t1) * prf * 86400.0 + 0.2)
 
-        # Create shifted reference PRM
-        prm_ref_shifted = PRM(prm_ref)
-        prm_ref_shifted.orbit_df = prm_ref.orbit_df
-        prm_ref_shifted.set(
-            prm_ref.sel('clock_start', 'clock_stop', 'SC_clock_start', 'SC_clock_stop')
-            + nl / prf / 86400.0
+            # Create shifted reference PRM
+            prm_ref_shifted = PRM(prm_ref)
+            prm_ref_shifted.orbit_df = prm_ref.orbit_df
+            prm_ref_shifted.set(
+                prm_ref.sel('clock_start', 'clock_stop')
+                + nl / prf / 86400.0
+            )
+            prm_ref_shifted.calc_dop_orb(earth_radius, inplace=True, debug=debug)
+
+            # Compute offsets
+            tmpm_dat = prm_ref_shifted.SAT_llt2rat(coords=topo_llt, precise=1, n_jobs=n_jobs, debug=debug)
+            prm_rep_temp.calc_dop_orb(earth_radius, inplace=True, debug=debug)
+            tmp1_dat = prm_rep_temp.SAT_llt2rat(coords=topo_llt, precise=1, n_jobs=n_jobs, debug=debug)
+
+            # Compute offset table (vectorized)
+            offset_dat0 = np.hstack([tmpm_dat, tmp1_dat])
+            offset_dat = np.column_stack([
+                offset_dat0[:, 0],                      # r_ref
+                offset_dat0[:, 5] - offset_dat0[:, 0],  # dr = r_rep - r_ref
+                offset_dat0[:, 1],                      # a_ref
+                offset_dat0[:, 6] - offset_dat0[:, 1],  # da = a_rep - a_ref
+                np.full(len(offset_dat0), 100.0)        # SNR
+            ])
+
+            # Filter valid points for fitoffset
+            from .utils_satellite import offset_valid_mask
+            rmax = prm_rep_temp.get('num_rng_bins')
+            amax = prm_rep_temp.get('num_lines')
+            par_tmp = offset_dat[offset_valid_mask(offset_dat, rmax, amax)].copy()
+            par_tmp[:, 2] += nl
+
+            # Load deramped SLC (no shift, no reramp)
+            prm_dict, orbit_df, slc, reramp_params = deramped_burst(
+                xml_file, tiff_file, orbit_file
+            )
+            prm = PRM()
+            prm.set(**prm_dict)
+            prm.orbit_df = orbit_df
+
+            # Apply fitoffset parameters (bilinear offset model)
+            prm.set(PRM.fitoffset(3, 3, par_tmp))
+            prm.calc_dop_orb(earth_radius, inplace=True, debug=debug)
+
+            baseline_result = prm_ref.SAT_baseline(prm, search_half_window=_burst_half_window(prm))
+            baseline_params = {
+                'baseline_start': baseline_result.get('baseline_start'),
+                'baseline_center': baseline_result.get('baseline_center'),
+                'baseline_end': baseline_result.get('baseline_end'),
+                'alpha_start': baseline_result.get('alpha_start'),
+                'alpha_center': baseline_result.get('alpha_center'),
+                'alpha_end': baseline_result.get('alpha_end'),
+                'B_offset_start': baseline_result.get('B_offset_start'),
+                'B_offset_center': baseline_result.get('B_offset_center'),
+                'B_offset_end': baseline_result.get('B_offset_end')
+            }
+
+        # Transform and save
+        _transform_slc_int16(
+            outdir=outdir, transform=transform, topo=topo,
+            prm_rep=prm, prm_ref=prm_ref, slc_data=slc,
+            burst_name=burst_name, record_dict=record_dict,
+            epsg=epsg, baseline_params=baseline_params, sc_height_params=sc_height,
+            reramp_params=reramp_params, remove_tidal_phase=remove_tidal_phase,
+            reference_height=reference_height,
+            debug=debug
         )
-        prm_ref_shifted.calc_dop_orb(earth_radius, inplace=True, debug=debug)
-
-        # Compute offsets
-        tmpm_dat = prm_ref_shifted.SAT_llt2rat(coords=topo_llt, precise=1, n_jobs=n_jobs, debug=debug)
-        prm_rep_temp.calc_dop_orb(earth_radius, inplace=True, debug=debug)
-        tmp1_dat = prm_rep_temp.SAT_llt2rat(coords=topo_llt, precise=1, n_jobs=n_jobs, debug=debug)
-
-        # Compute offset table (vectorized)
-        offset_dat0 = np.hstack([tmpm_dat, tmp1_dat])
-        offset_dat = np.column_stack([
-            offset_dat0[:, 0],                      # r_ref
-            offset_dat0[:, 5] - offset_dat0[:, 0],  # dr = r_rep - r_ref
-            offset_dat0[:, 1],                      # a_ref
-            offset_dat0[:, 6] - offset_dat0[:, 1],  # da = a_rep - a_ref
-            np.full(len(offset_dat0), 100.0)        # SNR
-        ])
-
-        # Filter valid points for fitoffset
-        from .utils_satellite import offset_valid_mask
-        rmax = prm_rep_temp.get('num_rng_bins')
-        amax = prm_rep_temp.get('num_lines')
-        par_tmp = offset_dat[offset_valid_mask(offset_dat, rmax, amax)].copy()
-        par_tmp[:, 2] += nl
-
-        # Load deramped SLC (no shift, no reramp)
-        prm_dict, orbit_df, slc, reramp_params = deramped_burst(
-            xml_file, tiff_file, orbit_file
-        )
-        prm = PRM()
-        prm.set(**prm_dict)
-        prm.orbit_df = orbit_df
-
-        # Apply fitoffset parameters (bilinear offset model)
-        prm.set(PRM.fitoffset(3, 3, par_tmp))
-        prm.calc_dop_orb(earth_radius, inplace=True, debug=debug)
-
-        baseline_result = prm_ref.SAT_baseline(prm)
-        baseline_params = {
-            'baseline_start': baseline_result.get('baseline_start'),
-            'baseline_center': baseline_result.get('baseline_center'),
-            'baseline_end': baseline_result.get('baseline_end'),
-            'alpha_start': baseline_result.get('alpha_start'),
-            'alpha_center': baseline_result.get('alpha_center'),
-            'alpha_end': baseline_result.get('alpha_end'),
-            'B_offset_start': baseline_result.get('B_offset_start'),
-            'B_offset_center': baseline_result.get('B_offset_center'),
-            'B_offset_end': baseline_result.get('B_offset_end')
-        }
-
-    # Transform and save
-    _transform_slc_int16(
-        outdir=outdir, transform=transform, topo=topo,
-        prm_rep=prm, prm_ref=prm_ref, slc_data=slc,
-        burst_name=burst_name, record_dict=record_dict,
-        epsg=epsg, baseline_params=baseline_params, sc_height_params=sc_height,
-        reramp_params=reramp_params, remove_tidal_phase=remove_tidal_phase,
-        reference_height=reference_height,
-        debug=debug
-    )
-    return burst_name
+        return burst_name
 
 
 def _compute_reramp_phase(azi_rep, rng_rep, reramp_params):
@@ -251,11 +258,11 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
     if remove_tidal_phase and topo is not None and not is_reference:
         import datetime as _dt
         def _sc_clock_to_dt(prm):
-            sc_mid = (prm.get('SC_clock_start') + prm.get('SC_clock_stop')) / 2.0
-            year = int(sc_mid // 1000)
-            doy_frac = sc_mid % 1000
-            # SC_clock carries GMTSAR's 0-based day of year: day 0.x is January 1
-            return _dt.datetime(year, 1, 1) + _dt.timedelta(days=doy_frac)
+            # SC_clock is whole seconds (year x 1000 + 0-based day + second / 86400): only the year is read from it;
+            # the day and the time of day come from clock_start and clock_stop.
+            year = int(prm.get('SC_clock_start') // 1000)
+            mid = (prm.get('clock_start') + prm.get('clock_stop')) / 2.0
+            return _dt.datetime(year, 1, 1) + _dt.timedelta(days=mid)
         tidal_dt = (_sc_clock_to_dt(prm_ref), _sc_clock_to_dt(prm_rep))
 
     # Convert to int16: interpolation overshoot and the reramp can push a component past the int16 range, where
@@ -425,7 +432,7 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
         BPR = 0.0
         data_proj.attrs.update(dict.fromkeys(triples, 0.0))
     else:
-        baseline = prm_ref.SAT_baseline(prm_rep)
+        baseline = prm_ref.SAT_baseline(prm_rep, search_half_window=_burst_half_window(prm_rep))
         BPR = baseline.get('B_perpendicular')
         data_proj.attrs.update({name: baseline.get(name) + 0 for name in triples})
     data_proj.attrs['BPR'] = BPR + 0
@@ -497,7 +504,7 @@ class S1_transform(S1_align):
                   dem_vertical_accuracy: float=0.5,
                   alignment_spacing: float=12.0/3600,
                   bbox: list|tuple|None = None,
-                  overwrite: bool=False,
+                  overwrite: bool=True,
                   append: bool=False,
                   n_jobs: int|None=None,
                   scheduler: str|None=None,
@@ -537,9 +544,12 @@ class S1_transform(S1_align):
             it are processed (the others are skipped, with a note), and each burst's output is cropped to it.
             Raises ValueError if it overlaps no burst.
         overwrite : bool, optional
-            Overwrite existing results and process all bursts.
+            Overwrite existing results and process all bursts. Default True (it was False before): a completed
+            target is removed and processed again, with a NOTE; overwrite=False keeps the completed target.
         append : bool, optional
-            Append new burstID processed with the same parameters to the existing results.
+            Append new burstID processed with the same parameters to the existing results. Requires overwrite=True: the
+            existing target is kept and extended (the consolidated zarr.json is written again). With overwrite=False an
+            existing target is never modified and the call skips it, with or without append.
         n_jobs : int, optional
             The number of jobs to run in parallel, for every internal step: the burst or date workers and the
             geocoding and alignment (satellite_llt2rat) workers, which share it inside a burst or date worker
@@ -564,349 +574,363 @@ class S1_transform(S1_align):
         import pandas as pd
         import numpy as np
 
-        # Suppress zarr v3 consolidated metadata warnings
-        warnings.filterwarnings('ignore', message='.*Consolidated metadata.*', category=UserWarning)
+        # zarr v3 consolidated metadata warnings: call-scoped
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', message='.*Consolidated metadata.*', category=UserWarning)
 
-        # radar-coordinate output (epsg=0) is not supported: geocoding is always enabled
-        if epsg is not None and not isinstance(epsg, str) and epsg == 0:
-            raise ValueError("ERROR: epsg=0 (radar coordinates) is not supported, geocoding is always enabled. "
+            # radar-coordinate output (epsg=0) is not supported: geocoding is always enabled
+            if epsg is not None and not isinstance(epsg, str) and epsg == 0:
+                raise ValueError("ERROR: epsg=0 (radar coordinates) is not supported, geocoding is always enabled. "
                              "Use epsg='auto' (default) or an explicit EPSG code.")
 
-        # Validate reference_height vs remove_topo_phase
-        if remove_topo_phase and reference_height is not None:
-            raise ValueError("reference_height is only used when remove_topo_phase=False (flat-earth mode for DEM generation)")
-        if reference_height is None:
-            reference_height = 0.0
-        # the stored ref_height, one value on every date: the flat-earth reference height, NaN in DEM mode (the
-        # grids give a residual height there, and the elevation reads NaN as 0 as it read the former 0.0)
-        ref_height = float('nan') if remove_topo_phase else float(reference_height)
+            # Validate reference_height vs remove_topo_phase
+            if remove_topo_phase and reference_height is not None:
+                raise ValueError("reference_height is only used when remove_topo_phase=False (flat-earth mode for DEM generation)")
+            if reference_height is None:
+                reference_height = 0.0
+            # the stored ref_height, one value on every date: the flat-earth reference height, NaN in DEM mode (the
+            # grids give a residual height there, and the elevation reads NaN as 0 as it read the former 0.0)
+            ref_height = float('nan') if remove_topo_phase else float(reference_height)
 
-        # Control library threading to prevent over-subscription
-        # Must be set BEFORE workers spawn (loky inherits env from parent process)
-        for var in ['OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
-                    'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS']:
-            os.environ[var] = '1'
+            # Control library threading to prevent over-subscription
+            # Must be set BEFORE workers spawn (loky inherits env from parent process)
+            # and put back when the transform ends, also on an error (N156)
+            thread_vars = ['OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS',
+                           'MKL_NUM_THREADS', 'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS']
+            thread_vars_before = {var: os.environ.get(var) for var in thread_vars}
+            try:
+                for var in thread_vars:
+                    os.environ[var] = '1'
 
-        if self.DEM is None:
-            raise ValueError('ERROR: DEM is not set. Please create a new instance of S1 with a DEM.')
+                if self.DEM is None:
+                    raise ValueError('ERROR: DEM is not set. Please create a new instance of S1 with a DEM.')
 
-        records = self.to_dataframe(ref=ref)
+                records = self.to_dataframe(ref=ref)
 
-        if epsg is None:
-            print('NOTE: EPSG code will be computed automatically for each burst. These projections can be different.')
-        elif isinstance(epsg, str) and epsg == 'auto':
-            from .utils_satellite import get_utm_epsg
-            with warnings.catch_warnings():
-                warnings.filterwarnings('ignore', message='.*geographic CRS.*')
-                epsgs = self.to_dataframe().centroid.apply(lambda geom: get_utm_epsg(geom.y, geom.x)).unique()
-            if len(epsgs) > 1:
-                raise ValueError(f'ERROR: Multiple UTM zones found: {", ".join(map(str, epsgs))}. Specify the EPSG code manually.')
-            epsg = epsgs[0]
-            print(f'NOTE: EPSG code is computed automatically for all bursts: {epsg}.')
+                if epsg is None:
+                    print('NOTE: EPSG code will be computed automatically for each burst. These projections can be different.')
+                elif isinstance(epsg, str) and epsg == 'auto':
+                    from .utils_satellite import get_utm_epsg
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings('ignore', message='.*geographic CRS.*')
+                        epsgs = self.to_dataframe().centroid.apply(lambda geom: get_utm_epsg(geom.y, geom.x)).unique()
+                    if len(epsgs) > 1:
+                        raise ValueError(f'ERROR: Multiple UTM zones found: {", ".join(map(str, epsgs))}. Specify the EPSG code manually.')
+                    epsg = epsgs[0]
+                    print(f'NOTE: EPSG code is computed automatically for all bursts: {epsg}.')
 
-        # Get reference and repeat bursts as groups
-        refrep_dict = self.get_repref(ref=ref)
-        if bbox is not None and refrep_dict:
-            # only the bursts whose footprint meets the bbox: the scan geometry of the reference record, the record
-            # of the burst transform. Checked before the target is touched, so a wrong bbox removes no results.
-            from shapely.geometry import box
-            area = box(*bbox)
-            skipped = [key for key, (burst_refs, _) in refrep_dict.items()
-                       if not self.get_record(burst_refs[0][-1]).geometry.iloc[0].intersects(area)]
-            if len(skipped) == len(refrep_dict):
-                raise ValueError(f'ERROR: bbox {bbox} does not overlap any of the {len(refrep_dict)} bursts.')
-            if skipped:
-                print(f'NOTE: bbox does not overlap {len(skipped)} of {len(refrep_dict)} bursts, skipped: {", ".join(skipped)}.')
-                refrep_dict = {key: value for key, value in refrep_dict.items() if key not in skipped}
-        refreps = [v for v in refrep_dict.values()]
+                # Get reference and repeat bursts as groups
+                refrep_dict = self.get_repref(ref=ref)
+                if bbox is not None and refrep_dict:
+                    # only the bursts whose footprint meets the bbox: the scan geometry of the reference record, the record
+                    # of the burst transform. Checked before the target is touched, so a wrong bbox removes no results.
+                    from shapely.geometry import box
+                    area = box(*bbox)
+                    skipped = [key for key, (burst_refs, _) in refrep_dict.items()
+                               if not self.get_record(burst_refs[0][-1]).geometry.iloc[0].intersects(area)]
+                    if len(skipped) == len(refrep_dict):
+                        raise ValueError(f'ERROR: bbox {bbox} does not overlap any of the {len(refrep_dict)} bursts.')
+                    if skipped:
+                        print(f'NOTE: bbox does not overlap {len(skipped)} of {len(refrep_dict)} bursts, skipped: {", ".join(skipped)}.')
+                        refrep_dict = {key: value for key, value in refrep_dict.items() if key not in skipped}
+                refreps = [v for v in refrep_dict.values()]
 
-        # add asserts for the obvious expectations
-        assert not os.path.exists(target) or os.path.isdir(target), f'ERROR: target exists but is not a directory'
-        # an orbit that cannot be used raises before anything is removed or written
-        self._check_orbits(refreps, target, overwrite, append)
-        if overwrite and os.path.exists(target):
-            # remove all previous results and process all bursts
-            print(f'NOTE: Removing all previous results and processing all bursts.')
-            shutil.rmtree(target)
-        # consolidated metadata file zarr.json is saved at the end of the processing
-        metafile = os.path.join(target, 'zarr.json')
-        assert not os.path.exists(metafile) or os.path.isfile(metafile), f'ERROR: target metadata is not a file'
-        # check if the processing is completed; an empty metadata file raises, the bursts' before any processing
-        if os.path.exists(target):
-            if not exists(metafile, again='run the processing'):
-                print(f'NOTE: target processing is not completed before. Continuing...')
-            elif not append:
-                # processing is completed before, nothing to do
-                print(f'NOTE: target processing is completed before. Skipping...')
-                return
-            for burst_refs, _ in refreps:
-                exists(os.path.join(target, self.fullBurstId(burst_refs[0][-1]), 'zarr.json'),
-                       again='run the processing')
-        # remove the consolidated metadata file when appending
-        if os.path.exists(metafile):
-            os.remove(metafile)
+                # add asserts for the obvious expectations
+                assert not os.path.exists(target) or os.path.isdir(target), f'ERROR: target exists but is not a directory'
+                # overwrite=False keeps an existing target as it is, with or without append: nothing is modified or processed
+                if os.path.exists(target) and not overwrite:
+                    print(f'NOTE: target exists and overwrite=False: skipping, nothing is modified.')
+                    return
+                # an orbit that cannot be used raises before anything is removed or written
+                self._check_orbits(refreps, target, overwrite, append)
+                if overwrite and not append and os.path.exists(target):
+                    # remove all previous results and process all bursts; append keeps the target and extends it
+                    print(f'NOTE: Removing all previous results and processing all bursts (overwrite=True is the default now; overwrite=False keeps the target).')
+                    shutil.rmtree(target)
+                # consolidated metadata file zarr.json is saved at the end of the processing
+                metafile = os.path.join(target, 'zarr.json')
+                assert not os.path.exists(metafile) or os.path.isfile(metafile), f'ERROR: target metadata is not a file'
+                # append (overwrite=True) extends the existing target; an empty metadata file raises, the bursts' before any processing
+                if os.path.exists(target):
+                    if not exists(metafile, again='run the processing'):
+                        print(f'NOTE: target processing is not completed before. Continuing...')
+                    for burst_refs, _ in refreps:
+                        exists(os.path.join(target, self.fullBurstId(burst_refs[0][-1]), 'zarr.json'),
+                               again='run the processing')
+                # remove the consolidated metadata file when appending
+                if os.path.exists(metafile):
+                    os.remove(metafile)
 
-        def process_burst_sequential(bursts, target, n_jobs_inner, debug=False):
-            """Process a single burst with dates processed sequentially (efficient - caches prm/transform).
+                def process_burst_sequential(bursts, target, n_jobs_inner, debug=False):
+                    """Process a single burst with dates processed sequentially (efficient - caches prm/transform).
 
             n_jobs_inner is this burst worker's share of n_jobs, for its satellite_llt2rat workers.
             """
-            burst_refs = bursts[0]
-            burst_reps = bursts[1]
-            fullBurstId = self.fullBurstId(burst_refs[0][-1])
-            outdir = os.path.join(target, fullBurstId)
-            metafile = os.path.join(outdir, 'zarr.json')
+                    # Suppress zarr v3 consolidated metadata warnings in worker (a loky worker does not inherit the parent's filters; same as _process_date_worker)
+                    warnings.filterwarnings('ignore', message='.*Consolidated metadata.*', category=UserWarning)
 
-            # Check if already completed
-            if os.path.exists(outdir):
-                assert os.path.isdir(outdir), f'ERROR: {fullBurstId} exists but is not a directory'
-                if exists(metafile, again='run the processing'):
-                    return  # Already done
+                    burst_refs = bursts[0]
+                    burst_reps = bursts[1]
+                    fullBurstId = self.fullBurstId(burst_refs[0][-1])
+                    outdir = os.path.join(target, fullBurstId)
+                    metafile = os.path.join(outdir, 'zarr.json')
+
+                    # Check if already completed
+                    if os.path.exists(outdir):
+                        assert os.path.isdir(outdir), f'ERROR: {fullBurstId} exists but is not a directory'
+                        if exists(metafile, again='run the processing'):
+                            return  # Already done
+                        else:
+                            print(f'NOTE: {fullBurstId} directory exists but metadata file is missing. Removing...')
+                            shutil.rmtree(outdir)
+
+                    # Phase 1: Compute transform - cache PRMs (computed once, reused)
+                    prm_cache = {}
+                    for burst_ref in burst_refs:
+                        prm, _, _ = self.align_ref(burst_ref[-1], debug=debug, return_slc=False)
+                        prm_cache[burst_ref[-1]] = prm
+
+                    ref_burst_name = burst_refs[0][-1]
+                    prm_ref_main = prm_cache[ref_burst_name]
+
+                    # Load DEM and compute transform
+                    from .utils_satellite import compute_transform_inverse, get_dem_wgs84ellipsoid, save_transform, get_utm_epsg
+                    record = self.get_record(ref_burst_name)
+                    # epsg=None: this burst's own UTM zone, from the centroid of its reference record
+                    _centroid = record.geometry.iloc[0].centroid
+                    burst_epsg = epsg if epsg is not None else get_utm_epsg(_centroid.y, _centroid.x)
+                    dem = get_dem_wgs84ellipsoid(self.DEM, record.geometry.iloc[0], geoid_correction=False)
+                    topo, transform = compute_transform_inverse(prm_ref_main, dem, self.DEM, scale_factor=1/dem_vertical_accuracy, epsg=burst_epsg, resolution=resolution, bbox=bbox, compute_topo=remove_topo_phase, n_jobs=n_jobs_inner, debug=debug, datum=self.dem_datum())
+                    del dem
+
+                    # Save transform to zarr
+                    save_transform(transform, outdir, scale_factor=1/dem_vertical_accuracy)
+
+                    if not remove_topo_phase:
+                        # flat-earth reference: the WGS84 ellipsoid at reference_height per radar pixel, referenced to the
+                        # PRM scalar earth_radius like the DEM topo (a constant height on a per-line sphere drifted across range)
+                        from .utils_satellite import reference_surface_topo
+                        topo = reference_surface_topo(prm_ref_main, topo, reference_height)
+                    # Drop ele - not needed for geocoding
+                    transform = transform.drop_vars('ele')
+
+                    # Pre-compute SC_height (cached)
+                    sc_height_cache = {}
+                    for burst_ref in burst_refs:
+                        burst_ref_name = burst_ref[-1]
+                        prm_ref = prm_cache[burst_ref_name]
+                        sc_height_result = prm_ref.SAT_baseline(prm_ref, search_half_window=_burst_half_window(prm_ref))
+                        sc_height_cache[burst_ref_name] = {
+                            'SC_height': sc_height_result.get('SC_height'),
+                            'SC_height_start': sc_height_result.get('SC_height_start'),
+                            'SC_height_end': sc_height_result.get('SC_height_end')
+                        }
+
+                    # Cache topo_llt per reference burst (same DEM geometry for all dates)
+                    topo_llt_cache = {}
+                    for burst_ref in burst_refs:
+                        topo_llt_cache[burst_ref[-1]] = self._get_topo_llt(burst_ref[-1], degrees=alignment_spacing)
+
+                    # Phase 2: Process dates sequentially (efficient - reuses cached data)
+                    all_dates = burst_reps + burst_refs
+                    for burst_item in all_dates:
+                        is_reference = burst_item in burst_refs
+                        burst_ref = [b for b in burst_refs if b[:2] == burst_item[:2]][0]
+                        burst_ref_name = burst_ref[-1]
+                        burst_name = burst_item[-1]
+                        prm_ref = prm_cache[burst_ref_name]
+
+                        if is_reference:
+                            # Deramped SLC for symmetric geocoding (same as rep path)
+                            _, slc, reramp_params = self.align_ref(burst_name, debug=debug)
+                            prm = prm_ref  # use cached PRM (ensures is_reference identity check works)
+                            baseline_params = None
+                        else:
+                            prm, slc, reramp_params = self.align_rep(burst_name, burst_ref_name, prm_ref,
+                                                                      degrees=alignment_spacing, debug=debug,
+                                                                      topo_llt=topo_llt_cache.get(burst_ref_name),
+                                                                      n_jobs=n_jobs_inner)
+                            baseline_result = prm_ref.SAT_baseline(prm, search_half_window=_burst_half_window(prm))
+                            baseline_params = {
+                                'baseline_start': baseline_result.get('baseline_start'),
+                                'baseline_center': baseline_result.get('baseline_center'),
+                                'baseline_end': baseline_result.get('baseline_end'),
+                                'alpha_start': baseline_result.get('alpha_start'),
+                                'alpha_center': baseline_result.get('alpha_center'),
+                                'alpha_end': baseline_result.get('alpha_end'),
+                                'B_offset_start': baseline_result.get('B_offset_start'),
+                                'B_offset_center': baseline_result.get('B_offset_center'),
+                                'B_offset_end': baseline_result.get('B_offset_end')
+                            }
+
+                        self.transform_slc_int16(outdir, transform, topo, prm, prm_ref, slc, epsg=burst_epsg,
+                                                baseline_params=baseline_params,
+                                                sc_height_params=sc_height_cache[burst_ref_name],
+                                                reramp_params=reramp_params,
+                                                remove_tidal_phase=remove_tidal_phase,
+                                                reference_height=ref_height)
+                        del slc
+
+                    # Cleanup and consolidate
+                    del topo, transform, prm_cache
+                    self.consolidate_metadata(target, record_id=all_dates[-1][-1])
+
+                def process_burst_dates_parallel(bursts, target, n_jobs_inner, scheduler_inner=None, debug=False):
+                    """Process a single burst with dates parallelized across n_jobs_inner workers."""
+                    import numpy as np
+                    import xarray as xr
+
+                    burst_refs = bursts[0]
+                    burst_reps = bursts[1]
+                    fullBurstId = self.fullBurstId(burst_refs[0][-1])
+                    outdir = os.path.join(target, fullBurstId)
+                    metafile = os.path.join(outdir, 'zarr.json')
+
+                    # Check if already completed
+                    if os.path.exists(outdir):
+                        assert os.path.isdir(outdir), f'ERROR: {fullBurstId} exists but is not a directory'
+                        if exists(metafile, again='run the processing'):
+                            return  # Already done
+                        else:
+                            print(f'NOTE: {fullBurstId} directory exists but metadata file is missing. Removing...')
+                            shutil.rmtree(outdir)
+
+                    # Phase 1: Compute transform inline (same as process_burst_sequential)
+                    prm_cache = {}
+                    for burst_ref in burst_refs:
+                        prm, _, _ = self.align_ref(burst_ref[-1], debug=debug, return_slc=False)
+                        prm_cache[burst_ref[-1]] = prm
+
+                    ref_burst_name = burst_refs[0][-1]
+                    prm_ref_main = prm_cache[ref_burst_name]
+
+                    from .utils_satellite import compute_transform_inverse, get_dem_wgs84ellipsoid, save_transform, get_utm_epsg
+                    record = self.get_record(ref_burst_name)
+                    # epsg=None: this burst's own UTM zone, from the centroid of its reference record
+                    _centroid = record.geometry.iloc[0].centroid
+                    burst_epsg = epsg if epsg is not None else get_utm_epsg(_centroid.y, _centroid.x)
+                    dem = get_dem_wgs84ellipsoid(self.DEM, record.geometry.iloc[0], geoid_correction=False)
+                    topo, transform = compute_transform_inverse(prm_ref_main, dem, self.DEM, scale_factor=1/dem_vertical_accuracy, epsg=burst_epsg, resolution=resolution, bbox=bbox, compute_topo=remove_topo_phase, n_jobs=n_jobs_inner, debug=debug, datum=self.dem_datum())
+                    del dem
+
+                    save_transform(transform, outdir, scale_factor=1/dem_vertical_accuracy)
+
+                    if not remove_topo_phase:
+                        from .utils_satellite import reference_surface_topo
+                        topo = reference_surface_topo(prm_ref_main, topo, reference_height)
+                    transform = transform.drop_vars('ele')
+
+                    # Pre-compute SC_height and topo_llt caches
+                    sc_height_cache = {}
+                    for burst_ref in burst_refs:
+                        burst_ref_name = burst_ref[-1]
+                        prm_ref = prm_cache[burst_ref_name]
+                        sc_height_result = prm_ref.SAT_baseline(prm_ref, search_half_window=_burst_half_window(prm_ref))
+                        sc_height_cache[burst_ref_name] = {
+                            'SC_height': sc_height_result.get('SC_height'),
+                            'SC_height_start': sc_height_result.get('SC_height_start'),
+                            'SC_height_end': sc_height_result.get('SC_height_end')
+                        }
+
+                    topo_llt_cache = {}
+                    for burst_ref in burst_refs:
+                        topo_llt_cache[burst_ref[-1]] = self._get_topo_llt(burst_ref[-1], degrees=alignment_spacing)
+
+                    # Phase 2: Build worker args and process dates in parallel
+                    all_dates = burst_reps + burst_refs
+                    prm_ref_df = prm_cache[ref_burst_name].df
+                    prm_ref_orbit_df = prm_cache[ref_burst_name].orbit_df
+                    topo_llt = topo_llt_cache[ref_burst_name]
+                    # each of the concurrent date workers takes its share of n_jobs for its satellite_llt2rat workers
+                    n_jobs_date = max(1, n_jobs_inner // min(n_jobs_inner, len(all_dates)))
+
+                    worker_args = []
+                    for burst_item in all_dates:
+                        is_ref = burst_item in burst_refs
+                        burst_name = burst_item[-1]
+                        burst_ref = [b for b in burst_refs if b[:2] == burst_item[:2]][0]
+                        burst_ref_name = burst_ref[-1]
+
+                        prefix = self.fullBurstId(burst_name)
+                        record = self.get_record(burst_name)
+                        xml_file = os.path.join(self.datadir, prefix, 'annotation', f'{burst_name}.xml')
+                        tiff_file = measurement_path(os.path.join(self.datadir, prefix, 'measurement'), burst_name)
+                        orbit_file = self._orbit_file(burst_name, record)
+
+                        record_dict = {}
+                        record_reset = record.reset_index()
+                        for col in record_reset.columns:
+                            val = record_reset[col].iloc[0]
+                            if hasattr(val, 'wkt'):
+                                record_dict[col] = val.wkt
+                            else:
+                                record_dict[col] = val
+
+                        worker_args.append((
+                            outdir, burst_item, burst_refs, is_ref,
+                            xml_file, tiff_file, orbit_file, record_dict,
+                            topo, transform,
+                            prm_ref_df, prm_ref_orbit_df, sc_height_cache[burst_ref_name],
+                            topo_llt, burst_epsg, remove_tidal_phase,
+                            ref_height, n_jobs_date, debug
+                        ))
+
+                    joblib.Parallel(n_jobs=n_jobs_inner, backend=scheduler_inner)(
+                        joblib.delayed(_process_date_worker)(args) for args in worker_args
+                    )
+
+                    # Cleanup and consolidate
+                    del topo, transform, prm_cache
+                    self.consolidate_metadata(target, record_id=all_dates[-1][-1])
+
+                # Default n_jobs to cpu_count(), -1 too (joblib convention), before any min(n_jobs, ...)
+                if n_jobs is None or n_jobs == -1:
+                    n_jobs = os.cpu_count()
+
+                # Auto-select sequential scheduler for single-worker mode (most memory-efficient)
+                if n_jobs == 1 and scheduler is None:
+                    scheduler = 'sequential'
+                    print(f'NOTE: n_jobs=1, auto-selecting scheduler="sequential" for lowest memory usage.')
+                    print(f'      Use scheduler="loky" or "threading" to override if needed.')
+
+                n_bursts = len(refreps)
+                # n_dates is total dates, n_rep_dates is repeat dates only (excluding reference)
+                n_dates = len(refreps[0][0]) + len(refreps[0][1]) if refreps else 1
+                n_rep_dates = n_dates - 1  # Only repeat dates matter for parallelization comparison
+
+                # Force sequential scheduler for debug mode
+                if debug and scheduler is None:
+                    scheduler = 'sequential'
+
+                # Determine scheduler: 'sequential', 'threading', or 'loky' (default)
+                if n_bursts >= n_rep_dates or scheduler == 'sequential':
+                    # More bursts than repeat dates: parallelize across bursts
+                    # e.g., 1000 bursts × 2 dates → burst-parallel
+                    n_procs = min(n_jobs, n_bursts)
+                    # each of the concurrent burst workers takes its share of n_jobs for its satellite_llt2rat workers
+                    n_jobs_burst = n_jobs if scheduler == 'sequential' else max(1, n_jobs // n_procs)
+                    print(f'NOTE: Using {n_procs} workers for {n_bursts} bursts, {n_dates} dates each (burst-parallel, scheduler={scheduler}).')
+                    with self.progressbar_joblib(tqdm(desc='Transforming SLC...'.ljust(25), total=len(refreps))) as progress_bar:
+                        joblib.Parallel(n_jobs=n_procs, backend=scheduler)(
+                            joblib.delayed(process_burst_sequential)(bursts, target, n_jobs_burst, debug) for bursts in refreps
+                        )
                 else:
-                    print(f'NOTE: {fullBurstId} directory exists but metadata file is missing. Removing...')
-                    shutil.rmtree(outdir)
+                    # More repeat dates than bursts: parallelize dates within each burst
+                    # e.g., 1 burst × 100 dates → date-parallel
+                    print(f'NOTE: Processing {n_bursts} bursts sequentially, {n_dates} dates each with {n_jobs} workers (date-parallel, scheduler={scheduler}).')
+                    for bursts in tqdm(refreps, desc='Transforming SLC...'.ljust(25)):
+                        process_burst_dates_parallel(bursts, target, n_jobs_inner=n_jobs, scheduler_inner=scheduler, debug=debug)
 
-            # Phase 1: Compute transform - cache PRMs (computed once, reused)
-            prm_cache = {}
-            for burst_ref in burst_refs:
-                prm, _, _ = self.align_ref(burst_ref[-1], debug=debug, return_slc=False)
-                prm_cache[burst_ref[-1]] = prm
-
-            ref_burst_name = burst_refs[0][-1]
-            prm_ref_main = prm_cache[ref_burst_name]
-
-            # Load DEM and compute transform
-            from .utils_satellite import compute_transform_inverse, get_dem_wgs84ellipsoid, save_transform, get_utm_epsg
-            record = self.get_record(ref_burst_name)
-            # epsg=None: this burst's own UTM zone, from the centroid of its reference record
-            _centroid = record.geometry.iloc[0].centroid
-            burst_epsg = epsg if epsg is not None else get_utm_epsg(_centroid.y, _centroid.x)
-            dem = get_dem_wgs84ellipsoid(self.DEM, record.geometry.iloc[0], datum=self.dem_datum())
-            topo, transform = compute_transform_inverse(prm_ref_main, dem, self.DEM, scale_factor=1/dem_vertical_accuracy, epsg=burst_epsg, resolution=resolution, bbox=bbox, compute_topo=remove_topo_phase, n_jobs=n_jobs_inner, debug=debug)
-            del dem
-
-            # Save transform to zarr
-            save_transform(transform, outdir, scale_factor=1/dem_vertical_accuracy)
-
-            if not remove_topo_phase:
-                # flat-earth reference: the WGS84 ellipsoid at reference_height per radar pixel, referenced to the
-                # PRM scalar earth_radius like the DEM topo (a constant height on a per-line sphere drifted across range)
-                from .utils_satellite import reference_surface_topo
-                topo = reference_surface_topo(prm_ref_main, topo, reference_height)
-            # Drop ele - not needed for geocoding
-            transform = transform.drop_vars('ele')
-
-            # Pre-compute SC_height (cached)
-            sc_height_cache = {}
-            for burst_ref in burst_refs:
-                burst_ref_name = burst_ref[-1]
-                prm_ref = prm_cache[burst_ref_name]
-                sc_height_result = prm_ref.SAT_baseline(prm_ref)
-                sc_height_cache[burst_ref_name] = {
-                    'SC_height': sc_height_result.get('SC_height'),
-                    'SC_height_start': sc_height_result.get('SC_height_start'),
-                    'SC_height_end': sc_height_result.get('SC_height_end')
-                }
-
-            # Cache topo_llt per reference burst (same DEM geometry for all dates)
-            topo_llt_cache = {}
-            for burst_ref in burst_refs:
-                topo_llt_cache[burst_ref[-1]] = self._get_topo_llt(burst_ref[-1], degrees=alignment_spacing)
-
-            # Phase 2: Process dates sequentially (efficient - reuses cached data)
-            all_dates = burst_reps + burst_refs
-            for burst_item in all_dates:
-                is_reference = burst_item in burst_refs
-                burst_ref = [b for b in burst_refs if b[:2] == burst_item[:2]][0]
-                burst_ref_name = burst_ref[-1]
-                burst_name = burst_item[-1]
-                prm_ref = prm_cache[burst_ref_name]
-
-                if is_reference:
-                    # Deramped SLC for symmetric geocoding (same as rep path)
-                    _, slc, reramp_params = self.align_ref(burst_name, debug=debug)
-                    prm = prm_ref  # use cached PRM (ensures is_reference identity check works)
-                    baseline_params = None
-                else:
-                    prm, slc, reramp_params = self.align_rep(burst_name, burst_ref_name, prm_ref,
-                                                              degrees=alignment_spacing, debug=debug,
-                                                              topo_llt=topo_llt_cache.get(burst_ref_name),
-                                                              n_jobs=n_jobs_inner)
-                    baseline_result = prm_ref.SAT_baseline(prm)
-                    baseline_params = {
-                        'baseline_start': baseline_result.get('baseline_start'),
-                        'baseline_center': baseline_result.get('baseline_center'),
-                        'baseline_end': baseline_result.get('baseline_end'),
-                        'alpha_start': baseline_result.get('alpha_start'),
-                        'alpha_center': baseline_result.get('alpha_center'),
-                        'alpha_end': baseline_result.get('alpha_end'),
-                        'B_offset_start': baseline_result.get('B_offset_start'),
-                        'B_offset_center': baseline_result.get('B_offset_center'),
-                        'B_offset_end': baseline_result.get('B_offset_end')
-                    }
-
-                self.transform_slc_int16(outdir, transform, topo, prm, prm_ref, slc, epsg=burst_epsg,
-                                        baseline_params=baseline_params,
-                                        sc_height_params=sc_height_cache[burst_ref_name],
-                                        reramp_params=reramp_params,
-                                        remove_tidal_phase=remove_tidal_phase,
-                                        reference_height=ref_height)
-                del slc
-
-            # Cleanup and consolidate
-            del topo, transform, prm_cache
-            self.consolidate_metadata(target, record_id=all_dates[-1][-1])
-
-        def process_burst_dates_parallel(bursts, target, n_jobs_inner, scheduler_inner=None, debug=False):
-            """Process a single burst with dates parallelized across n_jobs_inner workers."""
-            import numpy as np
-            import xarray as xr
-
-            burst_refs = bursts[0]
-            burst_reps = bursts[1]
-            fullBurstId = self.fullBurstId(burst_refs[0][-1])
-            outdir = os.path.join(target, fullBurstId)
-            metafile = os.path.join(outdir, 'zarr.json')
-
-            # Check if already completed
-            if os.path.exists(outdir):
-                assert os.path.isdir(outdir), f'ERROR: {fullBurstId} exists but is not a directory'
-                if exists(metafile, again='run the processing'):
-                    return  # Already done
-                else:
-                    print(f'NOTE: {fullBurstId} directory exists but metadata file is missing. Removing...')
-                    shutil.rmtree(outdir)
-
-            # Phase 1: Compute transform inline (same as process_burst_sequential)
-            prm_cache = {}
-            for burst_ref in burst_refs:
-                prm, _, _ = self.align_ref(burst_ref[-1], debug=debug, return_slc=False)
-                prm_cache[burst_ref[-1]] = prm
-
-            ref_burst_name = burst_refs[0][-1]
-            prm_ref_main = prm_cache[ref_burst_name]
-
-            from .utils_satellite import compute_transform_inverse, get_dem_wgs84ellipsoid, save_transform, get_utm_epsg
-            record = self.get_record(ref_burst_name)
-            # epsg=None: this burst's own UTM zone, from the centroid of its reference record
-            _centroid = record.geometry.iloc[0].centroid
-            burst_epsg = epsg if epsg is not None else get_utm_epsg(_centroid.y, _centroid.x)
-            dem = get_dem_wgs84ellipsoid(self.DEM, record.geometry.iloc[0], datum=self.dem_datum())
-            topo, transform = compute_transform_inverse(prm_ref_main, dem, self.DEM, scale_factor=1/dem_vertical_accuracy, epsg=burst_epsg, resolution=resolution, bbox=bbox, compute_topo=remove_topo_phase, n_jobs=n_jobs_inner, debug=debug)
-            del dem
-
-            save_transform(transform, outdir, scale_factor=1/dem_vertical_accuracy)
-
-            if not remove_topo_phase:
-                from .utils_satellite import reference_surface_topo
-                topo = reference_surface_topo(prm_ref_main, topo, reference_height)
-            transform = transform.drop_vars('ele')
-
-            # Pre-compute SC_height and topo_llt caches
-            sc_height_cache = {}
-            for burst_ref in burst_refs:
-                burst_ref_name = burst_ref[-1]
-                prm_ref = prm_cache[burst_ref_name]
-                sc_height_result = prm_ref.SAT_baseline(prm_ref)
-                sc_height_cache[burst_ref_name] = {
-                    'SC_height': sc_height_result.get('SC_height'),
-                    'SC_height_start': sc_height_result.get('SC_height_start'),
-                    'SC_height_end': sc_height_result.get('SC_height_end')
-                }
-
-            topo_llt_cache = {}
-            for burst_ref in burst_refs:
-                topo_llt_cache[burst_ref[-1]] = self._get_topo_llt(burst_ref[-1], degrees=alignment_spacing)
-
-            # Phase 2: Build worker args and process dates in parallel
-            all_dates = burst_reps + burst_refs
-            prm_ref_df = prm_cache[ref_burst_name].df
-            prm_ref_orbit_df = prm_cache[ref_burst_name].orbit_df
-            topo_llt = topo_llt_cache[ref_burst_name]
-            # each of the concurrent date workers takes its share of n_jobs for its satellite_llt2rat workers
-            n_jobs_date = max(1, n_jobs_inner // min(n_jobs_inner, len(all_dates)))
-
-            worker_args = []
-            for burst_item in all_dates:
-                is_ref = burst_item in burst_refs
-                burst_name = burst_item[-1]
-                burst_ref = [b for b in burst_refs if b[:2] == burst_item[:2]][0]
-                burst_ref_name = burst_ref[-1]
-
-                prefix = self.fullBurstId(burst_name)
-                record = self.get_record(burst_name)
-                xml_file = os.path.join(self.datadir, prefix, 'annotation', f'{burst_name}.xml')
-                tiff_file = measurement_path(os.path.join(self.datadir, prefix, 'measurement'), burst_name)
-                orbit_file = self._orbit_file(burst_name, record)
-
-                record_dict = {}
-                record_reset = record.reset_index()
-                for col in record_reset.columns:
-                    val = record_reset[col].iloc[0]
-                    if hasattr(val, 'wkt'):
-                        record_dict[col] = val.wkt
+                # Consolidate zarr metadata for the target directory
+                self.consolidate_metadata(target)
+                # the idle joblib workers keep their memory: stop them, the next parallel step starts its own
+                release_workers()
+            finally:
+                for var, value in thread_vars_before.items():
+                    if value is None:
+                        os.environ.pop(var, None)
                     else:
-                        record_dict[col] = val
-
-                worker_args.append((
-                    outdir, burst_item, burst_refs, is_ref,
-                    xml_file, tiff_file, orbit_file, record_dict,
-                    topo, transform,
-                    prm_ref_df, prm_ref_orbit_df, sc_height_cache[burst_ref_name],
-                    topo_llt, burst_epsg, remove_tidal_phase,
-                    ref_height, n_jobs_date, debug
-                ))
-
-            joblib.Parallel(n_jobs=n_jobs_inner, backend=scheduler_inner)(
-                joblib.delayed(_process_date_worker)(args) for args in worker_args
-            )
-
-            # Cleanup and consolidate
-            del topo, transform, prm_cache
-            self.consolidate_metadata(target, record_id=all_dates[-1][-1])
-
-        # Default n_jobs to cpu_count(), -1 too (joblib convention), before any min(n_jobs, ...)
-        if n_jobs is None or n_jobs == -1:
-            n_jobs = os.cpu_count()
-
-        # Auto-select sequential scheduler for single-worker mode (most memory-efficient)
-        if n_jobs == 1 and scheduler is None:
-            scheduler = 'sequential'
-            print(f'NOTE: n_jobs=1, auto-selecting scheduler="sequential" for lowest memory usage.')
-            print(f'      Use scheduler="loky" or "threading" to override if needed.')
-
-        n_bursts = len(refreps)
-        # n_dates is total dates, n_rep_dates is repeat dates only (excluding reference)
-        n_dates = len(refreps[0][0]) + len(refreps[0][1]) if refreps else 1
-        n_rep_dates = n_dates - 1  # Only repeat dates matter for parallelization comparison
-
-        # Force sequential scheduler for debug mode
-        if debug and scheduler is None:
-            scheduler = 'sequential'
-
-        # Determine scheduler: 'sequential', 'threading', or 'loky' (default)
-        if n_bursts >= n_rep_dates or scheduler == 'sequential':
-            # More bursts than repeat dates: parallelize across bursts
-            # e.g., 1000 bursts × 2 dates → burst-parallel
-            n_procs = min(n_jobs, n_bursts)
-            # each of the concurrent burst workers takes its share of n_jobs for its satellite_llt2rat workers
-            n_jobs_burst = n_jobs if scheduler == 'sequential' else max(1, n_jobs // n_procs)
-            print(f'NOTE: Using {n_procs} workers for {n_bursts} bursts, {n_dates} dates each (burst-parallel, scheduler={scheduler}).')
-            with self.progressbar_joblib(tqdm(desc='Transforming SLC...'.ljust(25), total=len(refreps))) as progress_bar:
-                joblib.Parallel(n_jobs=n_procs, backend=scheduler)(
-                    joblib.delayed(process_burst_sequential)(bursts, target, n_jobs_burst, debug) for bursts in refreps
-                )
-        else:
-            # More repeat dates than bursts: parallelize dates within each burst
-            # e.g., 1 burst × 100 dates → date-parallel
-            print(f'NOTE: Processing {n_bursts} bursts sequentially, {n_dates} dates each with {n_jobs} workers (date-parallel, scheduler={scheduler}).')
-            for bursts in tqdm(refreps, desc='Transforming SLC...'.ljust(25)):
-                process_burst_dates_parallel(bursts, target, n_jobs_inner=n_jobs, scheduler_inner=scheduler, debug=debug)
-
-        # Consolidate zarr metadata for the target directory
-        self.consolidate_metadata(target)
-        # the idle joblib workers keep their memory: stop them, the next parallel step starts its own
-        release_workers()
+                        os.environ[var] = value
 
     def transform_slc_int16(self,
                             outdir: str,

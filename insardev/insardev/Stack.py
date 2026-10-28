@@ -281,19 +281,85 @@ def _on_data(name):
     return method
 
 
-def _on_data_reflected(name):
-    """A reflected operator of the stack's data: 2 * stack is stack * 2. Python asks a
-    SUBCLASS's reflected operator first, so batch * stack would reach stack.__rmul__(batch):
-    a batch on the left answers for itself instead, as it did before."""
-    def method(self, other):
-        if isinstance(other, BatchCore):
-            return NotImplemented
-        data = BatchComplex(self)
-        return self._restack(data, getattr(data, name)(other))
-    method.__name__ = name
-    method.__qualname__ = f'Stack.{name}'
-    method.__doc__ = getattr(BatchComplex, name).__doc__
-    return method
+
+# THE ATMOSPHERE OF A BURST (the user, 2026-10-20, RP/gfa_rulings.md): the toolkit opens each atmosphere model once per stack
+# (one model grid shared by all bursts) and evaluates it per output chunk (OpenedModel.phase in insardev_toolkit
+# utils_atmosphere: the ERA5 and VMF3 nodes reprojected to the output CRS as sparse points, bilinear per pixel; the IONEX nodes
+# stay in latitude and longitude, each pixel at its geodesic pierce point; each node's form at the pixel's own height and
+# incidence). This module holds no model name branch, no node and no pixel helper.
+
+
+def _atmosphere_open(folder, times, crs, lam, factor, kind, method):
+    """The atmosphere model of the folder, opened once for the stack: the class of the folder (toolkit model_class) and its
+    open() with the union of the bursts' times, the output crs and the wavelength. Nothing is computed here: the terms are
+    one task of the graph that every chunk of the bursts shares. Raises one ERROR line when the folder holds another kind of model."""
+    from insardev_toolkit.utils_atmosphere import model_class
+    cls = model_class(folder)
+    if (cls.__name__ == 'IONEX') != (kind == 'iono'):
+        raise ValueError(f"ERROR: {method}() needs the {kind} model, the folder {folder} holds {cls.__name__}")
+    return cls().open(folder, list(times), crs, lam, 1.0 if factor is None else factor)
+
+
+def _atmosphere_phase(stack, kind, factor, method, geocentric=True):
+    """Batch of per burst Datasets with the variable 'phase' (date, y, x), float32 radians, one lazy dask array per
+    burst. The folder of kind ('tropo' or 'iono') comes from the burst attributes set by load(); the heights from
+    stack.transform() ('ele'), the incidence from stack.incidence() and, for the ionosphere, the look azimuth from
+    stack.look(): grids of the stack's own pixels, as arrays. The wavelength and the times come from the burst. Bursts
+    sharing a folder, crs and wavelength share ONE opened model (_atmosphere_open). geocentric is the zenith flag of
+    OpenedModel.phase (IONEX only). Nothing is computed here."""
+    import dask.array as da
+    import xarray as xr
+    import pandas as pd
+    missing = [key for key, ds in stack.items() if kind not in ds.attrs]
+    if missing:
+        raise ValueError(f"ERROR: {method}() needs the {kind} folder of the bursts: call Stack().load(..., {kind}=folder) first")
+    tf = stack.transform()
+    import insardev.utils_geometry as ug
+    for key in tf.keys():
+        missing = [n for n in ug.SCALARS + ('BPR', 'ref_height') if n not in tf[key].variables]
+        if missing:
+            raise KeyError(f"ERROR: {method}(): burst {key} carries no {', '.join(missing)}.")
+    inc = stack.incidence()
+    lk = stack.look() if kind == 'iono' else None
+    bursts = []
+    for key, ds in stack.items():
+        if 'startTime' not in ds or 'radar_wavelength' not in ds:
+            raise ValueError(f"ERROR: {method}() needs startTime and radar_wavelength on burst {key}")
+        if 'ele' not in tf[key]:
+            raise ValueError(f"ERROR: {method}() needs the heights (ele) of the transform on burst {key}")
+        lam = np.unique(np.asarray(ds['radar_wavelength'].values, dtype=np.float64))
+        if lam.size != 1:
+            raise ValueError(f"ERROR: {method}() needs one radar_wavelength on burst {key}")
+        times = tuple(pd.Timestamp(str(t)) for t in np.asarray(ds['startTime'].values))
+        bursts.append((key, ds, str(ds.attrs[kind]), float(lam[0]), times, ds.rio.crs.to_string()))
+    union = {}
+    for key, ds, folder, lam, times, crs in bursts:
+        union.setdefault((folder, crs, lam), set()).update(times)
+    opened = {}
+    for gkey, stamps in union.items():
+        folder, crs, lam = gkey
+        opened[gkey] = _atmosphere_open(folder, tuple(sorted(stamps)), crs, lam, factor, kind, method)
+    out = {}
+    for key, ds, folder, lam, times, crs in bursts:
+        ele = da.asarray(tf[key]['ele'].data)
+        incidence = da.asarray(inc[key]['incidence'].data)
+        look = None if lk is None else da.asarray(lk[key]['look'].data)
+        ycoord = np.asarray(ds.y.values, dtype=np.float64)
+        xcoord = np.asarray(ds.x.values, dtype=np.float64)
+        res = opened[(folder, crs, lam)].phase(times, ycoord, xcoord, ele, incidence, look=look, geocentric=geocentric)
+        phase = xr.DataArray(res, dims=('date', 'y', 'x'), coords={'date': ds.date, 'y': ds.y, 'x': ds.x},
+                             attrs={'units': 'radians'})
+        result_ds = xr.Dataset({'phase': phase})
+        result_ds.attrs = dict(ds.attrs)
+        out[key] = result_ds.rio.write_crs(ds.rio.crs)
+    return Batch(out)
+
+
+# THE VISIBLE API OF A STACK (Stack.__dir__, the user's rule of 2026-10-09): on a stack, dir() hides the BatchCore functions except
+# these additions; EXCLUSIONS hides the BatchComplex names a stack does not have (real, imag: AttributeError on a Stack).
+# The other hidden names stay callable.
+ADDITIONS = ('sel', 'isel', 'to_dataset', 'chunk1d', 'chunk2d', 'crop', 'assign', 'drop_vars')
+EXCLUSIONS = ('real', 'imag')
 
 
 class Stack(BatchComplex):
@@ -301,10 +367,15 @@ class Stack(BatchComplex):
     the TRANSFORM, the geometry grids (azi, ele, rng, look_E/N/U) and the per-date
     geometry polynomials, which stack.transform() gives.
 
-    THE TRANSFORM IS NOT DATA (N81). Every data operation of a Stack -- the operators,
-    comparisons and numpy ufuncs, where(), mask(), the map helpers, the reductions,
-    gaussian(), multilook(), goldstein(), fit1d(), fit3d(), trend2d(), predict(), ...
-    -- runs on BatchComplex(stack), so the transform grids are never masked,
+    A STACK IS NOT AN ARRAY (N81). It is a metaobject: the complex data, the transform
+    and the attributes. Math operators, ordering comparisons and numpy functions refuse it
+    (Python raises its TypeError); == and != compare identity. numpy and math on the data
+    go through stack.complex(), which is BatchComplex(stack).
+
+    THE TRANSFORM IS NOT DATA (N81). Every data operation of a Stack -- where(), mask(),
+    the map helpers, the reductions, gaussian(), multilook(), goldstein(), fit1d(),
+    fit3d(), trend2d(), predict(), ... -- runs on BatchComplex(stack), so the transform grids
+    are never masked,
     weighted, filtered, smoothed or reduced as data were. A result on the stack's own
     grid that stays complex data comes back as a Stack with the transform untouched
     (stack.where(mask).transform() is the stack's transform, unmasked); any other
@@ -321,32 +392,21 @@ class Stack(BatchComplex):
 
     _STRUCTURE_4CONN = utils_unwrap2d.STRUCTURE_4CONN
 
-    # THE DATA OPERATIONS RUN ON BatchComplex(self) (N81, see the class docstring)
-    __add__ = _on_data('__add__')
-    __sub__ = _on_data('__sub__')
-    __mul__ = _on_data('__mul__')
-    __truediv__ = _on_data('__truediv__')
-    __pow__ = _on_data('__pow__')
-    __neg__ = _on_data('__neg__')
-    __abs__ = _on_data('__abs__')
-    __invert__ = _on_data('__invert__')
-    __gt__ = _on_data('__gt__')
-    __lt__ = _on_data('__lt__')
-    __ge__ = _on_data('__ge__')
-    __le__ = _on_data('__le__')
-    __eq__ = _on_data('__eq__')
-    __ne__ = _on_data('__ne__')
-    __and__ = _on_data('__and__')
-    __or__ = _on_data('__or__')
-    __array_ufunc__ = _on_data('__array_ufunc__')
-    __radd__ = _on_data_reflected('__radd__')
-    __rsub__ = _on_data_reflected('__rsub__')
-    __rmul__ = _on_data_reflected('__rmul__')
-    __rtruediv__ = _on_data_reflected('__rtruediv__')
-    __rand__ = _on_data_reflected('__rand__')
-    __ror__ = _on_data_reflected('__ror__')
-    __rgt__ = _on_data_reflected('__rgt__')
-    __rlt__ = _on_data_reflected('__rlt__')
+    _refuse = lambda self, *args, **kwargs: NotImplemented  # the refusal of a Stack (N81): Python raises its TypeError
+
+    # A STACK IS NOT AN ARRAY (N81): binary operators and comparisons refuse through NotImplemented, unary ones are
+    # None (not available), numpy ufuncs through __array_ufunc__ = None, numpy functions through __array_function__.
+    # | is None, not NotImplemented: dict's own union accepts a dict subclass and would silently return a plain dict.
+    __add__ = __radd__ = __sub__ = __rsub__ = __mul__ = __rmul__ = _refuse
+    __truediv__ = __rtruediv__ = __pow__ = _refuse
+    __and__ = __rand__ = _refuse
+    __or__ = __ror__ = __ior__ = None
+    __lt__ = __le__ = __gt__ = __ge__ = _refuse
+    __eq__ = object.__eq__
+    __ne__ = object.__ne__
+    __neg__ = __abs__ = __invert__ = None
+    __array_ufunc__ = None
+    __array_function__ = _refuse
     __hash__ = None
     map_da = _on_data('map_da')
     astype = _on_data('astype')
@@ -360,8 +420,7 @@ class Stack(BatchComplex):
     isfinite = _on_data('isfinite')
     fillna = _on_data('fillna')
     power = _on_data('power')
-    real = _on_data('real')
-    imag = _on_data('imag')
+    real = imag = property()  # no getter: the lookup falls to __getattr__, which raises AttributeError (N81)
     conj = _on_data('conj')
     angle = _on_data('angle')
     where = _on_data('where')
@@ -385,7 +444,6 @@ class Stack(BatchComplex):
     coarsen = _on_data('coarsen')
     downsample = _on_data('downsample')
     interp = _on_data('interp')
-    interp_like = _on_data('interp_like')
     unwrap3d = _on_data('unwrap3d')
     fit1d = _on_data('fit1d')
     fit3d = _on_data('fit3d')
@@ -450,6 +508,7 @@ class Stack(BatchComplex):
         data = BatchComplex(self)
         if vars is None and all('trend2d_vars' in model[k].attrs for k in model):
             vars = self.transform()
+        # NOTE: prints through BatchComplex.predict
         return self._restack(data, data.predict(model, baseline=baseline, ref=ref, vars=vars))
     predict.__doc__ = BatchComplex.predict.__doc__
 
@@ -585,6 +644,13 @@ class Stack(BatchComplex):
 
             return result[np.newaxis, ...] if squeeze else result
 
+        def whole_pair(arr):
+            """One block per pair, the whole y and x in one block (the leading axis of a 3D array is the pair)."""
+            chunks = {arr.ndim - 2: -1, arr.ndim - 1: -1}
+            if arr.ndim == 3:
+                chunks[0] = 1
+            return arr.rechunk(chunks)
+
         # Process each dataset in the batch
         result = {}
         for key in unwrapped.keys():
@@ -600,18 +666,23 @@ class Stack(BatchComplex):
             linked_vars = {}
             for var, data_arr in grids.items():
                 # Use da.blockwise for efficient dask integration
-                dask_data = data_arr.data
+                dask_data = dask.array.asarray(data_arr.data)
                 dim_str = ''.join(chr(ord('a') + i) for i in range(dask_data.ndim))
+                # THE WHOLE PAIR IN ONE BLOCK (N183): the components are sized, filtered and offset on one raster,
+                # as unwrap2d_irls() solves them, so the linked phase does not depend on the block grid of the input.
+                # The result goes back to the input block grid below (lazily); one task holds one whole pair.
+                orig_chunks = dask_data.chunks
+                whole_phase = whole_pair(dask_data)
 
                 # Provide meta to avoid calling _link_2d during graph construction
                 meta = np.empty((0,) * dask_data.ndim, dtype=np.float32)
 
                 if var in conncomp_grids:
-                    # Pass conncomp to _link_2d
-                    conncomp_dask = conncomp_grids[var].data
+                    # Pass conncomp to _link_2d, on the same whole-pair blocks as the phase
+                    conncomp_dask = whole_pair(dask.array.asarray(conncomp_grids[var].data))
                     result_dask = dask.array.blockwise(
                         _link_2d, dim_str,
-                        dask_data, dim_str,
+                        whole_phase, dim_str,
                         conncomp_dask, dim_str,
                         dtype=np.float32,
                         meta=meta,
@@ -620,10 +691,12 @@ class Stack(BatchComplex):
                     # No conncomp - will recompute inside _link_2d
                     result_dask = dask.array.blockwise(
                         lambda phase: _link_2d(phase, None), dim_str,
-                        dask_data, dim_str,
+                        whole_phase, dim_str,
                         dtype=np.float32,
                         meta=meta,
                     )
+                # back to the input block grid
+                result_dask = result_dask.rechunk(orig_chunks)
 
                 linked_da = xr.DataArray(
                     result_dask,
@@ -682,7 +755,7 @@ class Stack(BatchComplex):
         >>> unwrapped = phase.unwrap2d_irls(weight=corr)
         >>>
         >>> # Then link components separately
-        >>> linked = unwrapped.unwrap2d_link(conncomp_size=10_000, debug=True)
+        >>> linked = stack.unwrap2d_link(unwrapped, conncomp_size=10_000, debug=True)
 
         Notes
         -----
@@ -1192,121 +1265,6 @@ class Stack(BatchComplex):
         # the labels are integers, not units: a plain Batch (N81)
         return Batches((Batch(unwrap_result), Batch(conncomp_result)))
 
-    @staticmethod
-    def _detect_discontinuity_hough(phase, grad_threshold=2.0, mask_width=3, debug=False):
-        """
-        Detect discontinuity using Hough transform - masks the full detected line.
-
-        Unlike hough_focal which tries to find the fault segment, this method
-        masks the entire Hough line across the image. Use this when you want
-        to see if the line would split the image.
-
-        Parameters
-        ----------
-        phase : np.ndarray
-            2D wrapped phase array
-        grad_threshold : float
-            Gradient threshold for Hough detection
-        mask_width : int
-            Half-width of mask
-        debug : bool
-            Print debug info
-
-        Returns
-        -------
-        mask : np.ndarray
-            Boolean mask
-        info : dict
-            Detection info including 'splits_image' flag
-        """
-        import cv2
-        from scipy import ndimage
-
-        phase = np.asarray(phase)
-        height, width = phase.shape
-
-        # Compute gradient magnitude using wrap-aware gradient
-        dx, dy = utils_unwrap2d.wrapped_gradient(phase)
-        grad_mag = np.sqrt(dx**2 + dy**2)
-
-        # Binary edge image
-        edges = (grad_mag > grad_threshold).astype(np.uint8) * 255
-        nan_mask = np.isnan(phase)
-        edges[nan_mask] = 0
-
-        if not np.any(edges):
-            return np.zeros((height, width), dtype=bool), {
-                'angle': None, 'n_masked': 0, 'splits_image': False, 'n_components': 1
-            }
-
-        # Hough transform using OpenCV
-        lines = cv2.HoughLines(edges, rho=1, theta=np.pi/180, threshold=50)
-
-        if lines is None or len(lines) == 0:
-            return np.zeros((height, width), dtype=bool), {
-                'angle': None, 'n_masked': 0, 'splits_image': False, 'n_components': 1
-            }
-
-        # Get strongest line
-        rho, theta = lines[0][0]
-
-        if debug:
-            print(f'  Hough line: rho={rho:.1f}, theta={np.rad2deg(theta):.1f}°')
-
-        angle = theta
-        dist = rho
-
-        # Create mask along the FULL line (not just high-gradient segment)
-        # OpenCV Hough: x*cos(theta) + y*sin(theta) = rho
-        mask = np.zeros((height, width), dtype=bool)
-
-        cos_t = np.cos(angle)
-        sin_t = np.sin(angle)
-
-        # Sample points along the line across the entire image
-        if abs(sin_t) > abs(cos_t):
-            # Line is more horizontal - iterate over x
-            for x in range(width):
-                y = int((dist - x * cos_t) / sin_t)
-                if 0 <= y < height:
-                    for ddy in range(-mask_width, mask_width + 1):
-                        for ddx in range(-mask_width, mask_width + 1):
-                            yy, xx = y + ddy, x + ddx
-                            if 0 <= yy < height and 0 <= xx < width:
-                                mask[yy, xx] = True
-        else:
-            # Line is more vertical - iterate over y
-            for y in range(height):
-                x = int((dist - y * sin_t) / cos_t)
-                if 0 <= x < width:
-                    for ddy in range(-mask_width, mask_width + 1):
-                        for ddx in range(-mask_width, mask_width + 1):
-                            yy, xx = y + ddy, x + ddx
-                            if 0 <= yy < height and 0 <= xx < width:
-                                mask[yy, xx] = True
-
-        n_masked = np.sum(mask)
-
-        # Check if mask splits image
-        valid_region = ~mask
-        labeled, n_components = ndimage.label(valid_region)
-        splits_image = n_components > 1
-
-        if debug:
-            print(f'  Mask: {n_masked} pixels')
-            if splits_image:
-                print(f'  WARNING: Mask splits image into {n_components} disconnected regions!')
-
-        info = {
-            'angle': angle,
-            'rho': dist,
-            'n_masked': n_masked,
-            'splits_image': splits_image,
-            'n_components': n_components
-        }
-
-        return mask, info
-
     def unwrap2d_dataset_mask(self, phase, method='hough_focal', grad_threshold=2.0,
                                mask_width=3, debug=False):
         """
@@ -1413,288 +1371,6 @@ class Stack(BatchComplex):
         )
 
         return mask_da.to_dataset(name=var_name)
-
-    @staticmethod
-    def _snaphu_unwrap_array(phase_arr, corr_arr=None, defomax=0, debug=False):
-        """
-        Unwrap a single 2D phase array using SNAPHU via pipes.
-
-        Parameters
-        ----------
-        phase_arr : np.ndarray
-            2D wrapped phase array in radians.
-        corr_arr : np.ndarray, optional
-            2D correlation array (0-1). If None, uniform weight is used.
-        defomax : float, optional
-            Maximum expected deformation in cycles. 0 = smooth mode. Default 0.
-        debug : bool, optional
-            Print debug info. Default False.
-
-        Returns
-        -------
-        unwrap_arr : np.ndarray
-            2D unwrapped phase array.
-        """
-        import subprocess
-        import os
-        import tempfile
-
-        nrow, ncol = phase_arr.shape
-
-        # Build SNAPHU config
-        # Note: NPROC only applies to tiled mode, non-tiled uses 1 CPU
-        conf = f"""
-INFILEFORMAT   FLOAT_DATA
-OUTFILEFORMAT  FLOAT_DATA
-CORRFILEFORMAT FLOAT_DATA
-ALTITUDE       693000.0
-EARTHRADIUS    6378000.0
-NEARRANGE      831000
-DR             18.4
-DA             28.2
-RANGERES       28
-AZRES          44
-LAMBDA         0.0554658
-NLOOKSRANGE    1
-NLOOKSAZ       1
-NPROC          1
-DEFOMAX_CYCLE  {defomax}
-"""
-
-        # Create temp directory for SNAPHU files
-        with tempfile.TemporaryDirectory(prefix='snaphu_') as tmpdir:
-            phase_file = os.path.join(tmpdir, 'phase.bin')
-            mask_file = os.path.join(tmpdir, 'mask.bin')
-            corr_file = os.path.join(tmpdir, 'corr.bin')
-            unwrap_file = os.path.join(tmpdir, 'unwrap.bin')
-
-            # Write phase (NaN -> 0)
-            phase_filled = np.where(np.isnan(phase_arr), 0, phase_arr).astype(np.float32)
-            phase_filled.tofile(phase_file)
-
-            # Write mask (valid=1, NaN=0)
-            mask = np.where(np.isnan(phase_arr), 0, 1).astype(np.uint8)
-            mask.tofile(mask_file)
-
-            # Build command
-            argv = ['snaphu', phase_file, str(ncol), '-M', mask_file,
-                    '-f', '/dev/stdin', '-o', unwrap_file, '-d']
-
-            # Add correlation if provided
-            if corr_arr is not None:
-                corr_filled = np.where(np.isnan(corr_arr), 0, corr_arr).astype(np.float32)
-                corr_filled.tofile(corr_file)
-                argv.extend(['-c', corr_file])
-
-            if debug:
-                argv.append('-v')
-                print(f'DEBUG: snaphu argv: {argv}')
-
-            # Run SNAPHU
-            p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE, encoding='utf8')
-            stdout, stderr = p.communicate(input=conf)
-
-            if debug and stderr:
-                print(f'DEBUG: snaphu stderr:\n{stderr}')
-
-            # Read output
-            if os.path.exists(unwrap_file):
-                unwrap_arr = np.fromfile(unwrap_file, dtype=np.float32).reshape(nrow, ncol)
-                # Restore NaN mask
-                unwrap_arr = np.where(np.isnan(phase_arr), np.nan, unwrap_arr)
-                # Remove mean (same as IRLS does for consistency)
-                valid_mask = ~np.isnan(unwrap_arr)
-                if np.any(valid_mask):
-                    unwrap_arr[valid_mask] -= np.nanmean(unwrap_arr)
-            else:
-                if debug:
-                    print(f'DEBUG: SNAPHU failed, output file not found')
-                unwrap_arr = np.full((nrow, ncol), np.nan, dtype=np.float32)
-
-        return unwrap_arr
-
-    def unwrap2d_snaphu(self, phase, corr=None, defomax=0, debug=False):
-        """
-        Unwrap phase using SNAPHU algorithm.
-
-        Simplified SNAPHU wrapper for single-burst processing.
-        No tiling needed as bursts are small enough.
-
-        Parameters
-        ----------
-        phase : BatchWrap
-            Batch of wrapped phase datasets with 'pair' dimension.
-        corr : BatchUnit, optional
-            Batch of correlation values. If None, uniform weight is used.
-        defomax : float, optional
-            Maximum expected deformation in cycles per pixel.
-            0 = smooth mode (default), good for atmospheric/orbital signals.
-            Use higher values (e.g., 1.2) for deformation with discontinuities.
-        debug : bool, optional
-            Print debug information. Default False.
-
-        Returns
-        -------
-        Batch
-            Batch of unwrapped phase datasets (lazy).
-
-        Examples
-        --------
-        >>> intf, corr = stack.phasediff_multilook(pairs, wavelength=30)
-        >>> unwrapped = stack.unwrap2d_snaphu(intf, corr).compute()
-        """
-        import dask
-        import dask.array
-        import xarray as xr
-        from .Batch import Batch
-        # a BatchUnit (N81); a DataArray one weights every grid
-        corr = BatchCore._weight(corr, phase, 'corr')
-
-        results = {}
-
-        for key in phase.keys():
-            phase_ds = phase[key]
-            corr_ds = corr[key] if corr is not None else None
-
-            result_vars = {}
-            # THE (y, x) GRIDS ONLY (N151): the per-pair metadata the Dataset carries (burst, radar_wavelength, geometry, ...)
-            # are no phase and are carried as every method carries them; they were taken for phases, and each one cost a
-            # compute of its pair coordinates at the call (2160 of them, 28 s) and came back as 1-D garbage that raises
-            for var in phase_ds.data_vars:
-                if var == 'spatial_ref' or not BatchCore._is_grid(phase_ds[var]):
-                    continue
-
-                phase_da = phase_ds[var]
-                # the burst's OWN coordinates, as they are: `.chunk()` below turns the coordinates of a numpy-backed
-                # variable into dask arrays, and reading them back for the result was a compute each
-                coords = phase_da.coords
-                if isinstance(corr_ds, xr.DataArray):
-                    # a DataArray corr weights every grid as it is (N81)
-                    corr_da = corr_ds if BatchCore._is_grid(phase_da) else None
-                else:
-                    corr_da = corr_ds[var] if corr_ds is not None and var in corr_ds else None
-
-                # Ensure data is chunked for lazy processing (1 chunk per pair)
-                if 'pair' in phase_da.dims:
-                    if not isinstance(phase_da.data, dask.array.Array):
-                        phase_da = phase_da.chunk({'pair': 1})
-                    if corr_da is not None and not isinstance(corr_da.data, dask.array.Array):
-                        corr_da = corr_da.chunk({'pair': 1})
-
-                # Create wrapper that captures defomax and debug
-                def make_wrapper(defomax_val, debug_val):
-                    def process_wrapper(phase_chunk, corr_chunk=None):
-                        """Process single pair chunk: (1, y, x) -> (1, y, x)"""
-                        phase_2d = phase_chunk[0]
-                        corr_2d = corr_chunk[0] if corr_chunk is not None else None
-                        unwrap_2d = Stack._snaphu_unwrap_array(
-                            phase_2d, corr_2d, defomax=defomax_val, debug=debug_val
-                        )
-                        return unwrap_2d[np.newaxis, ...].astype(np.float32)
-                    return process_wrapper
-
-                wrapper = make_wrapper(defomax, debug)
-
-                # Use da.blockwise for efficient dask integration
-                phase_dask = phase_da.data
-                dim_str = ''.join(chr(ord('a') + i) for i in range(phase_dask.ndim))
-
-                # Provide meta to avoid calling wrapper during graph construction
-                meta = np.empty((0,) * phase_dask.ndim, dtype=np.float32)
-
-                if corr_da is None:
-                    result_dask = dask.array.blockwise(
-                        wrapper, dim_str,
-                        phase_dask, dim_str,
-                        dtype=np.float32,
-                        meta=meta,
-                    )
-                else:
-                    corr_dask = corr_da.data
-                    def wrapper_with_corr(phase_chunk, corr_chunk):
-                        return wrapper(phase_chunk, corr_chunk)
-                    result_dask = dask.array.blockwise(
-                        wrapper_with_corr, dim_str,
-                        phase_dask, dim_str,
-                        corr_dask, dim_str,
-                        dtype=np.float32,
-                        meta=meta,
-                    )
-
-                result_vars[var] = xr.DataArray(
-                    result_dask,
-                    dims=phase_da.dims,
-                    coords=coords
-                )
-
-            result_ds = xr.Dataset(Stack._carry_meta(phase_ds, result_vars))
-            result_ds.attrs = phase_ds.attrs
-            results[key] = result_ds
-
-        return Batch(results)
-
-    import numpy as np
-
-    import xarray as xr
-
-    import pandas as pd
-
-    def _get_pairs(self, pairs, dates=False):
-        """
-        Get pairs as DataFrame and optionally dates array.
-
-        Parameters
-        ----------
-        pairs : np.ndarray, optional
-            An array of pairs. If None, all pairs are considered. Default is None.
-        dates : bool, optional
-            Whether to return dates array. Default is False.
-        name : str, optional
-            The name of the phase filter. Default is 'phasefilt'.
-
-        Returns
-        -------
-        pd.DataFrame or tuple
-            A DataFrame of pairs. If dates is True, also returns an array of dates.
-        """
-        import xarray as xr
-        import pandas as pd
-        import numpy as np
-        from glob import glob
-
-        if isinstance(pairs, pd.DataFrame):
-            # workaround for baseline_pairs() output
-            pairs = pairs.rename(columns={'ref_date': 'ref', 'rep_date': 'rep'})
-        elif isinstance(pairs, (xr.DataArray, xr.Dataset)):
-            # pairs = pd.DataFrame({
-#                 'ref': pairs.coords['ref'].values,
-#                 'rep': pairs.coords['rep'].values
-#             })
-            refs = pairs.coords['ref'].values
-            reps = pairs.coords['rep'].values
-            pairs = pd.DataFrame({
-                'ref': refs if isinstance(refs, np.ndarray) else [refs],
-                'rep': reps if isinstance(reps, np.ndarray) else [reps]
-            })
-        else:
-            # Convert numpy array to DataFrame
-            # in case of 1d array with 2 items convert to a single pair
-            pairs_2d = [pairs] if np.asarray(pairs).shape == (2,) else pairs
-            pairs = pd.DataFrame(pairs_2d, columns=['ref', 'rep'])
-
-        # Convert ref and rep columns to datetime format
-        pairs['ref'] = pd.to_datetime(pairs['ref'])
-        pairs['rep'] = pd.to_datetime(pairs['rep'])
-        pairs['pair'] = [f'{ref} {rep}' for ref, rep in zip(pairs['ref'].dt.date, pairs['rep'].dt.date)]
-        # Calculate the duration in days and add it as a new column
-        #pairs['duration'] = (pairs['rep'] - pairs['ref']).dt.days
-
-        if dates:
-            # pairs is DataFrame
-            dates = np.unique(pairs[['ref', 'rep']].astype(str).values.flatten())
-            return (pairs, dates)
-        return pairs
 
     def stl(self, data, freq='W', periods=52, robust=False):
         """
@@ -2312,6 +1988,24 @@ DEFOMAX_CYCLE  {defomax}
             batch_type = Batch
         return batch_type(subset)
 
+    def __dir__(self):
+        """The public names of the stack, as dir(stack) lists them: the BatchCore functions are hidden except ADDITIONS, the
+        names of Stack and BatchComplex are shown (BatchComplex names but EXCLUSIONS), dict methods and names that start with
+        an underscore are untouched. A hidden name stays callable: only the listing changes, not the attribute lookup.
+
+        >>> Stack().__dir__()
+        """
+        names = []
+        for name in object.__dir__(self):
+            if not name.startswith('_'):
+                owner = next((c for c in type(self).__mro__ if name in c.__dict__), None)
+                if owner is BatchCore and name not in ADDITIONS:
+                    continue
+                if name in EXCLUSIONS:
+                    continue
+            names.append(name)
+        return names
+
     def __getattr__(self, name: str):
         """
         Access a variable (e.g., 'ele') of the Stack: `stack.ele` is
@@ -2327,6 +2021,15 @@ DEFOMAX_CYCLE  {defomax}
                 pass
 
         raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
+    def complex(self) -> BatchComplex:
+        """Return the complex data of this Stack as a BatchComplex, without the transform:
+        stack.complex() is BatchComplex(stack). numpy and math on the data go through it,
+        as a Stack itself is not an array (N81).
+
+        >>> stack.complex().abs()
+        """
+        return BatchComplex(self)
 
     def transform(self) -> Batch:
         """Return a Batch view of this Stack's transform: its non-complex (y, x) grids
@@ -2360,6 +2063,64 @@ DEFOMAX_CYCLE  {defomax}
         """Incidence angle (radians) of each burst's grid, from the stack's per-date numbers and the crop polygon,
         no raster read (see Batch.incidence())."""
         return self.transform().incidence()
+
+    def look(self) -> Batch:
+        """Look azimuth (degrees, clockwise from geodetic north, satellite to target) of each burst's grid, from the orbit
+        geometry, no raster read (see Batch.look())."""
+        return self.transform().look()
+
+    def troposphere_phase(self) -> Batch:
+        """The tropospheric phase (radians) of each burst on the stack's grid and dates, the phase each date adds to the
+        interferometric phase: corrected phase = phase minus this result. The sign is the library's: -4 pi / wavelength times
+        the one-way delay of the model (a longer path is a negative phase).
+
+        The folder is the tropo= of load() (a VMF3 or ERA5 folder of the atmosphere model, the model is detected from it).
+        The toolkit returns the model's terms on its own nodes, reprojected lazily to the stack's crs inside the toolkit, for
+        the two epochs that bracket each date (weighted by the time). Per burst the terms are cropped to the nodes that bracket
+        the burst (one margin node). Each pixel takes the model's delay at its own ellipsoidal height (transform().ele) and
+        incidence: the common form evaluated on the 4 nodes around the pixel, then bilinear in x and y. A pixel outside the
+        model grid, or an incidence outside [0, 90) degrees, raises one ERROR line.
+
+        Lazy, as the Tiles reprojection: the call computes nothing and reads no file; each chunk is computed when the result
+        is. The chunks are the burst's, with all dates in one chunk. Returns a Batch of Datasets with the variable 'phase'
+        (date, y, x), float32.
+
+        >>> stack = Stack().load('gas.zarr', tropo='dem_tiles/VMF3_OP')
+        >>> phase = stack.troposphere_phase()
+        """
+        return _atmosphere_phase(self, 'tropo', None, 'troposphere_phase')
+
+    def ionosphere_phase(self, factor: float = 0.78, geocentric: bool = True) -> Batch:
+        """The ionospheric phase (radians) of each burst on the stack's grid and dates, the phase each date adds to the
+        interferometric phase: corrected phase = phase minus this result. The sign is the library's: +4 pi / wavelength
+        times the one-way slant delay, the ionosphere shortens the phase path.
+
+        The folder is the iono= of load() (a folder of the CODE IONEX maps). Each pixel takes the TEC at its pierce
+        point: the point of the single-layer shell (R + H, 450 km above the earth sphere of the maps) where the line of
+        sight from the satellite to the pixel crosses it (TN-200 step 2). The pierce point lies at the sine-law ground
+        distance from the pixel, toward the satellite, on the bearing stack.look() + 180 (stack.look() is the azimuth
+        from the satellite to the target, an array on the stack's grid like the incidence), in the stack's crs. The
+        toolkit reads the maps on their native grid, reprojects the nodes lazily to the crs, and gives the bilinear TEC
+        over the 4 nodes around each pierce point, times the mapping at the pixel's incidence (TN-200 Eq. 21 and 22, R =
+        the pixel's distance from the earth centre) and factor. factor is the ionospheric factor of the mapping: the
+        delay is factor times the slant TEC, so it scales the correction linearly. Proposed values: 0.78 for Sentinel-1
+        (MPC 2025, at solar maximum; the default used here), 0.90 for Sentinel-1 with the older products (TN-200 and
+        ETAD before 2025, which changes with the Sun's state), 0.76 for ALOS-2 (published), about 0.79 for NISAR (from
+        the profile model's altitude slope anchored at Sentinel-1; not measured). The L-band accuracy is well below
+        Sentinel-1's, so the single default 0.78 is used for all of them. A pixel outside the model grid, or an
+        incidence outside [0, 90) degrees, raises one ERROR line.
+
+        geocentric=True (default) maps each pixel at the geocentric zenith of the exact ray at its pierce point (ETAD ATBD
+        2.7 Eq. 45-46). geocentric=False maps it at the ellipsoid-normal zenith of the pixel (FRM4SAR TN-200 Eq. 22), for
+        verifications against TN-200; the pierce point is the same for both.
+
+        Lazy, as troposphere_phase(): nothing is computed or read at the call, the chunks are the burst's, all dates in one
+        chunk. Returns a Batch of Datasets with the variable 'phase' (date, y, x), float32.
+
+        >>> stack = Stack().load('gas.zarr', iono='dem_tiles')
+        >>> phase = stack.ionosphere_phase(factor=0.78)
+        """
+        return _atmosphere_phase(self, 'iono', float(factor), 'ionosphere_phase', geocentric=bool(geocentric))
 
     def _elevation_phase_approximate(self) -> dict:
         """`{burst_id: value}` at the burst centre. See Batch."""
@@ -3037,7 +2798,7 @@ DEFOMAX_CYCLE  {defomax}
         return Batches(batches).compute()
 
     def snapshot(self, *args, store: str | None = None, storage_options: dict[str, str] | None = None,
-                caption: str | None = None, debug=False):
+                caption: str | None = None, debug=False, overwrite: bool = True):
         """Open or save a Batch/Batches snapshot.
 
         This is a convenience passthrough to Batches.snapshot(). Stack itself
@@ -3055,6 +2816,8 @@ DEFOMAX_CYCLE  {defomax}
             Progress bar caption.
         debug : bool
             Print debug information.
+        overwrite : bool
+            True (default) replaces an existing store; False keeps a complete one and returns it opened.
 
         Returns
         -------
@@ -3081,17 +2844,16 @@ DEFOMAX_CYCLE  {defomax}
         if len(args) == 0:
             if store is None:
                 raise ValueError("store path is required to open snapshot")
-            if len(self) > 0:
+            if len(self) > 0 and utils_io.write_wanted(store, storage_options, overwrite):
                 # Non-empty Stack: save itself, then reopen
                 utils_io.save(self, store=store, storage_options=storage_options,
                              caption=caption or 'Snapshotting...', debug=debug)
-                return utils_io.open(store=store, storage_options=storage_options,
-                                     n_jobs=-1, debug=debug)
             return utils_io.open(store=store, storage_options=storage_options,
                                 n_jobs=-1, debug=debug)
 
         # Save mode - args are batches
-        return Batches(args).snapshot(store=store, storage_options=storage_options, caption=caption, debug=debug)
+        return Batches(args).snapshot(store=store, storage_options=storage_options, caption=caption, debug=debug,
+                                      overwrite=overwrite)
 
     def archive(self, *args, store: str | None = None, caption: str | None = None,
                 compression: int = 6, debug=False):
@@ -3354,7 +3116,7 @@ DEFOMAX_CYCLE  {defomax}
         assert len(shape) >= 2, f"_load_zarr_array is for 2D+ delayed vars only, got {name} with shape {shape}"
         dtype = meta['data_type']
         attrs = meta.get('attributes', {})
-        scale_factor = np.float32(attrs.get('scale_factor', 1.0))
+        scale_factor = np.float64(attrs.get('scale_factor', 1.0))
         fill_value = attrs.get('_FillValue')
 
         # Single chunk only - for multi-chunk use _load_zarr_array_chunk
@@ -3419,7 +3181,7 @@ DEFOMAX_CYCLE  {defomax}
         shape = tuple(meta['shape'])
         chunks = tuple(meta.get('chunk_grid', {}).get('configuration', {}).get('chunk_shape', shape))
         attrs = meta.get('attributes', {})
-        scale_factor = np.float32(attrs.get('scale_factor', 1.0))
+        scale_factor = np.float64(attrs.get('scale_factor', 1.0))
         fill_value = attrs.get('_FillValue')
         dtype = meta['data_type']
 
@@ -3530,7 +3292,7 @@ DEFOMAX_CYCLE  {defomax}
             meta = json.load(f)
         shape = tuple(meta['shape'])
         re_dtype = meta.get('data_type', 'int16')
-        scale = np.float32(meta['attributes'].get('scale_factor', 1.0))
+        scale = np.float64(meta['attributes'].get('scale_factor', 1.0))
         fill_value = meta['attributes'].get('_FillValue')
 
         codec = Zstd()
@@ -3597,18 +3359,32 @@ DEFOMAX_CYCLE  {defomax}
         shape = tuple(meta['shape'])
         chunks = tuple(meta.get('chunk_grid', {}).get('configuration', {}).get('chunk_shape', shape))
         dtype = meta.get('data_type', 'int16')
-        scale = np.float32(meta['attributes'].get('scale_factor', 1.0))
+        scale = np.float64(meta['attributes'].get('scale_factor', 1.0))
         fill_value = meta['attributes'].get('_FillValue')
 
         return shape, chunks, scale, fill_value, dtype
 
     @staticmethod
-    def _zarr_complex_source(zarr_path, group_path, storage_options=None):
-        """A burst's complex64 re/im for _zarr_dask(): (reader of disk chunk (iy, ix, chunk_shape), disk chunks)."""
+    def _zarr_meta_of(var):
+        """
+        (shape, chunks, scale, fill_value, dtype) of a stored zarr array, from its decoded variable in the consolidated
+        tree: the encoding keeps the stored chunks, dtype, scale_factor and _FillValue, so no zarr.json is read.
+        """
+        import numpy as np
+        enc = var.encoding
+        shape = tuple(var.shape)
+        chunks = tuple(enc.get('chunks') or shape)
+        scale = np.float64(enc.get('scale_factor', 1.0))
+        fill_value = enc.get('_FillValue')
+        dtype = np.dtype(enc['dtype']).name
+        return shape, chunks, scale, fill_value, dtype
+
+    @staticmethod
+    def _zarr_complex_source(zarr_path, group_path, meta, storage_options=None):
+        """A burst's complex64 re/im for _zarr_dask(): (reader of disk chunk (iy, ix, chunk_shape), disk chunks).
+        meta: (shape, chunks, scale, fill_value, dtype) of its re array, read by the caller."""
         import dask.array as da
-        shape, zarr_chunks, scale, fill_value, re_dtype = Stack._get_zarr_slc_meta(
-            zarr_path, group_path, storage_options
-        )
+        shape, zarr_chunks, scale, fill_value, re_dtype = meta
         disk = da.core.normalize_chunks(zarr_chunks, shape)
         if len(disk[0]) == 1 and len(disk[1]) == 1:
             # Single chunk: one reader for entire array
@@ -3621,12 +3397,11 @@ DEFOMAX_CYCLE  {defomax}
                 disk)
 
     @staticmethod
-    def _zarr_array_source(zarr_path, group_path, name, storage_options=None):
-        """One float32 transform variable for _zarr_dask(): (reader of disk chunk (iy, ix, chunk_shape), disk chunks)."""
+    def _zarr_array_source(zarr_path, group_path, name, meta, storage_options=None):
+        """One float32 transform variable for _zarr_dask(): (reader of disk chunk (iy, ix, chunk_shape), disk chunks).
+        meta: (shape, chunks, scale, fill_value, dtype) of the variable, read by the caller."""
         import dask.array as da
-        shape, zarr_chunks, scale_factor, fill_value, dtype = Stack._get_zarr_array_meta(
-            zarr_path, group_path, name, storage_options
-        )
+        shape, zarr_chunks, scale_factor, fill_value, dtype = meta
         disk = da.core.normalize_chunks(zarr_chunks, shape)
         if len(disk[0]) == 1 and len(disk[1]) == 1:
             # Single chunk: one reader for entire array
@@ -3717,15 +3492,15 @@ DEFOMAX_CYCLE  {defomax}
     def _load_attrs(attrs: dict, where: str, notes: list, used: set) -> tuple[dict, dict]:
         """One date group's stored attributes, split into the scalars and the lists load() makes variables of.
 
-        The scalars named in `used` (load()'s whitelist) and every list, except Conventions and spatial_ref,
-        which load() handles itself. Numbers become float, as they always did; a JSON null is no value and is left
-        out, so that date is filled like a date without the key. A list becomes an array of its own rank; a ragged
-        one has no array shape and is an error naming it.
+        The scalars and the lists named in `used` (load()'s whitelist, with the names of attrs), except Conventions
+        and spatial_ref, which load() handles itself. Numbers become float, as they always did; a JSON null is no
+        value and is left out, so that date is filled like a date without the key. A list becomes an array of its
+        own rank; a ragged one has no array shape and is an error naming it.
         """
         import numpy as np
         scalars, arrays = {}, {}
         for k, v in attrs.items():
-            if k in ('Conventions', 'spatial_ref') or v is None:
+            if k in ('Conventions', 'spatial_ref') or v is None or k not in used:
                 continue
             if isinstance(v, (list, tuple)):
                 try:
@@ -3733,8 +3508,6 @@ DEFOMAX_CYCLE  {defomax}
                 except ValueError as ex:
                     raise ValueError(f'Stack.load: {where}: attribute {k!r} is a ragged list, which has no '
                                      f'array shape: {ex}') from None
-            elif k not in used:
-                continue
             elif isinstance(v, str):
                 scalars[k] = v
             elif isinstance(v, (int, float)):
@@ -3816,14 +3589,37 @@ DEFOMAX_CYCLE  {defomax}
         return ds
 
     def load(self, urls:str | list | pd.DataFrame, storage_options:dict[str, str]|None=None,
-             debug:bool=False):
+             debug:bool=False, attrs:list[str]|None=None, tropo:str|None=None, iono:str|None=None):
+        """Load a store, a list of burst URLs or a DataFrame of them into this Stack, one Dataset per burst.
+
+        Every stored burst attribute the stack functions read is loaded as a per-date variable (the whitelist
+        _USED_SCALAR_ATTRS; every list it names). The argument attrs is a list of further stored attribute
+        names, loaded the same way, so that a custom function can read them: each becomes a per-date variable
+        with the stored values, NaN on a date that does not store it. None (the default) loads exactly the used
+        names. A name that no loaded burst loads as a per-date variable is not a per-date parameter of the bursts
+        (a data variable such as VV or azi, polarization, a null or a dict): it raises a ValueError naming it;
+        attrs that is not a list raises a TypeError.
+
+        The arguments tropo and iono are the folders of the atmosphere model fields (e.g. dem_tiles, where the
+        ERA5, VMF3 and IONEX downloads were stored). Given, the model of each folder is detected from its VRT index,
+        every scene time of the bursts is verified against it (utils_tropo.verify and utils_iono.verify: the stored
+        epochs and their tile files; no model value is read here), and each burst keeps the absolute folder path
+        as its attribute 'tropo' or 'iono'. A folder that holds no such model, or misses a scene time, raises one
+        ERROR: line before the Stack is changed. None (the default) keeps nothing and checks nothing.
+
+        Examples
+        --------
+        >>> stack = Stack().load('gas.zarr', tropo='dem_tiles/VMF3_OP', iono='dem_tiles')
+        """
+        if attrs is not None and (not isinstance(attrs, list) or not all(isinstance(a, str) for a in attrs)):
+            raise TypeError(f'Stack.load: attrs must be a list of attribute names (str), not {type(attrs).__name__}')
+        extra_attrs = list(attrs or [])
         import numpy as np
         import dask
         import dask.array as da
         import xarray as xr
         import pandas as pd
         import geopandas as gpd
-        import zarr
         from shapely import wkt
         import os
         from insardev_toolkit import progressbar_joblib
@@ -3850,27 +3646,79 @@ DEFOMAX_CYCLE  {defomax}
         client = get_client()
         client.register_plugin(IgnoreDaskDivide(), name='ignore_divide')
 
-        # Whitelist of scalar attrs actually used by insardev processing
-        # Alignment params (sub_int_*, stretch_*, a_stretch_*, ashift, rshift) are
+        def _print_notes(notes):
+            """Prints the notes of a load once each, in the order they were made."""
+            for note in dict.fromkeys(notes):
+                print(note, flush=True)
+
+        # The stored burst attributes the stack functions read: the scalars, and the lists named here (a list is
+        # loaded only when it is named; the others stay in the store). Each name carries its reader. The names of
+        # attrs join this set for one call. Alignment params (sub_int_*, stretch_*, a_stretch_*, ashift, rshift) are
         # excluded - they're only needed for debugging alignment quality in insardev_pygmtsar
         _USED_SCALAR_ATTRS = {
             # Mission/acquisition metadata
-            'startTime', 'polarization', 'burst', 'flightDirection',
-            'pathNumber', 'subswath', 'mission', 'beamModeType',
-            'fullBurstID', 'geometry',  # Used in to_dataframe()
-            'lookdir', 'band', 'frequency',  # Shown in to_dataframe(): look side, radar band, NISAR sub-band
+            'startTime',           # reader: BatchCore._start_from (subscript)
+            'polarization',        # reader: BatchCore.to_dataframe; also the name of the complex variable
+            'burst',               # reader: BatchCore.to_dataframe (name list)
+            'flightDirection',     # reader: BatchCore.to_dataframe (name list)
+            'pathNumber',          # reader: BatchCore.to_dataframe (name list)
+            'subswath',            # reader: BatchCore.to_dataframe (name list)
+            'mission',             # reader: BatchCore.to_dataframe (name list)
+            'beamModeType',        # reader: BatchCore.to_dataframe (name list)
+            'fullBurstID',         # reader: BatchCore.to_dataframe (name list)
+            'geometry',            # reader: Batch._fit3d_select_ps (subscript)
+            'lookdir',             # reader: utils_geometry.burst_geometry (subscript)
+            'band',                # display: the columns of Stack.to_dataframe (a fixed set of names)
+            'frequency',           # display: the columns of Stack.to_dataframe; tells the two NISAR bands apart
             # Radar parameters for incidence, elevation, LOS calculations
-            'radar_wavelength', 'near_range',
-            'SC_height_start', 'SC_height_end', 'earth_radius',
-            'rng_samp_rate', 'num_lines',
-            'num_rng_bins',  # the far edge of the crop polygon: elevation(), incidence() rebuild the track from it
+            'radar_wavelength',    # reader: Batch.BatchComplex._fit3d_setup (subscript)
+            'near_range',          # reader: Batch._centre_geometry_approximate (string)
+            'SC_height_start',     # reader: Batch._centre_geometry_approximate (string)
+            'SC_height_end',       # reader: Batch._centre_geometry_approximate (string)
+            'earth_radius',        # reader: Batch._centre_geometry_approximate (string)
+            'rng_samp_rate',       # reader: Batch._centre_geometry_approximate (string)
+            'num_lines',           # reader: Batch._centre_geometry_approximate (string)
+            'num_rng_bins',        # reader: Batch._centre_geometry_approximate; the far edge of the crop polygon
             # Baseline
-            'BPR', 'BPT', 'B_perpendicular', 'B_parallel',
+            'BPR',                 # reader: Batch.filter (subscript)
             # the GMTSAR baseline triples per date (m, deg), pairs() gives the pair's by vector difference
-            'baseline_start', 'baseline_center', 'baseline_end', 'alpha_start', 'alpha_center', 'alpha_end',
+            'baseline_start',      # reader: Batch._pair_geometry (subscript)
+            'baseline_center',     # reader: utils_geometry TRIPLES, read by Batch._stack_geometry
+            'baseline_end',        # reader: utils_geometry TRIPLES, read by Batch._stack_geometry
+            'alpha_start',         # reader: utils_geometry TRIPLES, read by Batch._stack_geometry
+            'alpha_center',        # reader: utils_geometry TRIPLES, read by Batch._stack_geometry
+            'alpha_end',           # reader: utils_geometry TRIPLES, read by Batch._stack_geometry
             # Reference height for elevation computation
-            'ref_height',
+            'ref_height',          # reader: Batch._stack_geometry (subscript)
+            # The gain formula of the azimuth alignment (align3d, G4w U2; reports/g4p_U1_gain_source.md section 2):
+            # no reader in the stack files yet, the preprocessors read them too
+            'PRF',                 # reader: the gain formula (align3d, planned)
+            'SC_vel',              # reader: the gain formula (align3d, planned)
+            'azimuthSteeringRate', # reader: the gain formula (align3d, planned)
+            'azimuthFmRateT0',     # reader: the gain formula (align3d, planned)
+            'azimuthFmRatePolynomial',  # a list: reader: the gain formula (align3d, planned)
         }
+        # the names of attrs (one call): loaded beside the whitelist, the same rule
+        _used_attrs = _USED_SCALAR_ATTRS | set(extra_attrs)
+
+        def refuse_absent(datasets):
+            """ValueError naming each attrs name that no loaded burst loads as a variable along date.
+
+            A burst attribute is loaded as a variable with dims ('date', ...) (a number, a string or a list); a data
+            variable of the burst (the image, azi, rng, ele: dims ('date', 'y', 'x') or ('y', 'x')) is not an attribute.
+            A name stored only as a null, a dict, or one load() handles itself (spatial_ref, Conventions) loads no variable.
+            """
+            if not extra_attrs:
+                return
+            loaded = set()
+            for dataset in datasets:
+                for name in dataset.data_vars:
+                    dims = dataset[name].dims
+                    if 'date' in dims and 'y' not in dims and 'x' not in dims:
+                        loaded.add(name)
+            absent = [a for a in extra_attrs if a not in loaded]
+            if absent:
+                raise ValueError(f'Stack.load: attrs {absent} are not per-date parameters of the bursts')
 
         # Resolve dask chunk budget in main process (joblib loky workers
         # don't inherit dask.config, so get_dask_chunk_size_mb() would
@@ -3878,20 +3726,19 @@ DEFOMAX_CYCLE  {defomax}
         from .utils_dask import get_dask_chunk_size_mb
         _load_target_mb = get_dask_chunk_size_mb()
 
-        def store_open_group_delayed(zarr_path, group):
+        def store_open_group_delayed(zarr_path, tree, group):
             """
             Open a fullBurstID group using delayed loading for complex data.
 
-            This avoids the complex xarray concat graph by creating simple
-            dask.delayed tasks for each date's data. File handles are opened
-            and closed cleanly for each load operation.
+            The group is taken from the DataTree of the consolidated metadata that the caller opened once: no
+            metadata file is read per group or per array. File handles are opened and closed cleanly for each
+            load operation.
             """
             import rioxarray
-            root = zarr.open_consolidated(zarr_path, zarr_format=3, mode='r')
-            grp = root[group]
+            grp = tree[group]
 
             # Get burst subgroups (excluding transform)
-            burst_keys = [k for k in grp.keys() if k != 'transform']
+            burst_keys = [k for k in grp.children if k != 'transform']
 
             # Collect metadata for all bursts (no 2D data loading)
             burst_infos = []
@@ -3899,14 +3746,12 @@ DEFOMAX_CYCLE  {defomax}
             notes = []
             spatial_ref = None
             for burst_key in burst_keys:
-                burst_grp = grp[burst_key]
                 burst_path = f"{group}/{burst_key}"
 
-                # Open to get metadata only
-                ds = xr.open_zarr(burst_grp.store, group=burst_grp.path,
-                                  consolidated=True, zarr_format=3)
-
-                shape = burst_grp['re'].shape
+                # the burst's metadata from the consolidated tree (a copy: the caller's attributes are its own)
+                ds = grp[burst_key].to_dataset(inherit=False).copy(deep=False)
+                meta = Stack._zarr_meta_of(ds['re'])
+                shape = ds['re'].shape
                 date = np.datetime64(ds.attrs['startTime'], 's')
                 polarization = ds.attrs['polarization']
                 burst_name = ds.attrs['burst']
@@ -3916,7 +3761,7 @@ DEFOMAX_CYCLE  {defomax}
                     spatial_ref = ds.attrs.get('spatial_ref')
 
                 # Extract scalar attrs (only whitelisted keys used by insardev) and every list attr
-                scalar_attrs, array_attrs = Stack._load_attrs(ds.attrs, burst_path, notes, _USED_SCALAR_ATTRS)
+                scalar_attrs, array_attrs = Stack._load_attrs(ds.attrs, burst_path, notes, _used_attrs)
 
                 # Store only what we need (not the full dataset!)
                 burst_infos.append({
@@ -3924,6 +3769,7 @@ DEFOMAX_CYCLE  {defomax}
                     'burst_path': burst_path,
                     'burst_name': burst_name.replace(polarization, 'XX'),
                     'shape': shape,
+                    'meta': meta,
                     'date': date,
                     'y': ds.y.values,
                     'x': ds.x.values,
@@ -3942,7 +3788,7 @@ DEFOMAX_CYCLE  {defomax}
                 )
                 # one reader task per zarr disk chunk of each date
                 pol_sources[polarization] = (pol_infos, [Stack._zarr_complex_source(zarr_path, info['burst_path'],
-                                                                                   storage_options)
+                                                                                   info['meta'], storage_options)
                                                          for info in pol_infos])
             # the dask chunks of every grid: chunk2d logic on the disk chunks of the first polarization's data
             chunks = Stack._load_chunks(pol_sources[polarizations[0]][1][0][1], _load_target_mb)
@@ -3980,9 +3826,7 @@ DEFOMAX_CYCLE  {defomax}
             del datas
 
             # Load transform: zarr handles metadata/coords, custom reader for 2D chunks
-            grp_transform = grp['transform']
-            transform = xr.open_zarr(grp_transform.store, group=grp_transform.path,
-                                     consolidated=True, zarr_format=3)
+            transform = grp['transform'].to_dataset(inherit=False).copy(deep=False)
 
             # Coords eagerly (small 1D arrays)
             ds = ds.assign_coords(x=transform.x.values, y=transform.y.values)
@@ -3994,8 +3838,8 @@ DEFOMAX_CYCLE  {defomax}
             # One reader call per chunk for memory efficiency, in the dask chunks of the data
             transform_path = f"{group}/transform"
             for var in transform.data_vars:
-                arr = Stack._zarr_dask(f'load-{var}', [Stack._zarr_array_source(zarr_path, transform_path, var,
-                                                                                storage_options)],
+                arr = Stack._zarr_dask(f'load-{var}', [Stack._zarr_array_source(
+                    zarr_path, transform_path, var, Stack._zarr_meta_of(transform[var]), storage_options)],
                                        chunks, np.float32, lead=False)
 
                 # the variable's attributes travel with it: actual_range is
@@ -4011,9 +3855,8 @@ DEFOMAX_CYCLE  {defomax}
             ds.attrs['spatial_ref'] = spatial_ref
             ds.rio.write_crs(spatial_ref, inplace=True)
 
-            # Close zarr resources (metadata only, no lazy data references)
+            # Close the transform (metadata only, no lazy data references)
             transform.close()
-            root.store.close()
 
             return group, Stack._load_rechunk(ds, chunks), notes
 
@@ -4026,23 +3869,50 @@ DEFOMAX_CYCLE  {defomax}
             u = os.path.expanduser(str(u))
             return u if '://' in u else os.path.abspath(u)
 
+        # The atmosphere model folders (tropo=, iono=): the model of each is detected and every scene time of the
+        # bursts verified before anything is loaded into the Stack (the check reads the VRT indexes only); the
+        # absolute folder paths are kept as burst attributes, where every operation of the Stack keeps them.
+        atmosphere = {}
+        if tropo is not None:
+            atmosphere['tropo'] = _local_abspath(tropo)
+        if iono is not None:
+            atmosphere['iono'] = _local_abspath(iono)
+
+        def check_atmosphere(datasets):
+            """Raises one ERROR: line when a folder holds no model of its kind or misses a scene time of the bursts."""
+            if not atmosphere:
+                return
+            from insardev_toolkit import utils_tropo, utils_iono
+            times = sorted({pd.Timestamp(d) for ds in datasets for d in ds.date.values})
+            if 'tropo' in atmosphere:
+                utils_tropo.model(atmosphere['tropo'])
+                utils_tropo.verify(atmosphere['tropo'], times)
+            if 'iono' in atmosphere:
+                utils_iono.model(atmosphere['iono'])
+                utils_iono.verify(atmosphere['iono'], times)
+
+        def keep_atmosphere(datasets):
+            """The folder paths as attributes of each burst Dataset (nothing when tropo and iono are None)."""
+            for ds in datasets:
+                ds.attrs.update(atmosphere)
+
         if isinstance(urls, str):
             # note: isinstance(urls, zarr.storage.ZipStore) can be loaded too but it is less efficient
             urls = _local_abspath(urls)
             zarr_path = urls  # Store for delayed loading
-            root = zarr.open_consolidated(urls, zarr_format=3, mode='r')
-            groups = list(root.group_keys())
-            del root  # Close the root - we'll reopen in each group loader
-
-            # Use the new delayed loading approach
-            with progressbar_joblib.progressbar_joblib(tqdm(desc='Loading Dataset...'.ljust(25), total=len(groups))) as progress_bar:
-                dss = joblib.Parallel(n_jobs=-1, backend='loky')\
-                    (joblib.delayed(store_open_group_delayed)(zarr_path, group) for group in groups)
+            # one read of the root's consolidated metadata: every group is taken from this tree in memory
+            tree = xr.open_datatree(urls, engine='zarr', consolidated=True, zarr_format=3, chunks=None)
+            groups = list(tree.children)
+            dss = [store_open_group_delayed(zarr_path, tree, group)
+                   for group in tqdm(groups, desc='Loading Dataset...'.ljust(25))]
+            del tree
             # the idle joblib workers keep their memory: stop them, the next parallel step starts its own
             release_workers()
-            for note in dict.fromkeys(note for _, _, notes in dss for note in notes):
-                print(note, flush=True)
+            _print_notes([note for _, _, notes in dss for note in notes])
             # list of key - dataset converted to dict and appended to the existing dict
+            refuse_absent([ds for _, ds, _ in dss])
+            check_atmosphere([ds for _, ds, _ in dss])
+            keep_atmosphere([ds for _, ds, _ in dss])
             self.update((group, ds) for group, ds, _ in dss)
         # elif isinstance(urls, FsspecStore):
         #     root = zarr.open_consolidated(urls, zarr_format=3, mode='r')
@@ -4070,6 +3940,7 @@ DEFOMAX_CYCLE  {defomax}
             urls = urls.assign(**{urls.columns[0]: [_local_abspath(u) for u in urls.iloc[:, 0].values]})
 
             dss = {}
+            notes_all = []
             for fullBurstID in tqdm(urls.index.get_level_values(0).unique(), desc='Loading Datasets...'.ljust(25)):
                 df = urls[urls.index.get_level_values(0) == fullBurstID]
                 burst_urls = df[df.index.get_level_values(1) != 'transform'].iloc[:,0].values
@@ -4091,7 +3962,7 @@ DEFOMAX_CYCLE  {defomax}
                         spatial_ref = bds.attrs.get('spatial_ref')
 
                     # Extract scalar attrs (only whitelisted keys used by insardev) and every list attr
-                    scalar_attrs, array_attrs = Stack._load_attrs(bds.attrs, burst_url, notes, _USED_SCALAR_ATTRS)
+                    scalar_attrs, array_attrs = Stack._load_attrs(bds.attrs, burst_url, notes, _used_attrs)
 
                     burst_infos.append({
                         'url': burst_url,
@@ -4114,8 +3985,8 @@ DEFOMAX_CYCLE  {defomax}
                         [info for info in burst_infos if info['polarization'] == polarization],
                         key=lambda x: x['date']
                     )
-                    pol_sources[polarization] = (pol_infos, [Stack._zarr_complex_source(info['url'], '',
-                                                                                       storage_options)
+                    pol_sources[polarization] = (pol_infos, [Stack._zarr_complex_source(
+                        info['url'], '', Stack._get_zarr_slc_meta(info['url'], '', storage_options), storage_options)
                                                              for info in pol_infos])
                 # the dask chunks of every grid: chunk2d logic on the disk chunks of the first polarization's data
                 chunks = Stack._load_chunks(pol_sources[polarizations[0]][1][0][1], _load_target_mb)
@@ -4143,8 +4014,6 @@ DEFOMAX_CYCLE  {defomax}
                 # Merge polarizations
                 ds = Stack._merge_polarizations(datas)
                 del datas
-                for note in dict.fromkeys(notes):
-                    print(note, flush=True)
 
                 # Load transform: zarr for metadata/coords, custom reader for 2D
                 transform = xr.open_zarr(transform_url, consolidated=True, zarr_format=3,
@@ -4155,8 +4024,9 @@ DEFOMAX_CYCLE  {defomax}
                 for var in transform.data_vars:
                     # one reader task per zarr disk chunk, as the store path does
                     ds[var] = xr.DataArray(
-                        Stack._zarr_dask(f'load-{var}', [Stack._zarr_array_source(transform_url, '', var,
-                                                                                  storage_options)],
+                        Stack._zarr_dask(f'load-{var}', [Stack._zarr_array_source(
+                            transform_url, '', var, Stack._get_zarr_array_meta(transform_url, '', var, storage_options),
+                            storage_options)],
                                          chunks, np.float32, lead=False),
                         dims=['y', 'x'], attrs=dict(transform[var].attrs)
                     )
@@ -4168,10 +4038,16 @@ DEFOMAX_CYCLE  {defomax}
                 ds.attrs['spatial_ref'] = spatial_ref
                 ds.rio.write_crs(spatial_ref, inplace=True)
                 transform.close()
+                notes_all.extend(notes)
 
                 dss[fullBurstID] = Stack._load_rechunk(ds, chunks)
+            # one print for the call
+            _print_notes(notes_all)
 
             #assert len(np.unique([ds.rio.crs.to_epsg() for ds in dss])) == 1, 'All datasets must have the same coordinate reference system'
+            refuse_absent(dss.values())
+            check_atmosphere(list(dss.values()))
+            keep_atmosphere(dss.values())
             self.update(dss)
         else:
             raise ValueError(f'ERROR: urls must be a store path (str), a list of URLs, or a Pandas DataFrame '
@@ -4773,7 +4649,7 @@ DEFOMAX_CYCLE  {defomax}
     def _displacement_component(self, phase: Batch, transform: Batch = None, func=None, suffix: str = '') -> Batch:
         """Internal helper to scale LOS displacement by an incidence-based function (e.g., cos/sin).
 
-        Delegates like displacement_los(): ONE conversion, Batch._displacement_component(), which converts the
+        Delegates like displacement_los(): ONE conversion, Batch._displacement_component(transform, func), which converts the
         grids, passes every other variable through (N81) and takes a Batch of DataArrays directly, so
         stack.displacement_vertical(phase) is phase.displacement_vertical(stack). This used to be a copy without
         the grid filter, and raised TypeError on the burst names an unwrapped phase carries."""

@@ -7,7 +7,14 @@
 #
 # See the LICENSE file in the insardev_pygmtsar directory for license terms.
 # ----------------------------------------------------------------------------
+# N140: two bbox crops of one NISAR frame can differ on the REFERENCE date by at most 0.0036 rad
+# on 0.049 % of the common pixels (2,157 of 4,423,870 measured). The one quantity on this path that
+# depends on the crop is the Doppler centroid, taken at the centre of the crop's own radar extent
+# (nisar_doppler_centroid, called in _transform_slc_int16_nisar_chunked). The link between it and the
+# unequal pixels is not proven. A bit-reproducibility difference between crops, not an accuracy defect,
+# but it can affect tests that compare crops.
 from .Nisar_align import Nisar_align
+from .utils_satellite import nisar_granule_half_window as _granule_half_window
 # the split of an output chunk into blocks by the radar box of their pixels (shared with insardev_ecef)
 from insardev_toolkit.utils_chunks import radar_boxes as _radar_boxes
 from insardev_toolkit.utils_pool import release_workers
@@ -365,11 +372,11 @@ def _transform_slc_int16_nisar_chunked(outdir, conversion_dir, prm_rep, prm_ref,
     if remove_tidal_phase and not is_reference:
         import datetime as _dt
         def _sc_clock_to_dt(prm):
-            sc_mid = (prm.get('SC_clock_start') + prm.get('SC_clock_stop')) / 2.0
-            year = int(sc_mid // 1000)
-            doy_frac = sc_mid % 1000
-            # SC_clock carries GMTSAR's 0-based day of year: day 0.x is January 1
-            return _dt.datetime(year, 1, 1) + _dt.timedelta(days=doy_frac)
+            # SC_clock is whole seconds (year x 1000 + 0-based day + second / 86400): only the year is read from it;
+            # the day and the time of day come from clock_start and clock_stop.
+            year = int(prm.get('SC_clock_start') // 1000)
+            mid = (prm.get('clock_start') + prm.get('clock_stop')) / 2.0
+            return _dt.datetime(year, 1, 1) + _dt.timedelta(days=mid)
         tidal_dt = (_sc_clock_to_dt(prm_ref), _sc_clock_to_dt(prm_rep))
 
     # The workers rebuild the PRMs from dicts, without the orbit: tidal_phase_radar() and reference_surface_topo()
@@ -488,7 +495,7 @@ def _transform_slc_int16_nisar_chunked(outdir, conversion_dir, prm_rep, prm_ref,
         BPR = 0.0
         attrs.update(dict.fromkeys(triples, 0.0))
     else:
-        baseline = prm_ref.SAT_baseline(prm_rep)
+        baseline = prm_ref.SAT_baseline(prm_rep, search_half_window=_granule_half_window(prm_rep))
         BPR = baseline.get('B_perpendicular')
         attrs.update({name: _convert_value(baseline.get(name) + 0) for name in triples})
     attrs['BPR'] = BPR + 0
@@ -598,7 +605,7 @@ class Nisar_transform(Nisar_align):
                   alignment_spacing: float = 12.0 / 3600,
                   xcorr: tuple | int | None = (256, 256),
                   bbox: list | tuple | None = None,
-                  overwrite: bool = False,
+                  overwrite: bool = True,
                   append: bool = False,
                   n_jobs: int | None = None,
                   scheduler: str | None = None,
@@ -656,9 +663,12 @@ class Nisar_transform(Nisar_align):
             Bounding box [lon_min, lat_min, lon_max, lat_max] in WGS84 to crop
             output grid. Useful when input data was downloaded for a subregion.
         overwrite : bool, optional
-            Overwrite existing results.
+            Overwrite existing results. Default True (it was False before): a completed target is removed and
+            processed again, with a NOTE; overwrite=False keeps the completed target.
         append : bool, optional
-            Append new scenes to existing results.
+            Append new scenes to existing results. Requires overwrite=True: the existing target is kept and extended
+            (the consolidated zarr.json is written again). With overwrite=False an existing target is never modified and
+            the call skips it, with or without append.
         n_jobs : int, optional
             Number of parallel workers of every internal step: the geocoding tiles, the alignment
             (SAT_llt2rat and xcorr) and the SLC chunks. None or -1 (default): all cores.
@@ -699,228 +709,239 @@ class Nisar_transform(Nisar_align):
             reference_height = 0.0
 
         # Control library threading
-        for var in ['OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
-                    'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS']:
-            os.environ[var] = '1'
+        # and put back when the transform ends, also on an error (N156)
+        thread_vars = ['OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS',
+                       'MKL_NUM_THREADS', 'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS']
+        thread_vars_before = {var: os.environ.get(var) for var in thread_vars}
+        try:
+            for var in thread_vars:
+                os.environ[var] = '1'
 
-        if self.DEM is None:
-            raise ValueError('ERROR: DEM is not set. Please create a new instance with a DEM.')
+            if self.DEM is None:
+                raise ValueError('ERROR: DEM is not set. Please create a new instance with a DEM.')
 
-        records = self.to_dataframe(ref=ref)
+            records = self.to_dataframe(ref=ref)
 
-        # Validate and determine frequency to use
-        if frequency is not None:
-            if frequency not in ('A', 'B'):
-                raise ValueError(f"frequency must be 'A', 'B', or None, got '{frequency}'")
-            use_frequency = frequency
-        elif self.frequency is not None:
-            # Use frequency detected during __init__
-            use_frequency = self.frequency
-        else:
-            # Check what frequencies are available in input files
-            import h5py
-            from .utils_nisar import nisar_get_frequencies
-            sample_path = records['path'].iloc[0]
-            available_freqs = nisar_get_frequencies(sample_path)
-            if len(available_freqs) == 1:
-                use_frequency = available_freqs[0]
+            # Validate and determine frequency to use
+            if frequency is not None:
+                if frequency not in ('A', 'B'):
+                    raise ValueError(f"frequency must be 'A', 'B', or None, got '{frequency}'")
+                use_frequency = frequency
+            elif self.frequency is not None:
+                # Use frequency detected during __init__
+                use_frequency = self.frequency
             else:
-                raise ValueError(
-                    f"Input files contain both frequencyA and frequencyB.\n"
-                    f"Please specify frequency='A' or frequency='B' parameter:\n"
-                    f"  frequency='A': 20MHz bandwidth (~7m resolution)\n"
-                    f"  frequency='B': 5MHz bandwidth (~25m resolution)"
-                )
-
-        print(f'NOTE: Processing frequency{use_frequency}.')
-
-        if epsg is None:
-            print('NOTE: EPSG code will be computed automatically for each scene.')
-        elif isinstance(epsg, str) and epsg == 'auto':
-            from .utils_satellite import get_utm_epsg
-            import warnings
-            with warnings.catch_warnings():
-                warnings.filterwarnings('ignore', message='.*geographic CRS.*centroid.*')
-                epsgs = self.to_dataframe().centroid.apply(lambda geom: get_utm_epsg(geom.y, geom.x)).unique()
-            if len(epsgs) > 1:
-                raise ValueError(f'ERROR: Multiple UTM zones found: {", ".join(map(str, epsgs))}.')
-            epsg = epsgs[0]
-            print(f'NOTE: EPSG code computed automatically: {epsg}.')
-
-        # Get reference and repeat scenes as groups
-        refrep_dict = self.get_repref(ref=ref)
-        refreps = [v for v in refrep_dict.values()]
-
-        assert not os.path.exists(target) or os.path.isdir(target)
-        # an orbit that cannot be used raises before anything is removed or written
-        self._check_orbits(refreps, target, overwrite, append)
-        if overwrite and os.path.exists(target):
-            print(f'NOTE: Removing all previous results.')
-            shutil.rmtree(target)
-
-        metafile = os.path.join(target, 'zarr.json')
-        if os.path.exists(target):
-            # an empty metadata file raises
-            if not exists(metafile, again='run the processing'):
-                print(f'NOTE: target processing is not completed. Continuing...')
-            elif not append:
-                print(f'NOTE: target processing is completed. Skipping...')
-                return
-        # an empty metadata file of a scene raises before any scene is processed and before anything is removed
-        for scene_refs, _ in refreps:
-            exists(os.path.join(target, self.sceneId(scene_refs[0][-1]), 'zarr.json'), again='run the processing')
-        if os.path.exists(metafile):
-            os.remove(metafile)
-
-        tmpdir_base = tmpdir if tmpdir is not None else tempfile.gettempdir()
-
-        def process_scene_sequential(scenes, target, debug=False):
-            """Process a single scene group with dates processed sequentially."""
-            scene_refs = scenes[0]
-            scene_reps = scenes[1]
-            sceneId = self.sceneId(scene_refs[0][-1])
-            outdir = os.path.join(target, sceneId)
-            metafile_scene = os.path.join(outdir, 'zarr.json')
-
-            # Check if already completed
-            if os.path.exists(outdir):
-                assert os.path.isdir(outdir)
-                if exists(metafile_scene, again='run the processing'):
-                    return
+                # Check what frequencies are available in input files
+                import h5py
+                from .utils_nisar import nisar_get_frequencies
+                sample_path = records['path'].iloc[0]
+                available_freqs = nisar_get_frequencies(sample_path)
+                if len(available_freqs) == 1:
+                    use_frequency = available_freqs[0]
                 else:
-                    print(f'NOTE: {sceneId} incomplete. Removing...')
-                    shutil.rmtree(outdir)
+                    raise ValueError(
+                        f"Input files contain both frequencyA and frequencyB.\n"
+                        f"Please specify frequency='A' or frequency='B' parameter:\n"
+                        f"  frequency='A': 20MHz bandwidth (~7m resolution)\n"
+                        f"  frequency='B': 5MHz bandwidth (~25m resolution)"
+                    )
 
-            # Phase 1: Compute transform - cache PRMs
-            prm_cache = {}
-            for scene_ref in scene_refs:
-                prm, _, _ = self.align_ref(scene_ref[-1], debug=debug, return_slc=False)
-                prm_cache[scene_ref[-1]] = prm
+            print(f'NOTE: Processing frequency{use_frequency}.')
 
-            ref_scene_name = scene_refs[0][-1]
-            prm_ref_main = prm_cache[ref_scene_name]
+            if epsg is None:
+                print('NOTE: EPSG code will be computed automatically for each scene.')
+            elif isinstance(epsg, str) and epsg == 'auto':
+                from .utils_satellite import get_utm_epsg
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.filterwarnings('ignore', message='.*geographic CRS.*centroid.*')
+                    epsgs = self.to_dataframe().centroid.apply(lambda geom: get_utm_epsg(geom.y, geom.x)).unique()
+                if len(epsgs) > 1:
+                    raise ValueError(f'ERROR: Multiple UTM zones found: {", ".join(map(str, epsgs))}.')
+                epsg = epsgs[0]
+                print(f'NOTE: EPSG code computed automatically: {epsg}.')
 
-            # Compute transform and topo tile-by-tile, writing directly to zarr
-            # Never builds full arrays in memory - suitable for 12GB Colab
-            # Workers read DEM chunks from file - no full DEM in memory
-            from .utils_satellite import compute_conversion_chunked, get_utm_epsg, precise_transform_dir
-            record = self.get_record(ref_scene_name)
-            conversion_dir = os.path.join(outdir, 'conversion')
-            # epsg=None: the scene's own UTM zone, from the centroid of its reference record
-            _centroid = record.geometry.iloc[0].centroid
-            scene_epsg = epsg if epsg is not None else get_utm_epsg(_centroid.y, _centroid.x)
+            # Get reference and repeat scenes as groups
+            refrep_dict = self.get_repref(ref=ref)
+            refreps = [v for v in refrep_dict.values()]
 
-            try:
-                compute_conversion_chunked(
-                    prm_ref_main, self.DEM, record.geometry.iloc[0], outdir,
-                    scale_factor=1 / dem_vertical_accuracy,
-                    epsg=scene_epsg, resolution=resolution, bbox=bbox,
-                    compute_topo=remove_topo_phase,
-                    n_jobs=n_jobs, debug=debug, datum=self.dem_datum()
-                )
+            assert not os.path.exists(target) or os.path.isdir(target)
+            # overwrite=False keeps an existing target as it is, with or without append: nothing is modified or processed
+            if os.path.exists(target) and not overwrite:
+                print(f'NOTE: target exists and overwrite=False: skipping, nothing is modified.')
+                return
+            # an orbit that cannot be used raises before anything is removed or written
+            self._check_orbits(refreps, target, overwrite, append)
+            if overwrite and not append and os.path.exists(target):
+                print(f'NOTE: Removing all previous results (overwrite=True is the default now; overwrite=False keeps the target).')
+                shutil.rmtree(target)
 
-                # Pre-compute SC_height
-                sc_height_cache = {}
-                for scene_ref in scene_refs:
-                    scene_ref_name = scene_ref[-1]
-                    prm_ref = prm_cache[scene_ref_name]
-                    sc_height_result = prm_ref.SAT_baseline(prm_ref)
-                    sc_height_cache[scene_ref_name] = {
-                        'SC_height': sc_height_result.get('SC_height'),
-                        'SC_height_start': sc_height_result.get('SC_height_start'),
-                        'SC_height_end': sc_height_result.get('SC_height_end')
-                    }
+            metafile = os.path.join(target, 'zarr.json')
+            if os.path.exists(target):
+                # append (overwrite=True) extends the existing target; an empty metadata file raises
+                if not exists(metafile, again='run the processing'):
+                    print(f'NOTE: target processing is not completed. Continuing...')
+            # an empty metadata file of a scene raises before any scene is processed and before anything is removed
+            for scene_refs, _ in refreps:
+                exists(os.path.join(target, self.sceneId(scene_refs[0][-1]), 'zarr.json'), again='run the processing')
+            if os.path.exists(metafile):
+                os.remove(metafile)
 
-                # Phase 2: Process dates sequentially
-                all_dates = scene_reps + scene_refs
-                for scene_item in all_dates:
-                    is_reference = scene_item in scene_refs
-                    scene_ref = [s for s in scene_refs if s[:2] == scene_item[:2]][0]
-                    scene_ref_name = scene_ref[-1]
-                    scene_name = scene_item[-1]
-                    prm_ref = prm_cache[scene_ref_name]
+            tmpdir_base = tmpdir if tmpdir is not None else tempfile.gettempdir()
 
-                    # Get HDF5 path and polarization for this scene
-                    rec = self.get_record(scene_name)
-                    h5_path = rec['path'].iloc[0]
-                    pol = rec.index.get_level_values(1)[0]
+            def process_scene_sequential(scenes, target, debug=False):
+                """Process a single scene group with dates processed sequentially."""
+                scene_refs = scenes[0]
+                scene_reps = scenes[1]
+                sceneId = self.sceneId(scene_refs[0][-1])
+                outdir = os.path.join(target, sceneId)
+                metafile_scene = os.path.join(outdir, 'zarr.json')
 
-                    if is_reference:
-                        prm, _, _ = self.align_ref(scene_name, debug=debug, return_slc=False)
-                        prm = prm_ref
-                        baseline_params = None
+                # Check if already completed
+                if os.path.exists(outdir):
+                    assert os.path.isdir(outdir)
+                    if exists(metafile_scene, again='run the processing'):
+                        return
                     else:
-                        prm, _, _ = self.align_rep(scene_name, scene_ref_name, prm_ref,
-                                                    degrees=alignment_spacing, debug=debug,
-                                                    return_slc=False, xcorr=xcorr, n_jobs=n_jobs)
-                        baseline_result = prm_ref.SAT_baseline(prm)
-                        baseline_params = {
-                            'baseline_start': baseline_result.get('baseline_start'),
-                            'baseline_center': baseline_result.get('baseline_center'),
-                            'baseline_end': baseline_result.get('baseline_end'),
-                            'alpha_start': baseline_result.get('alpha_start'),
-                            'alpha_center': baseline_result.get('alpha_center'),
-                            'alpha_end': baseline_result.get('alpha_end'),
-                            'B_offset_start': baseline_result.get('B_offset_start'),
-                            'B_offset_center': baseline_result.get('B_offset_center'),
-                            'B_offset_end': baseline_result.get('B_offset_end')
+                        print(f'NOTE: {sceneId} incomplete. Removing...')
+                        shutil.rmtree(outdir)
+
+                # Phase 1: Compute transform - cache PRMs
+                prm_cache = {}
+                for scene_ref in scene_refs:
+                    prm, _, _ = self.align_ref(scene_ref[-1], debug=debug, return_slc=False)
+                    prm_cache[scene_ref[-1]] = prm
+
+                ref_scene_name = scene_refs[0][-1]
+                prm_ref_main = prm_cache[ref_scene_name]
+
+                # Compute transform and topo tile-by-tile, writing directly to zarr
+                # Never builds full arrays in memory - suitable for 12GB Colab
+                # Workers read DEM chunks from file - no full DEM in memory
+                from .utils_satellite import compute_conversion_chunked, get_utm_epsg, precise_transform_dir
+                record = self.get_record(ref_scene_name)
+                conversion_dir = os.path.join(outdir, 'conversion')
+                # epsg=None: the scene's own UTM zone, from the centroid of its reference record
+                _centroid = record.geometry.iloc[0].centroid
+                scene_epsg = epsg if epsg is not None else get_utm_epsg(_centroid.y, _centroid.x)
+
+                try:
+                    compute_conversion_chunked(
+                        prm_ref_main, self.DEM, record.geometry.iloc[0], outdir,
+                        scale_factor=1 / dem_vertical_accuracy,
+                        epsg=scene_epsg, resolution=resolution, bbox=bbox,
+                        compute_topo=remove_topo_phase,
+                        n_jobs=n_jobs, debug=debug, datum=self.dem_datum()
+                    )
+
+                    # Pre-compute SC_height
+                    sc_height_cache = {}
+                    for scene_ref in scene_refs:
+                        scene_ref_name = scene_ref[-1]
+                        prm_ref = prm_cache[scene_ref_name]
+                        sc_height_result = prm_ref.SAT_baseline(prm_ref, search_half_window=_granule_half_window(prm_ref))
+                        sc_height_cache[scene_ref_name] = {
+                            'SC_height': sc_height_result.get('SC_height'),
+                            'SC_height_start': sc_height_result.get('SC_height_start'),
+                            'SC_height_end': sc_height_result.get('SC_height_end')
                         }
 
-                    # Build record dict
-                    record_dict = {}
-                    record_reset = rec.reset_index()
-                    for col in record_reset.columns:
-                        val = record_reset[col].iloc[0]
-                        if hasattr(val, 'wkt'):
-                            record_dict[col] = val.wkt
+                    # Phase 2: Process dates sequentially
+                    all_dates = scene_reps + scene_refs
+                    for scene_item in all_dates:
+                        is_reference = scene_item in scene_refs
+                        scene_ref = [s for s in scene_refs if s[:2] == scene_item[:2]][0]
+                        scene_ref_name = scene_ref[-1]
+                        scene_name = scene_item[-1]
+                        prm_ref = prm_cache[scene_ref_name]
+
+                        # Get HDF5 path and polarization for this scene
+                        rec = self.get_record(scene_name)
+                        h5_path = rec['path'].iloc[0]
+                        pol = rec.index.get_level_values(1)[0]
+
+                        if is_reference:
+                            prm, _, _ = self.align_ref(scene_name, debug=debug, return_slc=False)
+                            prm = prm_ref
+                            baseline_params = None
                         else:
-                            record_dict[col] = val
+                            prm, _, _ = self.align_rep(scene_name, scene_ref_name, prm_ref,
+                                                        degrees=alignment_spacing, debug=debug,
+                                                        return_slc=False, xcorr=xcorr, n_jobs=n_jobs)
+                            baseline_result = prm_ref.SAT_baseline(prm, search_half_window=_granule_half_window(prm))
+                            baseline_params = {
+                                'baseline_start': baseline_result.get('baseline_start'),
+                                'baseline_center': baseline_result.get('baseline_center'),
+                                'baseline_end': baseline_result.get('baseline_end'),
+                                'alpha_start': baseline_result.get('alpha_start'),
+                                'alpha_center': baseline_result.get('alpha_center'),
+                                'alpha_end': baseline_result.get('alpha_end'),
+                                'B_offset_start': baseline_result.get('B_offset_start'),
+                                'B_offset_center': baseline_result.get('B_offset_center'),
+                                'B_offset_end': baseline_result.get('B_offset_end')
+                            }
 
-                    # Use chunked processing for memory efficiency with parallel chunks
-                    _transform_slc_int16_nisar_chunked(
-                        outdir=outdir, conversion_dir=conversion_dir,
-                        prm_rep=prm, prm_ref=prm_ref,
-                        scene_name=scene_name, record_dict=record_dict,
-                        epsg=scene_epsg, baseline_params=baseline_params,
-                        sc_height_params=sc_height_cache[scene_ref_name],
-                        remove_tidal_phase=remove_tidal_phase,
-                        remove_topo_phase=remove_topo_phase,
-                        h5_path=h5_path, pol=pol, frequency=self.frequency,
-                        n_jobs=n_jobs, debug=debug,
-                        reference_height=reference_height
-                    )
+                        # Build record dict
+                        record_dict = {}
+                        record_reset = rec.reset_index()
+                        for col in record_reset.columns:
+                            val = record_reset[col].iloc[0]
+                            if hasattr(val, 'wkt'):
+                                record_dict[col] = val.wkt
+                            else:
+                                record_dict[col] = val
+
+                        # Use chunked processing for memory efficiency with parallel chunks
+                        _transform_slc_int16_nisar_chunked(
+                            outdir=outdir, conversion_dir=conversion_dir,
+                            prm_rep=prm, prm_ref=prm_ref,
+                            scene_name=scene_name, record_dict=record_dict,
+                            epsg=scene_epsg, baseline_params=baseline_params,
+                            sc_height_params=sc_height_cache[scene_ref_name],
+                            remove_tidal_phase=remove_tidal_phase,
+                            remove_topo_phase=remove_topo_phase,
+                            h5_path=h5_path, pol=pol, frequency=self.frequency,
+                            n_jobs=n_jobs, debug=debug,
+                            reference_height=reference_height
+                        )
+                finally:
+                    # The radar-coordinate topo and the precise transform are temporary: only the dates above read them
+                    # (a completed scene is skipped on a rerun or append, an incomplete one is removed and rebuilt with a
+                    # new topo and transform), so they are removed when they are done, and after a failure too, with
+                    # their conversion directory
+                    for temp_dir in (os.path.join(conversion_dir, 'topo'), precise_transform_dir(outdir)):
+                        if os.path.exists(temp_dir):
+                            shutil.rmtree(temp_dir)
+                    if os.path.isdir(conversion_dir) and not os.listdir(conversion_dir):
+                        os.rmdir(conversion_dir)
+
+                # Cleanup and consolidate
+                del prm_cache
+                self.consolidate_metadata(target, record_id=all_dates[-1][-1])
+
+            n_scenes = len(refreps)
+            n_dates = len(refreps[0][0]) + len(refreps[0][1]) if refreps else 1
+
+            # n_jobs of every internal step (tiles, alignment and xcorr, chunks); None or -1: all cores
+            if n_jobs is None or n_jobs == -1:
+                n_jobs = os.cpu_count()
+            print(f'NOTE: Processing {n_scenes} scene(s), {n_dates} dates, chunks parallel with n_jobs={n_jobs}')
+            # the processing reads self.frequency: it is set for this call only, and restored when the call ends or raises
+            original_frequency = self.frequency
+            self.frequency = use_frequency
+            try:
+                for scenes in tqdm(refreps, desc='Transforming SLC...'.ljust(25)):
+                    process_scene_sequential(scenes, target, debug=debug)
+
+                # Consolidate zarr metadata
+                self.consolidate_metadata(target)
             finally:
-                # The radar-coordinate topo and the precise transform are temporary: only the dates above read them
-                # (a completed scene is skipped on a rerun or append, an incomplete one is removed and rebuilt with a
-                # new topo and transform), so they are removed when they are done, and after a failure too, with
-                # their conversion directory
-                for temp_dir in (os.path.join(conversion_dir, 'topo'), precise_transform_dir(outdir)):
-                    if os.path.exists(temp_dir):
-                        shutil.rmtree(temp_dir)
-                if os.path.isdir(conversion_dir) and not os.listdir(conversion_dir):
-                    os.rmdir(conversion_dir)
-
-            # Cleanup and consolidate
-            del prm_cache
-            self.consolidate_metadata(target, record_id=all_dates[-1][-1])
-
-        n_scenes = len(refreps)
-        n_dates = len(refreps[0][0]) + len(refreps[0][1]) if refreps else 1
-
-        # n_jobs of every internal step (tiles, alignment and xcorr, chunks); None or -1: all cores
-        if n_jobs is None or n_jobs == -1:
-            n_jobs = os.cpu_count()
-        print(f'NOTE: Processing {n_scenes} scene(s), {n_dates} dates, chunks parallel with n_jobs={n_jobs}')
-        # the processing reads self.frequency: it is set for this call only, and restored when the call ends or raises
-        original_frequency = self.frequency
-        self.frequency = use_frequency
-        try:
-            for scenes in tqdm(refreps, desc='Transforming SLC...'.ljust(25)):
-                process_scene_sequential(scenes, target, debug=debug)
-
-            # Consolidate zarr metadata
-            self.consolidate_metadata(target)
+                self.frequency = original_frequency
+            # the idle joblib workers keep their memory: stop them, the next parallel step starts its own
+            release_workers()
         finally:
-            self.frequency = original_frequency
-        # the idle joblib workers keep their memory: stop them, the next parallel step starts its own
-        release_workers()
+            for var, value in thread_vars_before.items():
+                if value is None:
+                    os.environ.pop(var, None)
+                else:
+                    os.environ[var] = value

@@ -212,38 +212,6 @@ def _3d_consensus(consensus):
         raise ValueError(
             f'consensus must be a whole number >= 1; got {consensus!r}')
     return ma
-def _3d_arc_offsets(window_y, window_x, cell_y=2, cell_x=8):
-    """Neighbour offsets inside the window that are not the same sample.
-
-    A pair is INADMISSIBLE when it lies inside `cell` in BOTH axes:
-    |dy| < cell_y and |dx| < cell_x. The default (2, 8) is 16 x 16 m on a
-    standalone Sentinel-1 IW grid (8 x 2 m, no upscaling) -- isotropic in
-    ground units, which a rectangular pixel grid is not.
-
-    This replaces a measured independence cell, which did not measure what its
-    name said. That estimate came from how far coherence stays high with
-    offset, and coherence stays high wherever the SCENE stays similar -- land
-    cover, terrain -- not merely across the impulse response. It therefore
-    returned cells many times the ground-range resolution, varying block to
-    block, and excluding out that far discarded real scatterers a few metres
-    apart: far more candidates survive once the exclusion is cut to the
-    resolution scale.
-
-    The window is the BOX, so the offsets run to half of it either way:
-    (16, 64) on an 8 x 2 m grid is 128 x 128 m of ground and the offsets reach
-    +-64 m. A scatterer whose only partners lie beyond that needs a bigger
-    window -- widening the reach inside a given window would just relabel the
-    argument.
-
-    A pair is INADMISSIBLE only when the two pixels touch. Such a pair is a
-    single sample measured twice, so its coherence reflects the impulse
-    response, not the ground. Oversampled copies still enter the network --
-    they are independent of any ORIGINATOR further away, and are found there.
-    """
-    return [(dy, dx)
-            for dy in range(-(window_y // 2), window_y // 2 + 1)
-            for dx in range(-(window_x // 2), window_x // 2 + 1)
-            if (dy or dx) and not (abs(dy) < cell_y and abs(dx) < cell_x)]
 
 @_numba.njit(nogil=True, cache=True)
 def _3d_ds_partners(Uv, Ub, cy, cx, fg, fyi, fxi, hy, hx,
@@ -697,44 +665,6 @@ def _3d_arcs_kernel(block, window_y, window_x, cell=(2, 8), budget=None,
     return res
 
 
-def _3d_depth(chunks, window):
-    """Halo depth per axis, and the check that the given chunks can carry it.
-
-    `chunks` is (chunks_y, chunks_x) as dask reports them. Returns
-    (depth_y, depth_x).
-
-    An arc reaches at most half the PS extent from the pixel, so half is what a
-    block must see beyond its own edge. An axis held in ONE chunk already has
-    the whole raster and needs no halo -- and asking for one raises, because
-    dask refuses a depth wider than the array.
-
-    THE CHUNKING IS THE CALLER'S AND IS NEVER CHANGED HERE, only checked --
-    and checked before `da.overlap` is reached, because that calls
-    `ensure_minimum_chunksize()`, which silently re-splits any chunk shorter
-    than the depth into lengths of its own choosing. Refusing first is what
-    keeps the layout the caller asked for.
-
-    Blocks are solved independently, so a different chunking gives a different
-    set of scatterers near the seams. That is the design, not an error: a
-    pixel at a block edge sees the neighbourhood its block affords.
-    """
-    # THE DS BOX IS THE REACH. What a block computes beyond its own edge is
-    # the neighbourhood the DS window looks over; the PS extent bounds nothing
-    # a halo can carry, since a node reaches every other node of its block.
-    wy, wx, _, _ = _3d_windows(window)
-    depth = []
-    for _cs, _w in zip((tuple(chunks[0]), tuple(chunks[1])), (wy, wx)):
-        if len(_cs) == 1:
-            depth.append(0)
-            continue
-        if min(_cs) < _w:
-            raise ValueError(f'chunk size {min(_cs)} less than processing '
-                             f'window size {_w}, enlarge chunks or decrease '
-                             f'window')
-        depth.append(_w // 2)
-    return tuple(depth)
-
-
 def _3d_windows(window):
     """(wy, wx) or (wy, wx, py, px) -> the DS box and the PS extent, validated.
 
@@ -769,130 +699,6 @@ def _3d_windows(window):
             f'by at least 2 pixels on each axis: the PS partners come from the '
             f'ring between them, and this one is empty')
     return wy, wx, py, px
-
-
-def _3d_arcs_select(U, quality, window, threshold, cell=(2, 8)):
-    """Sparse, independent, MUTUALLY CONNECTED pixels -- what the network uses.
-
-    Counting arcs per pixel says how well connected a pixel is, but not to
-    WHOM, and that distinction decides the network. Ranking candidates
-    independently and suppressing a cell box around each winner keeps only a
-    fraction of a winner's verified partners, because coherent partnership is a
-    specific pairing and independent thinning does not respect it. The
-    triangulation that follows then joins pixels never tested against each
-    other, so a node's Delaunay neighbours score far below the best partner
-    actually available to it and most of those edges fail the arc test.
-
-    Selecting here keeps the pairing, because here the partners are known. Take
-    the best-connected unblocked candidate, suppress its cell neighbourhood,
-    then test it against the candidates in its window and promote the ones that
-    PASS -- they are cell-independent by the same rule and joined to it by an
-    arc already known to work -- and carry on from them. Note the partners are
-    never inside the seed's own cell: the kernel excluded intra-cell pairs
-    before counting, so every partner is an independent sample by construction.
-
-    Same threshold and the kernel's own validity rule: no new parameter.
-
-    Returns (selection, edges): the best arc coherence at the selected pixels with
-    NaN everywhere else, and the VERIFIED pairs as (y0, x0, y1, x1) rows. The edges
-    are not a by-product to be discarded -- they are the arcs this stage proved
-    work, and re-deriving the network by triangulation instead throws them
-    away: a pixel selected here on three good close partners can be
-    triangulated to whichever nodes happen to be nearest, fail all of them, and
-    drop out with degree zero.
-    """
-    from collections import deque
-    n, ny, nx = U.shape
-    wy, wx = int(window[0]), int(window[1])
-    cy, cx = (int(cell[0]), int(cell[1])) if cell is not None else (2, 8)
-    cy_, cx_ = cy - 1, cx - 1
-    # THE SAME WHOLE-PIXEL RULE THE KERNEL USES. A pixel is inside the radar
-    # extent or it is not; out there the samples are noise. Carrying a
-    # per-PAIR valid count here would be a second, different notion of
-    # validity in the same file -- and it would let a pixel be selected on an
-    # arc to noise, which is a false positive by construction, not a weak
-    # scatterer. Two stages must not disagree about what a valid pixel is.
-    pix_ok = (np.abs(U) > 0).all(axis=0)
-    # A pixel is a candidate only if its OWN best arc reached the threshold.
-    # The growth below promotes a partner on a measured arc >= threshold, but a
-    # SEED is taken untested at _take() -- so with `quality > 0` every pixel
-    # that is not blocked becomes a point, whatever its arcs did. Ungated
-    # against planted truth, most selected pixels are decorrelated ground and
-    # few of the triangulated arcs survive the fit; gated, essentially all of
-    # them are real. The seed's best arc is itself a measured arc, so this is
-    # the same rule the growth applies, not a second parameter.
-    cand = np.isfinite(quality) & (quality >= threshold) & pix_ok
-    out = np.full((ny, nx), np.nan, dtype=np.float32)
-    edges = []
-    if not cand.any():
-        return out, np.zeros((0, 4), dtype=np.int64)
-
-    blocked = np.zeros((ny, nx), dtype=bool)
-    taken = np.zeros((ny, nx), dtype=bool)
-    owner = np.full((ny, nx), -1, dtype=np.int64)
-    ys, xs = np.where(cand)
-    # rank by the BEST ARC COHERENCE, not the arc count: of a touching
-    # group -- one sample seen several times -- the pixel whose best arc works
-    # best is the one to keep, whereas the count mostly reports how crowded
-    # that pixel's neighbourhood is
-    order = np.argsort(-quality[ys, xs], kind='stable')
-
-    def _take(y_, x_):
-        taken[y_, x_] = True
-        out[y_, x_] = quality[y_, x_]
-        sl = (slice(max(0, y_ - cy_), y_ + cy_ + 1),
-              slice(max(0, x_ - cx_), x_ + cx_ + 1))
-        # remember WHICH node covers each blocked pixel: a blocked partner is
-        # within one cell of that node, i.e. the same ground sample, so an arc
-        # verified against the partner is an arc against the node
-        owner[sl] = np.where(blocked[sl], owner[sl], y_ * nx + x_)
-        blocked[sl] = True
-
-    for p in order:
-        y0, x0 = int(ys[p]), int(xs[p])
-        if blocked[y0, x0]:
-            continue
-        _take(y0, x0)
-        q = deque([(y0, x0)])
-        while q:
-            yi, xi = q.popleft()
-            ya, yb = max(0, yi - wy // 2), min(ny, yi + wy // 2 + 1)
-            xa, xb = max(0, xi - wx // 2), min(nx, xi + wx // 2 + 1)
-            sub = cand[ya:yb, xa:xb] & ~blocked[ya:yb, xa:xb]
-            if not sub.any():
-                continue
-            ly, lx = np.where(sub)
-            gy, gx = ly + ya, lx + xa
-            keep = ~((np.abs(gy - yi) < cy) & (np.abs(gx - xi) < cx))
-            if not keep.any():
-                continue
-            gy, gx = gy[keep], gx[keep]
-            ok_ = pix_ok[gy, gx]
-            if not ok_.any():
-                continue
-            gy, gx = gy[ok_], gx[ok_]
-            g = np.abs(U[:, yi, xi].conj() @ U[:, gy, gx]) / n
-            hit = np.where(g >= threshold)[0]
-            # Only touching pixels are one sample, and the offsets excluded
-            # those already -- everything reaching here is a real partner.
-            for k in hit[np.argsort(-g[hit])]:
-                yk, xk = int(gy[k]), int(gx[k])
-                if not taken[yk, xk]:
-                    if blocked[yk, xk]:
-                        # the partner is one cell from an existing node, so it
-                        # IS that node's sample: keep the arc, against the node
-                        o = int(owner[yk, xk])
-                        if o >= 0:
-                            oy, ox = divmod(o, nx)
-                            if not ((abs(oy - yi) < cy) and (abs(ox - xi) < cx)):
-                                edges.append((yi, xi, oy, ox))
-                        continue
-                    _take(yk, xk)
-                    q.append((yk, xk))
-                edges.append((yi, xi, yk, xk))
-    E = (np.array(edges, dtype=np.int64) if edges
-         else np.zeros((0, 4), dtype=np.int64))
-    return out, E
 
 
 def _3d_arc_product(A, B):
@@ -1254,88 +1060,6 @@ def _3d_arc_fit(arc, ele2phase, t, meter2rad, max_dh=25.0, max_dv=25.0,
             np.where(bad, np.nan, seas))               # rad, complex
 
 
-def _3d_arc_fit_brute(arc, ele2phase, t, meter2rad, h_range=150.0, v_range=60.0,
-                      h_step=0.5, v_step=0.25, budget=None):
-    """Exhaustive (height, rate) scan -- the REFERENCE the ladder is checked against.
-
-    _3d_arc_fit walks a coarse-to-fine ladder and can land in the wrong basin;
-    that is not hypothetical, it happened: it returned a low coherence at a
-    wildly wrong height where a much better solution existed nearby. Nothing in
-    the ladder detects that, because a search cannot
-    report a maximum it never visited. An exhaustive scan can.
-
-    Every candidate is scored for every arc as ONE matrix product,
-
-        gamma(a, c) = |sum_d Z[d, a] conj(E[d, c])| / n_valid
-
-    with E the (dates x candidates) model bank, so it is a GEMM like the arc
-    kernel's, and a full grid over thousands of arcs stays cheap.
-
-    UNLIKE the ladder this takes a RANGE, which is a prior. That is why it is a
-    reference and not the estimator: the ladder's search window is set by the
-    baselines alone. Use it to verify, to debug a suspect pixel, or in a test
-    that asserts the ladder finds what is there.
-
-    Returns (gamma, height_rad, velocity_rad_yr), each (n_arcs,).
-    Height is radians per unit ele2phase and rate is radians per year: the
-    library works in phase throughout and only displacement_los()
-    converts to a length. `max_dh`/`max_dv` remain physical, since they
-    state what the caller wants bounded.
-    """
-    arc = np.asarray(arc)
-    if not np.iscomplexobj(arc):
-        raise TypeError(f'arc must be COMPLEX phasors, got {arc.dtype}')
-    A = np.abs(arc)
-    Z = np.where(A > 0, arc / np.where(A > 0, A, 1.0), 0).astype(np.complex64)
-    n, m = Z.shape
-    nv = np.maximum((A > 0).sum(axis=0), 1)
-    # PHASE THROUGHOUT, as `_3d_arc_fit` does -- the ranges
-    # and steps are the caller's, stated in metres and mm/yr, and converted
-    # once here so the scan, the gates and the return all speak one unit.
-    hh = np.asarray(ele2phase, dtype=np.float64)
-    tt = np.asarray(t, dtype=np.float64)
-    _m2h, _m2v = float(meter2rad), float(meter2rad) * 1e-3
-    # (-k, k+1) * step rather than arange(-range, range, step): the latter
-    # MISSES THE ORIGIN whenever the step does not divide the range -- 200 m
-    # in 3 m steps runs .. -2, 1, 4 .. -- which biases every solution by up to
-    # half a cell and silently removes the no-model candidate.
-    kh = int(np.ceil(float(h_range) / float(h_step) - 1e-9))
-    kv = int(np.ceil(float(v_range) / float(v_step) - 1e-9))
-    gh = np.arange(-kh, kh + 1) * float(h_step) * _m2h
-    gv = np.arange(-kv, kv + 1) * float(v_step) * _m2v
-    assert (gh == 0).any() and (gv == 0).any(), (
-        f'scan grid lost the origin: dh {gh[0]}..{gh[-1]} step {h_step}, '
-        f'dv {gv[0]}..{gv[-1]} step {v_step}')
-
-    best_g = np.zeros(m, np.float32)
-    best_h = np.zeros(m)
-    best_v = np.zeros(m)
-    # one velocity at a time keeps the model bank to (n x n_h): the full
-    # product would be (n x n_h n_v) and that is where the memory goes
-    cap = _3d_budget_mb(budget) * 1024 * 1024
-    hchunk = max(1, min(len(gh), int(cap // max(n * 8 * 4, 1))))
-    for v0 in gv:
-        Zv = Z * np.exp(-1j * (tt * v0))[:, None]
-        for a in range(0, len(gh), hchunk):
-            gsub = gh[a:a + hchunk]
-            E = np.exp(-1j * np.outer(hh, gsub)).astype(np.complex64)
-            sc = np.abs(Zv.T @ E) / nv[:, None]        # (m, n_h)
-            k = np.argmax(sc, axis=1)
-            g = sc[np.arange(m), k]
-            up = g > best_g
-            best_g = np.where(up, g, best_g)
-            best_h = np.where(up, gsub[k], best_h)
-            best_v = np.where(up, v0, best_v)
-    # an arc with nothing measured never rose above the zero seed; zero
-    # height at zero rate would read as a perfect no-motion answer
-    _bad = best_g <= 0.0
-    return (np.where(_bad, np.nan, best_g).astype(np.float32),
-            np.where(_bad, np.nan, best_h), np.where(_bad, np.nan, best_v))
-
-
-
-
-
 def _3d_budget_mb(budget):
     """Working-set budget in MB; None reads the dask chunk size.
 
@@ -1628,47 +1352,6 @@ def _3d_topk_per_src(score, src, nsrc, k):
                            np.asarray(src, np.int64), int(nsrc), int(k))
     out = idxs.ravel()
     return out[out >= 0]
-
-
-def _3d_reach_tiles(pos):
-    """DS candidates by tile, with the nodes that tile can reach.
-
-    `pos` is `(src_y, src_x, tgt_y, tgt_x, ry, rx, hy, hx)` in pixels: the
-    candidate and node positions, the HALF PS extent -- the same radius the
-    node-to-node arcs get from their Chebyshev query, so a DS reaches exactly
-    as far as a PS does -- and the DS window, which is the tile.
-
-    A TILE OF CANDIDATES IS ANSWERED BY ONE DENSE PRODUCT. The operand is the
-    nodes within the PS extent of the tile's own bounds, and since every pixel
-    in the tile lies inside those bounds, its whole window is inside the
-    operand: no pair in the product needs testing, and none that belongs is
-    missing. The reach the tile adds is its own half-size, and a tile is
-    counted in DS windows -- the scale the DS window is DEFINED by, the area
-    over which the atmospheric phase does not change -- so the extent and the
-    extent grown by a tile stand in the same atmosphere and the arcs mean the
-    same thing.
-
-    THE TILE IS THE DS WINDOW, and nothing else has to be decided. Larger
-    tiles reach further and so rank each candidate against more nodes, which
-    costs more than the products it saves; smaller ones cut the product into
-    pieces too thin to be worth a call. Neither margin is close, so there is
-    no size to tune and no memory to budget: a window's worth of candidates
-    against the nodes it reaches is a few megabytes whatever the block is,
-    and it falls out of the two windows the caller already declared.
-    """
-    sy, sx, ty, tx, ry, rx, wy, wx = pos
-    wy, wx = max(int(wy), 1), max(int(wx), 1)
-    kx = (sx // wx).astype(np.int64)
-    key = (sy // wy).astype(np.int64) * (int(kx.max()) + 1) + kx
-    order = np.argsort(key, kind='stable')
-    ks = key[order]
-    cut = np.flatnonzero(np.r_[True, ks[1:] != ks[:-1], True])
-    for a, b in zip(cut[:-1], cut[1:]):
-        idx = order[a:b]
-        _y, _x = sy[idx], sx[idx]
-        tsel = np.nonzero((ty >= _y.min() - ry) & (ty <= _y.max() + ry)
-                          & (tx >= _x.min() - rx) & (tx <= _x.max() + rx))[0]
-        yield idx, tsel
 
 
 def _3d_shortlist_ds_ps(Us, Ut, base_lab, nsrc, ele2phase, t, meter2rad,
@@ -2186,8 +1869,8 @@ def _3d_ps_network(U, iy, ix, date_values, *, bperp=None, window=(32, 128),
     from scipy.sparse.csgraph import connected_components
     from scipy.sparse.linalg import lsqr
     from scipy.spatial import cKDTree
-    import os as _os
-    _nth = max(1, int(threads) if threads else (_os.process_cpu_count() or 1))
+    from .utils_dask import cluster_cores
+    _nth = max(1, int(threads) if threads else cluster_cores()[1])
     _ma = _3d_consensus(consensus)
     _ii = max(1, int(iterations))
     Un = np.ascontiguousarray(U, dtype=np.complex64)
@@ -3045,7 +2728,7 @@ def _3d_ds_attach(S, cand_ds, ds_nodes, _oy, _ox, lab_out, vel_out,
             del _av
             # REACH: THE DS WINDOW, as everywhere else in the library. A
             # `window` of (wy, wx) is a BOX of that size, so its reach is
-            # +-wy//2 -- that is what `_3d_arc_offsets` ranges over for the
+            # +-wy//2 -- that is what `_3d_arcs_kernel` ranges over for the
             # DS test and what the PS ring abuts. This stage used to read it
             # as a RADIUS and search +-wy, twice as far as levels 0 and 1 for
             # the same stated window, past the separation where a differential
@@ -3423,8 +3106,8 @@ def _3d_ps_attach(scenes, q, nodes, date_values, *, spacing, bperp=None,
     with other blocks' -- so the datum crossing the seam is the point -- but
     the pixels never left their own block.
     """
-    import os as _os
-    _nth = max(1, int(threads) if threads else (_os.process_cpu_count() or 1))
+    from .utils_dask import cluster_cores
+    _nth = max(1, int(threads) if threads else cluster_cores()[1])
     _ma = _3d_consensus(consensus)
     _ii = max(1, int(iterations))
     # A VIEW IS ENOUGH: only the shape and fancy indexing are read, so the

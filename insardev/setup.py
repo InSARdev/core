@@ -69,11 +69,11 @@ setup(
                       'fsspec',
                       'tqdm',
                       'joblib',
+                      'opencv-python',
                       'uvloop'
                       ],
     extras_require={
-                      'vtk_support': ['vtk', 'panel'],
-                      'cv': ['opencv-python']
+                      'vtk_support': ['vtk', 'panel']
     },
     classifiers=[
         'Development Status :: 4 - Beta',

@@ -271,6 +271,46 @@ class Tiles(datagrid, progressbar_joblib):
 
         Parameters
         ----------
+        base_url : str
+            URL template of the provider's folder, formatted with the tile parameters (product, lat, lon, SN2, WE3 and
+            the others of _tile_params); the tile is requested from base_url/path_id/tile_id.
+        path_id : str
+            Folder of the tile below base_url, a template formatted as base_url.
+        tile_id : str
+            File name of the tile below path_id, a template formatted as base_url. With an archive it names the
+            archive file, such as '{SN2}{WE3}.nc.gz'.
+        archive : str or None
+            Archive the tile is served in: 'gz' (gzip, decompressed before the read), 'zip' (the file file_id is read
+            from it) or None (the tile is served as it is).
+        filetype : str
+            Format of the served tile: 'netcdf' (an HDF5 NetCDF4 tile, checked by its magic bytes), any other value
+            expects a GeoTIFF, and the body is read as a GeoTIFF or, otherwise, as an HGT tile.
+        geometry : object
+            The Shapely geometry, GeoPandas or Xarray object whose bounds select the 1-degree tiles to download.
+        file_id : str or None
+            Name of the raster inside the archive: the zip member read, and the stored name of the tile. None: the
+            stored name is the tile_id name, without the archive suffix when archive is set; its extension is replaced
+            by .nc.
+        product : str
+            Resolution of the tiles: '1s' (30 m) or '3s' (90 m); any other value raises an AssertionError.
+        n_jobs : int or None
+            Parallel tile downloads (joblib), at most two per CPU this process may use (a larger number is capped,
+            with a note). None runs them one after another.
+        joblib_backend : str
+            Backend of the parallel tile downloads; replaced by 'sequential' when n_jobs is None or debug is True.
+        skip_exist : bool
+            True keeps the tiles already on disk that can be read, and does not request again a tile marked missing
+            by a .missing marker that is not stale (_marker_is_stale); False downloads them again.
+        retries : int
+            Attempts per tile, the first one included; 0 makes one attempt, as 1 does (HTTP.attempts). A failure that a
+            retry cannot change (HTTP.final) is not retried.
+        timeout_second : float
+            Seconds waited between the attempts of one tile, not after the last one.
+        units : str or None
+            Units of the values, stored with each tile (utils_tiles.write_tile); None when not given.
+        debug : bool
+            Print debug information: each tile URL with its output file, and the retried failed attempts of each
+            request; with True the tiles are downloaded one after another.
         filename : str or None
             'dem.vrt': the tiles in the folder 'dem/' next to it and the VRT index over them.
             'dem.nc' is replaced by 'dem.vrt' with a warning, no single merged file is written.
@@ -615,6 +655,12 @@ class Tiles(datagrid, progressbar_joblib):
             Download attempts per tile. Default is 30.
         timeout_second : float, optional
             Seconds between attempts. Default is 3.
+        min_rate : str or float, optional
+            Bytes per second each tile download must keep, a size string such as '100KB' or a number, averaged over
+            min_rate_window seconds, or it is retried; the rate every one of the n_jobs parallel downloads must reach.
+            Default is '100KB'.
+        min_rate_window : float, optional
+            Seconds over which the rate is averaged. Default is 60.
         debug : bool, optional
             If True, prints debugging information. Default is False.
 

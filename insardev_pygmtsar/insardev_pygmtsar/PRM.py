@@ -13,7 +13,6 @@ from .PRM_gmtsar import PRM_gmtsar
 class PRM(datagrid, PRM_gmtsar):
     import numpy as np
     import pandas as pd
-    import xarray as xr
     from typing import Any, List, Union
     
     int_types = ['num_valid_az', 'num_rng_bins', 'num_patches', 'bytes_per_line', 'good_bytes_per_line', 'num_lines','SC_identity']
@@ -27,92 +26,6 @@ class PRM(datagrid, PRM_gmtsar):
             except ValueError:
                 return val
         return val
-
-    @staticmethod
-    def from_list(prm_list: list) -> "PRM":
-        """
-        Convert a list of parameter and value pairs to a PRM object.
-
-        Parameters
-        ----------
-        prm_list : list
-            A list of PRM strings.
-
-        Returns
-        -------
-        PRM
-            A PRM object.
-        """
-        from io import StringIO
-        prm = StringIO('\n'.join(prm_list))
-        return PRM._from_io(prm)
-
-    @staticmethod
-    def from_str(prm_string: str) -> "PRM":
-        """
-        Convert a string of parameter and value pairs to a PRM object.
-
-        Parameters
-        ----------
-        prm_string : str
-            A PRM string.
-
-        Returns
-        -------
-        PRM
-            A PRM object.
-        """
-        from io import StringIO
-        if isinstance(prm_string, bytes):
-            # for cases like
-            #return PRM.from_str(os.read(pipe2[0],int(10e6))
-            prm_string = prm_string.decode('utf-8')
-        # for cases like
-        # return PRM.from_str(os.read(pipe2[0],int(10e6).decode('utf8'))
-        prm = StringIO(prm_string)
-        return PRM._from_io(prm)
-
-    @staticmethod
-    def from_file(prm_filename: str) -> "PRM":
-        """
-        Convert a PRM file of parameter and value pairs to a PRM object.
-
-        Parameters
-        ----------
-        prm_filename : str
-            The filename of the PRM file.
-
-        Returns
-        -------
-        PRM
-            A PRM object.
-        """
-        #data = json.loads(document)
-        prm = PRM._from_io(prm_filename)
-        prm.filename = prm_filename
-        return prm
-
-    @staticmethod
-    def _from_io(prm: str) -> "PRM":
-        """
-        Read parameter and value pairs from IO stream to a PRM object.
-
-        Parameters
-        ----------
-        prm : IO stream
-            The IO stream.
-
-        Returns
-        -------
-        PRM
-            A PRM object.
-        """
-        import pandas as pd
-
-        df = pd.read_csv(prm, sep=r'\s+=\s+', header=None, names=['name', 'value'], engine='python').set_index('name')
-        df['value'] = df['value'].map(PRM.to_numeric_or_original)
-
-        return PRM(df)
 
     def __init__(self, prm: Union["PRM", pd.DataFrame, None]=None):
         """
@@ -384,7 +297,8 @@ class PRM(datagrid, PRM_gmtsar):
 
     def fix_aligned(self) -> "PRM":
         """
-        Correction for the range and azimuth shifts of the re-aligned SLC images (fix_prm_params() in GMTSAR)
+        Correction for the range shift of the re-aligned SLC images (fix_prm_params() in GMTSAR).
+        The clock_start and clock_stop attributes are not shifted: the span comes from them unchanged.
         """
         from scipy import constants
         # constant from GMTSAR code
@@ -395,73 +309,7 @@ class PRM(datagrid, PRM_gmtsar):
         near_range = self.get('near_range') + \
             (self.get('st_rng_bin') - self.get('chirp_ext') + self.get('rshift') + self.get('sub_int_r') - 1)* delr
     
-        SC_clock_start = self.get('SC_clock_start') + \
-            (self.get('ashift') + self.get('sub_int_a')) / (self.get('PRF') * 86400.0) + \
-            (self.get('nrows') - self.get('num_valid_az')) / (2 * self.get('PRF') * 86400.0)
-    
-        SC_clock_stop = SC_clock_start + \
-            (self.get('num_valid_az') * self.get('num_patches')) / (self.get('PRF') * 86400.0)
-    
-        return self.set(near_range=near_range,
-                        SC_clock_start=SC_clock_start,
-                        SC_clock_stop=SC_clock_stop)
-
-    # note: only one dimension chunked due to sequential file reading 
-    def read_SLC_int(self) -> xr.Dataset:
-        """
-        Read SLC (Single Look Complex) data and compute the power of the signal.
-        The method reads binary SLC data file, which contains alternating sequences of real and imaginary parts.
-        It calculates the intensity of the signal and return it as a 2D numpy array.
-
-        Returns
-        -------
-        xarray.DataArray
-            2D array representing the power of the signal. The array shape corresponds to the dimensions of the SLC data.
-
-        Notes
-        -----
-        This function uses a data factor (DFACT = 2.5e-07) from the GMTSAR code.
-        The GMTSAR note indicates that the square of the intensity is used to match gips ihconv.
-        The returned intensity data is flipped up-down ("shift data up if necessary") following the GMTSAR convention.
-
-        Raises
-        ------
-        FileNotFoundError
-            If the SLC file cannot be found.
-
-        Example
-        -------
-        >>> import numpy as np
-        >>> prm = PRM.from_file(filename)
-        >>> amp = prm.read_SLC_int()
-        """
-        import xarray as xr
-        import numpy as np
-        import os
-
-        prm = PRM.from_file(self.filename)
-        slc_filename, xdim, ydim, rshift, ashift = prm.get('SLC_file', 'num_rng_bins', 'num_valid_az', 'rshift', 'ashift')
-
-        dirname = os.path.dirname(self.filename)
-        slc_filename = os.path.join(dirname, slc_filename)
-
-        # read entire SLC file using memory mapping
-        # SLC format: [real_0, imag_0, real_1, imag_1, real_2, imag_2, ...]
-        slc_data = np.memmap(slc_filename, dtype=np.int16, mode='r')
-
-        # extract real and imaginary parts
-        total_pixels = ydim * xdim
-        re = slc_data[0:2*total_pixels:2].reshape((ydim, xdim))
-        im = slc_data[1:2*total_pixels:2].reshape((ydim, xdim))
-
-        assert re.shape == (ydim, xdim), f'Originated re shape ({ydim},{xdim}), but got {re.shape}'
-        assert im.shape == (ydim, xdim), f'Originated im width ({ydim},{xdim}), but got {im.shape}'
-
-        # the 0-based line and range sample of every pixel, the radar coordinates of both missions
-        coords = {'a': np.arange(ydim), 'r': np.arange(xdim)}
-        re = xr.DataArray(re, coords=coords, dims=['a', 'r']).rename('re')
-        im = xr.DataArray(im, coords=coords, dims=['a', 'r']).rename('im')
-        return xr.merge([re, im])
+        return self.set(near_range=near_range)
 
     def read_tops_params(self) -> dict:
         """

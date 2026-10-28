@@ -117,11 +117,23 @@ def _xcorr_batch(h5_path1, h5_path2, slc_path, patches, patch_size, min_response
 
     Parameters
     ----------
+    h5_path1 : str
+        Path of the reference scene's HDF5 file; the reference patches are read from it.
+    h5_path2 : str
+        Path of the repeat scene's HDF5 file; the repeat patches are read from it.
+    slc_path : str
+        Path of the SLC dataset inside both HDF5 files.
+    patches : list of dict
+        The xcorr patches of this batch, each a dict as described above.
+    patch_size : int
+        Edge length of the square correlation window in pixels (the Hann window is patch_size x patch_size).
     min_response : float
         Minimum correlation response threshold. Default 0.2 matches GMTSAR's SNR=20.
     cache : tuple or None
         ((rdcc_nbytes, rdcc_nslots) of the reference file, the same of the repeat file): the HDF5 chunk cache
         (_xcorr_cache); None keeps the h5py default.
+    passes : int
+        Number of re-centring passes per accepted patch (default XCORR_RECENTRE_PASSES, 3).
 
     Returns
     -------
@@ -333,7 +345,7 @@ class Nisar_align(Nisar_slc):
         prm_ref_shifted = PRM(prm_ref)
         prm_ref_shifted.orbit_df = prm_ref.orbit_df
         prm_ref_shifted.set(
-            prm_ref.sel('clock_start', 'clock_stop', 'SC_clock_start', 'SC_clock_stop')
+            prm_ref.sel('clock_start', 'clock_stop')
             + nl / prf / 86400.0
         )
         prm_ref_shifted.calc_dop_orb(earth_radius, inplace=True, debug=debug)
@@ -467,7 +479,8 @@ class Nisar_align(Nisar_slc):
         The patches cover the whole reference SLC file. Their spacing per axis is the band's base (band A every other
         window, band B touching windows), 2x denser when the file covers at most 1/2 of its full frame on that axis
         and 2x denser again at most 1/4, never closer than half the window (utils_nisar.nisar_frame_fraction: the
-        zeroDopplerTime span against a 35 s frame, the slantRange span against the frame's). Every patch accepted by
+        zeroDopplerTime span against the frame's span on the geolocation grid's zeroDopplerTime axis, the slantRange span
+        against the grid's slantRange axis). Every patch accepted by
         cv2.phaseCorrelate is re-centred 3 times (_xcorr_recentre); a patch whose re-centring stops early is skipped
         (with debug=True the skipped counts are printed). The fit is bilinear (rank 3) on a full frame, a file
         covering more than 1/2 of its frame on both axes, and a constant shift (rank 1) on any crop.

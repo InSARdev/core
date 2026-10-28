@@ -118,6 +118,10 @@ class Satellite(progressbar_joblib, datagrid):
             unreadable. Any other error reading the inputs raises too. Only a baseline that the
             orbits do not solve (ValueError or IndexError of SAT_baseline) is reported as an
             ERROR and left NaN.
+        FileNotFoundError
+            A closest approach of the repeat orbit outside its search window (satellite_baseline): the error
+            names the group and the date and the window used. For Sentinel-1 the window is half the duration
+            of the repeat burst (num_patches x num_valid_az / PRF / 2 of its PRM); Nisar: half the duration of the repeat granule (granule_duration of its PRM).
         ValueError
             An orbit that cannot be used: a Sentinel-1 orbit file that does not cover its burst or
             holds a state vector that is not finite, or a baseline that is not finite.
@@ -125,6 +129,7 @@ class Satellite(progressbar_joblib, datagrid):
         import numpy as np
         import pandas as pd
         from tqdm.auto import tqdm
+        from .utils_satellite import s1_burst_half_window, nisar_granule_half_window
 
         BPRs = pd.Series(np.nan, index=self.df.index, name='BPR')
         if 'orbit' in self.df.columns and self.df.orbit.isnull().all():
@@ -167,6 +172,9 @@ class Satellite(progressbar_joblib, datagrid):
                     # the origin is the first date and never moves: it only shifts the whole scale,
                     # so moving it would hide a defect instead of reporting one
                     origin, origin_date = names[0], name_dates[0]
+                    # Sentinel-1 (the records hold an orbit file): the closest-approach search half window is half the
+                    # repeat burst's duration from its PRM, as the transform uses it. NISAR: half the repeat granule's duration (granule_duration of its PRM).
+                    s1 = 'orbit' in records.columns
                     origins.setdefault(origin_date, []).append(group)
                     values = {}
                     for name, date in zip(names, name_dates):
@@ -177,7 +185,12 @@ class Satellite(progressbar_joblib, datagrid):
                             # FileNotFoundError, any OSError) or any other read error raises, it is no unsolved baseline
                             prm_origin, prm_name = prm_of(origin), prm_of(name)
                             try:
-                                value = float(prm_origin.SAT_baseline(prm_name).get('B_perpendicular'))
+                                window = {'search_half_window': s1_burst_half_window(prm_name) if s1 else nisar_granule_half_window(prm_name)}
+                                value = float(prm_origin.SAT_baseline(prm_name, **window).get('B_perpendicular'))
+                            except FileNotFoundError as e:
+                                # the repeat orbit has no closest approach inside its search window (satellite_baseline):
+                                # an error for this group and date, not an unsolved baseline, so it is not caught below
+                                raise FileNotFoundError(f'ERROR: {group} baseline of {date}: {e}') from e
                             except (ValueError, IndexError) as e:
                                 # the orbits do not solve it: SAT_baseline raises ValueError for a missing orbit or a
                                 # repeat orbit that does not cover the reference, IndexError for an orbit without state
@@ -397,7 +410,12 @@ class Satellite(progressbar_joblib, datagrid):
             root_dir = os.path.join(target, self.fullBurstId(record_id))
         root_store = zarr.storage.LocalStore(root_dir)
         zarr.group(store=root_store, zarr_format=3, overwrite=False)
-        zarr.consolidate_metadata(root_store)
+        import warnings
+        # Suppress zarr v3 consolidated metadata warnings: the same narrow filter as S1_transform.py:45-46 and :576-577,
+        # which document this warning as suppressed; scoped to this call only (no process-wide filter)
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', message='.*Consolidated metadata.*', category=UserWarning)
+            zarr.consolidate_metadata(root_store)
 
     def get_repref(self, ref: str) -> dict:
         """
@@ -657,13 +675,12 @@ class Satellite(progressbar_joblib, datagrid):
         if debug:
             print(f'DEBUG: DEM decimation factor={dec_factor}, decimated region={z_vals.shape[0]}x{z_vals.shape[1]}')
 
-        # Apply geoid correction (DEM heights -> WGS84 ellipsoid): the geoid of the DEM's vertical datum
-        import xarray as xr
-        from insardev_toolkit import utils_geoid
-        ortho = xr.DataArray(z_vals, coords={'lat': lat_vals, 'lon': lon_vals}, dims=('lat', 'lon'))
-        z_wgs84 = utils_geoid.ellipsoidal_height(ortho, self.dem_datum()).values.ravel()
-        del ortho
+        # DEM heights -> WGS84 ellipsoid: the geoid of the DEM's vertical datum at the points (no DEM-size geoid array);
+        # the dtype is the one utils_geoid.ellipsoidal_height() gives the heights
+        from .utils_satellite import _dem_plus_geoid
         lon_grid, lat_grid = np.meshgrid(lon_vals, lat_vals)
+        dtype = np.result_type(z_vals.dtype, np.float32) if np.issubdtype(z_vals.dtype, np.floating) else np.float32
+        z_wgs84 = _dem_plus_geoid(np.array(z_vals, dtype=dtype), lat_grid, lon_grid, self.dem_datum()).ravel()
 
         # Build topo_llt array
         topo_llt = np.column_stack([

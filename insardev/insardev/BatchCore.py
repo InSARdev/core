@@ -11,6 +11,7 @@
 from __future__ import annotations
 from . import utils_io,  utils_xarray
 import operator
+import threading
 from types import FunctionType
 import numpy as np
 import xarray as xr
@@ -340,6 +341,28 @@ def _apply_gaussian_2d_for_dask(block, weight_block=None, sigmas=None, threshold
                           device=device, pixel_sizes=pixel_sizes, skip=skip).astype(out_dtype)
 
 
+# rasterio rasterizes in memory inside warnings.catch_warnings, which is process-wide: dask threads entering it together leak its
+# NotGeoreferencedWarning to the display (rasterio 1.4.3, GDAL 3.9.3); one rasterization at a time per process keeps the values
+_GEOMETRY_MASK_LOCK = threading.Lock()
+
+
+def _geometry_mask_block(block, y=None, x=None, geoms=None, block_info=None, res=None):
+    """
+    The polygon test of one block of a burst, lazily: True where the pixel centre of the block lies inside the geometries,
+    rasterized as rio.clip does (rasterio geometry_mask, all_touched=False). The rows and columns of the block are read from
+    block_info; its transform is built from the burst's own coordinates y and x and their resolution res, so no array
+    larger than the block is built.
+    """
+    from rasterio import features
+    from rasterio.transform import Affine
+    (y0, y1), (x0, x1) = block_info[None]['array-location']
+    dx, dy = res
+    transform = Affine(dx, 0.0, x[x0] - dx / 2, 0.0, dy, y[y0] - dy / 2)
+    with _GEOMETRY_MASK_LOCK:
+        return features.geometry_mask(geoms, out_shape=(y1 - y0, x1 - x0), transform=transform,
+                                      all_touched=False, invert=True)
+
+
 class BatchCore(dict):
     """
     This class has 'pair' stack variable for the datasets in the dict and stores real values (correlation and unwrapped phase).
@@ -482,13 +505,6 @@ class BatchCore(dict):
                 f"variables are materialised: {', '.join(offenders) or 'unknown'}. "
                 f"Use .chunk('auto') to convert to dask arrays before calling {func_name}()."
             )
-
-    @staticmethod
-    def _gaussian(data_np, weight_np=None, sigma=None, truncate=4.0, threshold=0.5, device='auto',
-                  pixel_sizes=None, resolution=67.0):
-        """2D Gaussian convolution. See utils_gaussian.gaussian_numpy for full docs."""
-        from .utils_gaussian import gaussian_numpy
-        return gaussian_numpy(data_np, weight_np, sigma, truncate, threshold, device, pixel_sizes, resolution)
 
     def __init__(self, mapping: Mapping[str, xr.Dataset] | Stack | BatchComplex | None = None):
         from .Stack import Stack
@@ -909,6 +925,11 @@ class BatchCore(dict):
         """This batch's class over an operation's result, or a plain Batch (_as_class)."""
         return BatchCore._as_class(type(self), mapping, view)
 
+    def _like(self, mapping):
+        """This batch's class over `mapping` as a resample or a reduction builds it: the constructor (BatchWrap overrides it
+        to skip its wrap, see BatchWrap._like)."""
+        return type(self)(mapping)
+
     @staticmethod
     def _square_of(ds, name, key=''):
         """`<var>²` built on demand from `<var>`: a VIRTUAL VARIABLE, no
@@ -1287,7 +1308,7 @@ class BatchCore(dict):
 
         A DATASET WEIGHT MATCHES BY NAME, as a Dataset mask does: each grid of
         `data` is weighted by the weight's grid of the same name, and a grid it
-        lacks RAISES -- gaussian() and unwrap2d_snaphu() smoothed such a grid
+        lacks RAISES -- gaussian() smoothed such a grid
         unweighted and rmse() took the weight's first grid instead, without a
         word. by_name=False skips the match for a caller that weights every grid
         by one grid of the weight (Batches.coherent()). required=True raises for
@@ -1394,6 +1415,8 @@ class BatchCore(dict):
         return res
 
     def __add__(self, other):
+        if BatchCore._is_stack(other):
+            return NotImplemented
         # scalar + batch. Routed through _binary_vars like the Dataset case:
         # a bare `v + other` hits the string metadata and raises UFuncTypeError
         if isinstance(other, _SCALARS):
@@ -1438,6 +1461,8 @@ class BatchCore(dict):
         return BatchCore._binary_vars(ds, self._view({k: ds}).polyval({k: val})[k], _operator.sub)
 
     def __sub__(self, other):
+        if BatchCore._is_stack(other):
+            return NotImplemented
         # batch - scalar
         if isinstance(other, _SCALARS):
             import operator as _operator
@@ -1459,6 +1484,8 @@ class BatchCore(dict):
         return NotImplemented
 
     def __mul__(self, other):
+        if BatchCore._is_stack(other):
+            return NotImplemented
         # batch * scalar
         if isinstance(other, _SCALARS):
             import operator as _operator
@@ -1470,11 +1497,15 @@ class BatchCore(dict):
                               if k in other else self[k]) for k in keys})
 
     def __rmul__(self, other):
+        if BatchCore._is_stack(other):
+            return NotImplemented
         # scalar * batch
         return self._result({k: BatchCore._binary_vars(v, other, lambda a, b: b * a)
                            for k, v in self.items()})
 
     def __truediv__(self, other):
+        if BatchCore._is_stack(other):
+            return NotImplemented
         # batch / scalar
         if isinstance(other, _SCALARS):
             import operator as _operator
@@ -1501,6 +1532,13 @@ class BatchCore(dict):
         # BatchComplex gives a real Batch); Python had no abs() for a batch at all
         return self.abs()
 
+    @staticmethod
+    def _is_stack(other):
+        # a Stack takes part in no math (user, 2026-10-27): the binary operators return
+        # NotImplemented for it, so Python raises its own TypeError
+        from .Stack import Stack
+        return isinstance(other, Stack)
+
     def _binop(self, other, op):
         """
         generic helper for any binary operator `op(ds, other)` or `op(ds, other_ds)`
@@ -1512,6 +1550,8 @@ class BatchCore(dict):
         CONSTRUCTION, and not a phase or a unit either: a boolean result of any
         class is a plain Batch (_as_class), never wrapped into floats.
         """
+        if BatchCore._is_stack(other):
+            return NotImplemented
         if isinstance(other, _SCALARS):
             return self._result({k: BatchCore._binary_vars(ds, other, op) for k, ds in self.items()}, view=True)
         elif isinstance(other, BatchCore):
@@ -1937,7 +1977,8 @@ class BatchCore(dict):
               names, as where() takes them, and a grid without one raises
               (mask it with a DataArray: x.mask(land['VV'])); the other
               variables play no part
-            - GeoDataFrame: polygon(s) to mask by - pixels inside polygons are kept
+            - GeoDataFrame: polygon(s) to mask by - pixels inside polygons are kept; a burst the
+              polygons do not reach is left out, and no burst left raises ValueError
             A Batch of DataArrays needs no (y, x) grid: it takes the mask
             directly, as where() does -- a Dataset mask's one variable, no
             name compared -- with or without (y, x).
@@ -1966,26 +2007,74 @@ class BatchCore(dict):
 
         # Handle GeoDataFrame/GeoSeries/Geometry masking
         if isinstance(mask, (gpd.GeoDataFrame, gpd.GeoSeries, Geometry)):
-            # Extract geometry for rio.clip
+            import dask.array as da
+            import shapely
+            # the polygons, in the batch CRS
             if isinstance(mask, gpd.GeoDataFrame):
-                geom = mask.geometry
-                mask_crs = mask.crs
+                geoms, mask_crs = list(mask.geometry), mask.crs
             elif isinstance(mask, gpd.GeoSeries):
-                geom = mask
-                mask_crs = mask.crs
+                geoms, mask_crs = list(mask), mask.crs
             else:
                 # Shapely Geometry - no CRS info
-                geom = [mask]
-                mask_crs = None
-
-            # Reproject to batch CRS if needed
+                geoms, mask_crs = [mask], None
             crs = self.crs
             if crs is not None and mask_crs is not None and mask_crs != crs:
-                geom = gpd.GeoSeries(geom, crs=mask_crs).to_crs(crs)
+                geoms = list(gpd.GeoSeries(geoms, crs=mask_crs).to_crs(crs))
+            geoms = [g for g in geoms if g is not None and not g.is_empty]
+            if not geoms:
+                raise ValueError("ERROR: no burst intersects the mask.")
+            bounds = np.array([g.bounds for g in geoms])
+            minx, miny = bounds[:, :2].min(axis=0)
+            maxx, maxy = bounds[:, 2:].max(axis=0)
 
             out = {}
             for key, ds in self.items():
-                out[key] = ds.rio.clip(geom, all_touched=False)
+                # coordinates only: a burst whose extent does not meet the polygons is left out
+                xs, ys = ds.x.values, ds.y.values
+                if xs.size == 0 or ys.size == 0:
+                    continue
+                rx = (float(xs[-1]) - float(xs[0])) / (xs.size - 1) if xs.size > 1 else 0.0
+                ry = (float(ys[-1]) - float(ys[0])) / (ys.size - 1) if ys.size > 1 else 0.0
+                extent = shapely.box(float(xs.min()) - abs(rx) / 2, float(ys.min()) - abs(ry) / 2,
+                                     float(xs.max()) + abs(rx) / 2, float(ys.max()) + abs(ry) / 2)
+                if not any(shapely.intersects(extent, g) for g in geoms):
+                    continue
+
+                # crop by coordinates to the bounding box of the polygons (label slices, as crop())
+                y_asc = ys.size < 2 or ys[1] > ys[0]
+                x_asc = xs.size < 2 or xs[1] > xs[0]
+                ds = ds.sel(y=slice(miny, maxy) if y_asc else slice(maxy, miny),
+                            x=slice(minx, maxx) if x_asc else slice(maxx, minx))
+                if ds.sizes['y'] == 0 or ds.sizes['x'] == 0:
+                    continue
+                ny, nx = ds.sizes['y'], ds.sizes['x']
+                yv, xv = ds.y.values.astype(np.float64), ds.x.values.astype(np.float64)
+
+                # the polygon test per block of the cropped burst, lazy for dask variables: one mask per distinct
+                # chunking, so each variable keeps its own chunks (a numpy variable takes the one numpy mask)
+                masks = {}
+
+                def inside_of(var):
+                    chunks = dict(zip(var.dims, var.chunks)) if isinstance(var.data, da.Array) else None
+                    key = None if chunks is None else (chunks['y'], chunks['x'])
+                    if key not in masks:
+                        if key is None:
+                            masks[key] = _geometry_mask_block(None, y=yv, x=xv, geoms=geoms, res=(rx, ry),
+                                                              block_info={None: {'array-location': ((0, ny), (0, nx))}})
+                        else:
+                            masks[key] = da.zeros((ny, nx), chunks=key, dtype=bool).map_blocks(
+                                _geometry_mask_block, y=yv, x=xv, geoms=geoms, res=(rx, ry), dtype=bool)
+                    return xr.DataArray(masks[key], dims=('y', 'x'), coords={'y': ds.y, 'x': ds.x})
+
+                # the values outside the polygons are NaN, as before; the other variables pass unchanged
+                if isinstance(ds, xr.DataArray):
+                    ds = ds.where(inside_of(ds))
+                else:
+                    ds = ds.assign({name: var.where(inside_of(var)) for name, var in ds.data_vars.items()
+                                    if 'y' in var.dims and 'x' in var.dims})
+                out[key] = ds
+            if not out:
+                raise ValueError("ERROR: no burst intersects the mask.")
             return type(self)(out)
 
         # A BATCH MASK (adi < 0.4), as where() takes it: each burst by the mask of the same
@@ -2067,15 +2156,6 @@ class BatchCore(dict):
             out[key] = masked.assign({v: ds[v] for v in _meta}) if _meta else masked
         return type(self)(out)
 
-
-
-    @staticmethod
-    def _resolve_stride_static(stride, win_y, win_x):
-        if stride is None:
-            return max(1, win_y // 2), max(1, win_x // 2)
-        if isinstance(stride, (tuple, list)):
-            return max(1, int(stride[0])), max(1, int(stride[1]))
-        return max(1, int(stride)), max(1, int(stride))
 
 
     def unwrap3d(self, duration: float = 90.0, max_iter: int = 40,
@@ -2296,6 +2376,8 @@ class BatchCore(dict):
         return type(self)(out)
 
     def __pow__(self, exponent, **kwargs):
+        if BatchCore._is_stack(exponent):
+            return NotImplemented
         return self.map_da(lambda da: da**exponent, **kwargs)
 
     def power(self, **kwargs):
@@ -3052,24 +3134,21 @@ class BatchCore(dict):
     def interp(self, **kw):
         return type(self)({k: ds.interp(**kw) for k, ds in self.items()})
 
-    def interp_like(self, other: Batch, **interp_kwargs):
-        """Regrid each Dataset onto the coords of the *corresponding* Dataset in `other`."""
-        return type(self)({k: ds.interp_like(other[k], **interp_kwargs) for k, ds in self.items() if k in other})
-
     def reindex_like(self, other: Batch, **reindex_kwargs):
         return type(self)({k: ds.reindex_like(other[k], **reindex_kwargs) for k, ds in self.items() if k in other})
 
     def transpose(self, *dims, **kw):
         return type(self)({k: ds.transpose(*dims, **kw) for k, ds in self.items()})
 
-    def _restored(self, out: dict):
+    def _restored(self, out: dict, wrap: bool = True):
         """The results `out` of a reduction of this batch, each burst given back its OWN exact input chunks: along every dim
         its result keeps, a variable has the chunk tuple of the same variable of that burst's input (a stored edge block stays
         the stored one, so a later mix with the input's grid needs no rechunk). A result that already has them gets no
         rechunk. The dims of a coarsen() window are not given back: that result is in coarse units and already in the blocks
         of whole windows coarsen() made, the input's blocks scaled by the window. The reference is each burst's own input,
-        never the first burst's: a burst of ten blocks was cut into hundreds by a small first one."""
-        batch = type(self)(out)
+        never the first burst's: a burst of ten blocks was cut into hundreds by a small first one.
+        wrap=False: the results are wrapped already (the angle of a complex mean) and are not wrapped again (_like)."""
+        batch = type(self)(out) if wrap else self._like(out)
         restored = {}
         for key, res in dict.items(batch):
             obj = dict.__getitem__(self, key)
@@ -3657,6 +3736,7 @@ class BatchCore(dict):
 
         Computes optimal spatial chunk sizes so that each 2D slice (one pair/date)
         fits within the specified memory budget.
+        Prints one WARNING line per call when a data variable's output has more than 2000 chunks.
 
         Parameters
         ----------
@@ -3689,6 +3769,7 @@ class BatchCore(dict):
 
         with ctx:
             result = {}
+            most = (0, None, None)  # the largest output chunk count of a data variable: (count, variable, key)
             for k, ds in self.items():
                 # Compute spatial chunks once per burst using 8 bytes (complex64)
                 # so all variables get identical spatial chunks.
@@ -3724,11 +3805,18 @@ class BatchCore(dict):
                     else:
                         var_chunks = {'y': optimal['y'], 'x': optimal['x']}
                     rechunked_vars[var] = arr.chunk(var_chunks)
+                    n_chunks = int(np.prod(rechunked_vars[var].data.numblocks))
+                    if n_chunks > most[0]:
+                        most = (n_chunks, var, k)
                 if isinstance(ds, xr.DataArray):
                     ds = rechunked_vars[ds.name]
                 elif rechunked_vars:
                     ds = ds.assign(rechunked_vars)
                 result[k] = ds
+            # one line per call: the chunk count drives the memory of the chain, not the chunk size
+            if most[0] > 2000:
+                print(f"WARNING: chunk2d(): {most[0]} output chunks of {most[1]} in {most[2]} (more than 2000): "
+                      "use a larger budget or keep the stored chunks")
         return type(self)(result)
 
     def chunk1d(self, budget=None, chunks=-1):
@@ -4144,7 +4232,7 @@ class BatchCore(dict):
         if all(ds.sizes['y'] < yscale or ds.sizes['x'] < xscale for ds in self.values()):
             raise ValueError(f'ERROR: downsample({new_spacing[0]:g}, {new_spacing[1]:g}): every burst is smaller than one '
                              f'cell of {yscale} x {xscale} pixels. Use a smaller spacing.')
-        result = type(self)(spatial).coarsen(
+        result = self._like(spatial).coarsen(
             {'y': yscale, 'x': xscale}, boundary='trim').mean()
         for key in list(result.keys()):
             md = meta_keys.get(key)
@@ -4171,9 +4259,9 @@ class BatchCore(dict):
     
     def snapshot(self, store: str | None = None, storage_options: dict[str, str] | None = None,
                 caption: str | None = 'Snapshotting...',
-                debug=False, **kwargs):
-        # Only save if this batch has data; otherwise just open existing store
-        if len(self) > 0:
+                debug=False, overwrite: bool = True, **kwargs):
+        # Only save if this batch has data; otherwise just open existing store. overwrite=False keeps a complete store.
+        if len(self) > 0 and utils_io.write_wanted(store, storage_options, overwrite):
             utils_io.save(self, store=store, storage_options=storage_options, caption=caption,
                          debug=debug)
         return utils_io.open(store=store, storage_options=storage_options,
@@ -5765,8 +5853,8 @@ class BatchCore(dict):
         import xarray as xr
         import numpy as np
         from .Batch import BatchUnit
-        # constant 5.3 defines half-gain at filter_wavelength
-        cutoff = 5.3
+        # the cutoff defines half-gain at filter_wavelength
+        from .utils_gaussian import GAUSSIAN_CUTOFF
 
         # A WEIGHT WHERE THE WAVELENGTH GOES is the old argument order, and it
         # would otherwise reach the `wavelength <= 0` test and fail there with
@@ -5799,8 +5887,8 @@ class BatchCore(dict):
         if wavelength is None or wavelength <= 0:
             raise ValueError(
                 f'gaussian() needs a positive wavelength in metres, got {wavelength!r}')
-        sig_y = wavelength / (dy * cutoff)
-        sig_x = wavelength / (dx * cutoff)
+        sig_y = wavelength / (dy * GAUSSIAN_CUTOFF)
+        sig_x = wavelength / (dx * GAUSSIAN_CUTOFF)
         if debug:
             print(f'DEBUG: multilooking sigmas ({sig_y:.2f}, {sig_x:.2f}), wavelength {wavelength:.1f}')
         sigmas = (sig_y, sig_x)
@@ -6374,6 +6462,12 @@ class BatchCore(dict):
                 2D array of phase differences in the overlap region.
             x_coords : numpy.ndarray
                 1D array of x coordinate values for columns.
+            id1 : str
+                Burst id of the first scene of the overlap pair.
+            id2 : str
+                Burst id of the second scene of the overlap pair.
+            pair_idx : int
+                Index of the interferometric pair along the 'pair' dimension.
             """
             all_valid = diff_np.ravel()
             all_valid = all_valid[np.isfinite(all_valid)]

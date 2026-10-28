@@ -25,10 +25,20 @@ import numpy as np
 # the group attribute save() writes the data variable order in, and open() reads and removes
 _DATA_VARS_ATTR = '__data_vars__'
 
+# the reserved variable attribute save() writes the names of the datetime64 and timedelta64 attributes under, each with its
+# dtype ('datetime64[ns]' or 'timedelta64[ns]'); open() restores them from their int64 nanoseconds and removes it
+_TIME_ATTRS = '__time_attrs__'
+
 
 def _json_attrs(attrs):
-    """The attributes of a variable as Python types, for the JSON a Zarr array holds: a numpy scalar (np.float32,
-    np.int16, np.bool_) as its Python value, an array as a list, a list or tuple and a dict element by element."""
+    """The attributes of a variable, a coordinate or a group as Python types, for the JSON a Zarr node holds: a numpy scalar
+    (np.float32, np.int16, np.bool_) as its Python value, an array as a list, a list or tuple and a dict element by element.
+    A datetime64 or timedelta64 scalar or array is written as its int64 nanoseconds since 1970 (NaT as the int64 minimum)
+    and its name goes under the reserved _TIME_ATTRS with its dtype: open() restores it as a datetime64[ns] or
+    timedelta64[ns] array of the same shape (a scalar as a scalar). Another unit is converted to ns, and a value that ns
+    cannot hold exactly raises. A time value inside a list or a dict is cast as any other value."""
+    time_attrs = {}
+
     def cast(v):
         if isinstance(v, np.generic):
             return v.item()
@@ -39,7 +49,26 @@ def _json_attrs(attrs):
         if isinstance(v, dict):
             return {k: cast(x) for k, x in v.items()}
         return v
-    return {k: cast(v) for k, v in attrs.items()}
+
+    def time_ns(v):
+        """The int64 nanoseconds of a datetime64 or timedelta64 array (a 0-d array as a Python int), exact or raises."""
+        nat = np.isnat(v)
+        ns = v.astype('datetime64[ns]' if v.dtype.kind == 'M' else 'timedelta64[ns]')
+        if not np.array_equal(ns.astype(v.dtype)[~nat], v[~nat]):
+            raise ValueError(f'attribute value {v!r} cannot be stored in nanoseconds exactly')
+        return ns.astype(np.int64).tolist()
+
+    out = {}
+    for k, v in attrs.items():
+        arr = np.asarray(v) if isinstance(v, (np.datetime64, np.timedelta64, np.ndarray)) else None
+        if arr is not None and arr.dtype.kind in 'mM':
+            out[k] = time_ns(arr)
+            time_attrs[k] = 'datetime64[ns]' if arr.dtype.kind == 'M' else 'timedelta64[ns]'
+        else:
+            out[k] = cast(v)
+    if time_attrs:
+        out[_TIME_ATTRS] = time_attrs
+    return out
 
 
 def _zarr_fill_value(da):
@@ -149,9 +178,36 @@ class _TensorStoreTarget:
 #     """
 #     return snapshot(*args, store=store, storage_options=storage_options, compat=compat, interleave=True, n_jobs=n_jobs, debug=debug)
 
+def write_wanted(store, storage_options: dict[str, str] | None = None, overwrite: bool = True) -> bool:
+    """
+    True when snapshot() writes the store, False when it keeps the complete store it finds.
+
+    overwrite=True always writes. overwrite=False keeps a complete store: one whose consolidated metadata exists and opens.
+    A store without readable consolidated metadata (incomplete, broken, not zarr) is written, and a NOTE line is printed for
+    an existing path, since the store is replaced.
+    """
+    if overwrite:
+        return True
+    import os
+    if _consolidated_root(store, storage_options) is not None:
+        return False
+    if isinstance(store, str) and os.path.exists(store):
+        print(f'NOTE: {store!r} has no readable consolidated metadata (incomplete or not zarr), overwriting it', flush=True)
+    return True
+
+def _consolidated_root(store, storage_options: dict[str, str] | None = None):
+    """The root group of a store read from its consolidated metadata, or None when it is missing or unreadable."""
+    import zarr
+    try:
+        return zarr.open_consolidated(store, storage_options=storage_options, zarr_format=3, mode='r')
+    except (ValueError, KeyError, FileNotFoundError):
+        # no consolidated record, a record that does not parse (ValueError), or no store at all. Any other error (a permission, a
+        # connection of a remote store) propagates: a complete store is never overwritten because a read failed.
+        return None
+
 def snapshot(*args, store: str | None = None, storage_options: dict[str, str] | None = None,
                 caption: str | None = 'Snapshotting...',
-                debug=False, **kwargs):
+                debug=False, overwrite: bool = True, **kwargs):
     """
     Save and open a Zarr store or just open it when no data arguments are provided.
     This function wraps save(...) and open(...) functions.
@@ -168,9 +224,12 @@ def snapshot(*args, store: str | None = None, storage_options: dict[str, str] | 
         Caption for the progress bar. Default is 'Snapshotting...'.
     debug : bool, optional
         If True, print debug information. Default is False.
+    overwrite : bool, optional
+        True (default) writes the store, replacing an existing one. False keeps an existing complete store
+        (see write_wanted) and returns it opened.
     """
     # call the function without data arguments to only open existing store
-    if len(args) > 0:
+    if len(args) > 0 and write_wanted(store, storage_options, overwrite):
         save(*args, store=store, storage_options=storage_options, caption=caption,
              debug=debug, **kwargs)
     # Release input references and worker memory before opening the result
@@ -468,8 +527,11 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
         # come back, which differs between two opens of one store. Stack.to_dataframe() takes its columns by
         # position (the per-date variables after BPR), so open() restores this order.
         ds_clean.attrs[_DATA_VARS_ATTR] = [str(v) for v in ds.data_vars]
+        # the time attributes of the group and of its coordinates are written as _json_attrs writes them (int64 ns, names under _TIME_ATTRS)
+        ds_clean.attrs = _json_attrs(ds_clean.attrs)
         for coord in ds_clean.coords:
             ds_clean[coord].encoding.pop('chunks', None)
+            ds_clean[coord].attrs = _json_attrs(ds_clean[coord].attrs)
         if is_store_object:
             ds_clean.to_zarr(store=store, group=grp, mode='a', consolidated=True, zarr_format=3)
         else:
@@ -521,9 +583,18 @@ def open(store: str, storage_options: dict[str, str] | None = None,
     warnings.filterwarnings('ignore', category=UserWarning, module='zarr')
 
     # Check if store is a string path or a store object
-    is_store_object = not isinstance(store, str)
+    # a plain local path that does not exist is a missing file, not an incomplete store
+    if isinstance(store, str) and '://' not in store and not os.path.exists(store):
+        raise FileNotFoundError(f'open {store!r}: no such path')
 
-    root = zarr.open_consolidated(store, storage_options=storage_options, zarr_format=3, mode='r')
+    try:
+        # one read of the root's consolidated metadata: the tree holds every group's metadata in memory;
+        # chunks={} keeps each variable's stored zarr chunks ('auto' re-splits or merges them)
+        dt = xr.open_datatree(store, engine='zarr', consolidated=True, zarr_format=3, chunks={},
+                              backend_kwargs={'storage_options': storage_options})
+    except (ValueError, KeyError, FileNotFoundError) as e:
+        raise ValueError(f'open {store!r}: no readable consolidated metadata (zarr.json); the store is incomplete '
+                         f'or not zarr, save it again') from e
     from .Batch import Batch, BatchComplex, BatchUnit, BatchWrap
     from .Stack import Stack
     _class_map = {
@@ -543,7 +614,7 @@ def open(store: str, storage_options: dict[str, str] | None = None,
             )
         return cls
 
-    classes = [_resolve(c) for c in root.attrs.get('__class__')]
+    classes = [_resolve(c) for c in dt.attrs.get('__class__')]
     interleave = len(classes) > 1
 
     def _build(cls, dss_):
@@ -558,10 +629,10 @@ def open(store: str, storage_options: dict[str, str] | None = None,
                       f'read as Batch. Save it again to store it as Batch.', flush=True)
                 return Batch(dss_)
         return cls(dss_)
-    groups = list(root.group_keys())
+    groups = list(dt.children)
     # THE STORED COORDINATE ORDER: the 'coordinates' attribute xarray writes on each group (and pops on
     # decode), read from the consolidated metadata; nothing is added to the store
-    stored_coords = {grp: str(root[grp].attrs.get('coordinates') or '').split() for grp in groups}
+    stored_coords = {grp: str(dt[grp].attrs.get('coordinates') or '').split() for grp in groups}
 
     joblib_backend = 'sequential' if debug else 'threading'
 
@@ -569,11 +640,14 @@ def open(store: str, storage_options: dict[str, str] | None = None,
         import uuid
         import dask.array as da
         import rioxarray
-        # Use consolidated=False for subgroups - they share root's consolidated metadata
-        if is_store_object:
-            ds = xr.open_zarr(store, group=grp, storage_options=storage_options, consolidated=False, zarr_format=3)
-        else:
-            ds = xr.open_zarr(f'{store}/{grp}', storage_options=storage_options, consolidated=False, zarr_format=3)
+        # the group from the consolidated tree, read once by the open above: no metadata file per group; a copy,
+        # so the attributes popped below are not the tree's
+        ds = dt[grp].to_dataset(inherit=False).copy(deep=False)
+        # the time attributes save() wrote as int64 nanoseconds: restored as datetime64[ns] / timedelta64[ns], the reserved name removed,
+        # on the group, its variables and its coordinates
+        for attrs in [ds.attrs, *[ds.variables[v].attrs for v in ds.variables]]:
+            for name, dtype in attrs.pop(_TIME_ATTRS, {}).items():
+                attrs[name] = np.array(attrs[name], dtype=np.int64).astype(dtype)[()]
         # the variable order save() wrote; a store saved before it has none and keeps the listing order
         order = ds.attrs.pop(_DATA_VARS_ATTR, None)
         note = None
@@ -628,12 +702,9 @@ def open(store: str, storage_options: dict[str, str] | None = None,
             non_dim_coords = stored + sorted((c for c in rest if c not in stored), key=str)
             ordered = dim_coords + non_dim_coords
             if list(ds.coords) != ordered:
-                new_vars = {v: (ds[v].dims, ds[v].data, ds[v].attrs) for v in ds.data_vars}
-                new_coords = {}
-                for c in ordered:
-                    coord = ds.coords[c]
-                    new_coords[c] = (coord.dims, coord.values, coord.attrs) if coord.dims \
-                        else xr.Variable((), coord.values, coord.attrs)
+                # the Variable objects themselves: a (dims, data, attrs) tuple would drop the stored encoding
+                new_vars = {v: ds.variables[v] for v in ds.data_vars}
+                new_coords = {c: ds.variables[c] for c in ordered}
                 ds = xr.Dataset(new_vars, coords=new_coords, attrs=ds.attrs)
         return grp, ds, order is not None, note
 
@@ -664,7 +735,7 @@ def open(store: str, storage_options: dict[str, str] | None = None,
             batches.append(_build(cls, batch_dss))
         return Batches(batches)
     result = _build(classes[0], dss)
-    wrapper_name = root.attrs.get('__wrapper__')
+    wrapper_name = dt.attrs.get('__wrapper__')
     if wrapper_name is not None:
         from .Batch import Batches
         _wrapper_map = {'Batches': Batches}

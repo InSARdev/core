@@ -38,15 +38,16 @@ setup(
     author='Alexey Pechnikov',
     author_email='alexey@pechnikov.dev',
     license='BSD-3-Clause',
-    # the data folder of the EGM2008 and EGM96 geoid grids, with their README, LICENSE and the programs that wrote
-    # the two grids (documentation, not imported), is listed as a (namespace) package so setuptools ships it without
-    # ambiguity (see insardev_toolkit/data/geoid/README.md)
-    packages=['insardev_toolkit', 'insardev_toolkit.data.geoid'],
+    # data folders (documentation and inputs of the tables and grids, not imported): data/geoid, data/mapping
+    packages=['insardev_toolkit', 'insardev_toolkit.data.geoid', 'insardev_toolkit.data.mapping'],
     include_package_data=True,
     package_data={'insardev_toolkit.data.geoid': ['*.nc', 'README.md', 'LICENSE', 'egm2008_2.5min.py',
-                                                  'egm96_7.5min.py']},
+                                                  'egm96_7.5min.py'],
+                  'insardev_toolkit.data.mapping': ['*.txt', 'README.md', 'LICENSE', 'mapping_tables.py']},
     install_requires=['xarray>=2024.1.0',
                       'numpy',
+                      'numba',
+                      'llvmlite',
                       'pandas>=2.2',
                       'geopandas',
                       'distributed>=2024.1.0',
@@ -66,10 +67,19 @@ setup(
                       'h5netcdf',
                       'hdf5plugin>=4.1.0',
                       'imagecodecs',
-                      'requests'
+                      'requests',
+                      'scipy',
+                      'pyproj',
+                      'affine',
+                      'numcodecs',
+                      'urllib3',
+                      'tornado',
+                      'fsspec',
+                      'aiohttp',
+                      'ipython'
                       ],
     extras_require={
-                      'vtk_support': ['vtk', 'panel']
+                      'vtk_support': ['vtk', 'panel', 'pyvista', 'trame']
     },
     classifiers=[
         'Development Status :: 4 - Beta',

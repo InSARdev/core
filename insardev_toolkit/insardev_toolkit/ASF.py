@@ -448,7 +448,9 @@ class ASF(progressbar_joblib):
         Returns
         -------
         bool
-            True if all 4 files exist and are regular files. An empty one raises.
+            True if all files of the burst exist and are regular files: the 4 of the burst, and for an IW1 or IW3 burst
+            its IW2 annotation (annotation/<name>.xml with the burst name changed to IW2), which a burst downloaded
+            before lacks (ASF fetches the burst again). An empty one raises.
         """
         import os
         from glob import glob
@@ -478,6 +480,9 @@ class ASF(progressbar_joblib):
             os.path.join(burst_dir, 'calibration', f'{burst}.xml'),
             os.path.join(burst_dir, 'noise', f'{burst}.xml'),
         ]
+        # the IW2 annotation of an IW1 or IW3 burst: the burst name with its subswath token changed to IW2
+        if parts[2] in ('IW1', 'IW3'):
+            files.append(os.path.join(burst_dir, 'annotation', '_'.join(parts[:2] + ['IW2'] + parts[3:]) + '.xml'))
 
         # Check all files: exist and regular file; every one is checked, so that an empty one raises
         present = [exists(filepath) and os.path.isfile(filepath) for filepath in files]
@@ -587,6 +592,14 @@ class ASF(progressbar_joblib):
 
         Supports both Sentinel-1 bursts and NISAR RSLC granules. Mission is auto-detected
         from ID format.
+
+        Sentinel-1 bursts of subswaths IW1 and IW3 also get the annotation of the IW2 product of the scene, from the
+        burst manifest, in the burst folder as annotation/<name>.xml, where <name> is the burst name with the subswath
+        token changed to IW2: S1_135523_IW1_20221016T015057_VV_6681-BURST gets
+        annotation/S1_135523_IW2_20221016T015057_VV_6681-BURST.xml. An IW2 burst gets no such file. When the manifest
+        holds no IW2 product, a WARNING is printed and the file is not stored. The file is mandatory for ASF: a burst
+        folder without it is incomplete, and a rerun over it (skip_exist=True) fetches the burst again, which adds that
+        file when the manifest holds the IW2 product. CDSE does not need the file (see CDSE.download).
 
         Parameters
         ----------
@@ -776,11 +789,36 @@ class ASF(progressbar_joblib):
 
         Parameters
         ----------
+        basedir : str
+            Output directory; each burst is written into its own folder under it.
         bursts : list
             List of S1 burst IDs.
         polarizations : list or None
             If None, use polarization from burst name.
             If list, replace polarization in burst name with each requested pol.
+        session : asf_search.ASFSession or requests.Session
+            Session that every burst request is sent through (send(session.get, ...)), created by download().
+        n_jobs : int or None
+            Parallel burst downloads (joblib), at most two per CPU this process may use (a larger number is capped,
+            with a note). None gives the Sentinel-1 default of 8.
+        joblib_backend : str
+            Backend of the parallel burst downloads; replaced by 'sequential' when debug is True.
+        skip_exist : bool
+            True skips the bursts whose four files already exist (_burst_exists); False downloads them again.
+            When no burst is missing, no network request is made.
+        retries : int
+            Attempts per burst, the first one included; 0 makes one attempt, as 1 does (HTTP.attempts). A failure
+            that a retry cannot change (HTTP.final, such as HTTP 404) is not retried.
+        timeout_second : float
+            Seconds waited between the attempts of one burst, not after the last one.
+        min_rate : str or float
+            Bytes per second each burst request (the manifest and the TIFF) must keep, a size string such as '100KB'
+            or a number, averaged over min_rate_window seconds from its first byte, or the request is retried
+            (HTTP.read_body).
+        min_rate_window : float
+            Seconds over which the rate is averaged.
+        debug : bool
+            Print debug information of the burst requests; with True the bursts are downloaded one after another.
         """
         # S1-specific default: 8 parallel jobs
         if n_jobs is None:
@@ -788,7 +826,7 @@ class ASF(progressbar_joblib):
 
         import rioxarray as rio
         from tifffile import TiffFile
-        from .utils_S1 import measurement_path, slc_shape, tiff_data_offset, write_slc, burst_xmls, PAIRS_TIFF_OFFSET
+        from .utils_S1 import measurement_path, slc_shape, tiff_data_offset, write_slc, burst_xmls, iw2_annotation_xml, PAIRS_TIFF_OFFSET
         from .utils_files import exists, EmptyFileError, write_file
         from .HTTP import final, attempts, send, read_body
         import xmltodict
@@ -858,6 +896,11 @@ class ASF(progressbar_joblib):
             nc_file = os.path.join(tif_dir, f'{burst}.nc')
             tif_file = measurement_path(tif_dir, burst)
             #print ('tif_file', tif_file)
+            # the IW2 annotation of an IW1 or IW3 burst, named as the burst with its subswath token changed to IW2
+            burst_parts = burst.split('_')
+            iw2_file = None
+            if subswath in ('IW1', 'IW3'):
+                iw2_file = os.path.join(xml_annot_dir, '_'.join(burst_parts[:2] + ['IW2'] + burst_parts[3:]) + '.xml')
             for dirname in [burst_dir, tif_dir, xml_annot_dir, xml_noise_dir, xml_calib_dir]:
                 os.makedirs(dirname, exist_ok=True)
 
@@ -870,7 +913,8 @@ class ASF(progressbar_joblib):
 
             # check if all files already exist; every one is checked before any download, so that an empty one raises
             xml_exist = [exists(filepath) for filepath in (xml_file, xml_noise_file, xml_calib_file)]
-            all_exist = measurement_exists() and all(xml_exist)
+            iw2_exist = iw2_file is None or exists(iw2_file)
+            all_exist = measurement_exists() and all(xml_exist) and iw2_exist
 
             if all_exist:
                 # validate existing measurement dimensions using local annotation XML
@@ -913,9 +957,19 @@ class ASF(progressbar_joblib):
             # check XML file validity by parsing it
             _ = ElementTree.fromstring(xml_content)
 
-            subswathidx = int(subswath[-1:]) - 1
             metadata = xmltodict.parse(xml_content)['burst']['metadata']
-            content = metadata['product'][subswathidx]
+
+            def of_subswath(kind):
+                # the item (product, noise or calibration) of this burst's subswath, found by the swath its own annotation
+                # names: the position in the list is not the subswath, as a manifest may lack the IW2 product
+                items = [item for item in (metadata[kind] if isinstance(metadata[kind], list) else [metadata[kind]])
+                         if item['content'].get('adsHeader', {}).get('swath') == subswath]
+                if len(items) != 1:
+                    raise Exception(f'ERROR: The burst manifest holds {len(items)} {kind} annotations of {subswath} for {burst}; '
+                                    f'one is expected.')
+                return items[0]
+
+            content = of_subswath('product')
             assert polarization == content['polarisation'], 'ERROR: XML polarization differs from burst polarization'
             annotation = content['content']
 
@@ -1003,15 +1057,23 @@ class ASF(progressbar_joblib):
 
             if not all(xml_exist):
                 # the XMLs of the burst, as every source writes them (utils_S1.burst_xmls); the byteOffset is that of
-                # the measurement stored: the .nc written below, or the existing one
+                # the measurement stored: the .nc written below, or the existing one. An XML that exists is kept as it is.
                 byte_offset = PAIRS_TIFF_OFFSET if tiff_bytes is not None else tiff_data_offset(tif_file)
                 parts = {}
                 for kind in ('noise', 'calibration'):
-                    content = metadata[kind][subswathidx]
+                    content = of_subswath(kind)
                     assert polarization == content['polarisation'], 'ERROR: XML polarization differs from burst polarization'
                     parts[kind] = content['content']
-                xml_contents[xml_file], xml_contents[xml_noise_file], xml_contents[xml_calib_file] = \
-                    burst_xmls(annotation, parts['noise'], parts['calibration'], burstIndex, byte_offset)
+                built = burst_xmls(annotation, parts['noise'], parts['calibration'], burstIndex, byte_offset)
+                for filepath, present, content in zip((xml_file, xml_noise_file, xml_calib_file), xml_exist, built):
+                    if not present:
+                        xml_contents[filepath] = content
+            # the IW2 annotation, when the burst lacks it: from the manifest, which holds the IW2 product; none when the
+            # manifest has none (a WARNING from iw2_annotation_xml)
+            if iw2_file is not None and not iw2_exist:
+                iw2_content = iw2_annotation_xml(metadata, polarization)
+                if iw2_content is not None:
+                    xml_contents[iw2_file] = iw2_content
 
             # All validations passed - write to temp files then atomic rename.
             # This guarantees no partial files on disk if interrupted mid-write.
@@ -1503,6 +1565,41 @@ class ASF(progressbar_joblib):
         frequency : str
             'A' for frequencyA (20 MHz, high resolution).
             'B' for frequencyB (5 MHz, 4x less data, for quick look).
+        basedir : str
+            Output directory; the files of each granule go into its subfolder track_frame under it.
+        bbox : tuple or None
+            Bounding box (west, south, east, north) in WGS84. With it only the byte ranges of the chunks overlapping
+            the box are downloaded, and the file is cropped to the radar extent of the box (crop_info); None downloads
+            the full frame.
+        session : asf_search.ASFSession or requests.Session
+            Not used by the NISAR download: each granule opens its own session with the ASF login (_get_asf_session).
+            Kept for the signature shared with the Sentinel-1 download.
+        n_jobs : int or None
+            Without a username (the cache-proxy path) the number of parallel joblib workers for the blocks and small
+            chunks, at most two per CPU (HTTP.download_jobs); 1 or debug downloads them sequentially. With a username
+            the granules are downloaded one after another whatever the value. None is set to the NISAR default of 4
+            first.
+        joblib_backend : str
+            Not read by the NISAR download: the cache-proxy path picks its own backend (loky, or sequential for
+            n_jobs 1 or debug), and the credential path starts no joblib pool. Kept for the signature shared with the
+            Sentinel-1 download.
+        skip_exist : bool
+            True skips the polarization files that exist (ASF._nisar_exists), and a granule whose files all exist is
+            not downloaded; False downloads them again.
+        retries : int
+            Attempts per granule, the first one included; 0 makes one attempt, as 1 does (HTTP.attempts). A failure
+            that a retry cannot change (HTTP.final), a format error (ValueError) and an empty file (EmptyFileError)
+            are not retried.
+        timeout_second : float
+            Seconds waited between the attempts of one granule, not after the last one.
+        min_rate : str or float
+            Bytes per second each byte-range request of a granule (the metadata read and the data ranges) must keep,
+            a size string such as '100KB' or a number, averaged over min_rate_window seconds from its first byte, or
+            the request is retried (HTTP.read_body).
+        min_rate_window : float
+            Seconds over which the rate is averaged.
+        debug : bool
+            Print debug information of the granules; with True the granules are downloaded one after another.
         """
         # NISAR-specific default: 4 parallel jobs (optimal for Colab with decompression)
         if n_jobs is None:
@@ -1603,12 +1700,24 @@ class ASF(progressbar_joblib):
 
             Parameters
             ----------
+            url : str
+                URL of the granule's HDF5 file; the byte-range requests go to it, unless signed_url is given.
             chunk_info : dict
                 Output from _nisar_get_chunk_info()
             bbox_info : dict
                 Output from _nisar_bbox_to_pixel_indices()
             freq : str
                 'A' or 'B' (to look up correct rg_start/rg_end keys)
+            auth_tuple : tuple
+                (user, password) for the basic-auth byte-range request, used when neither signed_url nor http_session
+                is given.
+            pbar : tqdm or None
+                Progress bar updated with the bytes received; None shows no progress.
+            http_session : requests.Session or None
+                Session that reuses its connection for the byte-range requests.
+            signed_url : str or None
+                Signed URL the byte-range requests go to directly, without the OAuth redirect. None: the first request
+                goes to url, and with http_session the CloudFront URL it is redirected to is returned for the next call.
             gap_threshold : int
                 Maximum gap in bytes to merge (default 16MB)
 
@@ -2012,6 +2121,10 @@ class ASF(progressbar_joblib):
         from .HTTP import final, attempts, send, read_body, MAGIC_HDF5
 
         MAX_BLOCK = 128 * 1024 * 1024  # 128 MB max block
+        # Minimum total of a multi-range request (.../ranges.bin), the proxy's own message: "Total size 426567 below min 1048576".
+        # A block below it is fetched chunk by chunk with the single-range form (.../OFFSET/LENGTH.bin): measured on 2026-10-12,
+        # the proxy answers the two chunks of the failing block (228477 and 198090 bytes) with HTTP 200.
+        MIN_MULTI_BLOCK = 1024 * 1024  # 1 MB
 
         # 25x25km aligned block constants (for cache efficiency)
         # 512 pixels × 4.46m = 2.28km azimuth, 512 pixels × 9.44m = 4.83km range
@@ -2374,7 +2487,7 @@ class ASF(progressbar_joblib):
                         rg_start = bbox_info.get('rg_chunk_start_a', 0)
                         rg_end = bbox_info.get('rg_chunk_end_a', ci_a['n_rg'])
                         for block in chunks_to_bbox_blocks(ci_a, az_start, az_end, rg_start, rg_end):
-                            if block['total_size'] <= MAX_MULTI_BLOCK:
+                            if MIN_MULTI_BLOCK <= block['total_size'] <= MAX_MULTI_BLOCK:
                                 offsets_str = ','.join(f"{off}_{size}" for off, size in block['chunks'])
                                 blocks_to_download.append((offsets_str, block['total_size'], block['chunks']))
                             else:
@@ -2384,7 +2497,7 @@ class ASF(progressbar_joblib):
                         rg_start = bbox_info.get('rg_chunk_start_b', 0)
                         rg_end = bbox_info.get('rg_chunk_end_b', ci_b['n_rg'])
                         for block in chunks_to_bbox_blocks(ci_b, az_start, az_end, rg_start, rg_end):
-                            if block['total_size'] <= MAX_MULTI_BLOCK:
+                            if MIN_MULTI_BLOCK <= block['total_size'] <= MAX_MULTI_BLOCK:
                                 offsets_str = ','.join(f"{off}_{size}" for off, size in block['chunks'])
                                 blocks_to_download.append((offsets_str, block['total_size'], block['chunks']))
                             else:
@@ -2393,7 +2506,7 @@ class ASF(progressbar_joblib):
                     # Full download: use cache-aligned blocks
                     if ci_a:
                         for block in chunks_to_aligned_blocks(ci_a):
-                            if block['total_size'] <= MAX_MULTI_BLOCK:
+                            if MIN_MULTI_BLOCK <= block['total_size'] <= MAX_MULTI_BLOCK:
                                 offsets_str = ','.join(f"{off}_{size}" for off, size in block['chunks'])
                                 blocks_to_download.append((offsets_str, block['total_size'], block['chunks']))
                             else:
@@ -2401,7 +2514,7 @@ class ASF(progressbar_joblib):
 
                     if ci_b:
                         for block in chunks_to_aligned_blocks(ci_b):
-                            if block['total_size'] <= MAX_MULTI_BLOCK:
+                            if MIN_MULTI_BLOCK <= block['total_size'] <= MAX_MULTI_BLOCK:
                                 offsets_str = ','.join(f"{off}_{size}" for off, size in block['chunks'])
                                 blocks_to_download.append((offsets_str, block['total_size'], block['chunks']))
                             else:
@@ -2415,13 +2528,17 @@ class ASF(progressbar_joblib):
                           f"size: {min(sizes_mb):.1f}-{max(sizes_mb):.1f}MB (avg {sum(sizes_mb)/len(sizes_mb):.1f}MB)")
 
                 total_size = sum(blk[1] for blk in blocks_to_download) + sum(c[1] for c in small_chunks_to_download)
-                block_data = {}  # {chunk_offset: chunk_bytes}
                 cache_hits = 0
                 cache_misses = 0
-
+                out_name = f"NSR_{track:03d}_{frame:03d}_{datetime_str}_{pol}.h5"
+                out_path = os.path.join(out_dir, out_name)
+                # The chunks are written to the output at its temporary name as the blocks arrive, and each block's bytes are
+                # released after its chunks are written; the output is renamed to its final name when complete.
                 with tqdm(desc=f"NSR_{track:03d}_{frame:03d}_{datetime_str}_{pol}",
                           total=total_size, unit='B', unit_scale=True, unit_divisor=1024,
-                          smoothing=0) as pbar:
+                          smoothing=0) as pbar, \
+                        self._nisar_stream_writer(out_path, pol, ci_a, ci_b,
+                                                  lambda: self._read_nisar_metadata_direct(pol, meta_buf), bbox_info) as write:
 
                     # Download blocks via multi-offset API
                     if blocks_to_download:
@@ -2437,10 +2554,13 @@ class ASF(progressbar_joblib):
                             pbar.update(total_sz)
                             pbar.set_postfix_str(f"H{cache_hits}M{cache_misses}")
                             # Extract chunks - worker returns them concatenated in order
+                            pairs = []
                             pos = 0
                             for chunk_off, chunk_size in chunks:
-                                block_data[chunk_off] = data[pos:pos + chunk_size]
+                                pairs.append((chunk_off, data[pos:pos + chunk_size]))
                                 pos += chunk_size
+                            write(pairs)
+                            del data, pairs
 
                     # Download small chunks via single-block API
                     if small_chunks_to_download:
@@ -2450,49 +2570,12 @@ class ASF(progressbar_joblib):
                         )
                         for off, size, data in results:
                             pbar.update(size)
-                            block_data[off] = data
+                            write([(off, data)])
+                            del data
 
-                # the idle joblib workers keep their memory: stop them, the next parallel step starts its own
-                release_workers()
-                # Write file for this pol immediately
-                out_name = f"NSR_{track:03d}_{frame:03d}_{datetime_str}_{pol}.h5"
-                out_path = os.path.join(out_dir, out_name)
-                metadata = self._read_nisar_metadata_direct(pol, meta_buf)
-
-                def extract_chunks_from_data(ci, freq_label=''):
-                    if not ci:
-                        return None
-                    # Extract downloaded chunks — with bbox, only a subset is present
-                    result = {}
-                    empty = 0
-                    for c in ci['chunks']:
-                        if c['offset'] in block_data:
-                            chunk_bytes = block_data[c['offset']]
-                            if len(chunk_bytes) == 0:
-                                empty += 1
-                            result[c['offset']] = chunk_bytes
-                    if empty > 0:
-                        raise ValueError(
-                            f"freq{freq_label} {pol}: {empty} empty chunks")
-                    if len(result) == 0:
-                        raise ValueError(
-                            f"freq{freq_label} {pol}: no chunks downloaded "
-                            f"(0 of {len(ci['chunks'])} in block_data)")
-                    return result
-
-                data_a = extract_chunks_from_data(ci_a, 'A')
-                data_b = extract_chunks_from_data(ci_b, 'B')
-
-                self._write_nisar_pol_h5_from_bytes(
-                    data_a, ci_a, metadata, pol, out_path,
-                    track, frame, datetime_str, False,
-                    downloaded_data_b=data_b, chunk_info_b=ci_b,
-                    crop_info=bbox_info
-                )
+                    # the idle joblib workers keep their memory: stop them, the next parallel step starts its own
+                    release_workers()
                 all_downloaded.append(out_name)
-
-                # Free memory before next pol
-                del block_data
 
             # Free metadata buffer after all pols done
             del meta_buf
@@ -2694,6 +2777,278 @@ class ASF(progressbar_joblib):
 
         return c
 
+    @staticmethod
+    def _nisar_stream_writer(out_path, pol, chunk_info_a, chunk_info_b, get_metadata, crop_info=None):
+        """Write one polarization of a NISAR HDF5 file to out_path + '.tmp' as its chunks arrive, then rename it to out_path.
+
+        Returns a context manager whose value is write(pairs): pairs is an iterable of (chunk_offset, chunk_bytes). Each chunk of the
+        output is written to the file at once, so its bytes are not kept; a chunk outside the output (outside the crop) is ignored.
+        The output datasets are created on entry. On a normal exit the metadata is written, the file is validated and renamed to
+        out_path (os.replace). On an exception the temporary file is removed and nothing is written under out_path.
+
+        Parameters
+        ----------
+        out_path : str
+            The final file name.
+        pol : str
+            Polarization, e.g. 'HH'.
+        chunk_info_a, chunk_info_b : dict or None
+            Chunk metadata from get_chunk_info() for frequencyA and frequencyB; None when that frequency is not written.
+        get_metadata : callable
+            Returns ALL metadata from _read_nisar_metadata_direct(), called on a normal exit (after the chunks, as the
+            metadata is read after the downloads).
+        crop_info : dict, optional
+            The bbox crop: the output is cropped to chunk-aligned bounds, and the identification times to the crop's lines.
+        """
+        import contextlib
+        import os
+        import h5py
+
+        def stream():
+            has_freq_a = chunk_info_a is not None
+            has_freq_b = chunk_info_b is not None
+            tmp_path = out_path + '.tmp'
+            try:
+                with h5py.File(tmp_path, 'w') as h5_out:
+                    # Calculate chunk-aligned crop extents if cropping
+                    crop_az_start, crop_az_end = 0, None
+                    crop_rg_start_a, crop_rg_end_a = 0, None
+                    crop_rg_start_b, crop_rg_end_b = 0, None
+
+                    if crop_info:
+                        # Get chunk-aligned bounds (full chunks, not pixels)
+                        if has_freq_a:
+                            chunk_az = chunk_info_a['chunk_shape'][0]
+                            chunk_rg = chunk_info_a['chunk_shape'][1]
+                            # Align to chunk boundaries
+                            crop_az_start = (crop_info['az_start'] // chunk_az) * chunk_az
+                            crop_az_end = ((crop_info['az_end'] + chunk_az - 1) // chunk_az) * chunk_az
+                            # Only set freqA crop bounds if they exist in crop_info
+                            if 'rg_start_a' in crop_info:
+                                crop_rg_start_a = (crop_info['rg_start_a'] // chunk_rg) * chunk_rg
+                                crop_rg_end_a = ((crop_info['rg_end_a'] + chunk_rg - 1) // chunk_rg) * chunk_rg
+                        if has_freq_b:
+                            chunk_az_b = chunk_info_b['chunk_shape'][0]
+                            chunk_rg_b = chunk_info_b['chunk_shape'][1]
+                            if crop_az_start == 0:  # Not set by freqA
+                                crop_az_start = (crop_info['az_start'] // chunk_az_b) * chunk_az_b
+                                crop_az_end = ((crop_info['az_end'] + chunk_az_b - 1) // chunk_az_b) * chunk_az_b
+                            # Only set freqB crop bounds if they exist in crop_info
+                            if 'rg_start_b' in crop_info:
+                                crop_rg_start_b = (crop_info['rg_start_b'] // chunk_rg_b) * chunk_rg_b
+                                crop_rg_end_b = ((crop_info['rg_end_b'] + chunk_rg_b - 1) // chunk_rg_b) * chunk_rg_b
+
+                    wanted = {}   # chunk offset -> (dataset, coordinate in the output, frequency label)
+                    written = {}  # frequency label -> chunks written
+
+                    # 1. frequencyA SLC if available: the dataset now, its chunks as they arrive
+                    if has_freq_a:
+                        orig_shape = chunk_info_a['shape']
+                        chunk_shape = chunk_info_a['chunk_shape']
+                        dtype = chunk_info_a['dtype']
+                        compression = chunk_info_a['compression']
+                        compression_opts = chunk_info_a['compression_opts']
+                        shuffle = chunk_info_a.get('shuffle', False)
+
+                        # Calculate output shape (cropped or full)
+                        if crop_info:
+                            out_shape = (min(crop_az_end, orig_shape[0]) - crop_az_start,
+                                         min(crop_rg_end_a, orig_shape[1]) - crop_rg_start_a)
+                        else:
+                            out_shape = orig_shape
+
+                        dst_slc = h5_out.create_dataset(
+                            f'science/LSAR/RSLC/swaths/frequencyA/{pol}',
+                            shape=out_shape, dtype=dtype, chunks=chunk_shape,
+                            compression=compression, compression_opts=compression_opts,
+                            shuffle=shuffle
+                        )
+
+                        for chunk in chunk_info_a['chunks']:
+                            row, col = chunk['row'], chunk['col']
+                            orig_coord = chunk['coord']  # (row_idx * chunk_az, col_idx * chunk_rg)
+
+                            # Skip chunks outside crop area
+                            if crop_info:
+                                pixel_row = row * chunk_shape[0]
+                                pixel_col = col * chunk_shape[1]
+                                if pixel_row < crop_az_start or pixel_row >= crop_az_end:
+                                    continue
+                                if pixel_col < crop_rg_start_a or pixel_col >= crop_rg_end_a:
+                                    continue
+                                # Adjust coord for cropped output
+                                new_coord = (pixel_row - crop_az_start, pixel_col - crop_rg_start_a)
+                            else:
+                                new_coord = orig_coord
+                            wanted[chunk['offset']] = (dst_slc, new_coord, 'A')
+
+                    # 2. frequencyB SLC if available
+                    if has_freq_b:
+                        orig_shape_b = chunk_info_b['shape']
+                        chunk_shape_b = chunk_info_b['chunk_shape']
+                        dtype_b = chunk_info_b['dtype']
+                        compression_b = chunk_info_b['compression']
+                        compression_opts_b = chunk_info_b['compression_opts']
+                        shuffle_b = chunk_info_b.get('shuffle', False)
+
+                        # Calculate output shape (cropped or full)
+                        if crop_info:
+                            out_shape_b = (min(crop_az_end, orig_shape_b[0]) - crop_az_start,
+                                           min(crop_rg_end_b, orig_shape_b[1]) - crop_rg_start_b)
+                        else:
+                            out_shape_b = orig_shape_b
+
+                        dst_slc_b = h5_out.create_dataset(
+                            f'science/LSAR/RSLC/swaths/frequencyB/{pol}',
+                            shape=out_shape_b, dtype=dtype_b, chunks=chunk_shape_b,
+                            compression=compression_b, compression_opts=compression_opts_b,
+                            shuffle=shuffle_b
+                        )
+
+                        for chunk in chunk_info_b['chunks']:
+                            row, col = chunk['row'], chunk['col']
+                            orig_coord = chunk['coord']
+
+                            # Skip chunks outside crop area
+                            if crop_info:
+                                pixel_row = row * chunk_shape_b[0]
+                                pixel_col = col * chunk_shape_b[1]
+                                if pixel_row < crop_az_start or pixel_row >= crop_az_end:
+                                    continue
+                                if pixel_col < crop_rg_start_b or pixel_col >= crop_rg_end_b:
+                                    continue
+                                new_coord = (pixel_row - crop_az_start, pixel_col - crop_rg_start_b)
+                            else:
+                                new_coord = orig_coord
+                            wanted[chunk['offset']] = (dst_slc_b, new_coord, 'B')
+
+                    def write(pairs):
+                        for offset, chunk_bytes in pairs:
+                            target = wanted.pop(offset, None)
+                            if target is None:
+                                continue  # not in the output
+                            dataset, coord, label = target
+                            if len(chunk_bytes) == 0:
+                                raise ValueError(f'freq{label} {pol}: empty chunk at offset {offset}')
+                            dataset.id.write_direct_chunk(coord, chunk_bytes)
+                            written[label] = written.get(label, 0) + 1
+
+                    yield write
+
+                    # every chunk of the output has to have arrived
+                    for label, has_freq in (('A', has_freq_a), ('B', has_freq_b)):
+                        if has_freq and written.get(label, 0) == 0:
+                            raise ValueError(f'freq{label} {pol}: no chunks downloaded')
+                    if wanted:
+                        raise ValueError(f'{pol}: {len(wanted)} chunk(s) of the output not downloaded')
+
+                    # 3. Write metadata datasets (filter by frequency if needed); a crop gets the identification start and
+                    # end times of its own first and last lines
+                    metadata = get_metadata()
+                    crop_times = ASF._nisar_crop_times(metadata, crop_az_start, crop_az_end) if crop_info else {}
+                    for ds_path, ds_info in metadata.items():
+                        if ds_path in ('_root_attrs', '_group_attrs'):
+                            continue  # Handle separately
+
+                        # Skip frequency-specific metadata when not writing that frequency
+                        if not has_freq_a and 'frequencyA' in ds_path:
+                            continue
+                        if not has_freq_b and 'frequencyB' in ds_path:
+                            continue
+
+                        # Ensure parent groups exist
+                        parent_path = '/'.join(ds_path.split('/')[:-1])
+                        if parent_path and parent_path not in h5_out:
+                            h5_out.create_group(parent_path)
+
+                        # Get data, potentially cropping coordinate arrays
+                        data = ds_info['data']
+                        if crop_info:
+                            # Crop zeroDopplerTime (shared azimuth coordinate)
+                            if ds_path == 'science/LSAR/RSLC/swaths/zeroDopplerTime':
+                                az_end = min(crop_az_end, len(data)) if crop_az_end else len(data)
+                                data = data[crop_az_start:az_end]
+                            # Crop frequencyA slantRange
+                            elif ds_path == 'science/LSAR/RSLC/swaths/frequencyA/slantRange':
+                                rg_end = min(crop_rg_end_a, len(data)) if crop_rg_end_a else len(data)
+                                data = data[crop_rg_start_a:rg_end]
+                            # Crop frequencyB slantRange
+                            elif ds_path == 'science/LSAR/RSLC/swaths/frequencyB/slantRange':
+                                rg_end = min(crop_rg_end_b, len(data)) if crop_rg_end_b else len(data)
+                                data = data[crop_rg_start_b:rg_end]
+                            # Crop validSamplesSubSwath arrays (azimuth dimension)
+                            elif 'validSamplesSubSwath' in ds_path and len(data.shape) == 2:
+                                az_end = min(crop_az_end, data.shape[0]) if crop_az_end else data.shape[0]
+                                data = data[crop_az_start:az_end, :]
+                            # identification/zeroDopplerStartTime and zeroDopplerEndTime of the cropped lines
+                            elif ds_path in crop_times:
+                                data = crop_times[ds_path]
+
+                        # GeolocationGrid: select sea level height layer (index 1 = 0m)
+                        # Keep 3D shape (1, az, rg) for compatibility - saves ~162MB (20 layers -> 1 layer)
+                        if 'geolocationGrid' in ds_path and len(data.shape) == 3:
+                            data = data[1:2, :, :]
+                        # GeolocationGrid 1D height coordinate: keep only sea level value
+                        elif 'geolocationGrid' in ds_path and len(data.shape) == 1 and 'height' in ds_path.lower():
+                            data = data[1:2]
+
+                        # Create dataset with compression for metadata (matches source HDF5)
+                        try:
+                            # Use gzip compression for arrays, skip for scalars
+                            if hasattr(data, 'shape') and len(data.shape) > 0 and data.size > 100:
+                                ds = h5_out.create_dataset(ds_path, data=data, compression='gzip', compression_opts=4)
+                            else:
+                                ds = h5_out.create_dataset(ds_path, data=data)
+                            # Copy dataset attributes (description, units, etc.)
+                            if 'attrs' in ds_info:
+                                for attr_key, attr_val in ds_info['attrs'].items():
+                                    try:
+                                        ds.attrs[attr_key] = attr_val
+                                    except Exception:
+                                        pass
+                        except Exception as e:
+                            print(f"    Warning: could not create {ds_path}: {e}")
+
+                    # 4. Copy group attributes (filter by frequency if needed)
+                    if '_group_attrs' in metadata:
+                        for grp_path, grp_attrs in metadata['_group_attrs'].items():
+                            # Skip frequency-specific groups when not writing that frequency
+                            if not has_freq_a and 'frequencyA' in grp_path:
+                                continue
+                            if not has_freq_b and 'frequencyB' in grp_path:
+                                continue
+                            if grp_path in h5_out:
+                                for attr_key, attr_val in grp_attrs.items():
+                                    try:
+                                        h5_out[grp_path].attrs[attr_key] = attr_val
+                                    except Exception:
+                                        pass
+
+                    # 5. Copy root attributes
+                    if '_root_attrs' in metadata:
+                        for key, value in metadata['_root_attrs'].items():
+                            h5_out.attrs[key] = value
+
+                # Validate the finished file before it gets its final name
+                with h5py.File(tmp_path, 'r') as h5_check:
+                    swaths = h5_check['science/LSAR/RSLC/swaths']
+                    for freq_key in ['frequencyA', 'frequencyB']:
+                        if freq_key in swaths and pol in swaths[freq_key]:
+                            ds = swaths[freq_key][pol]
+                            if ds.shape[0] == 0 or ds.shape[1] == 0:
+                                raise ValueError(f'{freq_key}/{pol} has zero dimension: {ds.shape}')
+                            break
+                    else:
+                        raise ValueError(f'No SLC dataset found for {pol}')
+
+                os.replace(tmp_path, out_path)
+            except BaseException:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                raise
+
+        return contextlib.contextmanager(stream)()
+
     def _write_nisar_pol_h5_from_bytes(self, downloaded_data, chunk_info, metadata, pol,
                                         out_path, track, frame, datetime_str, debug,
                                         downloaded_data_b=None, chunk_info_b=None,
@@ -2707,6 +3062,8 @@ class ASF(progressbar_joblib):
         - FrequencyA only: downloaded_data present, downloaded_data_b is None
         - FrequencyB only: downloaded_data is None, downloaded_data_b present
         - Both frequencies: both present
+
+        The file is written at its temporary name chunk by chunk and renamed at the end (_nisar_stream_writer).
 
         When crop_info is provided, crops SLC data and coordinate arrays to bbox extent, and sets
         identification/zeroDopplerStartTime and zeroDopplerEndTime to the crop's first and last lines.
@@ -2729,11 +3086,6 @@ class ASF(progressbar_joblib):
         data_offset_b : int, optional
             Override min_offset for frequencyB bytes.
         """
-        import h5py
-        import numpy as np
-        from io import BytesIO
-        from tqdm.auto import tqdm
-
         import os
 
         # Determine which frequencies are being written
@@ -2750,240 +3102,23 @@ class ASF(progressbar_joblib):
         if debug:
             print(f"    Writing {n_chunks_total} chunks + {len(metadata)-1} metadata datasets...")
 
-        # Calculate chunk-aligned crop extents if cropping
-        crop_az_start, crop_az_end = 0, None
-        crop_rg_start_a, crop_rg_end_a = 0, None
-        crop_rg_start_b, crop_rg_end_b = 0, None
-
-        if crop_info:
-            # Get chunk-aligned bounds (full chunks, not pixels)
-            if has_freq_a:
-                chunk_az = chunk_info['chunk_shape'][0]
-                chunk_rg = chunk_info['chunk_shape'][1]
-                # Align to chunk boundaries
-                crop_az_start = (crop_info['az_start'] // chunk_az) * chunk_az
-                crop_az_end = ((crop_info['az_end'] + chunk_az - 1) // chunk_az) * chunk_az
-                # Only set freqA crop bounds if they exist in crop_info
-                if 'rg_start_a' in crop_info:
-                    crop_rg_start_a = (crop_info['rg_start_a'] // chunk_rg) * chunk_rg
-                    crop_rg_end_a = ((crop_info['rg_end_a'] + chunk_rg - 1) // chunk_rg) * chunk_rg
-            if has_freq_b:
-                chunk_az_b = chunk_info_b['chunk_shape'][0]
-                chunk_rg_b = chunk_info_b['chunk_shape'][1]
-                if crop_az_start == 0:  # Not set by freqA
-                    crop_az_start = (crop_info['az_start'] // chunk_az_b) * chunk_az_b
-                    crop_az_end = ((crop_info['az_end'] + chunk_az_b - 1) // chunk_az_b) * chunk_az_b
-                # Only set freqB crop bounds if they exist in crop_info
-                if 'rg_start_b' in crop_info:
-                    crop_rg_start_b = (crop_info['rg_start_b'] // chunk_rg_b) * chunk_rg_b
-                    crop_rg_end_b = ((crop_info['rg_end_b'] + chunk_rg_b - 1) // chunk_rg_b) * chunk_rg_b
-
-        # Build HDF5 in memory
-        mem_buffer = BytesIO()
-
-        with h5py.File(mem_buffer, 'w') as h5_mem:
-            # 1. Write frequencyA SLC if available
-            if has_freq_a:
-                orig_shape = chunk_info['shape']
-                chunk_shape = chunk_info['chunk_shape']
-                dtype = chunk_info['dtype']
-                compression = chunk_info['compression']
-                compression_opts = chunk_info['compression_opts']
-                shuffle = chunk_info.get('shuffle', False)
-                min_offset = data_offset_a if data_offset_a is not None else chunk_info['min_offset']
-
-                # Calculate output shape (cropped or full)
-                if crop_info:
-                    out_shape = (min(crop_az_end, orig_shape[0]) - crop_az_start,
-                                 min(crop_rg_end_a, orig_shape[1]) - crop_rg_start_a)
+        def pairs(data, ci, data_offset):
+            """The (chunk_offset, chunk_bytes) of one frequency: from a dict, or sliced from a byte range at data_offset."""
+            min_offset = data_offset if data_offset is not None else ci['min_offset']
+            for chunk in ci['chunks']:
+                if isinstance(data, dict):
+                    if chunk['offset'] in data:
+                        yield chunk['offset'], data[chunk['offset']]
                 else:
-                    out_shape = orig_shape
+                    offset_in_data = chunk['offset'] - min_offset
+                    yield chunk['offset'], data[offset_in_data:offset_in_data + chunk['size']]
 
-                dst_slc = h5_mem.create_dataset(
-                    f'science/LSAR/RSLC/swaths/frequencyA/{pol}',
-                    shape=out_shape, dtype=dtype, chunks=chunk_shape,
-                    compression=compression, compression_opts=compression_opts,
-                    shuffle=shuffle
-                )
-
-                chunk_iter = tqdm(chunk_info['chunks'], desc='    Writing freqA SLC', leave=False) if debug else chunk_info['chunks']
-                is_dict = isinstance(downloaded_data, dict)
-                for chunk in chunk_iter:
-                    row, col = chunk['row'], chunk['col']
-                    orig_coord = chunk['coord']  # (row_idx * chunk_az, col_idx * chunk_rg)
-
-                    # Skip chunks outside crop area
-                    if crop_info:
-                        pixel_row = row * chunk_shape[0]
-                        pixel_col = col * chunk_shape[1]
-                        if pixel_row < crop_az_start or pixel_row >= crop_az_end:
-                            continue
-                        if pixel_col < crop_rg_start_a or pixel_col >= crop_rg_end_a:
-                            continue
-                        # Adjust coord for cropped output
-                        new_coord = (pixel_row - crop_az_start, pixel_col - crop_rg_start_a)
-                    else:
-                        new_coord = orig_coord
-
-                    if is_dict:
-                        chunk_bytes = downloaded_data[chunk['offset']]
-                    else:
-                        offset_in_data = chunk['offset'] - min_offset
-                        chunk_bytes = downloaded_data[offset_in_data:offset_in_data + chunk['size']]
-                    dst_slc.id.write_direct_chunk(new_coord, chunk_bytes)
-
-            # 2. Write frequencyB SLC if available
+        with self._nisar_stream_writer(out_path, pol, chunk_info if has_freq_a else None,
+                                       chunk_info_b if has_freq_b else None, lambda: metadata, crop_info) as write:
+            if has_freq_a:
+                write(pairs(downloaded_data, chunk_info, data_offset_a))
             if has_freq_b:
-                orig_shape_b = chunk_info_b['shape']
-                chunk_shape_b = chunk_info_b['chunk_shape']
-                dtype_b = chunk_info_b['dtype']
-                compression_b = chunk_info_b['compression']
-                compression_opts_b = chunk_info_b['compression_opts']
-                shuffle_b = chunk_info_b.get('shuffle', False)
-                min_offset_b = data_offset_b if data_offset_b is not None else chunk_info_b['min_offset']
-
-                # Calculate output shape (cropped or full)
-                if crop_info:
-                    out_shape_b = (min(crop_az_end, orig_shape_b[0]) - crop_az_start,
-                                   min(crop_rg_end_b, orig_shape_b[1]) - crop_rg_start_b)
-                else:
-                    out_shape_b = orig_shape_b
-
-                dst_slc_b = h5_mem.create_dataset(
-                    f'science/LSAR/RSLC/swaths/frequencyB/{pol}',
-                    shape=out_shape_b, dtype=dtype_b, chunks=chunk_shape_b,
-                    compression=compression_b, compression_opts=compression_opts_b,
-                    shuffle=shuffle_b
-                )
-
-                chunk_iter_b = tqdm(chunk_info_b['chunks'], desc='    Writing freqB SLC', leave=False) if debug else chunk_info_b['chunks']
-                is_dict_b = isinstance(downloaded_data_b, dict)
-                for chunk in chunk_iter_b:
-                    row, col = chunk['row'], chunk['col']
-                    orig_coord = chunk['coord']
-
-                    # Skip chunks outside crop area
-                    if crop_info:
-                        pixel_row = row * chunk_shape_b[0]
-                        pixel_col = col * chunk_shape_b[1]
-                        if pixel_row < crop_az_start or pixel_row >= crop_az_end:
-                            continue
-                        if pixel_col < crop_rg_start_b or pixel_col >= crop_rg_end_b:
-                            continue
-                        new_coord = (pixel_row - crop_az_start, pixel_col - crop_rg_start_b)
-                    else:
-                        new_coord = orig_coord
-
-                    if is_dict_b:
-                        chunk_bytes = downloaded_data_b[chunk['offset']]
-                    else:
-                        offset_in_data = chunk['offset'] - min_offset_b
-                        chunk_bytes = downloaded_data_b[offset_in_data:offset_in_data + chunk['size']]
-                    dst_slc_b.id.write_direct_chunk(new_coord, chunk_bytes)
-
-            # 3. Write metadata datasets (filter by frequency if needed); a crop gets the identification start and
-            # end times of its own first and last lines
-            crop_times = self._nisar_crop_times(metadata, crop_az_start, crop_az_end) if crop_info else {}
-            for ds_path, ds_info in metadata.items():
-                if ds_path in ('_root_attrs', '_group_attrs'):
-                    continue  # Handle separately
-
-                # Skip frequency-specific metadata when not writing that frequency
-                if not has_freq_a and 'frequencyA' in ds_path:
-                    continue
-                if not has_freq_b and 'frequencyB' in ds_path:
-                    continue
-
-                # Ensure parent groups exist
-                parent_path = '/'.join(ds_path.split('/')[:-1])
-                if parent_path and parent_path not in h5_mem:
-                    h5_mem.create_group(parent_path)
-
-                # Get data, potentially cropping coordinate arrays
-                data = ds_info['data']
-                if crop_info:
-                    # Crop zeroDopplerTime (shared azimuth coordinate)
-                    if ds_path == 'science/LSAR/RSLC/swaths/zeroDopplerTime':
-                        az_end = min(crop_az_end, len(data)) if crop_az_end else len(data)
-                        data = data[crop_az_start:az_end]
-                    # Crop frequencyA slantRange
-                    elif ds_path == 'science/LSAR/RSLC/swaths/frequencyA/slantRange':
-                        rg_end = min(crop_rg_end_a, len(data)) if crop_rg_end_a else len(data)
-                        data = data[crop_rg_start_a:rg_end]
-                    # Crop frequencyB slantRange
-                    elif ds_path == 'science/LSAR/RSLC/swaths/frequencyB/slantRange':
-                        rg_end = min(crop_rg_end_b, len(data)) if crop_rg_end_b else len(data)
-                        data = data[crop_rg_start_b:rg_end]
-                    # Crop validSamplesSubSwath arrays (azimuth dimension)
-                    elif 'validSamplesSubSwath' in ds_path and len(data.shape) == 2:
-                        az_end = min(crop_az_end, data.shape[0]) if crop_az_end else data.shape[0]
-                        data = data[crop_az_start:az_end, :]
-                    # identification/zeroDopplerStartTime and zeroDopplerEndTime of the cropped lines
-                    elif ds_path in crop_times:
-                        data = crop_times[ds_path]
-
-                # GeolocationGrid: select sea level height layer (index 1 = 0m)
-                # Keep 3D shape (1, az, rg) for compatibility - saves ~162MB (20 layers -> 1 layer)
-                if 'geolocationGrid' in ds_path and len(data.shape) == 3:
-                    data = data[1:2, :, :]
-                # GeolocationGrid 1D height coordinate: keep only sea level value
-                elif 'geolocationGrid' in ds_path and len(data.shape) == 1 and 'height' in ds_path.lower():
-                    data = data[1:2]
-
-                # Create dataset with compression for metadata (matches source HDF5)
-                try:
-                    # Use gzip compression for arrays, skip for scalars
-                    if hasattr(data, 'shape') and len(data.shape) > 0 and data.size > 100:
-                        ds = h5_mem.create_dataset(ds_path, data=data, compression='gzip', compression_opts=4)
-                    else:
-                        ds = h5_mem.create_dataset(ds_path, data=data)
-                    # Copy dataset attributes (description, units, etc.)
-                    if 'attrs' in ds_info:
-                        for attr_key, attr_val in ds_info['attrs'].items():
-                            try:
-                                ds.attrs[attr_key] = attr_val
-                            except Exception:
-                                pass
-                except Exception as e:
-                    if debug:
-                        print(f"    Warning: could not create {ds_path}: {e}")
-
-            # 4. Copy group attributes (filter by frequency if needed)
-            if '_group_attrs' in metadata:
-                for grp_path, grp_attrs in metadata['_group_attrs'].items():
-                    # Skip frequency-specific groups when not writing that frequency
-                    if not has_freq_a and 'frequencyA' in grp_path:
-                        continue
-                    if not has_freq_b and 'frequencyB' in grp_path:
-                        continue
-                    if grp_path in h5_mem:
-                        for attr_key, attr_val in grp_attrs.items():
-                            try:
-                                h5_mem[grp_path].attrs[attr_key] = attr_val
-                            except Exception:
-                                pass
-
-            # 5. Copy root attributes
-            if '_root_attrs' in metadata:
-                for key, value in metadata['_root_attrs'].items():
-                    h5_mem.attrs[key] = value
-
-        # Validate in-memory HDF5 before writing to disk
-        import h5py
-        with h5py.File(BytesIO(mem_buffer.getvalue()), 'r') as h5_check:
-            swaths = h5_check['science/LSAR/RSLC/swaths']
-            for freq_key in ['frequencyA', 'frequencyB']:
-                if freq_key in swaths and pol in swaths[freq_key]:
-                    ds = swaths[freq_key][pol]
-                    if ds.shape[0] == 0 or ds.shape[1] == 0:
-                        raise ValueError(f'{freq_key}/{pol} has zero dimension: {ds.shape}')
-                    break
-            else:
-                raise ValueError(f'No SLC dataset found for {pol}')
-
-        # Write to temp file, then atomic rename
-        from .utils_files import write_file
-        write_file(out_path, mem_buffer.getvalue())
+                write(pairs(downloaded_data_b, chunk_info_b, data_offset_b))
 
         if debug:
             file_size = os.path.getsize(out_path)

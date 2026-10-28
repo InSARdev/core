@@ -25,6 +25,7 @@ Chunk size is controlled via Dask configuration:
 
 import dask.config
 from dask._task_spec import Task as _Task
+import weakref as _weakref
 
 
 def get_dask_chunk_size_mb() -> int:
@@ -62,6 +63,48 @@ def get_dask_chunk_size_mb() -> int:
             return max(1, int(float(chunk_size_str) / (1024 * 1024)))
         except ValueError:
             return 128  # Default fallback
+
+
+def cluster_cores():
+    """
+    Get the worker count and the CPU cores of the current Dask cluster.
+
+    The cores are the 'cpu' resource the workers declare, the largest one, as the cluster
+    states them (Client(resources={'cpu': N})). os.process_cpu_count() is asked only when
+    no worker declares cores.
+
+    Returns
+    -------
+    tuple of (int, int)
+        (workers, cores): 1 worker without a Dask client or without workers.
+
+    Examples
+    --------
+    >>> workers, cores = cluster_cores()
+    """
+    import os as _os
+    _slots, _cores = 1, None
+    try:
+        from dask.distributed import get_client as _gc
+        _winfo = _gc().scheduler_info().get('workers', {})
+        if _winfo:
+            _slots = len(_winfo)
+            _decl = [w.get('resources', {}).get('cpu') for w in _winfo.values()]
+            _decl = [d for d in _decl if d]
+            if _decl:
+                _cores = int(max(_decl))
+    except (ValueError, ImportError):
+        pass
+    # THE DECLARED CORES FIRST, the process's own count only without them:
+    # os.process_cpu_count() is new in Python 3.13
+    if _cores is None:
+        if not hasattr(_os, 'process_cpu_count'):
+            raise RuntimeError(
+                "fit3d() cannot count the CPU cores. Use Python 3.13+, or "
+                "declare the cores in the Dask cluster init: Client(..., "
+                "resources={'cpu': N}) with N the machine's CPU cores.")
+        _cores = max(1, _os.process_cpu_count() or 1)
+    return _slots, _cores
 
 
 def get_aligned_chunk_size(original_chunk: int, target_bytes: int, element_bytes: int,
@@ -1025,3 +1068,237 @@ def progress_persisted(persisted, desc):
             time.sleep(delay)
             delay = min(2 * delay, 1.0)
     progressbar(persisted, desc=desc)
+
+
+_RESTART_SETTING = 'distributed.deploy.lost-worker-timeout'
+# Client -> (monotonic end of its last restart, workers registered before it). Weak: a closed Client drops out.
+_restart_last = _weakref.WeakKeyDictionary()
+
+
+def _worker_count(client):
+    return len(client.scheduler_info(n_workers=-1)['workers'])
+
+
+def _wait_before_restart(client, timeout):
+    """
+    The wait of a restart of `client` that follows another one (see install_safe_restart). Waits only while less than the
+    lost-worker timeout has passed since the previous restart returned; prints one line when it waits.
+    """
+    import time
+    from dask.typing import no_default
+    from dask.utils import parse_timedelta
+    previous = _restart_last.get(client)
+    if previous is None:
+        return
+    end, workers = previous
+    setting = dask.config.get(_RESTART_SETTING)
+    delay = parse_timedelta(setting, 's')
+    elapsed = time.monotonic() - end
+    if elapsed >= delay:
+        return
+    try:
+        # the bound of distributed's own restart: the caller's timeout, else 4 x the connect timeout as Client.restart
+        bound = (parse_timedelta(dask.config.get('distributed.comm.timeouts.connect'), 's') * 4
+                 if timeout is no_default else parse_timedelta(timeout, 's'))
+    except Exception:
+        return                      # the original restart raises the error of its timeout argument itself
+    print(f'insardev: client.restart() waits {delay - elapsed:.1f} s for the lost-worker timers of the previous restart '
+          f'({_RESTART_SETTING} = {setting})', flush=True)
+    if _worker_count(client) < workers:
+        client.wait_for_workers(workers, timeout=bound)     # raises TimeoutError as restart does when the workers stay away
+    rest = end + delay - time.monotonic()
+    if rest > 0:
+        time.sleep(rest)
+
+
+def _restart_bound(timeout):
+    """
+    The bound of a restart: the caller's timeout, else 4 x the connect timeout (as the wait above). Parsed before any change,
+    so a bad value raises here, as the original restart raises it.
+    """
+    from dask.typing import no_default
+    from dask.utils import parse_timedelta
+    if timeout is no_default:
+        timeout = parse_timedelta(dask.config.get('distributed.comm.timeouts.connect'), 's') * 4
+    return parse_timedelta(timeout, 's')
+
+
+def _worker_names(client):
+    """The names of the workers the scheduler has registered, as strings."""
+    return {str(w['name']) for w in client.scheduler_info(n_workers=-1)['workers'].values()}
+
+
+def _managed_by(client, cluster):
+    """
+    True when every registered worker is a spec entry of the cluster, and every spec entry is one of the cluster's workers. A
+    worker the scheduler has lost may still be a cluster worker until its lost-worker timer closes it (deploy/spec.py 398-419); it
+    is then a worker the cluster holds but the scheduler does not, and the restart drops its entry.
+    """
+    registered = _worker_names(client)
+    spec = {str(name) for name in list(cluster.worker_spec)}
+    names = {str(name) for name in list(cluster.workers)}
+    return bool(registered) and registered <= spec <= names
+
+
+def _release_on_scheduler(dask_scheduler=None, stimulus_id=None):
+    """
+    Runs on the scheduler (Client.run_on_scheduler): the part of Scheduler.restart before restart_workers (scheduler.py 6446-6462):
+    keys released, task state cleared, plugins told. A copy of that body; drift is caught by the keys_freed rows.
+    """
+    import logging
+    import time
+    if stimulus_id is None:
+        stimulus_id = f'client-restart-{time.time()}'
+    for cs in dask_scheduler.clients.values():
+        dask_scheduler.client_releases_keys(keys=[ts.key for ts in cs.wants_what], client=cs.client_key, stimulus_id=stimulus_id)
+    dask_scheduler._clear_task_state()
+    if dask_scheduler.tasks:
+        raise RuntimeError('restart: the scheduler still holds tasks after the release')
+    dask_scheduler.report({'op': 'restart'})
+    for plugin in list(dask_scheduler.plugins.values()):
+        try:
+            plugin.restart(dask_scheduler)
+        except Exception as e:
+            logging.getLogger('distributed.scheduler').exception(e)
+
+
+def _wait_gone(client, cluster, names, bound):
+    """
+    Waits, bounded, until none of `names` (strings) is a worker of `cluster` or registered with the scheduler. SpecCluster deletes
+    a worker after its close (deploy/spec.py 366-368); the scheduler drops it when it has closed.
+    """
+    import time
+    deadline = time.monotonic() + bound
+    delay = 0.05
+    while True:
+        left = names & ({str(name) for name in cluster.workers} | _worker_names(client))
+        if not left:
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f'workers {sorted(left)} still open {bound} s after the restart started')
+        time.sleep(delay)
+        delay = min(2 * delay, 0.5)
+
+
+def _wait_recorded(cluster, names, bound):
+    """
+    Waits, bounded, until every name of `names` (strings) is a worker of `cluster`. SpecCluster records a new worker only after all
+    the new workers have started (deploy/spec.py 387-390), which is later than the scheduler's registration that wait_for_workers counts.
+    """
+    import time
+    deadline = time.monotonic() + bound
+    while not names <= {str(name) for name in list(cluster.workers)}:
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f'workers {sorted(names)} not recorded by the cluster {bound} s after the restart started')
+        time.sleep(0.05)
+
+
+def _replace_workers(client, cluster, bound, wait_for_workers):
+    """
+    Variant V1: the spec entries of the registered workers are replaced by the same number of entries with fresh string names and
+    the cluster is scaled to them. An entry of a worker the scheduler has lost is dropped: a restart restarts the registered workers
+    only, as Client.restart does. SpecCluster closes the old workers (and deletes them) before it opens the new ones, in one pass.
+    The retired integer names are never allocated again: SpecCluster allocates integer names from _i (deploy/spec.py 541-565), which
+    is advanced past them.
+    """
+    import uuid
+    registered = _worker_names(client)
+    specs = [dict(spec) for name, spec in cluster.worker_spec.items() if str(name) in registered]
+    retired = set(cluster.worker_spec) | set(cluster.workers)
+    fresh = {f'r{uuid.uuid4().hex[:12]}-{i}': spec for i, spec in enumerate(specs)}
+    integers = [name for name in retired if isinstance(name, int)]
+    if integers:
+        cluster._i = max(cluster._i, max(integers) + 1)
+    cluster.worker_spec.clear()
+    cluster.worker_spec.update(fresh)
+    cluster.scale(len(fresh))
+    _wait_gone(client, cluster, {str(name) for name in retired}, bound)
+    if wait_for_workers:
+        cluster.wait_for_workers(len(fresh), timeout=bound)
+        _wait_recorded(cluster, set(fresh), bound)
+
+
+def _missing_private_names():
+    """
+    The private distributed names the safe-restart hook calls that are missing or not accessible, as a list of their names (empty when
+    all are there). Scheduler._clear_task_state is read on the class (it is inherited from the scheduler state). SpecCluster._i is an
+    instance attribute that SpecCluster.__init__ assigns, and no instance exists at installation: it is accessible when the class has no
+    entry of that name that raises on read, and the __init__ code assigns it.
+    """
+    from distributed.scheduler import Scheduler
+    from distributed.deploy.spec import SpecCluster
+    missing = []
+    try:
+        getattr(Scheduler, '_clear_task_state')
+    except AttributeError:
+        missing.append('Scheduler._clear_task_state')
+    init_code = getattr(SpecCluster.__init__, '__code__', None)
+    try:
+        if '_i' in vars(SpecCluster):
+            getattr(SpecCluster, '_i')
+        elif init_code is None or '_i' not in init_code.co_names:
+            missing.append('SpecCluster._i')
+    except AttributeError:
+        missing.append('SpecCluster._i')
+    return missing
+
+
+def install_safe_restart():
+    """
+    Replace the workers of a SpecCluster on restart instead of restarting them under their names (BUGS N194; GRS6 variant V1, C5).
+
+    When the client has a SpecCluster in this process and every registered worker is one of the cluster's workers (_managed_by), the wrapper:
+      1. releases the keys and clears the task state on the scheduler (the body of Scheduler.restart before restart_workers);
+      2. replaces the spec entries of the registered workers by fresh string names (the entry of a worker the scheduler has lost is
+         dropped) and scales the cluster to them: the old workers are closed and deleted, the new ones are opened
+         (SpecCluster._correct_state_internal, deploy/spec.py 352-396). The retired integer names are never allocated again:
+         SpecCluster._i is advanced past them, so a later scale() cannot take a name whose lost-worker timer
+         (deploy/spec.py 398-419) is still pending;
+      3. waits, bounded by the restart timeout, until the old workers are gone from the cluster and from the scheduler; with
+         wait_for_workers it then waits until the new workers are registered and recorded by the cluster, as Client.restart
+         does, and not otherwise.
+    A fresh name matches no pending lost-worker timer, so this path does not wait between restarts.
+    Otherwise (no SpecCluster, a registered worker that is not the cluster's, or an asynchronous client) it waits as before
+    (_wait_before_restart) and
+    calls the original restart. Errors of the restart pass through unchanged; KeyboardInterrupt is not caught.
+
+    The private names it calls are Scheduler._clear_task_state (_release_on_scheduler) and SpecCluster._i (_replace_workers). At
+    installation they are checked to exist and to be accessible (_missing_private_names); if one is missing, nothing is installed and
+    one WARNING line names it: Client.restart stays dask's own. Every other name is public. Idempotent: a second call wraps nothing.
+    """
+    import functools
+    import time
+    from distributed import Client
+    from distributed.deploy.spec import SpecCluster
+    from dask.typing import no_default
+    if getattr(Client.restart, '__insardev_safe_restart__', False):
+        return
+    missing = _missing_private_names()
+    if missing:
+        print(f"WARNING: install_safe_restart skipped, Client.restart is dask's own: private dask name(s) missing or not accessible "
+              f"in this distributed version: {', '.join(missing)}", flush=True)
+        return
+    original = Client.restart
+
+    @functools.wraps(original)
+    def restart(self, timeout=no_default, wait_for_workers=True):
+        if self.asynchronous:
+            return original(self, timeout=timeout, wait_for_workers=wait_for_workers)
+        cluster = getattr(self, 'cluster', None)
+        if not isinstance(cluster, SpecCluster) or not _managed_by(self, cluster):
+            _wait_before_restart(self, timeout)
+            workers = _worker_count(self)
+            try:
+                return original(self, timeout=timeout, wait_for_workers=wait_for_workers)
+            finally:
+                _restart_last[self] = (time.monotonic(), workers)
+        bound = _restart_bound(timeout)
+        workers = _worker_count(self)
+        try:
+            self.run_on_scheduler(_release_on_scheduler, stimulus_id=f'client-restart-{time.time()}')
+            _replace_workers(self, cluster, bound, wait_for_workers)
+        finally:
+            _restart_last[self] = (time.monotonic(), workers)
+
+    restart.__insardev_safe_restart__ = True
+    Client.restart = restart

@@ -22,6 +22,11 @@ from .NCubeVTK import NCubeVTK
 from .ASF import ASF
 # Copernicus Data Space Ecosystem (CDSE) burst access
 from .CDSE import CDSE
+# ERA5 atmospheric reanalysis tiles downloading
+from .ERA5 import ERA5
+# IONEX ionosphere maps downloading
+from .IONEX import IONEX
+from .VMF3 import VMF3
 # Translate PyGMTSAR-format burst downloads into InSARdev layout
 from .PyGMTSAR import PyGMTSAR
 # tiles downloading

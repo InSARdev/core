@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 from scipy import constants
+from .utils_s1 import _sc_clock_whole_second
 
 SOL = constants.speed_of_light
 
@@ -144,10 +145,11 @@ def nisar_orbit(h5_path: str, t1: float = None, t2: float = None) -> pd.DataFram
         else:
             ydf = year0 * 1000 + (jd + (datetime(year, 1, 1) - datetime(year0, 1, 1)).days) + sec / 86400.0
 
-        # Filter by time range if specified
-        if t1 is not None and ydf < t1:
+        # Filter by time range if specified, on whole milliseconds: a state vector exactly on the window edge is kept
+        ms = round(ydf * 86400000.0)
+        if t1 is not None and ms < round(t1 * 86400000.0):
             continue
-        if t2 is not None and ydf > t2:
+        if t2 is not None and ms > round(t2 * 86400000.0):
             continue
 
         records.append({
@@ -225,6 +227,7 @@ def nisar_prm(h5_path: str, pol: str = 'HH', frequency: str = 'B') -> dict:
     - rng_samp_rate = c / (2 * slantRangeSpacing)
     - PRF = 1 / zeroDopplerTimeSpacing
     - near_range = slantRange[0]
+    - granule_duration = span of metadata/geolocationGrid/zeroDopplerTime (s); the closest-approach search window is half of it
     """
     import h5py
 
@@ -261,7 +264,8 @@ def nisar_prm(h5_path: str, pol: str = 'HH', frequency: str = 'B') -> dict:
         prf = 1.0 / zdt_spacing
         num_lines = len(zdt)
 
-        # The first line's time to clock_start (year.day_fraction)
+        # The first line's time as clock_start (0-based day of the year + day fraction): the source of the fraction
+        # of a second
         day, sec = nisar_start_time(f)
         year = day.year
         jd = day.timetuple().tm_yday - 1  # 0-based
@@ -277,6 +281,17 @@ def nisar_prm(h5_path: str, pol: str = 'HH', frequency: str = 'B') -> dict:
 
         # PRF from nominal value (for reference)
         nominal_prf = float(swath['nominalAcquisitionPRF'][()])
+
+        # Granule duration: the span of the geolocation grid's azimuth axis, from the granule's own metadata (the full frame
+        # of nisar_frame_fraction: last minus first). The closest-approach search window of NISAR is half of it (U38b).
+        geo_zdt_name = 'science/LSAR/RSLC/metadata/geolocationGrid/zeroDopplerTime'
+        if geo_zdt_name not in f:
+            raise ValueError(f'{h5_path}: {geo_zdt_name} is missing, so the granule duration (the closest-approach search '
+                             f'window of NISAR) is unknown')
+        geo_zdt = f[geo_zdt_name][:]
+        granule_duration = abs(float(geo_zdt[-1]) - float(geo_zdt[0]))
+        if not (np.isfinite(granule_duration) and granule_duration > 0):
+            raise ValueError(f'{h5_path}: {geo_zdt_name} spans {granule_duration} s, not a valid granule duration')
 
     # Build PRM dictionary (matching GMTSAR format)
     prm = {
@@ -307,9 +322,9 @@ def nisar_prm(h5_path: str, pol: str = 'HH', frequency: str = 'B') -> dict:
         # Wavelength
         'radar_wavelength': wavelength,
 
-        # Timing
-        'SC_clock_start': year * 1000 + clock_start,
-        'SC_clock_stop': year * 1000 + clock_stop,
+        # Timing: SC_clock_* are year * 1000 + day and whole seconds only (never for timing, see _sc_clock_whole_second)
+        'SC_clock_start': _sc_clock_whole_second(year, clock_start),
+        'SC_clock_stop': _sc_clock_whole_second(year, clock_stop),
         'clock_start': clock_start,
         'clock_stop': clock_stop,
 
@@ -323,6 +338,7 @@ def nisar_prm(h5_path: str, pol: str = 'HH', frequency: str = 'B') -> dict:
         'num_lines': num_lines,
         'num_valid_az': num_lines,
         'num_patches': 1,  # Stripmap mode
+        'granule_duration': granule_duration,  # s, span of metadata/geolocationGrid/zeroDopplerTime (U38b, user QW)
 
         # Orbit direction
         'orbdir': 'A' if orbit_dir.lower().startswith('a') else 'D',
@@ -461,20 +477,14 @@ def nisar_doppler_centroid(h5_path: str, frequency: str, azi, rng):
     return out.reshape(azi.shape)
 
 
-# the zero-Doppler time span of a full NISAR frame: a nominal constant (a full frame, e.g. track 172 frame 8, has
-# 53,200 lines over 34.999 s); only the telling of a full frame from a crop uses it
-NISAR_FRAME_SECONDS = 35.0
-
-
 def nisar_frame_fraction(h5_path: str, frequency: str) -> tuple:
     """
     The extent of an RSLC file against its full frame, per axis: (azimuth, range).
 
-    Azimuth: the swaths/zeroDopplerTime span over NISAR_FRAME_SECONDS (35 s, the nominal full frame). Range: the
-    swaths/frequency<X>/slantRange span over the full frame's slant-range span, which every RSLC carries exactly in
-    metadata/calibrationInformation/frequency<X>/noiseEquivalentBackscatter/slantRange (a crop keeps that axis whole;
-    it also follows modes with a narrower swath). A full frame gives about 1 on both axes, a crop less on the
-    cropped axis.
+    The full frame is the span of the geolocation grid's axes, metadata/geolocationGrid/zeroDopplerTime (azimuth) and
+    metadata/geolocationGrid/slantRange (range), which every RSLC carries and which a crop keeps whole. The crop is
+    the span of swaths/zeroDopplerTime (azimuth) and of swaths/frequency<X>/slantRange (range). A full frame gives
+    about 1 on both axes, a crop less on the cropped axis.
 
     Parameters
     ----------
@@ -491,25 +501,29 @@ def nisar_frame_fraction(h5_path: str, frequency: str) -> tuple:
     Raises
     ------
     ValueError
-        When the file has no full-frame slant-range axis: a full frame cannot be told from a crop without it.
+        When a geolocation grid axis is missing or not a valid span: a full frame cannot be told from a crop without it.
     """
     import h5py
 
     root = 'science/LSAR/RSLC/'
-    full = f'{root}metadata/calibrationInformation/frequency{frequency}/noiseEquivalentBackscatter/slantRange'
+    grid = f'{root}metadata/geolocationGrid/'
     with h5py.File(h5_path, 'r') as f:
         zdt = f[f'{root}swaths/zeroDopplerTime']
         t0, t1 = float(zdt[0]), float(zdt[-1])
         sr = f[f'{root}swaths/frequency{frequency}/slantRange']
         r0, r1 = float(sr[0]), float(sr[-1])
-        if full not in f:
-            raise ValueError(f'{h5_path}: {full} is missing, so the full frame\'s slant-range extent is unknown and '
-                             f'a full frame cannot be told from a crop')
-        sr_full = f[full]
-        f0, f1 = float(sr_full[0]), float(sr_full[-1])
-    if not (np.isfinite(f1 - f0) and abs(f1 - f0) > 0):
-        raise ValueError(f'{h5_path}: {full} spans {f0}..{f1} m, not a valid full-frame slant-range extent')
-    return abs(t1 - t0) / NISAR_FRAME_SECONDS, abs(r1 - r0) / abs(f1 - f0)
+        spans = []
+        for name in (f'{grid}zeroDopplerTime', f'{grid}slantRange'):
+            if name not in f:
+                raise ValueError(f'{h5_path}: {name} is missing, so the full frame\'s extent is unknown and a full frame '
+                                 f'cannot be told from a crop')
+            axis = f[name]
+            span = abs(float(axis[-1]) - float(axis[0]))
+            if not (np.isfinite(span) and span > 0):
+                raise ValueError(f'{h5_path}: {name} spans {span}, not a valid full-frame extent')
+            spans.append(span)
+    full_t, full_r = spans
+    return abs(t1 - t0) / full_t, abs(r1 - r0) / full_r
 
 
 def nisar_burst(h5_path: str, pol: str = 'HH', frequency: str = 'B') -> tuple:
@@ -538,7 +552,8 @@ def nisar_burst(h5_path: str, pol: str = 'HH', frequency: str = 'B') -> tuple:
     # Extract PRM parameters
     prm = nisar_prm(h5_path, pol, frequency)
 
-    # Extract orbit with time padding (~23 minutes on each side, like S1)
+    # Extract orbit with time padding (~23 minutes on each side, like S1): the window ends are SC_clock_start/stop,
+    # whole seconds, and the 1400 s padding is far larger than the second
     t1 = prm['SC_clock_start'] - 1400.0 / 86400.0
     t2 = prm['SC_clock_stop'] + 1400.0 / 86400.0
     orbit_df = nisar_orbit(h5_path, t1, t2)

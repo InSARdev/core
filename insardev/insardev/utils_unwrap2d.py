@@ -14,6 +14,10 @@ Static utility functions for 2D phase unwrapping.
 These functions contain the core algorithms for 2D phase unwrapping,
 component detection, and component linking.
 """
+# Snaphu for comparison (dev-time only; the library has no snaphu function, BUGS N158).
+# To unwrap a 2-D array with snaphu eagerly, write the wrapped phase to a binary file,
+# run the snaphu binary on it by subprocess with the snaphu command-line options,
+# and read the unwrapped output back into a NumPy array. Nothing is lazy in this path.
 from .utils_torch import serialize_gpu
 import numpy as np
 import numba as nb

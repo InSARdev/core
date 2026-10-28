@@ -44,6 +44,10 @@ _dask.config.set(array_optimize=_culled_array_optimize)
 # and dask picks it by itself under a client when a rechunk graph is large. The method is decided where the rechunk
 # graph is built, so this setting covers the rechunks of every function of the library.
 _dask.config.set({'array.rechunk.method': 'tasks'})
+# Client.restart waits out the lost-worker timers of its previous restart (BUGS N194; distributed deploy/spec.py, the timers of
+# _update_worker_status): one wrapper, installed once, see utils_dask.install_safe_restart.
+from .utils_dask import install_safe_restart as _install_safe_restart
+_install_safe_restart()
 
 # processing functions
 from .Stack import Stack

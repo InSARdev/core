@@ -18,57 +18,6 @@ class S1_align(S1_gmtsar):
     import xarray as xr
     import pandas as pd
 
-    @staticmethod
-    def _offset2shift(offset_dat: np.ndarray, rmax: int, amax: int) -> tuple:
-        """
-        Convert offset coordinates to r and a shift grids in one interpolation.
-
-        Uses LinearNDInterpolator to build triangulation once and interpolate
-        both r_shift and a_shift values together, which is ~2x faster than
-        calling griddata separately for each.
-
-        Parameters
-        ----------
-        offset_dat : numpy.ndarray
-            Array with columns [r, dr, a, da, snr] from offset computation.
-        rmax : int
-            Maximum range bin.
-        amax : int
-            Maximum azimuth line.
-
-        Returns
-        -------
-        tuple
-            (r_grd, a_grd) - xarray.DataArrays with shift grids.
-        """
-        import xarray as xr
-        import numpy as np
-        from scipy.interpolate import LinearNDInterpolator
-
-        # use center pixel GMT registration mode
-        rngs = np.arange(8/2, rmax+8/2, 8)
-        azis = np.arange(4/2, amax+4/2, 4)
-        grid_r, grid_a = np.meshgrid(rngs, azis)
-        grid_points = np.column_stack([grid_r.ravel(), grid_a.ravel()])
-
-        # Input points: (range, azimuth) coordinates
-        points = np.column_stack([offset_dat[:, 0], offset_dat[:, 2]])  # [r, a]
-        # Shift values: (dr, da)
-        shifts = np.column_stack([offset_dat[:, 1], offset_dat[:, 3]])  # [dr, da]
-
-        # Build triangulation once, interpolate both shifts
-        interp = LinearNDInterpolator(points, shifts, fill_value=np.nan)
-        result = interp(grid_points)  # Shape: (n_points, 2)
-
-        # Reshape to grid
-        r_grid = result[:, 0].reshape(grid_r.shape)
-        a_grid = result[:, 1].reshape(grid_r.shape)
-
-        r_grd = xr.DataArray(r_grid, coords={'y': azis, 'x': rngs}, name='z')
-        a_grd = xr.DataArray(a_grid, coords={'y': azis, 'x': rngs}, name='z')
-
-        return r_grd, a_grd
-
     def align_ref(self, burst: str, debug: bool = False, return_slc: bool = True) -> tuple:
         """
         Process reference burst - extract PRM, orbit, and optionally deramped SLC.
@@ -170,7 +119,7 @@ class S1_align(S1_gmtsar):
         prm_ref_shifted = PRM(prm_ref)
         prm_ref_shifted.orbit_df = prm_ref.orbit_df
         prm_ref_shifted.set(
-            prm_ref.sel('clock_start', 'clock_stop', 'SC_clock_start', 'SC_clock_stop')
+            prm_ref.sel('clock_start', 'clock_stop')
             + nl / prf / 86400.0
         )
         prm_ref_shifted.calc_dop_orb(earth_radius, inplace=True, debug=debug)

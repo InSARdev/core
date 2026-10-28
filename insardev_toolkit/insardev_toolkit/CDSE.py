@@ -589,6 +589,9 @@ class CDSE(progressbar_joblib):
                  min_rate='100KB', min_rate_window=60, debug=False):
         """Download Sentinel-1 bursts from CDSE.
 
+        The IW2 annotation of an IW1 or IW3 burst (annotation/<name with IW2>.xml, written by the ASF downloader) is
+        optional here: a burst folder without it is complete, and an existing one is kept (CDSE never writes it).
+
         Parameters
         ----------
         basedir : str
@@ -1016,7 +1019,8 @@ class CDSE(progressbar_joblib):
 
     @staticmethod
     def _burst_exists(basedir, burst):
-        """Check if burst is completely downloaded. An empty file of the burst raises."""
+        """Check if burst is completely downloaded. An empty file of the burst raises. The IW2 annotation of an IW1 or
+        IW3 burst is not checked: a folder without it is complete, and an existing one is kept."""
         import os
         from glob import glob
         from .utils_files import exists

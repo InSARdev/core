@@ -137,6 +137,132 @@ def dem_interp_cubic(dem, dem_path, lat, lon):
     return out.reshape(shape)
 
 
+# The geoid at the point: the DEM-at-point step adds it to the orthometric DEM height. No DEM-size geoid array is built: the
+# native B-spline coefficients of insardev_toolkit utils_geoid.geoid_coefficients() are cropped (lazily) to the supports of
+# the points and materialised per call, as read_dem() reads the DEM window per call (only the grid handle is cached, in
+# utils_geoid), and the 16 weights are accumulated in place.
+
+
+def _bspline_geoid_points(coef, cr0, cc0, cstep, lat, lon, out):
+    """Geoid heights at points by the cubic B-spline of a window of the native coefficients, written to out (float64).
+
+    coef is a float64 window of the coefficients of a geoid grid (utils_geoid.geoid_coefficients()) whose [0, 0] node is
+    row cr0 and column cc0 of that grid, cstep is the grid step in degrees, lat and lon are 1-D finite arrays in degrees,
+    out a 1-D float64 array of their size. Each point takes the 16 weighted coefficients of its support, in the order of
+    utils_geoid.geoid_height(): the sums are accumulated into out, without (N, 4, 4) temporaries. A point whose support
+    is not inside coef raises ValueError.
+    """
+    from insardev_toolkit.utils_geoid import _weights
+    nrow, ncol = coef.shape
+    nlon = int(round(360.0 / cstep))
+    fi = (lat + 90.0) / cstep
+    fj = np.mod((lon + 180.0) / cstep, nlon)
+    fj = np.where(fj >= nlon, fj - nlon, fj)
+    i0 = np.floor(fi)
+    j0 = np.floor(fj)
+    ii = (i0 - 1 - cr0).astype(np.int64)
+    jj = (j0 - 1 - cc0).astype(np.int64)
+    # the columns are periodic: the copy of the point's column that the window holds
+    jj = np.where(jj < 0, jj + nlon, jj)
+    jj = np.where(jj > ncol - 4, jj - nlon, jj)
+    if (ii < 0).any() or (ii > nrow - 4).any() or (jj < 0).any() or (jj > ncol - 4).any():
+        raise ValueError('ERROR: a geoid point lies outside its coefficient window: the window does not cover its support')
+    wi = _weights(fi - i0)
+    wj = _weights(fj - j0)
+    out[...] = 0.0
+    for a in range(4):
+        for b in range(4):
+            out += wi[a] * wj[b] * coef[ii + a, jj + b]
+    return out
+
+
+def _geoid_window(lat_min, lat_max, lon_min, lon_max, datum):
+    """The native coefficients of the geoid of datum around a box of degrees, for the 4 x 4 supports of all its points.
+
+    The rows and columns of the grid are cropped to whole blocks of utils_geoid.BLOCK nodes (the columns periodic), read
+    lazily by utils_geoid.geoid_coefficients() and materialised per call, nothing kept between calls. Returns
+    (coef, r0, c0, step, support): coef the float64 window, r0 and c0 its first row and column of the grid, step the grid
+    step, support the slices (rows first, then columns) of the box's supports inside coef. A box that reaches past a pole
+    raises ValueError.
+    """
+    import math
+    from insardev_toolkit import utils_geoid
+    name = utils_geoid.datum_name(datum)
+    grid = utils_geoid._geoid_grid(name)
+    step, block = grid.step, utils_geoid.BLOCK
+    n0 = math.floor((lat_min + 90.0) / step) - 1
+    n1 = math.floor((lat_max + 90.0) / step) + 2
+    if n0 < 0 or n1 > grid.nlat - 1:
+        raise ValueError(f'ERROR: the geoid of {name} is needed for latitudes {lat_min:.4f} to {lat_max:.4f}, outside the '
+                         f'rows of its grid')
+    m0 = math.floor((lon_min + 180.0) / step) - 1
+    m1 = math.floor((lon_max + 180.0) / step) + 2
+    r0, r1 = (n0 // block) * block, min(grid.nlat, (n1 // block + 1) * block)
+    c0, c1 = (m0 // block) * block, (m1 // block + 1) * block
+    lazy = utils_geoid.geoid_coefficients(name)
+    cols = np.mod(np.arange(c0, c1), grid.nlon)
+    coef = np.asarray(lazy.isel(lat=slice(r0, r1), lon=cols).data.compute(scheduler='synchronous'), dtype=np.float64)
+    support = (n0 - r0, n1 - r0 + 1, m0 - c0, m1 - c0 + 1)
+    return coef, r0, c0, step, support
+
+
+def _geoid_range(lat_min, lat_max, lon_min, lon_max, datum):
+    """The low and high of the geoid of datum over a box of degrees, or None for no geoid (datum None or 'ellipsoid').
+
+    Evaluated at the corners of the box and at the native grid nodes inside it (the spline is exact at the nodes; between
+    them it is smooth, so its extremes are within those samples up to the spacing of the nodes).
+    """
+    import math
+    from insardev_toolkit import utils_geoid
+    if datum is None or utils_geoid.datum_name(datum) == utils_geoid.ELLIPSOID:
+        return None
+    step = utils_geoid._geoid_grid(utils_geoid.datum_name(datum)).step
+    rows = np.arange(math.ceil((lat_min + 90.0) / step), math.floor((lat_max + 90.0) / step) + 1) * step - 90.0
+    cols = np.arange(math.ceil((lon_min + 180.0) / step), math.floor((lon_max + 180.0) / step) + 1) * step - 180.0
+    lat_s, lon_s = np.meshgrid(np.concatenate([[lat_min, lat_max], rows]),
+                               np.concatenate([[lon_min, lon_max], cols]), indexing='ij')
+    vals = _geoid_at_points(lat_s, lon_s, datum)
+    return float(np.nanmin(vals)), float(np.nanmax(vals))
+
+
+def _geoid_at_points(lat, lon, datum):
+    """The geoid of datum at points (degrees, the shape of lat), float64, NaN where lat or lon is NaN; None for no geoid.
+
+    The coefficient window is the one of the points' box (_geoid_window): one window per call, not one per point.
+    """
+    from insardev_toolkit import utils_geoid
+    if datum is None or utils_geoid.datum_name(datum) == utils_geoid.ELLIPSOID:
+        return None
+    lat = np.asarray(lat, dtype=np.float64)
+    lon = np.asarray(lon, dtype=np.float64)
+    la, lo = lat.ravel(), lon.ravel()
+    ok = np.isfinite(la) & np.isfinite(lo)
+    out = np.full(la.shape, np.nan)
+    if ok.any():
+        if not ok.all():
+            la, lo = la[ok], lo[ok]
+        coef, r0, c0, step, _ = _geoid_window(float(la.min()), float(la.max()), float(lo.min()), float(lo.max()), datum)
+        if ok.all():
+            _bspline_geoid_points(coef, r0, c0, step, la, lo, out)
+        else:
+            vals = np.empty(la.size, dtype=np.float64)
+            _bspline_geoid_points(coef, r0, c0, step, la, lo, vals)
+            out[ok] = vals
+    return out.reshape(lat.shape)
+
+
+def _dem_plus_geoid(dem_h, lat, lon, datum):
+    """The heights above the ellipsoid at points: the orthometric DEM heights dem_h (of the shape of lat, e.g. from
+    dem_interp_cubic()) plus the geoid of datum at the points, written in place into dem_h. NaN stays NaN. With no geoid
+    (datum None or 'ellipsoid') dem_h is returned unchanged."""
+    geo = _geoid_at_points(lat, lon, datum)
+    if geo is None:
+        return dem_h
+    np.add(geo, dem_h, out=geo)
+    dem_h[...] = geo
+    return dem_h
+
+
 def _process_tile_worker(args):
     """Worker function for processing a single tile in spawned subprocess.
 
@@ -234,27 +360,63 @@ def _process_tile_worker(args):
     e2_wgs = (ra**2 - 6356752.31424518**2) / ra**2
 
     # === THE SLC FOOTPRINT of compute_conversion_chunked (_precise_footprint) ===
-    # The Doppler solve skips a row batch outside it and the pixels of a batch across its edge outside it; a batch
-    # inside it is solved whole
+    # The pre-filter is the footprint widened by 2 cells (fp_wkb): its cells are solved, and so is the buffer of the image
+    # (2 cells per axis, the cells outside the pre-filter too), which holds ele only.
+    # The outline itself is not returned: azi and rng are kept on the image (the pre-filter cells inside [0, n - 1]) and nowhere else.
     import shapely
     from shapely.geometry import box as shapely_box
     radar_polygon = shapely.from_wkb(fp_wkb)
     shapely.prepare(radar_polygon)
+    n_y_grid, n_x_grid = azi_arr.shape
 
-    # Process tile in row batches to limit memory
-    for by in range(0, tile_height, row_batch):
-        ey = min(by + row_batch, tile_height)
-        batch_shape = (ey - by, tile_width)
+    # The window of the tile: its rows and columns, widened by the 2 cells of the buffer and clipped to the grid. Its cells are
+    # solved (the buffer of the tile's own image cells lies in it); only the tile's own cells are written, the margin is not
+    # stored.
+    wy0, wy1 = max(0, iy - 2), min(n_y_grid, jy + 2)
+    wx0, wx1 = max(0, ix - 2), min(n_x_grid, jx + 2)
+    wh, ww = wy1 - wy0, wx1 - wx0
+    w_azi = np.full((wh, ww), np.nan, dtype=np.float32)
+    w_rng = np.full((wh, ww), np.nan, dtype=np.float32)
+    w_ele = np.full((wh, ww), np.nan, dtype=np.float32)
 
-        # Compute coordinates locally from grid params (no full arrays!)
-        # Grid coords are pixel centers: coord[i] = origin + spacing * (i + 0.5), float64: the stored y/x of
-        # compute_conversion_chunked, so every pixel is computed at its stored centre (in float32 a 1.25 m centre near
-        # 2.1e6 m is rounded by 0.125 m)
-        _arr = np.arange(iy + by, iy + ey) + 0.5
+    # Solve the window in row batches (the batch's rows of the window, all its columns)
+    for by in range(0, wh, row_batch):
+        ey = min(by + row_batch, wh)
+        batch_shape = (ey - by, ww)
+        r_lo, r_hi = wy0 + by, wy0 + ey
+        # the pre-filter of the batch widened by the buffer (rows r_lo - 2 to r_hi + 2, columns wx0 - 2 to wx1 + 2, clipped):
+        # its buffer decides the solve set of the batch's cells
+        e_lo, e_hi = max(0, r_lo - 2), min(n_y_grid, r_hi + 2)
+        e_x0, e_x1 = max(0, wx0 - 2), min(n_x_grid, wx1 + 2)
+        # Grid coords are pixel centers: coord[i] = origin + spacing * (i + 0.5), float64 (as compute_conversion_chunked stores
+        # them)
+        x_ext = x_min + dx * (np.arange(e_x0, e_x1) + 0.5)
+        y_ext = y_min + dy * (np.arange(e_lo, e_hi) + 0.5)
         if not np.isscalar(dy):
             raise ValueError(f"dy is array! type={type(dy)}, shape={dy.shape}, by={by}, ey={ey}")
-        y_batch = y_min + dy * _arr
-        x_batch = x_min + dx * (np.arange(ix, jx) + 0.5)
+        ext_box = shapely_box(float(x_ext.min()), float(y_ext.min()), float(x_ext.max()), float(y_ext.max()))
+        if not radar_polygon.intersects(ext_box):
+            # no pre-filter cell in the batch or within 2 cells of it: nothing to solve
+            continue
+        if radar_polygon.contains(ext_box):
+            pre_ext = np.ones((e_hi - e_lo, e_x1 - e_x0), dtype=bool)
+        else:
+            xx, yy = np.meshgrid(x_ext, y_ext)
+            pre_ext = np.asarray(shapely.contains_xy(radar_polygon, xx.ravel(), yy.ravel()), dtype=bool).reshape(xx.shape)
+            del xx, yy
+        # the solve set of the batch: the pre-filter cells of the batch and their buffer, in the window's columns
+        buf_ext = _buffer_cells(pre_ext, 2)
+        rows = slice(r_lo - e_lo, r_hi - e_lo)
+        cols = slice(wx0 - e_x0, wx1 - e_x0)
+        pre_blk = pre_ext[rows, cols]
+        solve_blk = buf_ext[rows, cols]
+        del pre_ext, buf_ext
+        if not solve_blk.any():
+            continue
+
+        # the batch's cells: pixel centres of the window's columns, to lon/lat (float64)
+        x_batch = x_min + dx * (np.arange(wx0, wx1) + 0.5)
+        y_batch = y_min + dy * (np.arange(r_lo, r_hi) + 0.5)
         x_grid, y_grid = np.meshgrid(x_batch, y_batch)
 
         # Project batch to lon/lat
@@ -264,29 +426,6 @@ def _process_tile_worker(args):
         # and slant-range solve carries into azi/rng (per row batch, so the memory stays bounded)
         batch_lat = np.asarray(batch_lat, dtype=np.float64).reshape(batch_shape)
         batch_lon = np.asarray(batch_lon, dtype=np.float64).reshape(batch_shape)
-
-        # Check if batch intersects radar polygon - skip if entirely outside
-        batch_box = shapely_box(
-            float(x_batch.min()), float(y_batch.min()),
-            float(x_batch.max()), float(y_batch.max())
-        )
-        if not radar_polygon.intersects(batch_box):
-            # Entire batch is outside radar coverage - skip
-            del x_grid, y_grid, batch_lat, batch_lon
-            continue
-
-        # The pixels inside the footprint: all of a batch whose pixel centres lie inside it, else pixel by pixel
-        x_flat = (x_min + dx * (np.arange(ix, jx) + 0.5))
-        y_flat = (y_min + dy * (np.arange(iy + by, iy + ey) + 0.5))
-        if radar_polygon.contains(shapely_box(float(x_flat.min()), float(y_flat.min()),
-                                              float(x_flat.max()), float(y_flat.max()))):
-            inside_mask = np.ones(batch_shape, dtype=bool)
-        else:
-            xx, yy = np.meshgrid(x_flat, y_flat)
-            inside_mask = shapely.contains_xy(radar_polygon, xx.ravel(), yy.ravel()).reshape(batch_shape)
-            del xx, yy
-        del x_flat, y_flat
-
         del x_grid, y_grid
 
         # Read DEM tile from file (h5py window read - no full load)
@@ -297,7 +436,8 @@ def _process_tile_worker(args):
             float(np.nanmax(batch_lon)) + buffer_deg,
             float(np.nanmax(batch_lat)) + buffer_deg
         )
-        dem_tile = get_dem_wgs84ellipsoid(dem_path, batch_geom, buffer_degrees=0.01, datum=datum)
+        # the orthometric DEM window; the geoid of the datum is added at the points (_dem_plus_geoid), not to the DEM
+        dem_tile = get_dem_wgs84ellipsoid(dem_path, batch_geom, buffer_degrees=0.01, geoid_correction=False)
 
         if dem_tile is None or dem_tile.size == 0 or len(dem_tile.lat) < 2 or len(dem_tile.lon) < 2:
             # DEM tile missing or too small for interpolation - fill with NaN
@@ -306,23 +446,20 @@ def _process_tile_worker(args):
             # cv2.remap INTER_CUBIC at each pixel's post position in the lattice of the whole DEM file, so ele, and
             # azi/rng with it, do not depend on the chunk size (dem_interp_cubic, as the S1 transform)
             batch_ele = dem_interp_cubic(dem_tile, dem_path, batch_lat, batch_lon)
+            batch_ele = _dem_plus_geoid(batch_ele, batch_lat, batch_lon, datum)
             del dem_tile
 
         # === INLINE LLT2RAT using pre-computed orbit (no function call overhead) ===
-        # Only process pixels inside radar polygon (skip pixels outside for performance)
-        inside_flat = inside_mask.ravel()
-        n_inside = inside_flat.sum()
+        # Only the solve set is processed (the pre-filter and its buffer; the other cells of the batch are not solved)
+        solve_flat = solve_blk.ravel()
+        n_points = int(solve_flat.sum())
 
-        if n_inside == 0:
-            # All pixels outside radar coverage - skip batch
-            del batch_lat, batch_lon, batch_ele, inside_mask, inside_flat
-            continue
-
-        # Extract only inside pixels for processing
-        lon_flat = batch_lon.ravel()[inside_flat]
-        lat_flat = batch_lat.ravel()[inside_flat]
-        ele_flat = batch_ele.ravel()[inside_flat]
-        n_points = n_inside
+        # Extract only the solved pixels for processing
+        lon_flat = batch_lon.ravel()[solve_flat]
+        lat_flat = batch_lat.ravel()[solve_flat]
+        ele_flat = batch_ele.ravel()[solve_flat]
+        # the solved pixels of the pre-filter itself: the others are the buffer, which holds ele only
+        pre_flat = pre_blk.ravel()[solve_flat]
 
         # Convert geodetic to ECEF
         lon_rad = np.radians(lon_flat)
@@ -411,30 +548,50 @@ def _process_tile_worker(args):
 
         del xp, yp, zp
 
-        # Mark out-of-bounds as NaN (in the flat inside arrays), and a pixel without a radar position (NaN azi or
-        # rng): its ele is not written either. azi/rng are the 0-based line and bin: the window is the first to the
-        # last pixel centre, [0, n - 1]
+        # Filter out-of-bounds (valid pixel centers are [0, n-1]). Only azi and rng are emptied: ele stays on the buffer around
+        # the image (see the margin buffer in _precise_footprint). The buffer cells outside the pre-filter are solved for their
+        # ele only, so their azi and rng are emptied too. azi/rng are the 0-based line and bin: the window is the first to the
+        # last pixel centre, [0, n - 1]; a pixel without a radar position (NaN azi or rng) is emptied the same way.
         out_of_bounds = ((batch_azi_pix < 0) | (batch_azi_pix > n_azi - 1) |
                         (batch_rng_pix < 0) | (batch_rng_pix > n_rng - 1) |
-                        ~np.isfinite(batch_azi_pix) | ~np.isfinite(batch_rng_pix))
+                        ~np.isfinite(batch_azi_pix) | ~np.isfinite(batch_rng_pix) | ~pre_flat)
         batch_azi_pix[out_of_bounds] = np.nan
         batch_rng_pix[out_of_bounds] = np.nan
 
         # ele is the WGS84 ellipsoidal height of the DEM at the pixel, as the S1 transform stores it (the topo pass
-        # computes the GMTSAR sphere height from it)
+        # computes the GMTSAR sphere height from it). It is kept on every solved cell here; the buffer of the image is
+        # applied to it after the solve (below).
         batch_ele_inside = ele_flat
-        batch_ele_inside[out_of_bounds] = np.nan
-        del out_of_bounds, lat_flat, lon_flat, ele_flat
+        del out_of_bounds, lat_flat, lon_flat, ele_flat, pre_flat
 
-        # Scatter inside results back to full batch arrays (NaN for outside pixels)
+        # Scatter the solved results back to full batch arrays (NaN for the cells not solved)
         batch_azi = np.full(batch_shape, np.nan, dtype=np.float32)
         batch_rng = np.full(batch_shape, np.nan, dtype=np.float32)
         batch_ele_out = np.full(batch_shape, np.nan, dtype=np.float32)
-        batch_azi.ravel()[inside_flat] = batch_azi_pix
-        batch_rng.ravel()[inside_flat] = batch_rng_pix
-        batch_ele_out.ravel()[inside_flat] = batch_ele_inside
-        del batch_azi_pix, batch_rng_pix, batch_ele_inside, inside_flat, inside_mask
+        batch_azi.ravel()[solve_flat] = batch_azi_pix
+        batch_rng.ravel()[solve_flat] = batch_rng_pix
+        batch_ele_out.ravel()[solve_flat] = batch_ele_inside
+        del batch_azi_pix, batch_rng_pix, batch_ele_inside, solve_flat, pre_blk, solve_blk
         del batch_lat, batch_lon, batch_ele
+
+        w_azi[by:ey] = batch_azi
+        w_rng[by:ey] = batch_rng
+        w_ele[by:ey] = batch_ele_out
+        del batch_azi, batch_rng, batch_ele_out
+
+    # The image: the pre-filter cells with azi and rng inside [0, n - 1] (their azi is finite; the others are NaN). ele is kept
+    # on the image widened by 2 cells (columns, then rows) and emptied elsewhere, as the margin buffer in _precise_footprint
+    # says.
+    w_ele[~_buffer_cells(np.isfinite(w_azi), 2)] = np.nan
+
+    # Write the tile's own cells in row batches of the tile (the window's origin is offset out of them)
+    for by in range(0, tile_height, row_batch):
+        ey = min(by + row_batch, tile_height)
+        a, b = iy + by - wy0, iy + ey - wy0
+        c, d = ix - wx0, jx - wx0
+        batch_azi = w_azi[a:b, c:d].copy()
+        batch_rng = w_rng[a:b, c:d].copy()
+        batch_ele_out = w_ele[a:b, c:d].copy()
 
         # Write batch to zarr: rounded for the stack, and as computed to the precise transform
         azi_arr[iy + by:iy + ey, ix:jx] = to_int32(batch_azi)
@@ -453,6 +610,7 @@ def _process_tile_worker(args):
                     extent[_i][0] = np.fmin(extent[_i][0], np.nanmin(_b))
                     extent[_i][1] = np.fmax(extent[_i][1], np.nanmax(_b))
         del batch_azi, batch_rng, batch_ele_out
+    del w_azi, w_rng, w_ele
 
     return extent
 
@@ -701,12 +859,12 @@ def _precise_outline(edge_azi, edge_rng, lon0, lat0, dem_path, orbit_time, orbit
     lon, lat, h = lon0, lat0, np.full(lon0.shape, np.nan)
     dem = None
     for _ in range(6):
-        dem = get_dem_wgs84ellipsoid(dem_path, box(*w), buffer_degrees=0.0, datum=datum)
+        dem = get_dem_wgs84ellipsoid(dem_path, box(*w), buffer_degrees=0.0, geoid_correction=False)
         if dem is None or dem.size == 0:
             break
         lon, lat, h = satellite_rat2llt(edge_azi, edge_rng, orbit_time, orbit_pos, orbit_vel, clock_start, prf,
                                         near_range, rng_samp_rate, earth_radius, dem=dem, max_iter=50, tol=0.01,
-                                        n_chunks=1, lookdir=lookdir)
+                                        n_chunks=1, lookdir=lookdir, datum=datum)
         dlon, dlat = dem.lon.values, dem.lat.values
         inside = ((lon > dlon.min() + 0.01) & (lon < dlon.max() - 0.01)
                   & (lat > dlat.min() + 0.01) & (lat < dlat.max() - 0.01))
@@ -742,11 +900,17 @@ def _precise_outline(edge_azi, edge_rng, lon0, lat0, dem_path, orbit_time, orbit
     bounds = None
     heights = dem.values[np.isfinite(dem.values)] if dem is not None and dem.size else np.empty(0)
     if unsolved.size and heights.size:
-        # a constant height surface over the DEM window and 1 degree around it
+        # a constant height surface over the DEM window and 1 degree around it; the heights above the ellipsoid are the
+        # orthometric extremes plus the geoid envelope of the window (_geoid_range: no DEM-size geoid array)
         glat = np.linspace(float(dem.lat.values.min()) - 1.0, float(dem.lat.values.max()) + 1.0, 64)
         glon = np.linspace(float(dem.lon.values.min()) - 1.0, float(dem.lon.values.max()) + 1.0, 64)
+        geoid = _geoid_range(float(dem.lat.values.min()), float(dem.lat.values.max()),
+                             float(dem.lon.values.min()), float(dem.lon.values.max()), datum)
+        low, high = float(heights.min()), float(heights.max())
+        if geoid is not None:
+            low, high = low + geoid[0], high + geoid[1]
         bounds = ()
-        for height in (float(heights.min()), float(heights.max())):
+        for height in (low, high):
             surface = xr.DataArray(np.full((64, 64), height, dtype=np.float32), coords={'lat': glat, 'lon': glon},
                                    dims=['lat', 'lon'])
             lon_h, lat_h, _ = satellite_rat2llt(np.asarray(edge_azi)[unsolved], np.asarray(edge_rng)[unsolved],
@@ -758,13 +922,65 @@ def _precise_outline(edge_azi, edge_rng, lon0, lat0, dem_path, orbit_time, orbit
     return y, x, unsolved, bounds
 
 
+def _buffer_cells(image, cells=2):
+    """The image widened by cells along the columns, then along the rows: every cell within cells (chessboard) of an image
+    cell, the diagonal cells too (the 5 x 5 box for cells=2). The buffer of the tile worker's ele and of the valid mask of
+    the transform (the cells of the buffer outside the image are solved for their ele only)."""
+    cols = image.copy()
+    for k in range(1, cells + 1):
+        cols[:, k:] |= image[:, :-k]
+        cols[:, :-k] |= image[:, k:]
+    out = cols.copy()
+    for k in range(1, cells + 1):
+        out[k:, :] |= cols[:-k, :]
+        out[:-k, :] |= cols[k:, :]
+    return out
+
+
+def _widen_by_cells(polygon, dy, dx, cells=2):
+    """The polygon widened by cells along each axis: a box of cells * dx on each side in x and cells * dy in y (the Minkowski
+    sum with the box, not a disc, so the diagonal cells count too). Exact for a polygon with holes or a concave outline: the
+    union of the polygon and, for every edge of its outlines, the convex hull of the edge swept by the box."""
+    import numpy as np
+    import shapely
+    corners = np.array([[sx * cells * dx, sy * cells * dy] for sx in (-1.0, 1.0) for sy in (-1.0, 1.0)])
+    pieces = [polygon]
+    for part in getattr(polygon, 'geoms', [polygon]):
+        if part.geom_type != 'Polygon':
+            continue
+        for outline in (part.exterior, *part.interiors):
+            c = np.asarray(outline.coords)
+            for a, b in zip(c[:-1], c[1:]):
+                pieces.append(shapely.convex_hull(shapely.MultiPoint(np.vstack([a + corners, b + corners]))))
+    return shapely.union_all(pieces)
+
+
+def _grid_mask(polygon, out_x, out_y):
+    """The output grid cells (the pixel centres out_x x out_y) inside the polygon's exterior, as a bool (n_y, n_x) array: all of
+    them when the polygon covers the grid, else the polygon rasterized by cv2 (no rasterio/GDAL to avoid fork deadlocks)."""
+    import numpy as np
+    import shapely
+    n_y, n_x = len(out_y), len(out_x)
+    grid_box = shapely.box(out_x[0], out_y[0], out_x[-1], out_y[-1])
+    if polygon.contains(grid_box):
+        return np.ones((n_y, n_x), dtype=bool)
+    import cv2
+    poly_coords = np.array(polygon.exterior.coords)
+    px = ((poly_coords[:, 0] - out_x[0]) / (out_x[-1] - out_x[0]) * (n_x - 1)).astype(np.int32)
+    py = ((poly_coords[:, 1] - out_y[0]) / (out_y[-1] - out_y[0]) * (n_y - 1)).astype(np.int32)
+    mask = np.zeros((n_y, n_x), dtype=np.uint8)
+    cv2.fillPoly(mask, [np.column_stack([px, py])], 1)
+    return mask.astype(bool)
+
+
 def _precise_footprint(outlines, dy, dx):
-    """The SLC footprint of the transform tile workers (WKB), from the precise outlines of the four SLC edges
-    (_precise_outline; first line, last line, first bin, last bin, as compute_conversion_chunked orders them): the
-    ring around the SLC (first line, last bin, last line and first bin reversed), not a convex hull, made valid (a
-    layover fold becomes a part of its own) and buffered by one output cell for the pixel-centre numerics. An edge
-    pixel without a solution on the DEM takes its position at the lowest or the highest DEM height, whichever is
-    farther from the centre of the solved outline (its ground point lies between the two), with a warning."""
+    """The SLC footprint of the transform tile workers, from the precise outlines of the four SLC edges (_precise_outline;
+    first line, last line, first bin, last bin, as compute_conversion_chunked orders them): the outline of the SLC (first
+    line, last bin, last line and first bin reversed), not a convex hull, made valid (a layover fold becomes a part of its
+    own). Returns one WKB: the outline widened by 2 cells along each axis (the pre-filter of the tile workers: their solve set
+    is this mask and its buffer). An edge pixel without a solution on the DEM
+    takes its position at the lowest or the highest DEM height, whichever is farther from the centre of the solved
+    outline (its ground point lies between the two), with a warning."""
     import numpy as np
     import shapely
 
@@ -796,13 +1012,20 @@ def _precise_footprint(outlines, dy, dx):
         print(f'WARNING: {n_unsolved} of {n_total} SLC outline pixels have no DEM solution (outside the DEM or not '
               f'converged): the transform footprint is bounded by the DEM height range there.')
     (y0, x0), (y1, x1), (y2, x2), (y3, x3) = edges
-    ring_y = np.concatenate([y0, y3, y1[::-1], y2[::-1]])
-    ring_x = np.concatenate([x0, x3, x1[::-1], x2[::-1]])
-    ok = np.isfinite(ring_y) & np.isfinite(ring_x)
-    polygon = shapely.Polygon(np.column_stack([ring_x[ok], ring_y[ok]]))
+    outline_y = np.concatenate([y0, y3, y1[::-1], y2[::-1]])
+    outline_x = np.concatenate([x0, x3, x1[::-1], x2[::-1]])
+    ok = np.isfinite(outline_y) & np.isfinite(outline_x)
+    polygon = shapely.Polygon(np.column_stack([outline_x[ok], outline_y[ok]]))
     if not polygon.is_valid:
         polygon = shapely.make_valid(polygon)
-    return shapely.to_wkb(polygon.buffer(max(dy, dx)))
+    # the outline itself: the polygon parts of the valid outline (a layover fold may come with lines, which hold no cell)
+    outline = shapely.union_all([p for p in getattr(polygon, 'geoms', [polygon]) if p.geom_type == 'Polygon'])
+    # Add margin buffer. The mask is the image footprint widened by 2 cells along each axis, and ele is stored on that buffer
+    # while azi and rng are emptied outside the image (below). It is intentional: aspect() and the other gradients need the
+    # elevation of the neighbours of the first and the last azi and rng pixels: one cell for the 3 x 3 kernel and one spare,
+    # because the radar to grid transform is not linear. Do not remove or narrow it.
+    widened = _widen_by_cells(outline, dy, dx)
+    return shapely.to_wkb(widened)
 
 
 def get_utm_epsg(lat, lon):
@@ -880,8 +1103,9 @@ def orbit_defect(orbit_df, start=None, stop=None):
         their median step), 'has invalid (not finite) state vectors for'; None when they can be used.
     """
     clock = orbit_df['clock'].to_numpy(dtype=np.float64)
-    if (len(clock) == 0 or (start is not None and clock.min() > start)
-            or (stop is not None and clock.max() < stop)):
+    # whole milliseconds: a state vector exactly at start or stop covers it
+    if (len(clock) == 0 or (start is not None and round(clock.min() * 1000.0) > round(start * 1000.0))
+            or (stop is not None and round(clock.max() * 1000.0) < round(stop * 1000.0))):
         return 'does not cover'
     steps = np.diff(clock)
     if len(steps) and steps.max() > 1.5 * np.median(steps):
@@ -1205,7 +1429,7 @@ def reference_surface_topo(prm, topo, height, nodes=(33, 65), iterations=4, grid
 
 def satellite_rat2llt(azi, rng, orbit_time, orbit_pos, orbit_vel,
                       clock_start, prf, near_range, rng_samp_rate,
-                      earth_radius, dem=None, max_iter=50, tol=0.01, n_chunks=1, *, lookdir):
+                      earth_radius, dem=None, max_iter=50, tol=0.01, n_chunks=1, *, lookdir, datum=None):
     """
     Direct radar-to-geographic coordinate transform with optional DEM.
 
@@ -1237,14 +1461,20 @@ def satellite_rat2llt(azi, rng, orbit_time, orbit_pos, orbit_vel,
     earth_radius : float
         Local Earth radius in meters (used for initial estimate)
     dem : xarray.DataArray, optional
-        DEM with coords (lat, lon) and values as height above ellipsoid.
+        DEM with coords (lat, lon) and values as height above ellipsoid, or above the vertical datum of datum.
         If None, returns ellipsoidal height based on earth_radius.
     max_iter : int, optional
         Maximum iterations for DEM refinement (default 4)
     tol : float, optional
         Convergence tolerance in meters (default 0.1)
+    n_chunks : int, optional
+        Number of azimuth chunks computed one after another to reduce the peak memory (default 1: no chunking);
+        applied to a 2-D azi grid only.
     lookdir : str
         Look side of the scene, prm.get('lookdir'): 'R' (Sentinel-1) or 'L' (NISAR). Required, never defaulted.
+    datum : str, optional
+        The vertical datum of a dem of orthometric heights (utils_geoid datum names, e.g. 'EGM2008'): the geoid of it is
+        added at each point of the DEM-at-point step. None, the default, means dem holds heights above the ellipsoid.
 
     Returns
     -------
@@ -1529,6 +1759,11 @@ def satellite_rat2llt(azi, rng, orbit_time, orbit_pos, orbit_vel,
                                                  borderMode=cv2.BORDER_CONSTANT, borderValue=0)
                         result[iy:jy, ix:jx] = chunk_result
 
+        # the geoid of datum at the in-bounds points (one coefficient window per call): the DEM heights are orthometric
+        inside = ~out_of_bounds
+        geo = _geoid_at_points(lat_pts[inside], lon_pts[inside], datum)
+        if geo is not None:
+            result[inside] = result[inside] + geo
         result[out_of_bounds] = np.nan
         return result
 
@@ -1648,6 +1883,44 @@ def radar_extent_polygon(prm):
     return Polygon(coords).wkt
 
 
+# Default closest-approach search half window (s) of satellite_baseline around the repeat scene start (t21), used only when
+# the caller gives none. The window the callers should give: Sentinel-1, half the repeat burst's duration from its PRM;
+# NISAR, half the repeat granule's duration from the granule's own metadata (user QW, 2026-10-19), not a cropped scene.
+# A closest approach outside the window means the orbits do not match the pair.
+SEARCH_HALF_WINDOW = 1.5
+
+
+def s1_burst_half_window(prm):
+    """Closest-approach search half window (s) of satellite_baseline for a Sentinel-1 repeat PRM: half the duration of its
+    burst, num_patches x num_valid_az / PRF / 2 (GFD U38a). The window comes from the PRM, not from a constant.
+    NISAR: nisar_granule_half_window (U38b)."""
+    return float(prm.get('num_patches')) * float(prm.get('num_valid_az')) / float(prm.get('PRF')) / 2.0
+
+
+def nisar_granule_half_window(prm):
+    """Closest-approach search half window (s) of satellite_baseline for a NISAR repeat PRM: half the duration of its
+    granule, half of the PRM key granule_duration (the span of metadata/geolocationGrid/zeroDopplerTime in the granule's own
+    metadata, user QW 2026-10-19). Never the duration of a cropped scene: a crop is shorter than its granule, so half the
+    granule is always enough (U38b)."""
+    return float(prm.get('granule_duration')) / 2.0
+
+
+def _check_closest_approach(offset, at_edge, arg, search_half_window=SEARCH_HALF_WINDOW):
+    """Raise FileNotFoundError unless the closest approach of satellite_baseline lies inside its search window: the offset
+    from the window's anchor within search_half_window and the minimum not on a window edge (at_edge). Without it the fit
+    would give a finite wrong baseline (its vertex lies outside its data); a NaN squared baseline (arg) raises too.
+    Inside the window a negative squared baseline is a rounded zero (the vertex of a self-baseline lies at the reference
+    itself, -1e-9 to -3e-9 m2): the function returns 0, and the caller takes the square root of the returned value.
+    search_half_window is the caller's half window in s (satellite_baseline: Sentinel-1 half the repeat burst; NISAR half
+    the repeat granule's duration from its metadata; the default SEARCH_HALF_WINDOW only when the caller gives none).
+    The group check (Satellite.baselines) names the group and the date."""
+    if at_edge or not abs(offset) <= search_half_window or np.isnan(arg):
+        raise FileNotFoundError(f'the closest approach of the repeat orbit is outside its search window of '
+                                f'{search_half_window:.6g} s around the repeat scene start (offset {offset:.3f} s, squared '
+                                f'baseline {arg:.6g} m2): the orbits of the two dates do not match')
+    return max(float(arg), 0.0)
+
+
 def satellite_baseline(orbit_df1: "pd.DataFrame", orbit_df2: "pd.DataFrame",
                        clock_start: float, prf: float,
                        num_valid_az: int, num_patches: int, nrows: int,
@@ -1656,7 +1929,8 @@ def satellite_baseline(orbit_df1: "pd.DataFrame", orbit_df2: "pd.DataFrame",
                        rng_samp_rate: float = None,
                        clock_start_rep: float = None,
                        num_valid_az_rep: int = None, num_patches_rep: int = None,
-                       nrows_rep: int = None, prf_rep: float = None, *, lookdir: str) -> dict:
+                       nrows_rep: int = None, prf_rep: float = None, *, lookdir: str,
+                       search_half_window: float = SEARCH_HALF_WINDOW) -> dict:
     """
     Compute satellite baseline between two acquisitions.
 
@@ -1704,6 +1978,12 @@ def satellite_baseline(orbit_df1: "pd.DataFrame", orbit_df2: "pd.DataFrame",
         Repeat image PRF. If None, uses prf.
     lookdir : str
         Look side, 'R' (Sentinel-1) or 'L' (NISAR). Required: GMTSAR flips the horizontal baseline for 'L'.
+    search_half_window : float, optional
+        Half width in s of the closest-approach search around the repeat scene start (t21). The window is derived per
+        mission: Sentinel-1, half the repeat burst's duration, num_patches_rep x num_valid_az_rep / prf_rep / 2, from the
+        repeat PRM; NISAR, half the repeat granule's duration from the granule's own metadata (the zeroDopplerTime span of
+        metadata/geolocationGrid, user QW 2026-10-19), never a cropped scene's duration. Default SEARCH_HALF_WINDOW (1.5 s)
+        applies only when the caller gives none. The error (FileNotFoundError) names the window used.
 
     Returns
     -------
@@ -1712,6 +1992,14 @@ def satellite_baseline(orbit_df1: "pd.DataFrame", orbit_df2: "pd.DataFrame",
         - B_parallel: Baseline component along the mid-range line of sight, at the scene centre (meters)
         - B_perpendicular: Baseline component normal to that line of sight, positive up, at the scene centre (meters)
         - baseline: Total baseline length (meters)
+
+    Raises
+    ------
+    FileNotFoundError
+        The closest approach of the repeat orbit is outside its search window (search_half_window s either side of the
+        repeat scene start; the message gives the value used), lies on a window edge, or the squared baseline is NaN:
+        the orbits do not match the pair.
+        A negative squared baseline inside the window is a rounded zero: the baseline is 0 (a self-baseline gives 0).
 
     Examples
     --------
@@ -1773,11 +2061,12 @@ def satellite_baseline(orbit_df1: "pd.DataFrame", orbit_df2: "pd.DataFrame",
     # Search repeat orbit for closest point to reference start position
     # This is the key GMTSAR algorithm - find minimum distance, not same time
     dt = 0.5 / prf
-    ns = int((t12 - t11) / dt)
-    ns2 = int(ns * 0.5)  # 50% extension for search
+    # the closest approach is searched within search_half_window of t21 (GMTSAR's window was the scene plus 50% on
+    # each side, -T/2 .. +3T/2 for the scene duration T: about -1.5 .. +4.5 s here)
+    ns2 = int(search_half_window / dt)
 
     # Vectorized search: batch all search times and interpolate once
-    k_vals = np.arange(-ns2, ns + ns2)
+    k_vals = np.arange(-ns2, ns2 + 1)
     ts_all = t21 + k_vals * dt
     # Filter to valid orbit time range
     valid_mask = (ts_all >= orbit_time2[0]) & (ts_all <= orbit_time2[-1])
@@ -1813,11 +2102,11 @@ def satellite_baseline(orbit_df1: "pd.DataFrame", orbit_df2: "pd.DataFrame",
 
     # Minimum at t = -d1/(2*d2), baseline = sqrt(d0 - d1^2/(4*d2))
     t_min_offset = -d1 / (2.0 * d2)
-    with np.errstate(invalid='ignore'):
-        baseline_start = np.sqrt(d0 - d1**2 / (4.0 * d2))
+    t_refined = t_coarse + t_min_offset
+    baseline_start = np.sqrt(_check_closest_approach(t_refined - t21, m1 in (-ns2, ns2), d0 - d1**2 / (4.0 * d2),
+                                                  search_half_window=search_half_window))
 
     # Get repeat position at refined minimum
-    t_refined = t_coarse + t_min_offset
     x21 = _hermite_interp(orbit_time2, orbit_df2['px'].values, orbit_df2['vx'].values, np.array([t_refined]))[0]
     y21 = _hermite_interp(orbit_time2, orbit_df2['py'].values, orbit_df2['vy'].values, np.array([t_refined]))[0]
     z21 = _hermite_interp(orbit_time2, orbit_df2['pz'].values, orbit_df2['vz'].values, np.array([t_refined]))[0]
@@ -1917,7 +2206,7 @@ def satellite_baseline(orbit_df1: "pd.DataFrame", orbit_df2: "pd.DataFrame",
         t2_search_start = t21 + (t1_pos - t11)  # Approximate corresponding time in repeat
 
         # Batch all search times
-        k_vals_local = np.arange(-ns2, ns + ns2)
+        k_vals_local = np.arange(-ns2, ns2 + 1)
         ts_all_local = t2_search_start + k_vals_local * dt
         valid_mask_local = (ts_all_local >= orbit_time2[0]) & (ts_all_local <= orbit_time2[-1])
         ts_valid_local = ts_all_local[valid_mask_local]
@@ -1947,11 +2236,11 @@ def satellite_baseline(orbit_df1: "pd.DataFrame", orbit_df2: "pd.DataFrame",
         coeffs_local = np.polyfit(times_local, bs_sq_local, 2)
         d2_l, d1_l, d0_l = coeffs_local[0], coeffs_local[1], coeffs_local[2]
         t_min_local = -d1_l / (2.0 * d2_l)
-        with np.errstate(invalid='ignore'):
-            baseline_val = np.sqrt(d0_l - d1_l**2 / (4.0 * d2_l))
+        t_ref = t_coarse + t_min_local
+        baseline_val = np.sqrt(_check_closest_approach(t_ref - t2_search_start, m_best in (-ns2, ns2), d0_l - d1_l**2 / (4.0 * d2_l),
+                                                      search_half_window=search_half_window))
 
         # Get repeat position at refined minimum
-        t_ref = t_coarse + t_min_local
         x2 = _hermite_interp(orbit_time2, orbit_df2['px'].values, orbit_df2['vx'].values, np.array([t_ref]))[0]
         y2 = _hermite_interp(orbit_time2, orbit_df2['py'].values, orbit_df2['vy'].values, np.array([t_ref]))[0]
         z2 = _hermite_interp(orbit_time2, orbit_df2['pz'].values, orbit_df2['vz'].values, np.array([t_ref]))[0]
@@ -2280,6 +2569,8 @@ def satellite_llt2rat(lon: np.ndarray, lat: np.ndarray, elevation: np.ndarray,
     n_jobs : int or None
         Number of parallel workers for the point chunks. None or -1 (default): all cores. Inside a worker of an
         outer pool the caller passes its share of the outer n_jobs.
+    debug : bool
+        Not read by this function, which prints nothing at any value (default False).
 
     Returns
     -------
@@ -3150,7 +3441,8 @@ def flat_earth_topo_phase(topo, prm_rep, prm_ref, earth_radius_azi=None, baselin
     ht0 = prm1.get('SC_height_start')
     htf = prm1.get('SC_height_end')
 
-    tspan = 86400 * abs(prm2.get('SC_clock_stop') - prm2.get('SC_clock_start'))
+    # the span of the precise clocks: the SC_clock_* attributes hold whole seconds only
+    tspan = 86400 * abs(prm2.get('clock_stop') - prm2.get('clock_start'))
 
     drange = constants.speed_of_light / (2 * prm2.get('rng_samp_rate'))
     alpha = prm2.get('alpha_start') * np.pi / 180
@@ -3316,7 +3608,8 @@ def compute_transform_inverse(prm, dem, dem_path,
                               n_chunks=8,
                               compute_topo=True,
                               n_jobs=None,
-                              debug=False):
+                              debug=False,
+                              datum=None):
     """
     Compute geocoding transform using optimized inverse method.
 
@@ -3328,7 +3621,8 @@ def compute_transform_inverse(prm, dem, dem_path,
     prm : PRM
         The reference burst PRM object with orbit_df attached.
     dem : xarray.DataArray
-        Pre-loaded ellipsoid-corrected DEM (WGS84 ellipsoidal heights).
+        Pre-loaded DEM window of orthometric heights (get_dem_wgs84ellipsoid(geoid_correction=False)); the geoid of
+        datum is added at each point, so the window holds no geoid.
     dem_path : str
         The DEM file dem is a window of (get_dem_wgs84ellipsoid() of it): the pixel heights are interpolated at
         their positions in its lattice (dem_interp_cubic(), as the NISAR transform).
@@ -3347,6 +3641,9 @@ def compute_transform_inverse(prm, dem, dem_path,
         Number of parallel workers of the inverse transform (satellite_llt2rat). None or -1 (default): all cores.
     debug : bool, optional
         If True, prints timing information. Default is False.
+    datum : str, optional
+        The vertical datum of dem (Satellite.dem_datum()): its geoid is added at the points. None, the default, means
+        dem holds heights above the ellipsoid.
 
     Returns
     -------
@@ -3359,8 +3656,6 @@ def compute_transform_inverse(prm, dem, dem_path,
     import time
     import gc
     import pandas as pd
-    import warnings
-    warnings.filterwarnings('ignore')
 
     _timings = {} if debug else None
 
@@ -3419,7 +3714,7 @@ def compute_transform_inverse(prm, dem, dem_path,
             azi_row, rng_coords,
             orbit_time, orbit_pos, orbit_vel,
             clock_start, prf, near_range, rng_samp_rate, earth_radius,
-            dem=dem, max_iter=10, tol=0.5, n_chunks=1, lookdir=lookdir
+            dem=dem, max_iter=10, tol=0.5, n_chunks=1, lookdir=lookdir, datum=datum
         )
         y_proj, x_proj = proj(lat, lon, from_epsg=4326, to_epsg=epsg)
         if row_azi == azi_coords[0]:
@@ -3495,7 +3790,7 @@ def compute_transform_inverse(prm, dem, dem_path,
             bnd_azi, bnd_rng,
             orbit_time, orbit_pos, orbit_vel,
             clock_start, prf, near_range, rng_samp_rate, earth_radius,
-            dem=dem, max_iter=10, tol=0.5, n_chunks=1, lookdir=lookdir
+            dem=dem, max_iter=10, tol=0.5, n_chunks=1, lookdir=lookdir, datum=datum
         )
         y_b, x_b = proj(lat_b, lon_b, from_epsg=4326, to_epsg=epsg)
         y_bnd_all.append(y_b)
@@ -3519,28 +3814,17 @@ def compute_transform_inverse(prm, dem, dem_path,
     bnd_x = x_bnd_all[valid]
     del y_bnd_all, x_bnd_all
 
-    # Build boundary polygon using shapely convex hull
+    # Build boundary polygon using shapely convex hull: the outline, the burst footprint before the widening
     import shapely
     points = shapely.MultiPoint(np.column_stack([bnd_x, bnd_y]))
-    polygon = points.convex_hull
+    outline = points.convex_hull
 
-    # Add margin buffer
-    margin = 10 * max(dx, dy)
-    polygon = polygon.buffer(margin)
-
-    # Fast path: if polygon covers entire grid, all pixels are valid (skip cv2 import)
-    grid_box = shapely.box(out_x[0], out_y[0], out_x[-1], out_y[-1])
-    if polygon.contains(grid_box):
-        valid_mask = np.ones((n_y, n_x), dtype=bool)
-    else:
-        # Rasterize polygon to valid mask (cv2, no rasterio/GDAL to avoid fork deadlocks)
-        import cv2
-        poly_coords = np.array(polygon.exterior.coords)
-        px = ((poly_coords[:, 0] - out_x[0]) / (out_x[-1] - out_x[0]) * (n_x - 1)).astype(np.int32)
-        py = ((poly_coords[:, 1] - out_y[0]) / (out_y[-1] - out_y[0]) * (n_y - 1)).astype(np.int32)
-        valid_mask = np.zeros((n_y, n_x), dtype=np.uint8)
-        cv2.fillPoly(valid_mask, [np.column_stack([px, py])], 1)
-        valid_mask = valid_mask.astype(bool)
+    # Add margin buffer. The mask is the burst footprint widened by 2 cells along each axis, and ele is stored on that buffer
+    # while azi and rng are emptied outside the image (below). It is intentional: aspect() and the other gradients need the
+    # elevation of the neighbours of the first and the last azi and rng pixels: one cell for the 3 x 3 kernel and one spare,
+    # because the radar to grid transform is not linear. Do not remove or narrow it.
+    polygon = _widen_by_cells(outline, dy, dx)
+    valid_mask = _grid_mask(polygon, out_x, out_y)
 
     n_valid = valid_mask.sum()
 
@@ -3569,16 +3853,21 @@ def compute_transform_inverse(prm, dem, dem_path,
     while r0 < n_y:
         cum = np.cumsum(row_counts[r0:])
         r1 = min(n_y, r0 + max(1, int(np.searchsorted(cum, block_points, side='right'))))
-        blk_mask = valid_mask[r0:r1]
-        k = int(cum[r1 - r0 - 1])
+        # the solved cells of the block: the pre-filter (valid_mask) and its buffer of 2 cells, on rows r0:r1 (the rows r0 - 2 to
+        # r1 + 2 are read, so the buffer of the block is exact). The buffer cells are solved for their ele only: azi and rng are
+        # emptied there (below)
+        lo, hi = max(0, r0 - 2), min(n_y, r1 + 2)
+        blk_solve = _buffer_cells(valid_mask[lo:hi])[r0 - lo:r1 - lo]
+        blk_pre = valid_mask[r0:r1][blk_solve]
+        k = int(blk_solve.sum())
         if k == 0:
             r0 = r1
             continue
 
-        # Step 5: the block's valid output pixels to lon/lat, and their DEM elevation
+        # Step 5: the block's solved output pixels to lon/lat, and their DEM elevation
         x_grid, y_grid = np.meshgrid(out_x, out_y[r0:r1])
-        vy = y_grid[blk_mask]
-        vx = x_grid[blk_mask]
+        vy = y_grid[blk_solve]
+        vx = x_grid[blk_solve]
         del x_grid, y_grid
         lat_b, lon_b = proj(vy, vx, from_epsg=epsg, to_epsg=4326)
         del vy, vx
@@ -3589,7 +3878,7 @@ def compute_transform_inverse(prm, dem, dem_path,
         lon_b = np.asarray(lon_b, dtype=np.float64)
         # cv2.remap INTER_CUBIC at each pixel's position in the DEM file's lattice, as the NISAR tile worker (the
         # value does not depend on the block or the DEM window); float32 DEM heights, the arithmetic below in float64
-        ele_b = dem_interp_cubic(dem, dem_path, lat_b, lon_b)
+        ele_b = _dem_plus_geoid(dem_interp_cubic(dem, dem_path, lat_b, lon_b), lat_b, lon_b, datum)
 
         # Step 6: inverse transform, in calls of at most _LLT2RAT_CALL_POINTS points: satellite_llt2rat returns
         # float64 [N, 5] and its parallel chunks are all in flight at once (threads, inside a burst worker process)
@@ -3610,8 +3899,14 @@ def compute_transform_inverse(prm, dem, dem_path,
             rng_b[j0:j1] = result[:, 0].astype(np.float32)
             azi_b[j0:j1] = result[:, 1].astype(np.float32)
             del result
-        # Filter out-of-bounds (valid pixel centers are [0, n-1])
+        # Filter out-of-bounds (valid pixel centers are [0, n-1]). Only azi and rng are emptied: ele stays on the buffer around
+        # the image (see the margin buffer above). The buffer cells outside the pre-filter are solved for their ele only, so
+        # their azi and rng are emptied too. The topo (step 9) keeps the in-bounds pre-filter points (azi_t, rng_t), so the
+        # topo and the phase of the bursts do not change.
         out_of_bounds = (azi_b < 0) | (azi_b > n_azi - 1) | (rng_b < 0) | (rng_b > n_rng - 1)
+        azi_t = np.where(out_of_bounds, np.nan, azi_b).astype(np.float32)
+        rng_t = np.where(out_of_bounds, np.nan, rng_b).astype(np.float32)
+        out_of_bounds = out_of_bounds | ~blk_pre
         azi_b[out_of_bounds] = np.nan
         rng_b[out_of_bounds] = np.nan
         del out_of_bounds
@@ -3644,9 +3939,9 @@ def compute_transform_inverse(prm, dem, dem_path,
         # incidence from the stack's reference numbers and the burst geometry, it reads no azi, rng or ele
 
         # Step 8: scatter to the output grids (the block's rows, in the row-major order of its mask)
-        inv_azi[r0:r1][blk_mask] = azi_b
-        inv_rng[r0:r1][blk_mask] = rng_b
-        inv_ele[r0:r1][blk_mask] = R_target - R_local
+        inv_azi[r0:r1][blk_solve] = azi_b
+        inv_rng[r0:r1][blk_solve] = rng_b
+        inv_ele[r0:r1][blk_solve] = R_target - R_local
         del R_local
 
         # Step 9 (scatter): the elevation of every pixel kept for its nearest radar cell
@@ -3657,17 +3952,27 @@ def compute_transform_inverse(prm, dem, dem_path,
             # Convert to radar grid indices and round to nearest. The mask comes before the int64 cast: a NaN azi or
             # rng (out of the radar grid, or over a DEM gap) has no radar cell, and its cast is platform-defined (0 on
             # arm64, the radar cell (0, 0))
-            azi_round = np.round(azi_b - azi_coords[0])
-            rng_round = np.round(rng_b - rng_coords[0])
+            azi_round = np.round(azi_t - azi_coords[0])
+            rng_round = np.round(rng_t - rng_coords[0])
             m = (np.isfinite(azi_round) & np.isfinite(rng_round)
-                 & (azi_round >= 0) & (azi_round < n_azi) & (rng_round >= 0) & (rng_round < n_rng))
+                 & (azi_round >= 0) & (azi_round < n_azi) & (rng_round >= 0) & (rng_round < n_rng) & blk_pre)
             idx = azi_round[m].astype(np.int64) * n_rng + rng_round[m].astype(np.int64)
             del azi_round, rng_round
             scatter.add(idx, ele_topo_b[m])
             del ele_topo_b, m, idx
-        del R_target, azi_b, rng_b
+        del R_target, azi_b, rng_b, azi_t, rng_t
         r0 = r1
     del valid_mask, row_counts
+
+    # ele is kept on the image widened by 2 cells (columns, then rows), and emptied elsewhere: the image is the pre-filter cells
+    # with azi inside [0, n - 1] (the finite azi), in blocks of rows (rows r0 - 2 to r1 + 2 are read for the buffer)
+    r0 = 0
+    while r0 < n_y:
+        r1 = min(n_y, r0 + 256)
+        lo, hi = max(0, r0 - 2), min(n_y, r1 + 2)
+        keep = _buffer_cells(np.isfinite(inv_azi[lo:hi]))[r0 - lo:r1 - lo]
+        inv_ele[r0:r1][~keep] = np.nan
+        r0 = r1
 
     if _timings is not None:
         _timings['inverse_transform'] = time.perf_counter() - t0
@@ -3748,7 +4053,8 @@ def compute_conversion_chunked(prm, dem_path, geometry, outdir,
 
     Directory structure:
     - outdir/transform/   : Persistent transform zarr (azi, rng, ele) for geocoding: azi/rng are the 0-based
-      pixel-centre line and bin of each output pixel, ele its WGS84 ellipsoidal height, rounded to int32 counts of
+      pixel-centre line and bin of each output pixel (empty outside the image), ele its WGS84 ellipsoidal height, also on
+      the buffer of 2 cells along each axis around the image where azi and rng are empty, rounded to int32 counts of
       1/scale_factor for the stack
     - outdir/conversion/transform/ : Temporary precise transform (float32, precise_transform_dir), which the
       processing reads (the topo below and the SLC chunks); the caller removes it when the dates are processed
@@ -3787,8 +4093,6 @@ def compute_conversion_chunked(prm, dem_path, geometry, outdir,
     import xarray as xr
     import joblib
     import cv2
-    import warnings
-    warnings.filterwarnings('ignore')
 
     t0_total = time.perf_counter()
 
@@ -3932,7 +4236,8 @@ def compute_conversion_chunked(prm, dem_path, geometry, outdir,
     if debug:
         print(f'Output grid: {n_y} x {n_x}, bounds from {n_bnd} boundary points in {time.perf_counter() - t0:.1f}s')
 
-    # The SLC footprint for the tile workers, once for all tiles: the ring of the precise outlines
+    # The SLC footprint for the tile workers, once for all tiles: the outline of the precise outlines, widened (the mask)
+    # (_precise_footprint)
     fp_wkb = _precise_footprint(outlines, dy, dx)
 
     # Free boundary arrays - workers will determine tile validity internally
@@ -4223,36 +4528,3 @@ def xcorr_fitoffset(results: list, nx: int, ny: int, rank: int = 3, debug: bool 
         'stretch_a': prm_result.get('stretch_a'),
         'a_stretch_a': prm_result.get('a_stretch_a'),
     }
-
-
-# =============================================================================
-# SATELLITE-AGNOSTIC UTILITIES (moved from S1_align.py, S1_transform.py)
-# =============================================================================
-
-def _offset2shift(xyz, rmax, amax, method='linear'):
-    """Convert offset coordinates to shift grid.
-
-    Parameters
-    ----------
-    xyz : np.ndarray
-        Array of shape (N, 3) with columns [range, azimuth, value].
-    rmax : int
-        Maximum range coordinate.
-    amax : int
-        Maximum azimuth coordinate.
-    method : str
-        Interpolation method for scipy.interpolate.griddata.
-
-    Returns
-    -------
-    xr.DataArray
-        Interpolated shift grid with dims ['a', 'r'].
-    """
-    import xarray as xr
-    from scipy.interpolate import griddata
-
-    rngs = np.arange(8/2, rmax+8/2, 8)
-    azis = np.arange(4/2, amax+4/2, 4)
-    grid_r, grid_a = np.meshgrid(rngs, azis)
-    grid = griddata((xyz[:, 0], xyz[:, 1]), xyz[:, 2], (grid_r, grid_a), method=method)
-    return xr.DataArray(grid, coords={'a': azis, 'r': rngs}, dims=['a', 'r'])

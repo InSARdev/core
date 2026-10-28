@@ -468,6 +468,39 @@ def burst_xmls(annotation, noise, calibration, burst_index, byte_offset, noise_a
                  for root, content in (('product', product), ('noise', noise_out), ('calibration', calibration_out)))
 
 
+def iw2_annotation_xml(metadata, polarization):
+    """
+    The annotation XML of the IW2 product of a burst manifest, stored with the IW1 and IW3 bursts of the scene: the
+    bistatic term of the ECEF range reads its slantRangeTime, numberOfSamples and rangeSamplingRate.
+
+    The manifest holds the subswath products of the polarization, the IW2 one found by the swath its annotation names (the
+    archive does not always hold it, so it is not at a fixed position). The product is written as the manifest holds it,
+    every element of the subswath annotation (it is not cut to a burst).
+
+    Parameters
+    ----------
+    metadata : dict
+        The <metadata> element of the burst manifest, parsed by xmltodict: the lists 'product', 'noise' and
+        'calibration' of the three subswaths, each with 'polarisation' and 'content'.
+    polarization : str
+        The polarization of the burst, e.g. 'VV'; the IW2 product must have the same.
+
+    Returns
+    -------
+    bytes or None
+        The IW2 annotation (UTF-8). None, with a WARNING, when the manifest holds no IW2 product of the polarization
+        (the archive lacks it): the burst is then stored without it.
+    """
+    import xmltodict
+
+    products = [product for product in _as_list(metadata['product'])
+                if product['content'].get('adsHeader', {}).get('swath') == 'IW2' and product.get('polarisation') == polarization]
+    if not products:
+        print(f'WARNING: the burst manifest holds no IW2 product of {polarization}: the IW2 annotation is not stored.')
+        return None
+    return xmltodict.unparse({'product': products[0]['content']}, pretty=True, indent='  ').encode('utf-8')
+
+
 # The Sentinel-1 IW burst ID, ESA Sentinel-1 Level 1 Detailed Algorithm Definition (SEN-TN-52-7445, issue 2/4,
 # section 9.25 "Burst ID", eqs. 9-89..9-91): the orbit period of the 12-day repeat cycle of 175 orbits, the preamble
 # time and the IW burst cycle time, in seconds.
