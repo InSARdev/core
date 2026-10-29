@@ -9,7 +9,6 @@
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
 from __future__ import annotations
-from .utils_torch import serialize_gpu
 from .BatchCore import BatchCore, _SCALARS
 import numpy as np
 import xarray as xr
@@ -235,10 +234,15 @@ def _trend2d_finalize_for_dask(acc, dates=None, *, stats=None,
     """One date block of accumulators -> its coefficients.
 
     Columns are the k gradients, the constant, why the date failed if it
-    did (0 solved, 1 no pixels, 2 the trend walked out of `range`, 3 the
-    covariate is degenerate on this date, 4 the iteration did not converge),
-    the coherence at the solution, the coherence at ZERO trend (their
-    difference is what the trend bought), the sample count, the k
+    did (0 solved, 1 no pixels or a checkerboard half with none, 2 the trend walked out of `range`, 3 the
+    covariate is degenerate on this date, 4 the iteration did not converge,
+    5 a different trend beats the answer on the global lattice, 6 the
+    coherence is not above the noise level). Every
+    unresolved date has NaN in the gradients, the constant, the errors, the
+    coherence, the coherence at ZERO trend and the gain: NaN means no data,
+    a coherence is proved only by a trend that stands. The coherence at the
+    solution, the coherence at ZERO trend (their difference is what the trend
+    bought), the sample count, the k
     reaches -- the half-power width of each variable's own sampling -- the
     k errors and the k centroids of the date's pixels.
     At degree 0 the gradients are zero, the reaches NaN, and the first error
@@ -257,11 +261,13 @@ def _trend2d_finalize_for_dask(acc, dates=None, *, stats=None,
         # NAME THEM. A date that comes back NaN takes every pixel of the stack
         # with it downstream, so the message has to say which date and what
         # stopped it rather than how many fell out of one block.
-        _reason = {1: 'no pixels',
+        _reason = {1: 'no pixels, or a checkerboard half with none',
                    2: 'the trend walked out of `range` -- widen it',
                    3: 'degenerate covariate on this date',
                    4: 'did not converge -- an unconverged number is a '
-                      'plausible wrong value, so it is not returned'}
+                      'plausible wrong value, so it is not returned',
+                   5: 'a different trend beats it on the global lattice -- coherence NaN',
+                   6: 'coherence not above the noise level -- not proved'}
         _d = (np.asarray(dates).ravel() if dates is not None
               else np.arange(det.size))
         for _i in np.flatnonzero(~det):
@@ -380,704 +386,10 @@ class _Fit3dSlice:
                                       num_workers=max(1, int(threads))))
 
 
-
-
-def _fit3d_scan_for_dask(block, owned, origin, cell_origin, kw, threads,
-                         token=None):
-    """PASS 1: the cascade's dense scan, one chunk, read inside the task.
-
-    What leaves is what the plan always specified: the DS-candidate RANK
-    RASTER for the owned pixels, and the PS-candidate WINNER GRID -- one
-    candidate per independence cell, its series and the pixel it came from.
-    The winner grid is the raster one pyramid level up, so the whole scene's
-    candidates weigh megabytes and the PS test can be asked ONCE, over all of
-    them, instead of once per chunk against whatever that chunk happened to
-    contain.
-
-    `cell_origin` names where this chunk's winner grid sits on the scene's own
-    cell lattice, so the level-1 stage can lay the parts side by side.
-    """
-    import numpy as np
-    from . import utils_arcs
-    if isinstance(block, _Fit3dSlice):
-        block = block.read(threads)
-    # PARTIAL PER-DATE COVERAGE IS NORMAL AND TOLERATED. A pixel valid on some
-    # dates and NaN on others is not a broken stack: the burst footprint drifts
-    # sub-pixel between acquisitions, so a thin strip along the slanted edge is
-    # imaged by only some dates. The pipeline handles it -- `_cascade_ps` only
-    # ever uses pixels valid on EVERY date as candidates, so an edge pixel with
-    # gaps simply is not a candidate, while the fully covered interior forms
-    # the network. An earlier hard check here raised on that edge strip and
-    # failed the whole fit; it was wrong. The one fatal case -- a date empty
-    # over the WHOLE scene, so no all-dates pixel exists anywhere -- surfaces
-    # as an empty network in `_fit3d_select_ps`, which raises there and names
-    # the absent dates from their real coverage.
-    wy, wx, _pey, _pex = kw['window']
-    rank, W, wiy, wix = utils_arcs._cascade_pass1(
-        block, owned, origin, wy, wx, tuple(kw['cell']),
-        float(kw['threshold']), int(kw['min_agreeing']), threads=threads)
-    # SCENE PIXELS ALREADY: the origin is handed to the scan in scene
-    # coordinates, so the cells are cut on the SCENE lattice and the winner
-    # positions come back on it -- one lattice for every burst, which is what
-    # lets the level-1 stage lay the parts side by side exactly.
-    return rank, W, wiy, wix
-
-
-def _fit3d_select_ps(parts, kw, threads):
-    """The PS test over the candidates in `parts`, on ONE scene lattice.
-
-    Each part is `((W, iy, ix), (cell_y0, cell_x0))`; the grids are laid
-    side by side by cell index and tested TOGETHER, a later part painting
-    over an earlier one where both hold a winner. Returns None when no part
-    holds a candidate, else a dict:
-      g, wiy, wix : the test's coherence per lattice cell and the winner's
-          scene pixel (-1 where none);
-      U, iy, ix : the CERTIFIED winners' unit phasors and scene pixels, the
-          network's input;
-      cands, lat : how many candidates were tested and the lattice shape.
-    Split out so the SELECTION can be varied -- all candidates together, or
-    each chunk's alone -- while the network solve that follows stays the same.
-    """
-    import numpy as np
-    from . import utils_arcs
-    parts = [p for p in parts if p is not None]
-    if not parts:
-        return None
-    n = parts[0][0][0].shape[0]
-    NY = max(int(p[1][0]) + p[0][0].shape[1] for p in parts)
-    NX = max(int(p[1][1]) + p[0][0].shape[2] for p in parts)
-    Wser = np.full((n, NY, NX), np.nan, np.complex64)
-    wiy = np.full((NY, NX), -1, np.int32)
-    wix = np.full((NY, NX), -1, np.int32)
-    for (W, iy_, ix_), (cy0, cx0) in parts:
-        sy = slice(int(cy0), int(cy0) + W.shape[1])
-        sx = slice(int(cx0), int(cx0) + W.shape[2])
-        take = np.asarray(iy_) >= 0
-        Wser[:, sy, sx] = np.where(take[None], W, Wser[:, sy, sx])
-        wiy[sy, sx] = np.where(take, iy_, wiy[sy, sx])
-        wix[sy, sx] = np.where(take, ix_, wix[sy, sx])
-
-    # THE ONE FATAL DISAGREEMENT: no candidate is valid on EVERY date, so the
-    # all-dates test that PS and the network both need leaves fewer than two.
-    # Partial edge coverage does not cause this -- the interior is imaged by
-    # every date and its candidates are all-dates valid; only a date that is
-    # empty across essentially the WHOLE candidate footprint empties the
-    # intersection. When that happens the fit would return a model of NaN with
-    # no error, so it is caught here and the ABSENT dates are named -- those
-    # far below the coverage the rest reach, not merely short of a stray edge
-    # pixel.
-    _amp = np.abs(Wser)
-    _good = np.isfinite(_amp)
-    _have = wiy >= 0
-    if _have.any() and int((_good.all(axis=0) & _have).sum()) < 2:
-        _cov = _good[:, _have].mean(axis=1)
-        _cmax = float(_cov.max())
-        _bad = np.flatnonzero(_cov < 0.5 * _cmax)
-        if len(_bad) and _cmax > 0.0:
-            _dvs = np.asarray(kw['date_values'])
-            _nm = ', '.join(f'{str(_dvs[i])[:10]} ({100*_cov[i]:.0f}%)'
-                            for i in _bad[:8])
-            raise ValueError(
-                f'fit3d(): no scatterer is coherent on every date -- '
-                f'{len(_bad)} of {len(_cov)} dates cover under half of what '
-                f'the rest do: {_nm}'
-                + (' ...' if len(_bad) > 8 else ''))
-    del _amp, _good
-    wy, wx, pey, pex = kw['window']
-    t, ele2phase, meter2rad, _car = utils_arcs._3d_fit_frame(
-        kw['date_values'], kw['bperp'], kw['geometry'], n)
-    g, _dh, _dv, _arcs = utils_arcs._cascade_ps(
-        Wser, wiy, wix, ele2phase, t, meter2rad, wy, wx, pey, pex,
-        float(kw['threshold']), int(kw['min_agreeing']),
-        max_dh=kw['max_dh'], max_dv=kw['max_dv'], step_dh=kw['step_dh'],
-        step_dv=kw['step_dv'], iterations=int(kw['iterations']),
-        threads=threads, budget=kw['budget'],
-        # the winner grid is built on the PS lattice in _cascade_pass1;
-        # reach and the short-arc exclusion count in it
-        pcell=utils_arcs._3d_ps_lattice(kw['cell']))
-    out = dict(g=np.asarray(g, np.float32), wiy=wiy, wix=wix,
-               cands=int(np.count_nonzero(wiy >= 0)), lat=(NY, NX))
-    sel = np.isfinite(g) & (g >= float(kw['threshold'])) & (wiy >= 0)
-    if not int(sel.sum()):
-        out.update(U=np.zeros((n, 0), np.complex64),
-                   iy=np.zeros(0, np.int64), ix=np.zeros(0, np.int64))
-        return out
-    W = Wser[:, sel]
-    a = np.abs(W)
-    with np.errstate(invalid='ignore', divide='ignore'):
-        U = np.ascontiguousarray(
-            np.where(a > 0, W / np.where(a > 0, a, 1), 0).astype(np.complex64))
-    out.update(U=U, iy=wiy[sel].astype(np.int64), ix=wix[sel].astype(np.int64))
-    return out
-
-
-def _fit3d_ps_raster_for_dask(test, oy, ox, ny, nx):
-    """The PS test written back onto ONE chunk of a burst's pixel grid.
-
-    The test answers per lattice cell; the winner knows which pixel it is,
-    so its coherence goes back to that pixel, NaN elsewhere. EVERY winner
-    inside the chunk is written, whichever burst it was scanned from --
-    the rule fit3d() writes its nodes by, so a burst whose grid overlaps
-    another's shows the same points the model will carry there.
-    """
-    import numpy as np
-    out = np.full((int(ny), int(nx)), np.nan, np.float32)
-    if test is None:
-        return out
-    g = np.asarray(test['g']).ravel()
-    yy = np.asarray(test['wiy']).ravel()
-    xx = np.asarray(test['wix']).ravel()
-    m = (yy >= 0) & (xx >= 0) & np.isfinite(g)
-    yy = yy[m] - int(oy)
-    xx = xx[m] - int(ox)
-    ok = (yy >= 0) & (yy < int(ny)) & (xx >= 0) & (xx < int(nx))
-    out[yy[ok], xx[ok]] = g[m][ok]
-    return out
-
-
-def _fit3d_level1_for_dask(parts, kw, threads):
-    """THE PS TEST, then the one network over whatever it certified.
-
-    The winner grids are laid on one cell lattice -- the bursts share a ground
-    grid, so a chunk's grid sits a whole number of cells from the scene's
-    origin -- and the long-arc test runs on the result. A candidate is
-    therefore judged against every candidate within the PS extent, not against
-    the ones that happen to share its chunk: at this chunking a chunk is a
-    fraction of that extent wide, so the chunk-local test was asking a question
-    the data in that chunk could not answer.
-
-    THE LATER BURST WINS THE OVERLAP, as everywhere else here.
-    """
-    import numpy as np
-    import time
-    from . import utils_arcs
-    _mark = time.monotonic()
-    got = _fit3d_select_ps(parts, kw, threads)
-    if got is not None and got['U'].shape[1] == 0:
-        got = None
-    cands = None if got is None else got['cands']
-    lat = None if got is None else got['lat']
-    # NO NETWORK IS FATAL, AND SAID SO HERE. This stage answers for the WHOLE
-    # scene: with no certified PS there is no datum, so every later level has
-    # nothing to attach to and every pixel comes back NaN. Returning None let
-    # the run continue -- an hour of DS work writing NaN into planes nothing
-    # anchors, ending in a model that is empty with no error anywhere. A block
-    # holding no nodes is ordinary and still handled below; a SCENE holding
-    # none is a stop.
-    if got is None:
-        raise ValueError(
-            'fit3d(): the PS test certified no scatterer anywhere in the '
-            f'scene{kw.get("tag", "")} at threshold={float(kw["threshold"]):g}. '
-            'Nothing can be '
-            'attached without a network, so the fit would return an empty '
-            'model. Lower `threshold`, widen the PS extent (the second window '
-            'value, or window[2:] in the four-value form), or check that the '
-            'stack carries coherent scatterers.')
-    U, iy, ix = got['U'], got['iy'], got['ix']
-    if kw['debug']:
-        # LEVEL 0, which is what this stage produces: the PS test and the
-        # network solved over what it certified. It is the union driver's
-        # FIRST pass, which is all the function's name says -- printing that
-        # ordinal as the level labelled the PS network as level 1 and left
-        # `level=0` reporting a level it had been asked not to run.
-        print(f'DEBUG: level 0{kw.get("tag", "")}  {cands:,} candidates'
-              f' on a {lat[0]} x {lat[1]} cell lattice'
-              + f' -> {U.shape[1]:,} PS'
-              + f'   {time.monotonic() - _mark:.1f}s', flush=True)
-    if U.shape[1] < 2:
-        raise ValueError(
-            f'fit3d(): the PS test certified {U.shape[1]} scatterer(s) in the '
-            f'whole scene{kw.get("tag", "")} at '
-            f'threshold={float(kw["threshold"]):g}; a network '
-            'needs at least two. The fit would return an empty model. Lower '
-            '`threshold`, widen the PS extent (the second window value, or '
-            'window[2:] in the four-value form), or check the stack.')
-    return utils_arcs._3d_ps_network(
-        U, iy, ix, kw['date_values'], bperp=kw['bperp'], window=kw['window'],
-        threshold=float(kw['threshold']), geometry=kw['geometry'],
-        budget=kw['budget'], consensus=kw['consensus'],
-        iterations=int(kw['iterations']), max_dh=kw['max_dh'],
-        max_dv=kw['max_dv'], step_dh=kw['step_dh'], step_dv=kw['step_dv'],
-        max_seasonal=kw['max_seasonal'],
-        err_dh=kw.get('err_dh', 5.0), err_dv=kw.get('err_dv', 1.0),
-        threads=threads, debug=kw['debug'])
-
-
-def _fit3d_attach_for_dask(block, part, net, kw, origin, threads, token=None,
-                           emit_nodes=False):
-    """PASS 2 of the union: the shared network written onto this block's grid.
-
-    The block is read a SECOND time. That is the price of solving one network:
-    pass 1 could not keep the pixels -- keeping them is what overloaded the
-    host -- so the series come back from the store while the network does not.
-    A node's model reaches this block only if the node stands in it; the datum
-    it carries is the one the whole scene agreed on.
-    """
-    import numpy as np
-    from . import utils_arcs
-    if isinstance(block, _Fit3dSlice):
-        block = block.read(threads)
-    n, ny, nx = block.shape
-    q = part
-    # THE NODES WITHIN THIS BLOCK'S PS EXTENT, in the block's own index space.
-    # Nodes outside the block are partners and nothing else -- the extent is a
-    # full box centred on a pixel, so a candidate here reaches half of it
-    # either side and no further. That bound is what lets the attachment go on
-    # ranking against every node it is handed: a block is narrower than the
-    # extent, so inside one burst the two rules already agreed, and across the
-    # seam this is the reach the window always claimed. Handing it the whole
-    # scene instead would rank a candidate against nodes its own window
-    # refuses, which is neither cheaper nor right.
-    nodes = None
-    if net is not None and len(np.asarray(net['iy'])):
-        _iy = np.asarray(net['iy']) - int(origin[0])
-        _ix = np.asarray(net['ix']) - int(origin[1])
-        _ry = max(int(kw['window'][2]) // 2, 1)
-        _rx = max(int(kw['window'][3]) // 2, 1)
-        m = ((_iy >= -_ry) & (_iy < ny + _ry)
-             & (_ix >= -_rx) & (_ix < nx + _rx))
-        if m.any():
-            nodes = dict(iy=_iy[m], ix=_ix[m],
-                         U=np.ascontiguousarray(net['U'][:, m]),
-                         label=np.asarray(net['label'])[m],
-                         vel=np.asarray(net['vel'])[m],
-                         hgt=np.asarray(net['hgt'])[m],
-                         coh=np.asarray(net['coh'])[m],
-                         sea=np.asarray(net['sea'])[m])
-            if kw['debug']:
-                # COUNTED HERE, REPORTED ONCE. One line per block said the
-                # same thing every time: the PS extent is wider than a block
-                # by design, so nearly the whole network clears the filter and
-                # only the owned count varies. The level's reducer prints the
-                # spread over the blocks instead.
-                _inb = ((nodes['iy'] >= 0) & (nodes['iy'] < ny)
-                        & (nodes['ix'] >= 0) & (nodes['ix'] < nx))
-                _offered, _ownedn = int(m.sum()), int(_inb.sum())
-    _own = {}
-    l, v, h, sa, cg, lv = utils_arcs._3d_ps_attach(
-        block, q, nodes, kw['date_values'], out_stats=_own,
-        spacing=kw['spacing'],
-        bperp=kw['bperp'], window=kw['window'], threshold=kw['threshold'],
-        cell=kw['cell'], geometry=kw['geometry'], budget=kw['budget'],
-        level=kw['level'], max_dh=kw['max_dh'], max_dv=kw['max_dv'],
-        step_dh=kw['step_dh'], step_dv=kw['step_dv'],
-        consensus=kw['consensus'], iterations=kw['iterations'],
-        err_dh=kw.get('err_dh', 5.0), err_dv=kw.get('err_dv', 1.0),
-        threads=threads, debug=kw['debug'])
-    # ONE CONVENTION ACROSS EVERY FIT, whichever driver called this
-    v = -v
-    sa = -sa
-    out = np.concatenate(
-        [l[None].astype(np.complex64), v[None].astype(np.complex64),
-         h[None].astype(np.complex64), sa[None].astype(np.complex64),
-         cg[None].astype(np.complex64), lv[None].astype(np.complex64)],
-        axis=0)
-    if not emit_nodes:
-        return out
-    # THE LEVEL-1 NODES, IN SCENE COORDINATES. Level 2 is a separate stage over
-    # these; a chunk needs the ones its neighbours own as well as its own, so
-    # they leave here in a frame every chunk shares.
-    # THIS CALL'S OWN NODES, WITH NO FALLBACK. `stats` outlives the task --
-    # dask reuses its worker threads, so the dict still holds whatever the
-    # previous block on this thread wrote. Falling back to it when this call
-    # produced nothing is not a safe default: the stale coordinates get
-    # re-based to THIS block's origin and shipped as this block's level-1
-    # nodes, so level 2 attaches to pixels that were never solved, carrying
-    # another block's velocities and another datum. An empty table is the
-    # correct answer for a block that attached nothing.
-    _st = _own
-    import numpy as _np
-    if int(_st.get('ds_attached', 0)) and 'ds_iy' in _st:
-        _nodes = dict(
-            iy=_np.asarray(_st['ds_iy'], _np.int64) + int(origin[0]),
-            ix=_np.asarray(_st['ds_ix'], _np.int64) + int(origin[1]),
-            vel=_np.asarray(_st['ds_velocity_rad_yr'], float),
-            hgt=_np.asarray(_st['ds_height_rad'], float),
-            sea=_np.asarray(_st['ds_seasonal_rad']),
-            label=_np.asarray(_st['ds_label']),
-            gamma=(_np.asarray(_st['ds_gamma'], float)
-                   if _st.get('ds_gamma') is not None else None),
-            level=_np.ones(len(_st['ds_iy']), _np.int16))
-    else:
-        _nodes = dict(iy=_np.zeros(0, _np.int64), ix=_np.zeros(0, _np.int64),
-                      vel=_np.zeros(0), hgt=_np.zeros(0),
-                      sea=_np.zeros(0, _np.complex64),
-                      label=_np.zeros(0, _np.int8), gamma=None)
-    _nodes['_stats'] = {k: v for k, v in _st.items() if k.startswith('lvl_')}
-    if kw['debug'] and nodes is not None:
-        _nodes['_stats']['lvl_net_total'] = int(len(_np.asarray(net['iy'])))
-        _nodes['_stats']['lvl_net_offered'] = _offered
-        _nodes['_stats']['lvl_net_owned'] = _ownedn
-    return out, _nodes
-
-
 def _fit3d_keep(value, *deps):
     """Return `value`, having waited for `deps`. The graph has no other way
     to say "run this too" without making it a real input of something."""
     return value
-
-
-def _fit3d_level_report(level_id, infos, debug=False, tag=''):
-    """ONE REPORT PER LEVEL, not one per chunk.
-
-    A chunk's numbers describe a chunk. With dozens of blocks the per-chunk
-    lines are unreadable and, worse, unusable: a level's yield is the sum over
-    its blocks and its error distribution is the pooled samples, neither of
-    which a reader can recover from a scrolling list. The blocks of a level are
-    all finished by the time this runs -- that is what the merge barrier is for
-    -- so this is the first point where the level can be described at all.
-
-    Returns the level's node tables, so it sits on the path the next level
-    already depends on rather than being a side branch that has to be kept
-    alive artificially.
-
-    Under union=False every chunk is its own level and calls this with its
-    one table and a `tag` naming the chunk, so the lines say what they
-    describe.
-    """
-    import numpy as np
-    tabs = [i for i in infos if i is not None]
-    if not debug:
-        return tabs
-    st = [t.get('_stats') or {} for t in tabs]
-    st = [x for x in st if x]
-    if not st:
-        return tabs
-    tot = lambda k: sum(int(x.get(k, 0)) for x in st)
-
-    # THE BLOCKS ALREADY REDUCED THESE. What arrives per key is a handful of
-    # scalars per block (see `_lvl_stat`): counts and threshold tallies add up
-    # exactly, extremes are the extreme of the blocks' own, and a percentile
-    # is reported as the RANGE across blocks -- a median of medians is not the
-    # median, so it is not printed as one.
-    def agg(k):
-        xs = [x[k] for x in st
-              if isinstance(x.get(k), dict) and int(x[k].get('n', 0))]
-        if not xs:
-            return None
-        a = dict(n=sum(int(x['n']) for x in xs),
-                 blocks=len(xs),
-                 min=min(x['min'] for x in xs),
-                 max=max(x['max'] for x in xs),
-                 p50lo=min(x['p50'] for x in xs),
-                 p50hi=max(x['p50'] for x in xs),
-                 p90hi=max(x['p90'] for x in xs),
-                 p99hi=max(x['p99'] for x in xs))
-        for key in set().union(*(set(x) for x in xs)):
-            if key[:2] in ('le', 'ge', 'gt'):
-                a[key] = sum(int(x.get(key, 0)) for x in xs)
-        a['_thr'] = xs[0].get('_thr') or []
-        return a
-    def over(a):
-        """(count, bound) for the single `gt` tally a key carries."""
-        for op, x in a.get('_thr', []):
-            if op == 'gt':
-                return a.get(f'gt{x:g}', 0), x
-        return 0, float('nan')
-    pct = lambda a, key: 100.0 * a.get(key, 0) / max(a['n'], 1)
-    rng = lambda a: (f"{a['p50lo']:.3g}" if a['p50lo'] == a['p50hi']
-                     else f"{a['p50lo']:.3g}..{a['p50hi']:.3g}")
-
-    left, att = tot('lvl_left'), tot('lvl_attached')
-    print(f'DEBUG: LEVEL {level_id} over {len(st)} block(s){tag}: '
-          f'{tot("lvl_cands"):,} candidates x {tot("lvl_fixed"):,} fixed nodes '
-          f'-> {tot("lvl_arcs"):,} arcs; {left:,} left, {att:,} attached '
-          f'({100.0 * att / max(left, 1):.1f}%)', flush=True)
-    _tn = [int(x['lvl_net_total']) for x in st if 'lvl_net_total' in x]
-    if _tn:
-        # THE ONE FACT WORTH A LINE. The PS extent is wider than a block by
-        # design, so every block is normally offered the whole network and
-        # saying so 48 times says nothing. It matters only when the extent
-        # STOPS reaching -- then some block was offered fewer, and that is
-        # what gets printed.
-        _net_n = max(_tn)
-        _short = min((int(x.get('lvl_net_offered', 0)) for x in st
-                      if 'lvl_net_total' in x), default=_net_n)
-        print(f'DEBUG:   network {_net_n:,} nodes, '
-              + ('all of them within the PS extent of every block'
-                 if _short >= _net_n
-                 else f'as few as {_short:,} within the PS extent of some '
-                      f'block -- the extent no longer spans the scene'),
-              flush=True)
-    _no, _few = tot('lvl_no_consensus'), tot('lvl_too_few')
-    if _no or _few:
-        print(f'DEBUG:   of the {_no:,} not attached: {_few:,} had too few '
-              f'partners, {_no - _few:,} had enough and disagreed', flush=True)
-        _xc, _sd = tot('lvl_multi_comp'), tot('lvl_straddled')
-        _xv = tot('lvl_cross_votes')
-        print(f'DEBUG:   {_xc:,} candidates saw more than one component; '
-              f'{_sd:,} straddled one, {_xv:,} votes crossed', flush=True)
-    _ps = tot('lvl_ps')
-    if _ps:
-        print(f'DEBUG:   {_ps:,} PS + {att:,} DS = {_ps + att:,} measured '
-              f'pixels after this level', flush=True)
-    _a = agg('lvl_gamma')
-    if _a:
-        print(f'DEBUG:   attaching arc gamma p50 per block {rng(_a)}',
-              flush=True)
-    _vet, _sin = tot('lvl_vetted'), tot('lvl_solve_in')
-    if _sin:
-        print(f'DEBUG:   funnel: consensus vetted {_vet:,} arcs; solve was '
-              f'handed {_sin:,} equations', flush=True)
-    _pc, _pv = agg('lvl_pcells'), agg('lvl_pvotes')
-    if _pc:
-        print(f'DEBUG:   partner INDEPENDENCE: votes p50 per block '
-              f'{rng(_pv) if _pv else "-"}, but distinct independence cells '
-              f'p50 {rng(_pc)}; all partners in ONE cell: '
-              f'{pct(_pc, "le1"):.1f}%, in <=2 cells: {pct(_pc, "le2"):.1f}%',
-              flush=True)
-    _pa2 = agg('lvl_parcm')
-    if _pa2:
-        print(f'DEBUG:   partner DISTANCE (mean over the voting arcs): p50 '
-              f'per block {rng(_pa2)} worst-block p90 {_pa2["p90hi"]:.0f} p99 '
-              f'{_pa2["p99hi"]:.0f} min {_pa2["min"]:.0f} max '
-              f'{_pa2["max"]:.0f} m', flush=True)
-    _oc = agg('lvl_offcentre')
-    if _oc:
-        _n_oc, _at_oc = over(_oc)
-        print(f'DEBUG:   arcs entering the solve, vs the pixel\'s consensus '
-              f'centre: p50 per block {rng(_oc)} worst-block p90 '
-              f'{_oc["p90hi"]:.3f} p99 {_oc["p99hi"]:.3f} mm/yr; over '
-              f'{_at_oc:g} mm/yr (err_dv) {_n_oc:,} of {_oc["n"]:,} '
-              f'({100.0 * _n_oc / max(_oc["n"], 1):.1f}%)', flush=True)
-    par = agg('lvl_partners')
-    if par:
-        kk = max((int(x.get('lvl_kk', 0)) for x in st), default=0)
-        print(f'DEBUG:   shortlist k={kk}: partners found p50 per block '
-              f'{rng(par)} min {int(par["min"])} max {int(par["max"])}',
-              flush=True)
-    av, ah = agg('lvl_clo_arc_v'), agg('lvl_clo_arc_h')
-    dv, dh = agg('lvl_clo_ds_v'), agg('lvl_clo_ds_h')
-    if av:
-        print(f'DEBUG:   closure over {av["n"]:,} VOTING partners:', flush=True)
-        _h = (f'   height p50 {rng(ah)} worst-block p90 {ah["p90hi"]:.2f} m'
-              if ah else '')
-        print(f'DEBUG:     per arc   rate p50 {rng(av)} worst-block p90 '
-              f'{av["p90hi"]:.3f} mm/yr{_h}', flush=True)
-    if dv:
-        _n_dv, _at_dv = over(dv)
-        _h = (f'   height p50 {rng(dh)} max {dh["max"]:.2f} m' if dh else '')
-        print(f'DEBUG:     per DS    rate p50 {rng(dv)} max {dv["max"]:.3f} '
-              f'mm/yr{_h}   over {_at_dv:g} mm/yr (err_dv): '
-              f'{_n_dv:,} of {dv["n"]:,}', flush=True)
-    return tabs
-
-
-def _fit3d_ds_attach_for_dask(block, part, net, planes, tables, kw, origin,
-                              owned, threads, token=None, emit_nodes=False,
-                              level_id=2):
-    """LEVEL 2, as its own stage: DS hung off the FIXED level-1 DS.
-
-    Level 1 has already run everywhere and its values are settled. This stage
-    READS them -- it never recomputes them -- which is what lets a chunk use
-    the nodes its neighbours own: the tables arrive in scene coordinates and
-    each chunk keeps the ones within ONE DS WINDOW of its bounds, the whole
-    reach of a level-2 candidate.
-
-    THE BLOCK IS READ WIDER THAN IT IS WRITTEN. A partner needs its phasor
-    series to be fitted against, and a node another chunk owns has none inside
-    this chunk's own rectangle -- so the read carries a DS-window halo while
-    the CANDIDATES stay owned-only. Nothing in the halo is attached here; it
-    exists to be attached to. What leaves is the owned rectangle alone.
-    """
-    import numpy as np
-    from . import utils_arcs
-    if isinstance(block, _Fit3dSlice):
-        block = block.read(threads)
-    S = np.ascontiguousarray(block, dtype=np.complex64)
-    n, ny, nx = S.shape
-    wy, wx, _pey, _pex = kw['window']
-    oy0, ox0 = int(origin[0]), int(origin[1])
-    y0, y1, x0, x1 = [int(v) for v in owned]
-    # the PS layer, in the haloed frame -- only to keep nodes out of the
-    # candidate set, as level 1 does. A scene with no network at all is the
-    # same as one with no nodes near this block: nothing to exclude.
-    if net is not None and len(np.asarray(net['iy'])):
-        _iy = np.asarray(net['iy']) - oy0
-        _ix = np.asarray(net['ix']) - ox0
-        _in = (_iy >= 0) & (_iy < ny) & (_ix >= 0) & (_ix < nx)
-        _oy, _ox = _iy[_in], _ix[_in]
-    else:
-        _oy = _ox = np.zeros(0, dtype=np.int64)
-    # CANDIDATES ONLY WHERE THIS CHUNK ANSWERS. The rank raster covers the
-    # owned rectangle; the halo is left NaN, so no candidate can arise there.
-    q = np.asarray(part)
-    cand_ds = np.zeros((ny, nx), dtype=bool)
-    cand_ds[y0:y1, x0:x1] = np.isfinite(q) & (q >= float(kw['threshold']))
-    if len(_oy):
-        cand_ds[_oy, _ox] = False
-    # the fixed layer: every table, kept to within one DS window of this block
-    _acc = {k: [] for k in ('iy', 'ix', 'vel', 'hgt', 'sea', 'label', 'gamma',
-                            'level')}
-    # THE PS NETWORK IS A PARTNER POOL TOO -- the best anchors a candidate can
-    # have, level 0 -- not only an exclusion mask
-    if net is not None and len(np.asarray(net['iy'])):
-        _gy0 = np.asarray(net['iy']) - oy0
-        _gx0 = np.asarray(net['ix']) - ox0
-        _m0 = (_gy0 >= 0) & (_gy0 < ny) & (_gx0 >= 0) & (_gx0 < nx)
-        _m0 &= (np.isfinite(np.asarray(net['vel'], dtype=float))
-                & np.isfinite(np.asarray(net['hgt'], dtype=float)))
-        if _m0.any():
-            _acc['iy'].append(_gy0[_m0]); _acc['ix'].append(_gx0[_m0])
-            for k in ('vel', 'hgt', 'sea', 'label'):
-                _acc[k].append(np.asarray(net[k])[_m0])
-            _acc['gamma'].append(np.asarray(net['gamma'], dtype=float)[_m0]
-                                 if net.get('gamma') is not None
-                                 else np.zeros(int(_m0.sum())))
-            _acc['level'].append(np.zeros(int(_m0.sum()), np.int16))
-    # a level arrives as ONE entry holding its blocks' tables, because the
-    # level's reducer sits between the levels; older callers pass them flat
-    _flat = []
-    for _t in tables:
-        if isinstance(_t, (list, tuple)):
-            _flat.extend(x for x in _t if x is not None)
-        elif _t is not None:
-            _flat.append(_t)
-    for _tb in _flat:
-        if _tb is None or not len(_tb['iy']):
-            continue
-        gy, gx = np.asarray(_tb['iy']) - oy0, np.asarray(_tb['ix']) - ox0
-        m = (gy >= 0) & (gy < ny) & (gx >= 0) & (gx < nx)
-        # FINITE ROWS ONLY. A consensus winner the anchor gate refused has no
-        # value: as a fixed row it cannot vote or anchor anything, and marking
-        # its pixel done would bar it from THIS level -- the level that exists
-        # to retry what the previous one could not hold.
-        m &= (np.isfinite(np.asarray(_tb['vel'], dtype=float))
-              & np.isfinite(np.asarray(_tb['hgt'], dtype=float)))
-        if not m.any():
-            continue
-        _acc['iy'].append(gy[m]); _acc['ix'].append(gx[m])
-        for k in ('vel', 'hgt', 'sea', 'label'):
-            _acc[k].append(np.asarray(_tb[k])[m])
-        _acc['gamma'].append(np.asarray(_tb['gamma'])[m]
-                             if _tb.get('gamma') is not None
-                             else np.zeros(int(m.sum())))
-        _acc['level'].append(np.asarray(_tb['level'])[m].astype(np.int16)
-                             if _tb.get('level') is not None
-                             else np.ones(int(m.sum()), np.int16))
-    if not _acc['iy']:
-        # NOTHING IN REACH, AND STILL TWO VALUES. `nout` is fixed when the
-        # graph is built, so an early return that hands back one array makes
-        # the caller's second slot a RASTER ROW instead of a node table, and
-        # the next level reads `_tb['iy']` off it. A block with no fixed layer
-        # near it is ordinary -- it just adds nothing.
-        _none = dict(iy=np.zeros(0, int), ix=np.zeros(0, int),
-                     vel=np.zeros(0, float), hgt=np.zeros(0, float),
-                     sea=np.zeros(0, np.complex64),
-                     label=np.zeros(0, np.int8), gamma=np.zeros(0, float),
-                     level=np.zeros(0, np.int16), _stats={})
-        return (np.asarray(planes), _none) if emit_nodes \
-            else np.asarray(planes)
-    ds_nodes = {k: np.concatenate(v) for k, v in _acc.items()}
-    t, ele2phase, meter2rad, _car = utils_arcs._3d_fit_frame(
-        kw['date_values'], kw['bperp'], kw['geometry'], n)
-    _ma = utils_arcs._3d_consensus(kw['consensus'])
-    _ii = max(1, int(kw['iterations']))
-    _err_h = float(kw.get('err_dh', 5.0)) * meter2rad
-    _err_v = float(kw.get('err_dv', 1.0)) * meter2rad / 1e3
-    # level 1's planes cover the owned rectangle; lift them into the haloed
-    # frame so this stage writes beside them, then hand back the owned part
-    P = np.asarray(planes)
-    lab_out = np.full((ny, nx), -1, dtype=np.int8)
-    vel_out = np.full((ny, nx), np.nan, dtype=np.float32)
-    hgt_out = np.full((ny, nx), np.nan, dtype=np.float32)
-    sea_out = np.full((ny, nx), np.nan + 1j * np.nan, dtype=np.complex64)
-    coh_out = np.full((ny, nx), np.nan, dtype=np.float32)
-    lvl_out = np.full((ny, nx), -1, dtype=np.int8)
-    lab_out[y0:y1, x0:x1] = P[0].real.astype(np.int8)
-    vel_out[y0:y1, x0:x1] = (-P[1].real).astype(np.float32)   # stored negated
-    hgt_out[y0:y1, x0:x1] = P[2].real.astype(np.float32)
-    sea_out[y0:y1, x0:x1] = (-P[3]).astype(np.complex64)
-    coh_out[y0:y1, x0:x1] = P[4].real.astype(np.float32)
-    lvl_out[y0:y1, x0:x1] = P[5].real.astype(np.int8)
-    # A CLEAN DICT FOR THIS LEVEL. Seeding from the thread's stats carries
-    # the PREVIOUS level's `lvl_*` keys into this level's report -- level 2
-    # was printing level 1's rejection counts and gamma. Nothing in
-    # `_3d_ds_attach` needs a pre-existing key it does not write itself.
-    _st = {'ds_attached': int(len(ds_nodes['iy']))}
-    utils_arcs._fit_stats.reset(_st)
-    utils_arcs._3d_ds_attach(
-        S, cand_ds, ds_nodes, _oy, _ox, lab_out, vel_out, hgt_out, sea_out,
-        coh_out, lvl_out, int(level_id), ele2phase, t, meter2rad,
-        ny=ny, nx=nx, wy=wy, wx=wx,
-        cell=tuple(kw['cell']), budget=kw['budget'],
-        threshold=float(kw['threshold']), level=2,
-        max_dh=kw['max_dh'], max_dv=kw['max_dv'], step_dh=kw['step_dh'],
-        step_dv=kw['step_dv'], iterations=int(kw['iterations']),
-        _ma=_ma, _ii=_ii, _err_h=_err_h, _err_v=_err_v,
-        _nth=max(1, int(threads) if threads else 1), _st=_st,
-        spacing=kw['spacing'], debug=bool(kw['debug']))
-    out = np.concatenate(
-        [lab_out[None, y0:y1, x0:x1].astype(np.complex64),
-         (-vel_out)[None, y0:y1, x0:x1].astype(np.complex64),
-         hgt_out[None, y0:y1, x0:x1].astype(np.complex64),
-         (-sea_out)[None, y0:y1, x0:x1].astype(np.complex64),
-         coh_out[None, y0:y1, x0:x1].astype(np.complex64),
-         lvl_out[None, y0:y1, x0:x1].astype(np.complex64)], axis=0)
-    if not emit_nodes:
-        return out
-    # WHAT THIS LEVEL ADDED, for the next one to stand on. Found by asking
-    # which owned pixels became finite, so it does not depend on the kernel's
-    # bookkeeping, and returned in SCENE coordinates because the next level's
-    # chunks each want a different part of it.
-    _was = np.isfinite(np.asarray(planes)[1].real)
-    _now = np.isfinite(vel_out[y0:y1, x0:x1])
-    _ny2, _nx2 = np.nonzero(_now & ~_was)
-    _gy, _gx = _ny2 + y0, _nx2 + x0
-    _new = dict(iy=_gy + oy0, ix=_gx + ox0,
-                vel=vel_out[_gy, _gx].astype(float),
-                hgt=hgt_out[_gy, _gx].astype(float),
-                sea=sea_out[_gy, _gx],
-                label=lab_out[_gy, _gx],
-                gamma=coh_out[_gy, _gx].astype(float),
-                level=lvl_out[_gy, _gx].astype(np.int16))
-    # this block's contribution to the LEVEL's report, carried on the table
-    # that already travels to the caller rather than on a second channel
-    _new['_stats'] = {k: v for k, v in _st.items() if k.startswith('lvl_')}
-    return out, _new
-
-def _fit3d_model(ds, da_xr, both, date_values, bp):
-    """The six planes of one burst as the model dataset, variables named by
-    QUANTITY alone. `both` is (6, y, x) complex64: label, velocity, height,
-    seasonal, coherence, level -- the planes every stage writes.
-
-    rmse is sqrt(-2 ln gamma), derived here rather than carried as a seventh
-    plane: the two are exact inverses, so shipping both through the graph
-    would move the same information twice. The `date` coordinate is the
-    MASTER, where B_perp is smallest -- where the fit zeroes its t -- so
-    predict() reads the origin instead of reconstructing it.
-    """
-    import numpy as np
-    import xarray as xr
-    import dask.array as da
-    lb = both[0].real.astype(np.int8)
-    vv = both[1].real.astype(np.float32)
-    hh_ = both[2].real.astype(np.float32)
-    sa_ = both[3].astype(np.complex64)
-    cg_ = both[4].real.astype(np.float32)
-    lv_ = both[5].real.astype(np.int8)
-    rr = da.sqrt(da.maximum(
-        -2.0 * da.log(da.clip(cg_, 1e-9, 1.0)), 0.0)).astype(np.float32)
-    coords = {k_: v for k_, v in da_xr.coords.items()
-              if k_ in ('y', 'x', 'spatial_ref')}
-    mvars = {}
-    for nm_, arr_ in (('velocity', vv), ('height', hh_),
-                      ('seasonal', sa_), ('coherence', cg_),
-                      ('rmse', rr), ('conncomp', lb),
-                      ('level', lv_)):
-        mvars[nm_] = xr.DataArray(arr_, dims=('y', 'x'), coords=coords)
-    mds = xr.Dataset(mvars, attrs=ds.attrs)
-    _dd = (np.asarray(date_values).astype('datetime64[D]')
-           .astype(np.float64))
-    _b3 = (np.zeros_like(_dd) if bp is None
-           else np.asarray(bp, float).ravel())
-    if _b3.shape != _dd.shape:
-        _b3 = np.zeros_like(_dd)
-    mds = mds.assign_coords(
-        date=np.datetime64(int(_dd[int(np.argmin(np.abs(_b3)))]), 'D'))
-    if 'spatial_ref' in ds.coords:
-        mds = mds.assign_coords(spatial_ref=ds.spatial_ref)
-    return mds
 
 
 # fit1d's per-block screen: the share of a block's pixels, ranked by raw
@@ -1119,8 +431,7 @@ def _horn_gradient_2d_for_dask(block, dy=1.0, dx=1.0):
     return out[None] if flat else out
 
 
-def _apply_goldstein_2d_for_dask(phase_block, corr_block, psize=32, threshold=0.5, device='cpu', halo=None,
-                                 block_info=None):
+def _apply_goldstein_2d_for_dask(phase_block, corr_block, psize=32, threshold=0.5, halo=None, block_info=None):
     """Module-level function for Goldstein filter map_overlap operation.
 
     Defined at module level to avoid dask serialization issues with nested functions.
@@ -1144,8 +455,6 @@ def _apply_goldstein_2d_for_dask(phase_block, corr_block, psize=32, threshold=0.
         Patch size {'y': ..., 'x': ...} for the filter
     threshold : float
         Minimum fraction of valid pixels
-    device : str
-        PyTorch device
     halo : tuple of int
         The overlap depth (y, x) of the map_overlap that cut this block.
     block_info : dict
@@ -1163,8 +472,7 @@ def _apply_goldstein_2d_for_dask(phase_block, corr_block, psize=32, threshold=0.
         skip = tuple((2 * h * i - loc[0]) % (p // 2)
                      for loc, i, h, p in zip(info['array-location'][-2:], info['chunk-location'][-2:], halo, (py, px)))
     # _goldstein handles (1, y, x) -> squeeze -> process -> unsqueeze
-    return BatchComplex._goldstein(phase_block, corr_block, psize=psize,
-                                   threshold=threshold, device=device, skip=skip)
+    return BatchComplex._goldstein(phase_block, corr_block, psize=psize, threshold=threshold, skip=skip)
 
 
 class Batch(BatchCore):
@@ -1329,7 +637,7 @@ class Batch(BatchCore):
 
         Examples
         --------
-        >>> model = stack.fit3d()
+        >>> model = stack.fit1d_network()
         >>> # modelled displacement per date, unwrapped
         >>> disp  = stack.predict(model=model).displacement_los(stack.transform())
         >>> # remove the modelled ground motion, keeping topography
@@ -1405,45 +713,6 @@ class Batch(BatchCore):
         )
 
     @staticmethod
-    def _solve_spd(A, b, eps=1e-12):
-        """Batched small symmetric-positive-definite solve, elementwise Cholesky.
-
-        A: (n, k, k), b: (n, k) -> (n, k). Singular systems yield NaN rather than a
-        plausible wrong value; those pixels are masked by valid_count downstream.
-        """
-        import torch
-        n_cols = A.shape[-1]
-        L = [[None] * n_cols for _ in range(n_cols)]
-        bad = None
-        for i in range(n_cols):
-            for j in range(i + 1):
-                acc = A[:, i, j].clone()
-                for k in range(j):
-                    acc = acc - L[i][k] * L[j][k]
-                if i == j:
-                    neg = acc <= eps
-                    bad = neg if bad is None else (bad | neg)
-                    L[i][j] = torch.sqrt(acc.clamp_min(eps))
-                else:
-                    L[i][j] = acc / L[j][j]
-        y = []
-        for i in range(n_cols):
-            acc = b[:, i].clone()
-            for k in range(i):
-                acc = acc - L[i][k] * y[k]
-            y.append(acc / L[i][i])
-        x = [None] * n_cols
-        for i in reversed(range(n_cols)):
-            acc = y[i].clone()
-            for k in range(i + 1, n_cols):
-                acc = acc - L[k][i] * x[k]
-            x[i] = acc / L[i][i]
-        out = torch.stack(x, dim=1)
-        if bad is not None:
-            out = torch.where(bad.unsqueeze(1), torch.full_like(out, float('nan')), out)
-        return out
-
-    @staticmethod
     def _ref_index(ref, dates):
         """Which acquisition a `ref` names, as an index into `dates`.
 
@@ -1483,202 +752,8 @@ class Batch(BatchCore):
                 f"({str(d[0])} .. {str(d[-1])}, {len(d)} dates).")
         return int(hit[0])
 
-    @staticmethod
-    @serialize_gpu
-    def _fit1d_pairs_torch(data, A, weight=None, device='auto',
-                           dh_prior=None, dh_col=None):
-        """Weighted least squares of a per-pixel model on per-PAIR unwrapped phase.
-
-        A is (n_pairs, k) and IDENTICAL for every pixel -- only the weights vary
-        with the data -- so the normal equations are two matrix products rather
-        than a loop:
-
-            AtWA = (outer(a_p, a_p) flattened)^T @ w      (k*k, N)
-            AtWy = A^T @ (w * y)                         (k, N)
-
-        and the whole fit is those two GEMMs plus a batched k x k solve. There is
-        no lattice and no refinement: unwrapped phase makes the objective convex,
-        which is the entire reason this is cheaper than the wrapped route it
-        replaces.
-
-        NO 2 PI AMBIGUITY REFIT. Removing integer cycles by
-        round(residual / 2 pi) is exact when the residual is dominated by an
-        unwrapping error and destructive when it is dominated by noise, and
-        which one holds is decided by the coherence of the stack, not by the
-        estimator. At low coherence it chases noise past pi rather than cycles.
-        Unwrapping errors belong to the unwrapper and to phase closure over
-        triplets, which sees them without a model in the way.
-
-        Columns are scaled to unit norm before the solve and the solution scaled
-        back: dt is O(1) years while ele2phase is O(1e-4), and a Cholesky on the
-        raw normal equations of two columns eight orders of magnitude apart is
-        not a solve, it is a coin toss.
-
-        Returns (theta (k, N), gamma (N,), rmse (N,)).
-        """
-        import torch
-        import numpy as np
-
-        dev = Batch._get_torch_device(device)
-        shape = data.shape
-        n_p = shape[0]
-        n_pix = int(np.prod(shape[1:]))
-        y = torch.from_numpy(np.ascontiguousarray(
-            data.reshape(n_p, -1), dtype=np.float32)).to(dev)
-        Am = torch.from_numpy(np.ascontiguousarray(A, dtype=np.float32)).to(dev)
-        k = int(Am.shape[1])
-
-        nan_mask = torch.isnan(y)
-        valid_count = (~nan_mask).sum(dim=0)
-        if weight is None:
-            w = (~nan_mask).float()
-        else:
-            g = np.asarray(weight, np.float32)
-            if g.ndim == 3:
-                g = g.reshape(g.shape[0], -1)
-            g = torch.from_numpy(np.ascontiguousarray(g)).to(dev)
-            g = torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 0.999)
-            # gamma^2, BOUNDED. The Cramer-Rao weight gamma^2/(1-gamma^2) is
-            # the right one for a well-observed pixel and the wrong one here: it
-            # is unbounded, so at low correlation it spans orders of magnitude
-            # within a pixel and the rate is decided by that pixel's single best
-            # pair. Clamping does not fix it, because the damage is the RATIO
-            # between pairs, not the maximum. Weighting earns its keep where
-            # correlation is high and uniform; where it is low, leaving it out
-            # does better, which is why the default is None rather than the
-            # correlation the caller happens to have.
-            w = (~nan_mask).float() * (g * g)
-        y = torch.where(nan_mask, torch.zeros_like(y), y)
-        finite = (~nan_mask).float()
-
-        scale = Am.norm(dim=0).clamp(min=1e-30)
-        An = Am / scale
-        # A PRIOR ON THE HEIGHT, not a robust loss. Adding the DEM column cost
-        # held-out accuracy at EVERY quantile alike, which is variance, not
-        # outliers. L1-IRLS and Huber were tried and both came back worse,
-        # confirming there is no tail to trim.
-        #
-        # What a poorly-observed nuisance parameter needs is shrinkage. DEM
-        # error is bounded by the DEM, not by this stack, so sigma_dh =
-        # max_dh/3 is a property of the terrain model rather than a number to
-        # tune, and
-        #
-        #     lambda = sigma_phi^2 / (meter2rad * sigma_dh)^2
-        #
-        # is the Bayesian weight it implies. It adapts by construction: where
-        # the baselines resolve the height the prior is inert, and where they do
-        # not it shrinks the column away.
-        T = (An[:, :, None] * An[:, None, :]).reshape(n_p, k * k)
-        # ALL PAIRS OR NOTHING. A pixel the unwrapper dropped from some pairs
-        # is a degraded network, not a smaller one: the surviving subset is
-        # whatever happened to stay coherent, so the model is fitted to a
-        # different experiment at every such pixel and the result is not
-        # comparable with its neighbours.
-        #
-        # The matrix is still tested below: linalg.solve raises on the WHOLE
-        # batch when one element is singular, and a full pair set can still be
-        # singular if every weight is zero.
-        solvable = (valid_count == n_p) & (w.sum(dim=0) > 0)
-        eye = torch.eye(k, device=dev, dtype=torch.float32).expand(n_pix, k, k)
-
-        # WHICH column carries the height. It is index -1 only when the
-        # seasonal is off; with the annual in the model the last column is its
-        # sine, and shrinking that instead would leave the height untouched.
-        _hc = k - 1 if dh_col is None else int(dh_col)
-        _use_prior = bool(dh_prior) and 0 <= _hc < k
-        lam_h = None
-        # L1 / IRLS, the same reweighting lstsq() applies to the same input:
-        # unwrapping error arrives as a whole cycle on one pair, which least
-        # squares spreads over every parameter.
-        w0 = w
-        n_irls = 5
-        eps_irls = 0.1
-        for _pass in range(2 if _use_prior else 1):
-          for _it in range(n_irls):
-            AtWA = (T.T @ w).T.reshape(n_pix, k, k)
-            AtWy = (An.T @ (w * y)).T
-            if lam_h is not None:
-                AtWA = AtWA.clone()
-                AtWA[:, _hc, _hc] = AtWA[:, _hc, _hc] + lam_h
-            AtWA_safe = torch.where(solvable[:, None, None], AtWA, eye)
-            ok = solvable
-            if dev.type == 'mps':
-                # _solve_spd returns NaN for a singular element instead of
-                # raising, so it needs no pre-test
-                th = Batch._solve_spd(AtWA_safe, AtWy)
-            else:
-                # cholesky_ex REPORTS failure in `info` rather than raising, and
-                # succeeding is exactly the property linalg.solve requires here,
-                # so the un-solvable elements are swapped for the identity
-                # before the solver ever sees them
-                _, info = torch.linalg.cholesky_ex(AtWA_safe)
-                ok = solvable & (info == 0)
-                AtWA_safe = torch.where(ok[:, None, None], AtWA_safe, eye)
-                th = torch.linalg.solve(AtWA_safe, AtWy.unsqueeze(-1)).squeeze(-1)
-            ok = ok & torch.isfinite(th).all(dim=1)
-            th = torch.where(ok[:, None], th, torch.full_like(th, 0.0))
-            resid = (y - An @ th.T) * finite
-            if _it + 1 < n_irls:
-                # reweight and go round again; the last pass keeps the weights it
-                # converged with so `resid` below is the one the model reports
-                w = w0 / torch.clamp(torch.abs(resid), min=eps_irls)
-                w = torch.where(finite > 0, w, torch.zeros_like(w))
-            if _use_prior and _pass == 0:
-                # sigma_phi per pixel from the unregularised pass, then the
-                # Bayesian weight the height prior implies. The prior lives on
-                # the NORMALISED column, so it means the same thing whatever
-                # the baselines span.
-                dof = (valid_count - k).clamp(min=1).float()
-                s2 = (resid ** 2).sum(dim=0) / dof
-                # An = A/s and theta_n = s*theta, so a penalty lambda on the
-                # UNNORMALISED height becomes lambda/s^2 on the normalised one
-                lam_h = s2 / float(dh_prior) ** 2 / (scale[_hc] ** 2)
-                w = w0          # second pass re-runs IRLS from the base weights
-
-        # LINEAR RESIDUALS, not circular. gamma used to be the resultant
-        # |sum w e^{i r}| / sum w, which is right for wrapped phase and wrong
-        # here: this phase is UNWRAPPED, so a residual of 2 pi is a whole cycle
-        # of error and cos(2 pi) = 1 counts it as a perfect sample. With cycle
-        # slips present it reports near-perfect agreement while the true
-        # residual RMS is large.
-        #
-        # Unwrapping error is the dominant error mode in multilooked pairs, so
-        # a quality number that cannot see it is worse than none: it certifies
-        # exactly the pixels a caller most needs to drop. rmse is now the
-        # weighted RMS of the residual itself, inflated by n/(n-k) for the
-        # parameters spent, and coherence is its exact inverse transform
-        # exp(-rmse^2/2) -- the same relation fit3d's pair satisfies, so the
-        # two remain comparable while both now respond to a cycle slip.
-        # The estimate is robust; the diagnostic must not be. rmse/coherence are
-        # computed from the BASE weights w0, never the IRLS weights: those were
-        # chosen to suppress the samples that fit worst, so scoring against them
-        # would report the fit the reweighting engineered.
-        wsum = w0.sum(dim=0)
-        infl = valid_count.float() / (valid_count - k).clamp(min=1).float()
-        mse = (w0 * resid * resid).sum(dim=0) / wsum.clamp(min=1e-12)
-        rmse = torch.sqrt(torch.clamp(mse, min=0.0) * infl)
-        gam = torch.exp(-0.5 * rmse * rmse).clamp(0.0, 1.0)
-
-        # A box bound cannot help a convex fit -- it can only distort it. On
-        # unwrapped phase the optimum is unique, so a constrained answer is a
-        # boundary point and the residual is forced into the other parameters.
-        # The bound therefore REJECTS here (see the caller).
-
-        nanv = torch.full_like(gam, float('nan'))
-        gam = torch.where(ok, gam, nanv)
-        rmse = torch.where(ok, rmse, nanv)
-        th = torch.where(ok[:, None], th / scale[None, :],
-                         torch.full_like(th, float('nan')))
-
-        out = (th.T.cpu().numpy(), gam.cpu().numpy(), rmse.cpu().numpy())
-        if dev.type == 'mps':
-            torch.mps.empty_cache()
-        elif dev.type == 'cuda':
-            torch.cuda.empty_cache()
-        return out
-
     def trend2d(self, transform: 'BatchCore | None' = None, weight: 'BatchUnit | None' = None,
-                degree: int = 1, device: str = 'auto', detrend: bool = False,
+                degree: int = 1, detrend: bool = False,
                 extrapolate: bool = False, debug: bool = False) -> 'BatchCore':
         """
         Compute 2D polynomial trend (ramp) from data.
@@ -1696,8 +771,6 @@ class Batch(BatchCore):
             Optional weight for the fitting (typically correlation).
         degree : int
             Polynomial degree (1=plane, 2=quadratic). Default 1.
-        device : str
-            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
         detrend : bool
             If True, return detrended data instead of the trend surface.
             Fuses fit+subtract into one blockwise call so the input phase is
@@ -1731,16 +804,6 @@ class Batch(BatchCore):
 
         # Validate lazy data
         BatchCore._require_lazy(phase, 'trend2d')
-
-        # Auto-detect device
-        resolved = BatchCore._get_torch_device(device, debug=debug)
-        device = resolved.type
-
-        if debug:
-            print(f"DEBUG: using device={device}")
-
-        if device == 'mps' and degree >= 3:
-            print(f"NOTE: MPS has float32 precision issues for degree>={degree}. Use device='cpu' for better accuracy.")
 
         is_complex = isinstance(phase, BatchComplex)
 
@@ -1974,7 +1037,7 @@ class Batch(BatchCore):
 
     def fit1d(self, weight=None, baseline: str = 'BPR',
               max_dh: float = 30.0,
-              max_seasonal: float = 0.0, device: str = 'auto',
+              max_seasonal: float = 0.0,
               debug: bool = False) -> 'Batch':
         """
         Full per-pixel model on UNWRAPPED per-PAIR phase -- NO network.
@@ -1982,7 +1045,7 @@ class Batch(BatchCore):
         The unwrapped twin of BatchComplex.fit1d(): the same model and the same
         output, fitted by weighted least squares instead of by coherence
         maximisation, because unwrapped phase makes the objective convex. Returns
-        the MODEL ONLY, named and scaled as fit3d() names and scales it, so
+        the MODEL ONLY, named and scaled as fit1d_network() names and scales it, so
         predict(model) is the one inverse for all three.
 
         WHY PAIRS AND NOT AN INVERTED SERIES. Multilooked phase has no zero
@@ -2014,7 +1077,8 @@ class Batch(BatchCore):
         ----------
         weight : BatchUnit or None
             Per-pair correlation, aligned 1:1 with the pairs. Enters as
-            gamma^2/(1-gamma^2), the phase-precision weight.
+            gamma^2, bounded at 0.999: the unbounded gamma^2/(1-gamma^2) lets
+            one pair decide a low-correlation pixel.
         baseline : str
             Per-pair perpendicular baseline coordinate, default 'BPR'. RAISES
             when it is absent: a height-free fit reports a velocity that has
@@ -2056,19 +1120,19 @@ class Batch(BatchCore):
         Returns
         -------
         Batch
-            The model, named and scaled exactly as fit3d() and
+            The model, named and scaled exactly as fit1d_network() and
             BatchComplex.fit1d():
 
               `velocity`   rad/yr
               `height`     rad per unit ele2phase, NaN with no baseline
               `seasonal`   complex rad, 0 when max_seasonal=0
-              `coherence`  |sum w exp(i r)| / sum w about the reported model
+              `coherence`  exp(-rmse^2/2) of the reported model
               `rmse`       sqrt(-2 ln coherence), radians, n/(n-k) inflated
 
             plus a scalar `date` coordinate: the epoch the model is
             referenced to, which is what every fit here carries so predict()
             never has to guess. A pairs batch holds only baseline DIFFERENCES,
-            so the master that fit3d() anchors on is not recoverable from it and
+            so the master that fit1d_network() anchors on is not recoverable from it and
             the median acquisition is used instead -- recorded rather than
             assumed. Rate and height are indifferent to the origin; the annual
             is not, and a model fitted on one origin and removed on another
@@ -2091,6 +1155,7 @@ class Batch(BatchCore):
         import xarray as xr
         import dask
         import dask.array as da
+        from .utils_fit1d import fit1d_pairs
 
         # the radar geometry is the Dataset's (N81): a DataArray batch raises here;
         # baseline=None reads radar_wavelength alone (the pair baselines are coordinates)
@@ -2285,12 +1350,12 @@ class Batch(BatchCore):
             _dh_prior = meter2rad * float(max_dh) / 3.0 if has_h else None
 
             def _blk(b, wb=None, _A=A, _k=k, _hh=has_h, _se=fit_seasonal,
-                     _dev=device, _dbg=bool(debug), _m2r=meter2rad,
+                     _dbg=bool(debug), _m2r=meter2rad,
                      _mh=float(max_dh),
                      _ms=float(max_seasonal), _dp=_dh_prior):
                 shp = b.shape[1:]
-                th, gam, rms = Batch._fit1d_pairs_torch(
-                    b, _A, weight=wb, device=_dev, dh_prior=_dp,
+                th, gam, rms = fit1d_pairs(
+                    b, _A, weight=wb, dh_prior=_dp,
                     dh_col=(1 if _hh else None))
                 nanp = np.full(shp, np.nan, np.float32)
                 vel = th[0].reshape(shp).astype(np.float32)
@@ -2301,7 +1366,7 @@ class Batch(BatchCore):
                            + 1j * th[j + 1].reshape(shp)).astype(np.complex64)
                 else:
                     # zero, not NaN: the model holds no annual, and that is a
-                    # value rather than an absence -- the same convention fit3d
+                    # value rather than an absence -- the same convention fit1d_network
                     # uses at max_seasonal=0
                     sea = np.zeros(shp, np.complex64)
                 gam = gam.reshape(shp).astype(np.float32)
@@ -2380,7 +1445,7 @@ class Batch(BatchCore):
         Parameters
         ----------
         model : Batch
-            Output of fit1d() or fit3d(): `velocity`, `height`, `seasonal`.
+            Output of fit1d() or fit1d_network(): `velocity`, `height`, `seasonal`.
         baseline : str
             Per-pair or per-date perpendicular baseline, default 'BPR'. None
             drops the height term -- a prediction of the deformation alone,
@@ -2431,7 +1496,7 @@ class Batch(BatchCore):
             if missing:
                 raise KeyError(
                     f"predict() needs {missing} in the model for '{key}'. "
-                    "Pass the Batch returned by fit1d() or fit3d().")
+                    "Pass the Batch returned by fit1d() or fit1d_network().")
 
             grids = [v for v in ds.data_vars
                      if 'y' in ds[v].dims and 'x' in ds[v].dims
@@ -2516,7 +1581,7 @@ class Batch(BatchCore):
             import dask.array as da
             vel = mds['velocity'].data
             hgt = mds['height'].data
-            # OPTIONAL: fit3d() fits an annual term and fit1d() does not, and
+            # OPTIONAL: fit1d_network() fits an annual term and fit1d() does not, and
             # a model without the variable HAS none rather than an unknown one.
             sea = mds['seasonal'].data if 'seasonal' in mds else None
             planes = []
@@ -2575,7 +1640,7 @@ class Batch(BatchCore):
 
     def mix(self, model, baseline: str = 'BPR') -> 'Batch':
         """
-        Per-pair displacement from a fit1d()/fit3d() model MIXED with the raw signal.
+        Per-pair displacement from a fit1d()/fit1d_network() model MIXED with the raw signal.
 
         The pair form of BatchComplex.mix(). Returns the model's displacement
         carrying the residual the interferograms actually have, rather than the
@@ -2610,7 +1675,7 @@ class Batch(BatchCore):
         Parameters
         ----------
         model : Batch
-            Output of fit1d() or fit3d(): `velocity`, `height`, `seasonal`.
+            Output of fit1d() or fit1d_network(): `velocity`, `height`, `seasonal`.
         baseline : str or None
             Per-pair perpendicular baseline carrying the height term. Default
             'BPR'. Pass None when topography is already gone from these pairs,
@@ -3641,10 +2706,10 @@ class BatchWrap(BatchCore):
     def unwrap2d(self, weight: 'BatchUnit | None' = None, conncomp: bool = False,
                  conncomp_size: int = 1000, conncomp_gap: int | None = None,
                  conncomp_linksize: int = 5, conncomp_linkcount: int = 30,
-                 union: bool = False, device: str = 'auto',
+                 union: bool = False,
                  debug: bool = False, **kwargs) -> 'Batch':
         """
-        Unwrap phase using GPU-accelerated IRLS algorithm (L1 norm).
+        Unwrap phase: L1 IRLS with a multigrid-preconditioned solver, on the CPU (numba).
 
         Parameters
         ----------
@@ -3667,15 +2732,12 @@ class BatchWrap(BatchCore):
             result, so the answer is consistent across burst edges -- viable
             while the merged scene fits. A Batch either way: the merge is
             internal, and each burst comes back holding only its own pixels.
-        device : str
-            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
         debug : bool
             Print diagnostic information.
         **kwargs
-            Additional arguments: max_iter, tol, cg_max_iter, cg_tol, epsilon.
-            Relaxed defaults: max_iter=50, tol=1e-2, cg_max_iter=10, cg_tol=1e-3,
-            epsilon=1e-2. Strong set: max_iter=200, tol=1e-3, cg_max_iter=20,
-            cg_tol=1e-4, epsilon=1e-2. A looser setting prints one WARNING per call.
+            Passed to unwrap2d_irls(): accuracy (default 2e-3; 5e-4 near the optimum,
+            about 1.9 times longer), max_iter (the safety cap, default 100), epsilon.
+            The former tol, cg_max_iter, cg_tol, device, semaphore print one WARNING.
 
         Returns
         -------
@@ -3685,9 +2747,9 @@ class BatchWrap(BatchCore):
 
         Examples
         --------
-        >>> phase, corr = stack.pairs(baseline.tolist()).phasediff(wavelength=30).angle()
-        >>> unwrapped = phase.unwrap2d()  # Without weights
-        >>> unwrapped = phase.unwrap2d(weight=corr)  # With weights
+        >>> intf, corr = stack.pairs(baseline.tolist()).interferogram(100).angle()
+        >>> unwrapped = intf.unwrap2d()  # Without weights
+        >>> unwrapped = intf.unwrap2d(corr, union=True)  # With weights, one solve over the bursts
         """
         from .Stack import Stack
 
@@ -3695,41 +2757,38 @@ class BatchWrap(BatchCore):
                                        conncomp=conncomp, conncomp_size=conncomp_size,
                                        conncomp_gap=conncomp_gap, conncomp_linksize=conncomp_linksize,
                                        conncomp_linkcount=conncomp_linkcount, union=union,
-                                       device=device, debug=debug, **kwargs)
+                                       debug=debug, **kwargs)
 
-    def unwrap2d_irls(self, weight: 'BatchUnit | None' = None, device: str = 'auto',
-                      max_iter: int = 50, tol: float = 1e-2, cg_max_iter: int = 10,
-                      cg_tol: float = 1e-3, epsilon: float = 1e-2,
-                      conncomp_size: int = 30, semaphore: int = 8, debug: bool = False) -> 'Batches':
+    def unwrap2d_irls(self, weight: 'BatchUnit | None' = None, accuracy: float = 2e-3,
+                      max_iter: int = 100, epsilon: float = 1e-2, conncomp_size: int = 30,
+                      debug: bool = False, **kwargs) -> 'Batches':
         """
-        Unwrap phase using GPU-accelerated IRLS algorithm (L1 norm).
+        Unwrap phase: L1 IRLS with a multigrid-preconditioned solver, on the CPU (numba).
 
         This is the core unwrapping algorithm. Disconnected components are
         unwrapped independently and aligned using per-component circular mean.
+        See Stack.unwrap2d_irls() for the tasks and the threads.
 
         Parameters
         ----------
         weight : BatchUnit or None
             Optional weight for the unwrapping (typically correlation).
-        device : str
-            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
-        max_iter : int
-            Maximum IRLS iterations. Default 50 (relaxed; strong: 200).
-        tol : float
-            Convergence tolerance. Default 1e-2 (relaxed; strong: 1e-3).
-        cg_max_iter : int
-            Maximum conjugate gradient iterations. Default 10 (relaxed; strong: 20).
-        cg_tol : float
-            Conjugate gradient tolerance. Default 1e-3 (relaxed; strong: 1e-4).
-        epsilon : float
-            Smoothing parameter for L1 approximation. Default 1e-2 (strong: 1e-2).
+        accuracy : float, optional
+            The stop: the relative decrease of the L1 objective over one step. Default 2e-3, which
+            reaches the former strong set's result in less time than the former relaxed set took;
+            5e-4 is near the optimum and takes about 1.9 times longer.
+        max_iter : int, optional
+            The safety cap on the steps; reaching it before `accuracy` prints one WARNING. Default 100.
+        epsilon : float, optional
+            Smoothing of the L1 norm at the end of its continuation. Default 1e-2.
         conncomp_size : int
             Minimum connected component size in pixels. Components smaller than this
             are marked invalid (label 0). Default 30.
-        semaphore : int
-            Maximum concurrent CPU IRLS tasks per process. Default 8.
         debug : bool
             Print diagnostic information.
+        **kwargs
+            The former tol, cg_max_iter, cg_tol, device, semaphore: accepted and ignored
+            with one WARNING.
 
         Returns
         -------
@@ -3738,30 +2797,16 @@ class BatchWrap(BatchCore):
             - unwrapped: Batch of unwrapped phase (float32)
             - conncomp: Batch of component labels (uint16, 0=invalid, 1=largest, ...)
 
-        Notes
-        -----
-        Uses a novel DCT+IRLS algorithm that combines DCT efficiency with IRLS
-        robustness. See `utils_unwrap2d.irls_unwrap_2d` for algorithm details
-        and references.
-
-        The defaults are the relaxed, fast set: max_iter=50, tol=1e-2,
-        cg_max_iter=10, cg_tol=1e-3. The strong set is the defaults of
-        `utils_unwrap2d.irls_unwrap_2d`: max_iter=200, tol=1e-3, cg_max_iter=20,
-        cg_tol=1e-4, epsilon=1e-2. Any parameter looser than the strong set
-        prints one WARNING per call naming the strong values.
-
         Examples
         --------
-        >>> phase, corr = stack.pairs(baseline.tolist()).phasediff(wavelength=30).angle()
-        >>> unwrapped, conncomp = phase.unwrap2d_irls(weight=corr)
+        >>> intf, corr = stack.pairs(baseline.tolist()).interferogram(100).angle()
+        >>> unwrapped, conncomp = intf.unwrap2d_irls(weight=corr)
         """
         from .Stack import Stack
 
-        return Stack.unwrap2d_irls(Stack(), self, weight=weight,
-                                            device=device, max_iter=max_iter, tol=tol,
-                                            cg_max_iter=cg_max_iter, cg_tol=cg_tol,
-                                            epsilon=epsilon, conncomp_size=conncomp_size,
-                                            semaphore=semaphore, debug=debug)
+        return Stack.unwrap2d_irls(Stack(), self, weight=weight, accuracy=accuracy,
+                                   max_iter=max_iter, epsilon=epsilon, conncomp_size=conncomp_size,
+                                   debug=debug, **kwargs)
 
     def unwrap2d_link(self, conncomp_size: int = 10_000, conncomp_gap: int | None = None,
                       conncomp_linksize: int = 5, conncomp_linkcount: int = 30,
@@ -3809,7 +2854,6 @@ class BatchWrap(BatchCore):
                                             debug=debug)
 
 
-
 class BatchUnit(BatchCore):
     """
     This class has 'pair' stack variable for the datasets in the dict and stores correlation in the range [0,1].
@@ -3851,7 +2895,6 @@ class BatchUnit(BatchCore):
         return super().plot(*args, **kwargs)
 
 
-
 class BatchComplex(BatchCore):
     def fit1d(self, threshold: float = 0.5, baseline: str = 'BPR',
               max_dh: float = 25.0, max_dv: float = 100.0,
@@ -3860,9 +2903,9 @@ class BatchComplex(BatchCore):
         """
         Per-pixel {height, rate} fit on the per-date complex stack, no network.
 
-        The 1d twin of fit3d(): the same `_3d_arc_fit` kernel on each pixel's
+        The 1d twin of fit1d_network(): the same `_3d_arc_fit` kernel on each pixel's
         own series instead of on arcs. `velocity` and `height` are named and
-        scaled as fit3d()'s, so predict(model) inverts both. No self-check: a
+        scaled as fit1d_network()'s, so predict(model) inverts both. No self-check: a
         pixel is NaN where its solution lies beyond `max_dh`/`max_dv` or it has
         no non-zero date, and its `coherence` says what the rest is worth.
 
@@ -3886,7 +2929,7 @@ class BatchComplex(BatchCore):
             Largest rate, mm/yr; a solution beyond it is NaN. The scan runs 10%
             past it, so a rate near the bound is a maximum, not an edge.
         step_dh, step_dv : float
-            Lattice steps, metres and mm/yr, as fit3d()'s. Two zoom levels,
+            Lattice steps, metres and mm/yr, as fit1d_network()'s. Two zoom levels,
             each 5x finer and 1.4 cells either side, refine the lattice winner,
             so a step must stay inside its main lobe; a long stack narrows the
             rate lobe and wants a finer `step_dv`.
@@ -4000,7 +3043,7 @@ class BatchComplex(BatchCore):
                            _sh=float(step_dh), _sv=float(step_dv),
                            _thr=float(threshold), _adaptive=bool(adaptive)):
                 # imported inside the task
-                from .utils_arcs import _3d_arc_fit
+                from .utils_fit1d import _3d_arc_fit
                 from .utils_dask import get_dask_chunk_size_mb
                 S = np.asarray(block)
                 nd = S.shape[0]
@@ -4142,7 +3185,7 @@ class BatchComplex(BatchCore):
     def predict(self, model, baseline: 'str | None' = 'BPR',
                 ref=None, vars=None) -> 'Batch':
         """
-        Predicted per-date phase from a fit3d() or fit1d() model.
+        Predicted per-date phase from a fit1d_network() or fit1d() model.
 
         Reconstructs, for every date in this stack,
 
@@ -4150,9 +3193,9 @@ class BatchComplex(BatchCore):
 
         with `car_d = exp(2j*pi*t_d)`, `t_d` in years from the first date, and
         `ele2phase_d = BPR_d / median(R sin(incidence))` -- the same geometry
-        fit3d() fitted against, so the two are exact inverses.
+        fit1d_network() fitted against, so the two are exact inverses.
 
-        The scatterer's constant phase is NOT part of the model: fit3d() profiles
+        The scatterer's constant phase is NOT part of the model: fit1d_network() profiles
         it out by rotation rather than gauging it to an epoch, so the prediction
         is correct up to one constant per pixel. That is what you want for
         removal -- `stack.complex() * predict(model).iexp(sign=1)` cancels the modelled
@@ -4164,7 +3207,7 @@ class BatchComplex(BatchCore):
         Parameters
         ----------
         model : Batch
-            Output of fit3d() or fit1d(): variables `velocity`, `height`,
+            Output of fit1d_network() or fit1d(): variables `velocity`, `height`,
             `seasonal`
             (unprefixed, one polarisation). Also a trend2d() model, and an
             insardev_polsar trend3d() field, which its predict3d() evaluates.
@@ -4197,7 +3240,7 @@ class BatchComplex(BatchCore):
 
         Examples
         --------
-        >>> model  = stack.fit3d()
+        >>> model  = stack.fit1d_network()
         >>> ground = stack.complex() * stack.predict(model=model, baseline=None).iexp(sign=1)
         >>> resid  = stack.complex() * stack.predict(model=model).iexp(sign=1)
         >>> # modelled displacement per date, unwrapped (no height term):
@@ -4223,7 +3266,7 @@ class BatchComplex(BatchCore):
             return self._trend2d_predict(model, vars=vars)
         if vars is not None:
             raise TypeError("predict(): `vars` are the covariates of a trend2d() "
-                            "model; a fit3d() / fit1d() model names none.")
+                            "model; a fit1d_network() / fit1d() model names none.")
         if baseline:
             # the height term reads the Dataset's baselines and radar geometry (N81);
             # baseline=None predicts from the model and the dates alone. A Dataset
@@ -4241,7 +3284,7 @@ class BatchComplex(BatchCore):
             if len(pols) > 1:
                 raise ValueError(
                     f"predict() takes ONE polarisation, burst '{key}' carries "
-                    f"{len(pols)}: {pols}. fit3d() has the same rule.")
+                    f"{len(pols)}: {pols}. fit1d_network() has the same rule.")
             if not pols:
                 raise TypeError(
                     f"predict() found no complex (date, y, x) variables in '{key}'.")
@@ -4255,9 +3298,9 @@ class BatchComplex(BatchCore):
             if missing:
                 raise KeyError(
                     f"predict() needs {missing} in the model for '{key}'. "
-                    "Pass the Batch returned by fit3d().")
+                    "Pass the Batch returned by fit1d_network().")
 
-            # TIME ORIGIN MUST MATCH THE FIT. utils_arcs zeroes t at the MASTER
+            # TIME ORIGIN MUST MATCH THE FIT. utils_fit1d zeroes t at the MASTER
             # -- argmin|B_perp| -- not at the first date, because there the phase
             # is zero by construction and the height term vanishes with the
             # baseline carrying it. Velocity and height absorb an origin shift
@@ -4300,7 +3343,7 @@ class BatchComplex(BatchCore):
             ele2phase = None
             if baseline and baseline in ds:
                 # FROM THIS STACK, always. A transform= argument used to be able
-                # to point the geometry somewhere else, but fit1d()/fit3d() take
+                # to point the geometry somewhere else, but fit1d()/fit1d_network() take
                 # theirs from the stack they are given and cannot be redirected,
                 # so another source could only make the prediction disagree with
                 # the model it inverts. Nothing physical rode on the choice
@@ -4317,7 +3360,7 @@ class BatchComplex(BatchCore):
 
             vel = mds['velocity'].data
             hgt = mds['height'].data
-            # OPTIONAL: fit3d() fits an annual term and fit1d() does not, and
+            # OPTIONAL: fit1d_network() fits an annual term and fit1d() does not, and
             # a model without the variable HAS none rather than an unknown one.
             sea = mds['seasonal'].data if 'seasonal' in mds else None
             planes = []
@@ -4384,7 +3427,7 @@ class BatchComplex(BatchCore):
 
     def mix(self, model, baseline: 'str | None' = 'BPR', ref=None) -> 'Batch':
         """
-        Per-date displacement from a fit1d()/fit3d() model MIXED with the raw signal.
+        Per-date displacement from a fit1d()/fit1d_network() model MIXED with the raw signal.
 
         Returns the model's displacement carrying the residual the data actually
         has, instead of the smooth curve predict() draws through it:
@@ -4393,7 +3436,7 @@ class BatchComplex(BatchCore):
             mix   = predict(model, baseline=None) - angle(resid * conj(mean_date(resid)))
 
         NOTHING IS UNWRAPPED HERE, and that is the point rather than an omission.
-        fit1d()/fit3d() fit in the complex domain, predict() returns radians that
+        fit1d()/fit1d_network() fit in the complex domain, predict() returns radians that
         were never wrapped -- a rate times a span of years is a real number, not a
         phase -- and the residual is read off a complex product. The model supplies
         the absolute scale an unwrapper would otherwise have to recover, which is
@@ -4420,7 +3463,7 @@ class BatchComplex(BatchCore):
         Parameters
         ----------
         model : Batch
-            Output of fit1d() or fit3d(): variables `velocity`, `height`,
+            Output of fit1d() or fit1d_network(): variables `velocity`, `height`,
             `seasonal` (unprefixed, one polarisation).
         baseline : str or None
             Per-date perpendicular baseline variable carrying the height term.
@@ -4454,7 +3497,7 @@ class BatchComplex(BatchCore):
             BatchCore._needs_vars(self, 'mix', (baseline,) + BatchCore._GEOMETRY,
                                   'Call it on the Dataset batch x, or pass baseline=None.')
         # The height term's metres-to-radians scale comes from this stack on both
-        # sides, as it does in fit1d()/fit3d(), so it cancels in the product.
+        # sides, as it does in fit1d()/fit1d_network(), so it cancels in the product.
         full = self.predict(model, baseline=baseline, ref=ref)
         # THE RESIDUAL NEEDS THE WHOLE MODEL, the height term included, even though
         # the output does not want it: left out of `full` it stays in the residual,
@@ -4527,8 +3570,8 @@ class BatchComplex(BatchCore):
         NOTHING IS GATED, EVERYTHING IS REPORTED. Per-date variables ride
         on the result:
           coherence, coherence0 -- phasor alignment with and without the
-              trend removed;
-          gain -- their difference. Fitting noise alone gains up to ~0.07,
+              trend removed; both are NaN on every unresolved date (see below);
+          gain -- their difference, NaN with it. Fitting noise alone gains up to ~0.07,
               so gain above that means a trend was found;
           slope_<var> -- the fitted slope, radians per unit of the variable;
           resolution_<var> -- how far apart two slopes must be for this
@@ -4541,8 +3584,25 @@ class BatchComplex(BatchCore):
           stderr_intercept -- with no covariate, the constant's one-sigma in
               radians, from the same halves;
           pixels -- samples fitted.
-        NaN only when there is no fit at all: no pixels, a degenerate
-        covariate, a trend walking out of `range`, or no convergence.
+        Every unresolved date -- no pixels or a checkerboard half with none,
+        a trend walking out of `range`, a degenerate covariate, no convergence,
+        a different trend beating the answer on the global lattice, or a
+        coherence not above the noise level -- has NaN in the intercept, the
+        slopes and their errors, and in coherence, coherence0 and gain: NaN
+        means no data. A coherence is proved only by a trend that stands, so
+        0 would claim a well determined coherence under the noise level.
+        pixels and resolution are the sampling's and stay.
+        THE LIMITS, MEASURED (2026-10-27; synthetic planted ramps, 3000 samples,
+        checkerboard split by pixel position, 20 noise seeds per point, range 4,
+        8 and 16 pi; coherence 1.0 noiseless, 0.6 and 0.4 add Gaussian phase
+        noise): every answer inside `range` is within 0.033 cycles at coherence
+        0.6, 0.058 at 0.4 and 1e-4 noiseless, and the noise level keeps all of
+        them; the seeds answered inside `range` (of 180) are 180 at coherence
+        1.0, 170 at 0.6 and 0.4 for one covariate, and 180, 163, 163 for three.
+        Trends beyond `range` come back NaN: of 2240 seeds (112 truths), answers
+        with the noise level are 0-2 at range 8 and 16 pi and 0-80 at range 4 pi
+        (one covariate), 0-5 for three; without it 1585-1910 (one covariate) and
+        311-1118 (three).
         THIS ONLY FITS; detrend() applies.
 
         Parameters
@@ -4582,7 +3642,8 @@ class BatchComplex(BatchCore):
             where the grid is cells**k and width costs real memory. A wider
             range can land a weak date's fit on another lobe, so the default
             is the intended setting; a date whose trend walks out of the range
-            comes back NaN with coherence 0, and the fit says so.
+            comes back NaN in its coherence, coherence0 and gain too, and the
+            fit says so.
             Leave it alone.
         union : bool
             False (default) fits each burst on its own pixels, so overlapping
@@ -4922,8 +3983,9 @@ class BatchComplex(BatchCore):
                       + " ".join(f"{'resolution ' + v:>13s}" for v in _tv)
                       + ("   [rad across the variable's span]" if degree
                          else "   [rad]"), flush=True)
-                _tag = {1: 'no pixels', 2: 'walked out of `range`',
-                        3: 'degenerate covariate', 4: 'did not converge'}
+                _tag = {1: 'no pixels or a half with none', 2: 'walked out of `range`',
+                        3: 'degenerate covariate', 4: 'did not converge',
+                         5: 'beaten on the global lattice', 6: 'below the noise level'}
                 for d in _builtins.range(p['nd']):
                     _coh = _cf[d, k + 2]
                     _reach = " ".join(
@@ -4946,7 +4008,7 @@ class BatchComplex(BatchCore):
                     debug = False        # the table is the same for every burst
 
             ds = p['ds']
-            # THE MODEL IS THE PRODUCT, like fit3d(): the fit's own numbers
+            # THE MODEL IS THE PRODUCT, like fit1d_network(): the fit's own numbers
             # and nothing of the stack. A date's trend is
             # `intercept_d + sum_i slope_di * v_i` -- a handful of numbers
             # per date over the stack's own covariates. Evaluating it here
@@ -5270,7 +4332,7 @@ class BatchComplex(BatchCore):
         print('WARNING: detrend2d() calls detrend(). Use detrend(trend).')
         return self.detrend(trend, vars=vars)
 
-    def fit3d(self, threshold: float = 0.5, window: tuple = (400, 4000),
+    def fit1d_network(self, threshold: float = 0.5, window: tuple = (400, 4000),
                 cell: 'float | tuple' = 24,
                 baseline: str = 'BPR',
                 level: int = 1,
@@ -5314,11 +4376,9 @@ class BatchComplex(BatchCore):
                    lands on the same datum. A DS with no arc clearing
                    `threshold` stays NaN: without a coherent path to the
                    network it has no datum
-          level 2+ the DS attached so far are offered to whatever is still
-                   unresolved as VOTERS only, inside the DS WINDOW: a pixel
-                   with too few PS arcs to fill the quorum alone may complete
-                   it with DS, but its value is solved from its PS arcs and
-                   nothing else -- only the PS hold the datum
+          level 2+ dropped: it added about 30 % more DS of clearly lower
+                   accuracy at a high cost in time and memory; a request
+                   prints one WARNING and runs level 1
 
         Returns ONE dataset carrying the solve, its variables named
         by quantity:
@@ -5330,12 +4390,12 @@ class BatchComplex(BatchCore):
           `rmse`       sqrt(-2 ln coherence), rad
           `conncomp`   int8, -1 nodata, 0 the largest component
           `level`      int8, WHICH CASCADE STEP PLACED THE PIXEL: 0 a PS
-                       network node, 1 a DS attached to that network, n a DS
-                       whose quorum needed DS of levels below n, -1 nothing solved
+                       network node, 1 a DS attached to that network, -1 nothing
+                       solved
 
         all NaN (or -1) where nothing was solved. Names rather than positions,
         so a caller never counts commas and adding a quantity moves nothing.
-        There is NO polarisation prefix: fit3d() takes exactly one polarisation
+        There is NO polarisation prefix: fit1d_network() takes exactly one polarisation
         and raises otherwise, so nothing needs disambiguating and predict() can
         look the names up directly.
 
@@ -5346,7 +4406,7 @@ class BatchComplex(BatchCore):
         transform, carried for convenience rather than as new information.
 
         VELOCITY IS A RASTER, not a stats entry. The kernels' stats live in
-        `utils_arcs._fit_stats`, a per-thread object written by whichever
+        `utils_fit1d._fit_stats`, a per-thread object written by whichever
         block ran last on that worker thread, so under dask it describes ONE
         chunk and misdescribes the others -- it reported 200 nodes for a
         raster carrying 29118. A product that cannot be rebuilt from what the
@@ -5366,6 +4426,11 @@ class BatchComplex(BatchCore):
         ----------
         threshold : float
             Arc coherence for an arc to count and to be kept in the network.
+            An arc is refined only where its coherence on the coarse lattice
+            could still reach it -- threshold times the stack's own response
+            half a lattice step off, the most a lattice point can under-read a
+            peak -- so the refinement is skipped only where it cannot change
+            which arcs are kept.
         window : tuple of float
             GROUND SIZES IN METRES, divided by the burst's posting once, here,
             so the same call describes the same neighbourhood on any grid.
@@ -5436,31 +4501,18 @@ class BatchComplex(BatchCore):
             LOW threshold usable, by removing what a low gate lets in.
 
         level : int
-            How far to carry the solve, 0 to 2. Each level uses the one below
-            it as its references, so they are cumulative rather than
-            alternative.
+            How far to carry the solve, 0 or 1. Level 1 uses the network as its
+            references.
 
             0   the PS network only. Nodes carry values; every other pixel is
                 NaN. This is the answer when a caller wants only what the PS
                 test certified.
             1   plus DS attached to PS, each by `consensus` agreeing PS
                 partners inside the PS extent.
-            2   plus DS whose quorum needed DS voters: a pixel can hold one
-                to four coherent PS arcs and still fail level 1 where the PS
-                are too sparse to field `consensus` -- a property of the
-                ground, not of the pixel. The DS attached so far complete its
-                vote; its value still comes from its PS arcs alone, so a
-                higher level adds a few pixels and never inherits DS error.
 
-            The default is 1. Level 2 costs the most arcs by far and is much
-            the slowest stage, and every reference it uses is itself one hop
-            from the network, so it adds coverage at a somewhat higher error
-            rate. That is a trade worth making deliberately rather than by
-            default.
-
-            There is no level 3. Each hop's error adds, and level-2 pixels are
-            certified by DS rather than by PS, so the argument that justifies
-            level 2 does not survive another step.
+            The default is 1. Level 2+ is dropped: it added about 30 % more DS
+            of clearly lower accuracy at a high cost in time and memory; a
+            request prints one WARNING and runs level 1.
 
         union : bool
             What a scene is, the same word as in trend2d(). False, the
@@ -5591,7 +4643,7 @@ class BatchComplex(BatchCore):
         Returns
         -------
         Batches of two Batch
-            `model = stack.fit3d(...)`, then `stack.predict(model=model)`.
+            `model = stack.fit1d_network(...)`, then `stack.predict(model=model)`.
 
             screen  complex unit phasors per date, NaN where no component
                     reached the pixel. NaN is the answer there: away from the
@@ -5607,544 +4659,24 @@ class BatchComplex(BatchCore):
 
         Examples
         --------
-        >>> model = stack.fit3d()
+        >>> model = stack.fit1d_network()
         >>> predicted = stack.predict(model=model)
         >>> model['velocity'].plot(cmap='turbo')   # rad/yr
         >>> good = model.where(model['conncomp'] == 0)
         >>> main = velocity.where(labels == 0)   # one datum, comparable
         """
-        # the baselines and the radar geometry are the Dataset's (N81)
-        BatchCore._needs_dataset(self, 'fit3d', ('BPR',) + BatchCore._GEOMETRY)
-        # DELEGATE BY STACK TYPE, exactly as fit1d() does: pairs take the
-        # pair branch (not implemented), dates take the PS network below.
-        if any('pair' in ds[v].dims
-               for ds in self.values() for v in ds.data_vars):
-            # `window` is the PS network's (DS, PS extent) pair in metres on
-            # the date path; on the pair path it is the side of the box the
-            # covariance is estimated over, so a scalar.
-            # the split is kept so a pair-domain fit has a home when one works
-            raise NotImplementedError(
-                'fit3d() does not support complex PAIRS. Use the per-DATE stack, '
-                'or unwrap and call Batch.fit1d() on the unwrapped pairs.')
-        # validated HERE, not only in the kernel: fit3d() returns a lazy Batch,
-        # so a bad value would otherwise surface at compute time far from where
-        # it was written
-        from . import utils_arcs as _ua
-        _ua._3d_consensus(consensus)
-        if int(level) < 0:
-            raise ValueError(f'level must be >= 0; got {level!r}')
-        _kw = dict(threshold=threshold, window=window, cell=cell,
-                   baseline=baseline, level=level,
-                   max_dh=max_dh, max_dv=max_dv, step_dh=step_dh,
-                   step_dv=step_dv, max_seasonal=max_seasonal,
-                   consensus=consensus, err_dh=err_dh, err_dv=err_dv,
-                   iterations=iterations, debug=debug)
-        if union or len(self) == 1:
-            return self._fit3d_union(**_kw)
-        # union=False: EACH BURST ITS OWN SCENE, as trend2d() fits each burst
-        # on its own pixels. The same driver runs once per burst -- there is
-        # no second code path -- and the bursts share ONE chain, so the
-        # cluster never holds more heavy tasks at once than a single scene
-        # would. Where bursts overlap the two models disagree over the shared
-        # ground, exactly as two per-burst trends do; union=True is the way
-        # to ask for one answer there.
-        from .Batch import Batch
-        chain = _Fit3dChain()
-        # ONCE FOR THE CALL, not once per burst: a missing ref_height warns
-        # once, naming every burst. Each burst's value is its own either way.
-        ep = Batch._elevation_phase_approximate(self)
-        out = {}
-        for k in self.keys():
-            out.update(type(self)({k: self[k]})._fit3d_union(
-                chain=chain, tag=f' [{k}]', ep=ep, **_kw).items())
-        return Batch(out)
+        from . import utils_fit1d
+        return utils_fit1d.fit1d_network(self, threshold=threshold, window=window, cell=cell, baseline=baseline,
+                                         level=level, max_dh=max_dh, max_dv=max_dv, step_dh=step_dh,
+                                         step_dv=step_dv, max_seasonal=max_seasonal, consensus=consensus,
+                                         err_dh=err_dh, err_dv=err_dv, union=union, iterations=iterations,
+                                         debug=debug)
 
+    def fit3d(self, *args, **kwargs):
+        """Renamed fit1d_network(): prints one WARNING and calls it with the same arguments (its docstring has them)."""
+        print('WARNING: fit3d() is renamed fit1d_network(); fit3d() calls it.')
+        return self.fit1d_network(*args, **kwargs)
 
-
-    def _fit3d_setup(self, threshold, window, cell, baseline, level,
-                     max_dh, max_dv, step_dh, step_dv, max_seasonal,
-                     consensus, err_dh, err_dv, iterations, debug,
-                     chain=None, tag='', ep=None):
-        """WHAT EVERY fit3d() DRIVER SHARES: the polarisation, the windows,
-        the cluster's shape, each burst's frame and the kwargs the stage
-        functions take, and the scene lattice the bursts sit on.
-
-        One place, so the union driver and the per-chunk driver cannot read
-        the same stack two ways. Returns a dict; `_fit3d_scan` adds the
-        pass-1 graph to it. `ep` is `_elevation_phase_approximate()` of a
-        stack holding these bursts, computed once by a caller that loops over
-        bursts; None computes it here.
-        """
-        import numpy as np
-        import xarray as xr
-        import dask as _dask
-        import dask.array as da
-        from .Batch import Batch
-        from . import utils_arcs
-        from .utils_dask import get_dask_chunk_size_mb
-
-        _pols = [v for ds in self.values() for v in ds.data_vars
-                 if ds[v].dtype.kind == 'c' and 'y' in ds[v].dims]
-        if len(set(_pols)) != 1:
-            raise ValueError(f"fit3d() takes ONE polarisation, this stack "
-                             f"carries {sorted(set(_pols))}.")
-        pol = sorted(set(_pols))[0]
-        # THE INPUT CHUNKS STATE THE SIZE. arcs() takes the same number the
-        # same way: a caller who wants the work blocked differently rechunks
-        # the stack, and a second knob saying the same thing could only
-        # contradict it.
-        budget_mb = get_dask_chunk_size_mb()
-
-        # THE CLUSTER STATES THE SHAPE, as the per-burst path reads it: the
-        # declared cores first, the process's own count only without them
-        from .utils_dask import cluster_cores
-        _slots, _cores = cluster_cores()
-        _threads = max(1, _cores // max(1, _slots))
-        _width = _slots
-        if chain is None:
-            chain = _Fit3dChain(_width)
-        elif chain.width is None:
-            chain.width = int(_width)
-
-        # EARLIEST BURST FIRST, so the later one wins the seam it shares: the one
-        # acquisition order of every burst merge, as to_dataset() lays the bursts
-        _keys = BatchCore._acquisition_order(self, 'fit3d')
-        _dss = [self[k] for k in _keys]
-
-        # EVERY CHUNK ANSWERS TO ITS OWN BURST'S GEOMETRY. Averaging the
-        # wavelength, the elevation phase and the baseline across bursts
-        # describes no acquisition that ever happened: each is recorded per
-        # burst and is exactly known, so a chunk is fitted with the numbers its
-        # own burst carries. The network is the one stage that spans bursts,
-        # and it takes the EARLIEST burst's frame -- a real geometry rather
-        # than a mean of several -- which is also the burst the datum rests on.
-        def _scalar(v):
-            a = np.asarray(v, dtype=float).ravel()
-            return float(a[0]) if a.size == 1 else float(np.mean(a))
-        _ep = Batch._elevation_phase_approximate(self) if ep is None else ep
-
-        def _frame(key, ds):
-            lam_ = _scalar(ds['radar_wavelength'].values)
-            bp_ = (np.asarray(ds[baseline].values, float).ravel()
-                   if baseline and baseline in ds.data_vars else None)
-            yv_ = np.asarray(ds['y'].values, dtype=float)
-            xv_ = np.asarray(ds['x'].values, dtype=float)
-            return dict(
-                date_values=np.asarray(ds.coords['date'].values),
-                spacing=(abs(float(yv_[1] - yv_[0])) if yv_.size > 1 else 1.0,
-                         abs(float(xv_[1] - xv_[0])) if xv_.size > 1 else 1.0),
-                bperp=bp_,
-                geometry=(lam_, (4.0 * np.pi / lam_) / _ep[key]))
-
-        # THE SCENE LATTICE. The bursts are geocoded on one ground grid, so a
-        # node's place in the scene is its place in its own burst plus a whole
-        # number of pixels -- no resampling, and nothing to interpolate.
-        yv0 = np.asarray(_dss[0]['y'].values, dtype=float)
-        xv0 = np.asarray(_dss[0]['x'].values, dtype=float)
-        dy = float(yv0[1] - yv0[0]) if yv0.size > 1 else 1.0
-        dx = float(xv0[1] - xv0[0]) if xv0.size > 1 else 1.0
-        spacing = (abs(dy), abs(dx))
-        # METRES IN, PIXELS INSIDE. `window` and `cell` are ground distances,
-        # so the same call means the same neighbourhood on any posting. They
-        # are divided by the scene's spacing ONCE, here, and everything below
-        # -- halos, lattices, the dask tasks -- sees pixels only. The pixel
-        # validators run after the division, on the counts they were written
-        # for.
-        wy, wx, pey, pex = utils_xarray.window_meters_to_pixels(window, spacing)
-        cell = utils_xarray.meters_to_pixels(cell, spacing, minimum=1,
-                                             name='cell')
-        wy, wx, pey, pex = utils_arcs._3d_windows((wy, wx, pey, pex))
-        utils_arcs._3d_check_window_cell(wy, wx, cell, 'fit3d', spacing=spacing)
-        _y0s = [float(np.asarray(d['y'].values, dtype=float)[0]) for d in _dss]
-        _x0s = [float(np.asarray(d['x'].values, dtype=float)[0]) for d in _dss]
-        y_org = max(_y0s) if dy < 0 else min(_y0s)
-        x_org = max(_x0s) if dx < 0 else min(_x0s)
-
-        # the cascade gates a DS candidate on how many in-window arcs it
-        # holds, which is the same count the rest of the solve answers to
-        _ma_ds = utils_arcs._3d_consensus(consensus)
-        _common = dict(
-            window=(wy, wx, pey, pex), threshold=float(threshold),
-            min_agreeing=int(_ma_ds),
-            cell=tuple(cell), budget=budget_mb,
-            level=int(level), max_dh=float(max_dh), max_dv=float(max_dv),
-            step_dh=float(step_dh), step_dv=float(step_dv),
-            max_seasonal=float(max_seasonal),
-            consensus=int(_ma_ds),
-            err_dh=float(err_dh), err_dv=float(err_dv),
-            iterations=int(iterations), debug=bool(debug), tag=str(tag))
-        _kw_of = {k: dict(_common, **_frame(k, ds))
-                  for k, ds in zip(_keys, _dss)}
-        # the network spans the bursts; it answers to the earliest one's
-        _kw_net = _kw_of[_keys[0]]
-        date_values = _kw_net['date_values']
-        bp = _kw_net['bperp']
-        return dict(pol=pol, keys=_keys, dss=_dss, kw_of=_kw_of, kw_net=_kw_net,
-                    cores=_cores, threads=_threads, width=_width,
-                    chain=chain, tag=str(tag), cell=tuple(cell),
-                    window=(wy, wx, pey, pex), origin=(y_org, x_org),
-                    step=(dy, dx), date_values=date_values, bperp=bp,
-                    budget=budget_mb)
-
-    def _fit3d_scan(self, threshold, window, cell, baseline, level,
-                    max_dh, max_dv, step_dh, step_dv, max_seasonal,
-                    consensus, err_dh, err_dv, iterations, debug,
-                    chain=None, tag='', ep=None):
-        """PASS 1, SHARED: every chunk scanned on the scene lattice.
-
-        This is the first half of fit3d()'s union driver, and the whole of
-        what arcs() needs: the graph that reads each chunk with its halo,
-        scans it for the DS rank raster and the PS-candidate winner grid, and
-        names where each winner grid sits on ONE scene lattice. fit3d() goes
-        on to the PS test, the network and the levels; arcs() stops at the
-        PS test and returns the two rasters. ONE driver, so the debug tool
-        sees exactly the candidates the delivery sees -- a second copy of
-        this loop drifted in every detail it was not kept up with.
-
-        Returns a dict: `keys` (earliest burst first), `dss`, `pol`, `grid`
-        (per key: rows, cols, the array, the dataset), `blocks` (one entry
-        per chunk, see the loop), `kw_of` (per key), `kw_net`, `cores`,
-        `threads`, `width`, `date_values`, `bperp`.
-        """
-        import numpy as np
-        import dask as _dask
-        import dask.array as da
-        from . import utils_arcs
-        _su = self._fit3d_setup(threshold, window, cell, baseline, level,
-                                max_dh, max_dv, step_dh, step_dv, max_seasonal,
-                                consensus, err_dh, err_dv, iterations, debug,
-                                chain=chain, tag=tag, ep=ep)
-        pol, _keys, _dss = _su['pol'], _su['keys'], _su['dss']
-        _kw_of, _kw_net = _su['kw_of'], _su['kw_net']
-        _cores, _threads, _width = _su['cores'], _su['threads'], _su['width']
-        chain = _su['chain']
-        # the PIXEL cell, converted from metres in _fit3d_setup: the block
-        # lattice below is scene-pixel arithmetic
-        cell = _su['cell']
-        wy, wx, _pey, _pex = _su['window']
-        y_org, x_org = _su['origin']
-        dy, dx = _su['step']
-        date_values, bp = _su['date_values'], _su['bperp']
-
-        # ---- PASS 1: the cascade scan, one chunk at a time ---------------
-        # Each chunk is read WITH A FULL DS WINDOW OF HALO, as arcs() reads
-        # it: the owned pixels' own windows have to be complete, and the cells
-        # the chunk owns must be able to see every pixel that could win them.
-        # What comes back is the owned rank raster and the chunk's winner
-        # grid -- one candidate per independence cell.
-        _blocks = []
-        _grid = {}
-        _hy2, _hx2 = wy // 2, wx // 2
-        for key, ds in zip(_keys, _dss):
-            da_xr = ds[pol]
-            if da_xr.dims[0] != 'date':
-                da_xr = da_xr.transpose('date', ...)
-            # NOT RECHUNKED HERE. Every window below is read through
-            # `_Fit3dSlice`, which assembles the blocks it is given inside the
-            # fit task; forcing the date axis into one chunk first only adds a
-            # merge layer to the graph and materialises the window twice. The
-            # caller's chunking is the caller's to state.
-            dsk = da_xr.data
-            _ny, _nx = dsk.shape[1], dsk.shape[2]
-            yv = np.asarray(ds['y'].values, dtype=float)
-            xv = np.asarray(ds['x'].values, dtype=float)
-            boy = int(round((float(yv[0]) - y_org) / dy)) if yv.size else 0
-            box = int(round((float(xv[0]) - x_org) / dx)) if xv.size else 0
-            _cy, _cx = dsk.chunks[1], dsk.chunks[2]
-            _y0 = np.r_[0, np.cumsum(_cy)][:-1]
-            _x0 = np.r_[0, np.cumsum(_cx)][:-1]
-            _grid[key] = (len(_cy), len(_cx), da_xr, ds)
-            for _i in range(len(_cy)):
-                gy0, gy1 = int(_y0[_i]), int(_y0[_i]) + int(_cy[_i])
-                ya, yb = max(0, gy0 - wy), min(_ny, gy1 + wy)
-                for _j in range(len(_cx)):
-                    gx0, gx1 = int(_x0[_j]), int(_x0[_j]) + int(_cx[_j])
-                    xa, xb = max(0, gx0 - wx), min(_nx, gx1 + wx)
-                    _gate = chain.gate()
-                    # ONE LATTICE, THE SCENE'S. The scan cuts its cells on
-                    # the lattice of the origin it is handed, and the origin
-                    # is handed in scene pixels below -- so the part's first
-                    # cell is exact integer arithmetic, never a rounded
-                    # burst-lattice reconstruction: a burst whose origin is
-                    # not a multiple of the half-window would land its whole
-                    # grid up to half a cell off, duplicating nodes at seams.
-                    # ON THE PS LATTICE: _cascade_pass1 lays its winner grid
-                    # on `_3d_ps_lattice(cell)` and names the first cell as
-                    # ceil(scene_origin / lattice); the merge in _fit3d_select_ps
-                    # places the grid by THIS cell index, so any other unit
-                    # here puts every block at the wrong offset and lets the
-                    # next block overwrite part of the previous one -- a hole
-                    # through the middle of the scene and thinned chunk edges
-                    _pl = utils_arcs._3d_ps_lattice(cell)
-                    _cell = (-(-(boy + gy0) // _pl[0]),
-                             -(-(box + gx0) // _pl[1]))
-                    _owned = (gy0 - ya, gy1 - ya, gx0 - xa, gx1 - xa)
-                    # nout: the rank raster and the winner grid leave the scan
-                    # as SEPARATE keys, so the one level-1 task depends on the
-                    # winners alone. Returned as one value they travel
-                    # together, and every block's raster would be shipped to
-                    # the worker that runs the PS test and never read there.
-                    _part = _dask.delayed(_fit3d_scan_for_dask, nout=4)(
-                        _Fit3dSlice(dsk[:, ya:yb, xa:xb]), _owned,
-                        (boy + ya, box + xa),
-                        _cell, _kw_of[key], _threads, _gate)
-                    chain.push(_part[2])
-                    _sub = dsk[:, gy0:gy1, gx0:gx1]
-                    # LEVEL 2 READS WIDER THAN IT WRITES. Its partners are
-                    # level-1 nodes another chunk owns and solved; the values
-                    # come from that chunk's table, but the ARC still needs
-                    # their phasor series, and only a haloed read has them.
-                    # Candidates stay owned-only, so nothing in the halo is
-                    # ever attached here -- it is there to be attached TO.
-                    #
-                    # ITS OWN, NARROWER SLICE. The scan above needs a FULL
-                    # window per side -- a winner cell reaches half a window
-                    # past the owned edge and gating those pixels needs their
-                    # windows whole -- but level 2 only reaches +-wy//2, the
-                    # window box. Sharing the scan's slice made every level
-                    # read twice the halo it uses, on every block of every
-                    # level, which is pure memory.
-                    _hy, _hx = max(wy // 2, 1), max(wx // 2, 1)
-                    _ya2, _yb2 = max(0, gy0 - _hy), min(_ny, gy1 + _hy)
-                    _xa2, _xb2 = max(0, gx0 - _hx), min(_nx, gx1 + _hx)
-                    _own2 = (gy0 - _ya2, gy1 - _ya2, gx0 - _xa2, gx1 - _xa2)
-                    _blocks.append((key, _sub, (gy0 + boy, gx0 + box),
-                                    int(_cy[_i]), int(_cx[_j]), _part,
-                                    _i, _j, _cell,
-                                    dsk[:, _ya2:_yb2, _xa2:_xb2],
-                                    (_ya2 + boy, _xa2 + box), _own2))
-
-        return dict(_su, grid=_grid, blocks=_blocks)
-
-    def _fit3d_union(self, threshold, window, cell, baseline, level,
-                     max_dh, max_dv, step_dh, step_dv, max_seasonal,
-                     consensus, err_dh, err_dv, iterations, debug,
-                     chain=None, tag='', ep=None):
-        """One network over the union of the bursts, returned on the burst grid.
-
-        A node's partners are whatever lies inside the window, and a burst edge
-        is not a fact about the ground: solved per burst, a node near the seam
-        reaches only half its neighbourhood and the two bursts answer the same
-        question from different networks. Merged, the network crosses the seam.
-
-        ONLY THE NODES ARE MERGED, NEVER THE RASTERS. Each block is scanned
-        where it is stored and yields a node table -- some thousands of phasor
-        columns -- and those tables are all the shared solve ever sees. Merging
-        the stacks instead, into one array over the scene, makes every block as
-        wide as the scene: the chunking the caller asked for stops applying,
-        and the host pays tens of gigabytes to carry a network that weighs
-        megabytes. arcs() unions its winner grids the same way, for the same
-        reason.
-
-        Only the SOLVE is unioned. The model comes back on each burst's own
-        grid, carrying only that burst's pixels, so nothing downstream sees a
-        different geometry than it handed in.
-        """
-        import numpy as np
-        import xarray as xr
-        import dask as _dask
-        import dask.array as da
-        from .Batch import Batch
-        _s = self._fit3d_scan(threshold, window, cell, baseline, level,
-                              max_dh, max_dv, step_dh, step_dv, max_seasonal,
-                              consensus, err_dh, err_dv, iterations, debug,
-                              chain=chain, tag=tag, ep=ep)
-        _keys, _grid, _blocks = _s['keys'], _s['grid'], _s['blocks']
-        chain = _s['chain']
-        _kw_of, _kw_net = _s['kw_of'], _s['kw_net']
-        _cores, _width = _s['cores'], _s['width']
-        date_values, bp = _s['date_values'], _s['bperp']
-        # ---- LEVEL 1: the PS test over the WHOLE scene's candidates ------
-        # The winner grids are merged onto one cell lattice and tested
-        # together. A chunk here is a fraction of the PS extent wide, so a
-        # chunk-local test asks each candidate about partners that mostly do
-        # not exist in its chunk; on the merged grid it is asked about all of
-        # them. The grid is the raster one pyramid level up, so the scene's
-        # whole candidate set is megabytes and this is one in-memory task.
-        _net = _dask.delayed(_fit3d_level1_for_dask)(
-            [((b[5][1], b[5][2], b[5][3]), b[8]) for b in _blocks], _kw_net,
-            _cores)
-
-        # ---- PASS 2: the shared network written onto each burst's grid ----
-        # THE THREAD BUDGET IS PER CONCURRENT TASK, NOT PER SLOT. This pass
-        # submits one task per block and the gate runs at most `_width` of them
-        # at once, so when there are fewer blocks than slots the cores divided
-        # among the slots are divided among tasks that do not exist and the
-        # rest of the machine idles. Attachment is the fitting-heavy stage, so
-        # that idleness is the wall clock.
-        _conc2 = max(1, min(int(_width) if _width else len(_blocks),
-                            len(_blocks)))
-        _threads2 = max(1, _cores // _conc2)
-        _cells = {}
-        _dly = {}
-        _l2in, _l2tab = [], []
-        for (key, _sub, _origin, _ny, _nx, _part, _i, _j, _c,
-             _hsub, _horg, _hown) in _blocks:
-            _kwb = _kw_of[key]
-            _gate = chain.gate()
-            # LEVEL 1 FIRST, EVERYWHERE. Its nodes are the fixed layer the
-            # next stage stands on, and a chunk needs the ones its neighbours
-            # own, so they have to be finished before level 2 starts. The
-            # table is a few megabytes; the planes stay put. It emits even at
-            # level=1, where nothing consumes the nodes, because the table is
-            # also how the level's numbers reach its report.
-            # THE CALLER'S LEVEL, CAPPED AT ONE. This stage IS level 1, and
-            # levels >= 2 are the driver's own pass below, over the finished
-            # tables. Capping instead of hardcoding keeps `level=0` meaning
-            # what it documents: the PS network alone, every other pixel
-            # NaN. Hardcoded to 1, union=True attached DS even when the
-            # caller asked for none.
-            _o = _dask.delayed(_fit3d_attach_for_dask, nout=2)(
-                _Fit3dSlice(_sub), _part[0], _net,
-                dict(_kwb, level=min(int(level), 1)),
-                _origin, _threads2, _gate, emit_nodes=True)
-            chain.push(_o[0])
-            _l2tab.append(_o[1])
-            if int(level) >= 2:
-                _l2in.append((key, _hsub, _horg, _hown, _ny, _nx, _part,
-                              _i, _j, _o[0]))
-            else:
-                _cells[(key, _i, _j)] = da.from_delayed(
-                    _o[0], shape=(6, _ny, _nx), dtype=np.complex64)
-                _dly[(key, _i, _j)] = _o[0]
-
-        # ---- PASS 3: LEVEL 2, over the FINISHED level-1 nodes ------------
-        # Level 1 is complete before this starts, so its values are fixed input
-        # and are never recomputed here. Each chunk keeps the nodes within one
-        # DS window of its own bounds -- the whole reach of a level-2 candidate
-        # -- and then solves its own local clusters alone. Every cluster is
-        # anchored to that fixed layer, so one split by a seam comes out
-        # consistent on both sides and no chunk has to agree with another.
-        # ONE PASS PER LEVEL, WITH A MERGE BETWEEN THEM. Each level stands on
-        # the COMPLETE previous network, not on the part of it its own chunk
-        # happened to find: the tables from every chunk are gathered before the
-        # next level starts, so a candidate near a seam is offered the nodes its
-        # neighbour attached in the round before. Repeating inside a chunk
-        # instead would starve exactly those pixels, round after round.
-        # THE LEVEL-1 REPORT, once every block of it has finished. At
-        # level=1 nothing consumes the tables, so the report is hung off a
-        # plane -- the only way to tell the graph to run it at all.
-        _rep1 = _dask.delayed(_fit3d_level_report)(1, _l2tab, bool(debug),
-                                                   str(tag))
-        if int(level) < 2:
-            _kk0 = next(iter(_cells))
-            _ny0, _nx0 = _cells[_kk0].shape[1], _cells[_kk0].shape[2]
-            # THE DELAYED, NOT THE ARRAY: a dask array handed to delayed() is
-            # finalized under new keys that carry a second copy of its whole
-            # upstream graph, so every scan, the network and one attach ran
-            # twice per compute
-            _cells[_kk0] = da.from_delayed(
-                _dask.delayed(_fit3d_keep)(_dly[_kk0], _rep1),
-                shape=(6, _ny0, _nx0), dtype=np.complex64)
-        _cur, _tabs = _l2in, ([_rep1] if int(level) >= 2 else [])
-        for _lv in range(2, int(level) + 1):
-            _nxt, _new3 = [], []
-            _last = (_lv == int(level))
-            for (key, _hsub, _horg, _hown, _ny, _nx, _part, _i, _j, _pl) \
-                    in _cur:
-                _g3 = chain.gate()
-                # EVERY LEVEL EMITS, including the last: the table is the
-                # channel its report travels on, and the last level deserves
-                # a report as much as the others. Only `_tabs` stops growing.
-                _o3 = _dask.delayed(_fit3d_ds_attach_for_dask, nout=2)(
-                    _Fit3dSlice(_hsub), _part[0], _net, _pl, _tabs,
-                    _kw_of[key], _horg, _hown, _threads2, _g3,
-                    emit_nodes=True, level_id=_lv)
-                _pl2 = _o3[0]
-                chain.push(_pl2)
-                _new3.append(_o3[1])
-                _nxt.append((key, _hsub, _horg, _hown, _ny, _nx, _part,
-                             _i, _j, _pl2))
-                _cells[(key, _i, _j)] = da.from_delayed(
-                    _pl2, shape=(6, _ny, _nx), dtype=np.complex64)
-            # THE MERGE, AFTER THE WHOLE LEVEL AND NOT DURING IT. Extending
-            # the table inside the block loop would hand block k the nodes
-            # blocks 1..k-1 attached in the SAME level -- a partial network
-            # that depends on the order the blocks were built, and one that
-            # makes every block wait for the block before it. A level stands
-            # on the COMPLETE level before it or it is not a level.
-            _cur = _nxt
-            # ONE REPORT FOR THE LEVEL, on the path the next level already
-            # waits for. The last level has nothing after it, so its report is
-            # hung off a plane instead -- otherwise it would never run.
-            _rep = _dask.delayed(_fit3d_level_report)(_lv, _new3,
-                                                      bool(debug), str(tag))
-            if not _last:
-                _tabs = _tabs + [_rep]
-            elif _nxt:
-                _k0, _s0, _o0, _w0, _n0, _x0, _p0, _i0, _j0, _q0 = _nxt[0]
-                _cells[(_k0, _i0, _j0)] = da.from_delayed(
-                    _dask.delayed(_fit3d_keep)(_q0, _rep),
-                    shape=(6, _n0, _x0), dtype=np.complex64)
-
-        model_result = {}
-        for key in _keys:
-            _nr, _nc, da_xr, ds = _grid[key]
-            both = da.concatenate(
-                [da.concatenate([_cells[(key, i, j)] for j in range(_nc)],
-                                axis=2) for i in range(_nr)], axis=1)
-            model_result[key] = _fit3d_model(ds, da_xr, both, date_values, bp)
-        return Batch(model_result)
-
-    def _fit3d_candidates(self, threshold, window, cell, baseline,
-                          consensus, iterations, union, debug):
-        """The DS rank raster and the PS test, per burst, BEFORE any network.
-
-        This is what arcs() returns: pass 1 exactly as fit3d() runs it, then
-        the PS test over the merged winner grid, written back to each burst's
-        pixels. `union=False` scans each burst as its own scene; `union=True`
-        tests the bursts together on one lattice, the later burst's winner
-        taking a cell both hold, and writes every winner inside a burst's
-        grid onto it, as fit3d() writes its nodes.
-        """
-        import numpy as np
-        import xarray as xr
-        import dask as _dask
-        import dask.array as da
-        from .Batch import Batch, Batches
-        groups = ([self] if union else
-                  [type(self)({k: self[k]}) for k in self.keys()])
-        # per burst: computed ONCE for the call, as fit3d() does, so a missing
-        # ref_height warns once and not once per burst
-        ep = None if union else Batch._elevation_phase_approximate(self)
-        ds_out, ps_out = {}, {}
-        chain = _Fit3dChain()
-        for grp in groups:
-            _s = grp._fit3d_scan(threshold, window, cell, baseline, 0,
-                                 25.0, 25.0, 8.0, 2.0, 0.0, consensus,
-                                 4.0, 1.0, iterations, debug, chain=chain,
-                                 tag='' if union else f' [{list(grp.keys())[0]}]',
-                                 ep=ep)
-            _keys, _grid, _blocks = _s['keys'], _s['grid'], _s['blocks']
-            _test = _dask.delayed(_fit3d_select_ps)(
-                [((b[5][1], b[5][2], b[5][3]), b[8]) for b in _blocks],
-                _s['kw_net'], _s['cores'])
-            for key in _keys:
-                _nr, _nc, da_xr, ds = _grid[key]
-                rank = [[None] * _nc for _ in range(_nr)]
-                ps = [[None] * _nc for _ in range(_nr)]
-                for b in _blocks:
-                    if b[0] != key:
-                        continue
-                    _, _sub, _origin, _ny, _nx, _part, _i, _j = b[:8]
-                    rank[_i][_j] = da.from_delayed(
-                        _part[0], shape=(_ny, _nx), dtype=np.float32)
-                    ps[_i][_j] = da.from_delayed(
-                        _dask.delayed(_fit3d_ps_raster_for_dask)(
-                            _test, int(_origin[0]), int(_origin[1]),
-                            int(_ny), int(_nx)),
-                        shape=(_ny, _nx), dtype=np.float32)
-                coords = {k_: v for k_, v in da_xr.coords.items()
-                          if k_ in ('y', 'x', 'spatial_ref')}
-                pol = _s['pol']
-                for store, rows in ((ds_out, rank), (ps_out, ps)):
-                    o = xr.Dataset({pol: xr.DataArray(
-                        da.block(rows), dims=('y', 'x'), coords=coords,
-                        name=pol)})
-                    if 'spatial_ref' in ds.coords:
-                        o = o.assign_coords(spatial_ref=ds.spatial_ref)
-                    store[key] = o
-        return Batches((Batch(ds_out), Batch(ps_out)))
 
     """
     This class has 'data' stack variable for the datasets in the dict.
@@ -6337,9 +4869,9 @@ class BatchComplex(BatchCore):
         by gaussian().
 
         THE REFERENCE EPOCH IS WHERE THE BASELINE IS SMALLEST, so the height
-        term vanishes there and fit3d()'s origin is the same epoch. The choice
+        term vanishes there and fit1d_network()'s origin is the same epoch. The choice
         is free for anything that differences dates or pixels, since a constant
-        per pixel cancels; matching fit3d only keeps the conventions aligned.
+        per pixel cancels; matching fit1d_network only keeps the conventions aligned.
         `baseline=None` takes the middle epoch. A baseline NAMED AND ABSENT
         raises rather than quietly picking another epoch.
 
@@ -6376,7 +4908,7 @@ class BatchComplex(BatchCore):
 
     def multilook(self, wavelength: float, baseline: 'str | None' = 'BPR',
                   weight: 'BatchUnit | None' = None, threshold: float = 0.5,
-                  device: str = 'auto', debug: bool = False) -> 'BatchComplex':
+                  debug: bool = False) -> 'BatchComplex':
         """Spatial looks on a per-date complex stack: singlelook() then gaussian().
 
         Averaging the stack itself is a random walk -- neighbouring SLC pixels
@@ -6386,7 +4918,7 @@ class BatchComplex(BatchCore):
         being averaged; the same filter is then a real multilook.
 
         THIS IS WHAT A DISTRIBUTED SCATTERER NEEDS BEFORE A PER-PIXEL FIT.
-        fit3d() builds every arc from single pixel columns, so a candidate's
+        fit1d_network() builds every arc from single pixel columns, so a candidate's
         own phase noise is COMMON to all of its arcs: no number of partners, no
         `consensus` and no `err_dv` can average it out, because the consensus
         can only reject the pixel, never improve it. Supply the looks here and
@@ -6404,7 +4936,7 @@ class BatchComplex(BatchCore):
             to that scale cost no resolution the data ever held.
         baseline : str or None
             Passed to singlelook() to name the reference epoch.
-        weight, threshold, device, debug
+        weight, threshold, debug
             Passed to gaussian().
 
         Returns
@@ -6415,7 +4947,7 @@ class BatchComplex(BatchCore):
 
         Examples
         --------
-        >>> model = stack.multilook(wavelength=60).fit3d(threshold=0)
+        >>> model = stack.multilook(wavelength=60).fit1d_network(threshold=0)
         """
         if not wavelength > 0:
             raise ValueError(f'multilook() needs a positive wavelength in metres, got {wavelength}')
@@ -6426,8 +4958,7 @@ class BatchComplex(BatchCore):
         # a BatchUnit (N81), checked here; gaussian() fits it to the grids
         BatchCore._weight(weight)
         return self.singlelook(baseline).gaussian(
-            weight=weight, wavelength=wavelength, threshold=threshold,
-            device=device, debug=debug)
+            weight=weight, wavelength=wavelength, threshold=threshold, debug=debug)
 
     def pairs(self, pairs):
         """Select date pairs from per-date data, returning ref and rep stacks.
@@ -6511,18 +5042,16 @@ class BatchComplex(BatchCore):
     def unwrap2d(self, *args, **kwargs):
         """Unwrap complex interferogram via .angle() conversion, see BatchWrap.unwrap2d().
 
-        Relaxed IRLS defaults: max_iter=50, tol=1e-2, cg_max_iter=10, cg_tol=1e-3. Strong set:
-        max_iter=200, tol=1e-3, cg_max_iter=20, cg_tol=1e-4, epsilon=1e-2. A looser
-        setting prints one WARNING per call.
+        The solver stops at `accuracy` (default 2e-3; 5e-4 near the optimum, about 1.9 times
+        longer); the former tol, cg_max_iter, cg_tol, device, semaphore print one WARNING.
         """
         return self.angle().unwrap2d(*args, **kwargs)
 
     def unwrap2d_irls(self, *args, **kwargs):
         """Unwrap complex interferogram via .angle() conversion, see BatchWrap.unwrap2d_irls().
 
-        Relaxed IRLS defaults: max_iter=50, tol=1e-2, cg_max_iter=10, cg_tol=1e-3. Strong set:
-        max_iter=200, tol=1e-3, cg_max_iter=20, cg_tol=1e-4, epsilon=1e-2. A looser
-        setting prints one WARNING per call.
+        The solver stops at `accuracy` (default 2e-3; 5e-4 near the optimum, about 1.9 times
+        longer); the former tol, cg_max_iter, cg_tol, device, semaphore print one WARNING.
         """
         return self.angle().unwrap2d_irls(*args, **kwargs)
 
@@ -6534,13 +5063,9 @@ class BatchComplex(BatchCore):
         )
 
     @staticmethod
-    @serialize_gpu
-    def _goldstein(phase_np, corr_np, psize=32, threshold=0.5, device='auto', skip=(0, 0)):
+    def _goldstein(phase_np, corr_np, psize=32, threshold=0.5, skip=(0, 0)):
         """
-        Apply Goldstein adaptive filter.
-
-        Uses loop-based processing for CPU (constant memory) and
-        PyTorch unfold/fold for GPU (vectorized).
+        Apply Goldstein adaptive filter (utils_goldstein.goldstein).
 
         Parameters
         ----------
@@ -6553,8 +5078,6 @@ class BatchComplex(BatchCore):
         threshold : float
             Minimum fraction of valid (non-NaN) pixels required to process a patch.
             Default 0.5 means at least 50% of pixels must be valid.
-        device : str, optional
-            PyTorch device: 'auto', 'cuda', 'mps', or 'cpu'.
         skip : tuple of int
             (rows, columns) at the start of the block that no patch covers: the patch grid starts there (NaN
             before it). For a block of a larger array, whose patch grid belongs to the whole array.
@@ -6565,8 +5088,7 @@ class BatchComplex(BatchCore):
             Filtered complex array with same shape as input.
         """
         import numpy as np
-        from .BatchCore import BatchCore
-        from .utils_goldstein import goldstein_numpy, goldstein_pytorch
+        from .utils_goldstein import goldstein
 
         if psize is None:
             return phase_np
@@ -6598,31 +5120,22 @@ class BatchComplex(BatchCore):
         if corr_np.dtype != np.float32:
             corr_np = corr_np.astype(np.float32)
 
-        # Dispatch based on device
-        dev = BatchCore._get_torch_device(device)
-
-        if dev.type == 'cpu':
-            result = goldstein_numpy(phase_np, corr_np, psize_y, psize_x, threshold=threshold, skip=skip)
-        else:
-            import torch
-            result = goldstein_pytorch(phase_np, corr_np, psize_y, psize_x, dev, threshold=threshold, skip=skip)
-            if dev.type == 'mps':
-                torch.mps.empty_cache()
-            elif dev.type == 'cuda':
-                torch.cuda.empty_cache()
+        result = goldstein(phase_np, corr_np, psize_y, psize_x, threshold=threshold, skip=skip)
 
         if squeeze:
             result = result[np.newaxis, ...]
         return result
 
     def goldstein(self, corr: BatchUnit, window: 'float | tuple | dict' = 200, threshold: float = 0.5,
-                  device: str = 'auto', debug: bool = False):
+                  debug: bool = False):
         """
         Apply Goldstein adaptive filter to each dataset in the batch.
 
         The patches sit at multiples of half a patch counted from pixel 0 of each burst's grid, so the result
         depends on the filter window and on the burst's grid, and does not depend on the dask chunks (up to float
-        rounding). It does depend on cropping the burst: a crop starts its own patch grid.
+        rounding). It does depend on cropping the burst: a crop starts its own patch grid. Each patch's spectrum S
+        is weighted by (|S| / max |S|)^alpha, alpha = 1 - the patch's mean correlation, so the phase does not
+        depend on the amplitude scale of the interferogram.
 
         Parameters
         ----------
@@ -6639,9 +5152,6 @@ class BatchComplex(BatchCore):
         threshold : float, optional
             Minimum fraction of valid (non-NaN) pixels required to process a patch.
             Default 0.5 means at least 50% of pixels must be valid.
-        device : str, optional
-            PyTorch device: 'auto' (default), 'cuda', 'mps', or 'cpu'.
-            'auto' uses GPU if Dask client has resources={'gpu': 1}.
         debug : bool, optional
             Print debug information. Default is False.
 
@@ -6705,11 +5215,6 @@ class BatchComplex(BatchCore):
                     f"of {ds.sizes['y']} x {ds.sizes['x']} pixels: crop a larger area or use a shorter window")
             windows[k] = window
 
-        # Resolve device ONCE here, not in every task
-        if device == 'auto':
-            resolved_device = BatchCore._get_torch_device(device, debug=debug)
-            device = resolved_device.type  # 'cpu', 'cuda', or 'mps' as string
-
         # Apply Goldstein filter to each dataset
         result = {}
         for k in self.keys():
@@ -6754,7 +5259,6 @@ class BatchComplex(BatchCore):
                         dtype=np.complex64,
                         psize=window,
                         threshold=threshold,
-                        device=device,
                         halo=(depth_y, depth_x),
                     )
 
@@ -7205,7 +5709,7 @@ class Batches(tuple):
                 results.append(b)
         return Batches(results)
 
-    def goldstein(self, window: 'float | tuple' = 200, threshold: float = 0.5, device: str = 'auto'):
+    def goldstein(self, window: 'float | tuple' = 200, threshold: float = 0.5):
         """Apply Goldstein filter to phase using correlation as weight.
 
         Expects Batches with [BatchComplex (phase), BatchUnit (correlation)].
@@ -7218,8 +5722,6 @@ class Batches(tuple):
         threshold : float
             Minimum fraction of valid (non-NaN) pixels required to process a patch.
             Default 0.5 means at least 50% of pixels must be valid.
-        device : str
-            PyTorch device: 'auto', 'cuda', 'mps', or 'cpu'.
 
         Returns
         -------
@@ -7240,15 +5742,14 @@ class Batches(tuple):
         # the correlation is the weight: the shared check and messages (N81)
         BatchCore._weight(corr, phase, 'corr', required=True)
 
-        filtered_phase = phase.goldstein(corr, window, threshold=threshold, device=device)
+        filtered_phase = phase.goldstein(corr, window, threshold=threshold)
         return Batches([filtered_phase, corr] + list(self[2:]))
 
     def interferogram(self,
                   wavelength: float | None = None,
                   weight: 'BatchUnit | None' = None,
                   phase: 'BatchComplex | None' = None,
-                  gaussian_threshold: float = 0.5,
-                  device: str = 'auto') -> 'Batches':
+                  gaussian_threshold: float = 0.5) -> 'Batches':
         """
         Compute phase difference from paired SLC data.
 
@@ -7273,8 +5774,6 @@ class Batches(tuple):
             Optional phase to subtract (e.g., topographic phase).
         gaussian_threshold : float
             Threshold for Gaussian filter (default 0.5).
-        device : str
-            PyTorch device: 'auto', 'cuda', 'mps', or 'cpu'.
 
         Returns
         -------
@@ -7317,9 +5816,9 @@ class Batches(tuple):
                 intf = intf * phase.iexp(-1)
 
         if wavelength is not None:
-            intf_look = intf.gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold, device=device)
-            intensity_ref = ref.power().gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold, device=device)
-            intensity_rep = rep.power().gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold, device=device)
+            intf_look = intf.gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold)
+            intensity_ref = ref.power().gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold)
+            intensity_rep = rep.power().gaussian(weight=weight, wavelength=wavelength, threshold=gaussian_threshold)
             del ref, rep
             corr_look = (intf_look.abs() / (intensity_ref * intensity_rep).sqrt()).clip(0, 1)
             del intensity_ref, intensity_rep
@@ -7393,9 +5892,9 @@ class Batches(tuple):
 
     def unwrap2d(self, conncomp=False, conncomp_size=1000, conncomp_gap=None,
                  conncomp_linksize=5, conncomp_linkcount=30, union=False,
-                 device='auto', debug=False, **kwargs):
+                 debug=False, **kwargs):
         """
-        Unwrap phase using GPU-accelerated IRLS algorithm (L¹ norm).
+        Unwrap phase: L¹ IRLS with a multigrid-preconditioned solver, on the CPU (numba).
 
         Expects Batches with [BatchWrap or BatchComplex (phase), BatchUnit (weight, optional)].
         If the first element is BatchComplex, .angle() is called automatically.
@@ -7419,15 +5918,12 @@ class Batches(tuple):
             result, so the answer is consistent across burst edges -- viable
             while the merged scene fits. A Batch either way: the merge is
             internal, and each burst comes back holding only its own pixels.
-        device : str
-            PyTorch device: 'auto', 'cuda', 'mps', 'cpu'.
         debug : bool
             Print diagnostic information.
         **kwargs
-            Additional arguments: max_iter, tol, cg_max_iter, cg_tol, epsilon.
-            Relaxed defaults: max_iter=50, tol=1e-2, cg_max_iter=10, cg_tol=1e-3,
-            epsilon=1e-2. Strong set: max_iter=200, tol=1e-3, cg_max_iter=20,
-            cg_tol=1e-4, epsilon=1e-2. A looser setting prints one WARNING per call.
+            Passed to unwrap2d_irls(): accuracy (default 2e-3; 5e-4 near the optimum,
+            about 1.9 times longer), max_iter (the safety cap, default 100), epsilon.
+            The former tol, cg_max_iter, cg_tol, device, semaphore print one WARNING.
 
         Returns
         -------
@@ -7437,9 +5933,9 @@ class Batches(tuple):
 
         Examples
         --------
-        >>> phase, corr = stack.pairs(baseline.tolist()).phasediff(wavelength=30).angle()
-        >>> unwrapped = phase.unwrap2d()  # Without weights
-        >>> unwrapped = Batches([phase, corr]).unwrap2d()  # With weights
+        >>> intf, corr = stack.pairs(baseline.tolist()).interferogram(100).angle()
+        >>> unwrapped = intf.unwrap2d()  # Without weights
+        >>> unwrapped = Batches([intf, corr]).unwrap2d()  # With weights
         """
         if len(self) < 1:
             raise ValueError("unwrap2d() requires Batches with at least 1 element: [phase]")
@@ -7459,7 +5955,7 @@ class Batches(tuple):
         return phase.unwrap2d(weight=weight, conncomp=conncomp, conncomp_size=conncomp_size,
                               conncomp_gap=conncomp_gap, conncomp_linksize=conncomp_linksize,
                               conncomp_linkcount=conncomp_linkcount, union=union,
-                              device=device, debug=debug, **kwargs)
+                              debug=debug, **kwargs)
 
     def subtract(self):
         """
@@ -7590,7 +6086,7 @@ class Batches(tuple):
         Batch
             The model: velocity, height, coherence, rmse, and `seasonal` from
             the variants that fit an annual term. Identical in name and unit to
-            fit3d()'s, so predict() consumes either.
+            fit1d_network()'s, so predict() consumes either.
         """
         phase = self[0]
         # the second element IS the weight: a BatchUnit or an error, never dropped (N81)

@@ -16,13 +16,11 @@ Stack_sbas -> Stack_detrend -> Stack_unwrap2d mixin chain, which added inheritan
 levels without separating concerns.
 """
 from __future__ import annotations
-from .utils_torch import serialize_gpu, GPU_LOCK
 from .BatchCore import BatchCore
 from . import utils_unwrap2d
 import numpy as np
 import numba as _numba
 import rioxarray
-import threading
 from contextlib import nullcontext
 from . import utils_stl
 from .utils_vtk import as_vtk as _as_vtk
@@ -36,76 +34,16 @@ if TYPE_CHECKING:
     import pandas as pd
     import xarray as xr
 
-# GPU work serializes on the ONE process-wide lock in utils_torch;
-# CPU work still uses a semaphore to cap parallelism (see below).
+def _unwrap_task(phase_blocks, weight_blocks, params):
+    """One raster of Stack.unwrap2d_irls(): the result and the labels stacked as (2, y, x) float32, (1, 2, y, x) with a
+    pair axis."""
+    accuracy, max_iter, epsilon, conncomp_size, threads, debug, lead = params
+    unwrapped, conncomp = utils_unwrap2d.irls_unwrap_2d(phase_blocks, weight_blocks, accuracy=accuracy, max_iter=max_iter,
+                                                         epsilon=epsilon, conncomp_size=conncomp_size, threads=threads,
+                                                         debug=debug)
+    out = np.stack([unwrapped, conncomp.astype(np.float32)])
+    return out[np.newaxis] if lead else out
 
-_irls_cpu_semaphores = {}
-
-_irls_cpu_semaphores_lock = threading.Lock()
-
-def _get_irls_semaphore(value):
-    """Get or create a per-process CPU semaphore with the given value."""
-    with _irls_cpu_semaphores_lock:
-        if value not in _irls_cpu_semaphores:
-            _irls_cpu_semaphores[value] = threading.Semaphore(value)
-        return _irls_cpu_semaphores[value]
-
-def _irls_process_chunk_with_tuple(phase_chunk, weight_chunk, params_tuple):
-    """Module-level function for IRLS processing with params as tuple.
-
-    Returns tuple of (unwrapped, conncomp) arrays, each with shape (1, y, x).
-    """
-    # Unpack params tuple
-    device, max_iter, tol, cg_max_iter, cg_tol, epsilon, conncomp_size, debug, semaphore = params_tuple
-
-    if debug:
-        print(f'DEBUG _irls_process_chunk: phase_chunk.shape={phase_chunk.shape}, device={device!r}')
-
-    # Squeeze to 2D for processing - handle both (1, y, x) and (y, x) input
-    if phase_chunk.ndim == 3:
-        phase_2d = phase_chunk[0]
-        weight_2d = weight_chunk[0] if weight_chunk is not None else None
-    elif phase_chunk.ndim == 2:
-        phase_2d = phase_chunk
-        weight_2d = weight_chunk
-    else:
-        raise ValueError(f"Expected 2D or 3D phase_chunk, got shape {phase_chunk.shape}")
-
-    if debug:
-        print(f'DEBUG _irls_process_chunk: phase_2d.shape={phase_2d.shape}')
-
-    if np.all(np.isnan(phase_2d)):
-        if debug:
-            print('  All NaN, skipping')
-        unwrapped = phase_2d.astype(np.float32)
-        conncomp = np.zeros_like(phase_2d, dtype=np.uint16)
-        return unwrapped[np.newaxis, ...], conncomp[np.newaxis, ...]
-
-    sem = _get_irls_semaphore(semaphore) if str(device) == 'cpu' else GPU_LOCK
-    with sem:
-        unwrapped, conncomp = utils_unwrap2d.irls_unwrap_2d(
-            phase_2d, weight=weight_2d, device=device,
-            max_iter=max_iter, tol=tol, cg_max_iter=cg_max_iter,
-            cg_tol=cg_tol, epsilon=epsilon, conncomp_size=conncomp_size, debug=debug
-        )
-    # Add pair dim back: (y, x) -> (1, y, x)
-    return unwrapped[np.newaxis, ...], conncomp[np.newaxis, ...]
-
-
-
-def _irls_process_no_weight_conncomp(phase_chunk, params_tuple):
-    """Process phase chunk without weight. Returns stacked (1, 2, y, x)."""
-    unwrapped, conncomp = _irls_process_chunk_with_tuple(phase_chunk, None, params_tuple)
-    # Stack: (1, y, x) + (1, y, x) -> (1, 2, y, x) for blockwise with 'pcyx' output
-    stacked = np.stack([unwrapped[0].astype(np.float32), conncomp[0].astype(np.float32)], axis=0)
-    return stacked[np.newaxis, ...]  # (1, 2, y, x)
-
-def _irls_process_with_weight_conncomp(phase_chunk, weight_chunk, params_tuple):
-    """Process phase chunk with weight. Returns stacked (1, 2, y, x)."""
-    unwrapped, conncomp = _irls_process_chunk_with_tuple(phase_chunk, weight_chunk, params_tuple)
-    # Stack: (1, y, x) + (1, y, x) -> (1, 2, y, x) for blockwise with 'pcyx' output
-    stacked = np.stack([unwrapped[0].astype(np.float32), conncomp[0].astype(np.float32)], axis=0)
-    return stacked[np.newaxis, ...]  # (1, 2, y, x)
 
 def _zarr_block(layout, *parts):
     """One block of Stack._zarr_dask(): cut from the disk chunks it overlaps (parts, row by row), joined.
@@ -374,7 +312,7 @@ class Stack(BatchComplex):
 
     THE TRANSFORM IS NOT DATA (N81). Every data operation of a Stack -- where(), mask(),
     the map helpers, the reductions, gaussian(), multilook(), goldstein(), fit1d(),
-    fit3d(), trend2d(), predict(), ... -- runs on BatchComplex(stack), so the transform grids
+    fit1d_network(), trend2d(), predict(), ... -- runs on BatchComplex(stack), so the transform grids
     are never masked,
     weighted, filtered, smoothed or reduced as data were. A result on the stack's own
     grid that stays complex data comes back as a Stack with the transform untouched
@@ -446,6 +384,7 @@ class Stack(BatchComplex):
     interp = _on_data('interp')
     unwrap3d = _on_data('unwrap3d')
     fit1d = _on_data('fit1d')
+    fit1d_network = _on_data('fit1d_network')
     fit3d = _on_data('fit3d')
     mix = _on_data('mix')
 
@@ -786,17 +725,15 @@ class Stack(BatchComplex):
     def unwrap2d(self, phase, weight=None, conncomp=False,
                 conncomp_size=1_000, conncomp_gap=None,
                 conncomp_linksize=5, conncomp_linkcount=30, union=False,
-                device='auto', debug=False, **kwargs):
+                debug=False, **kwargs):
         """
-        Unwrap phase using GPU-accelerated IRLS algorithm (L¹ norm).
+        Unwrap phase: L¹ IRLS with a multigrid-preconditioned solver, on the CPU (numba).
 
         .. deprecated::
             Use ``phase.unwrap2d(weight=corr)`` on BatchWrap instead.
             This Stack method will be removed in a future version.
 
-        Uses Iteratively Reweighted Least Squares with DCT-based preconditioner.
-        GPU-accelerated using PyTorch (MPS on Apple Silicon, CUDA on NVIDIA,
-        or CPU fallback).
+        See unwrap2d_irls() for the solver and its parameters.
 
         When conncomp=False (default), disconnected components are automatically
         linked using ILP optimization to find optimal 2π offsets.
@@ -839,17 +776,12 @@ class Stack(BatchComplex):
             bursts need not agree across a shared edge. True merges and solves
             once, consistent across them, while the merged scene fits. A Batch
             either way, each burst back with only its own pixels.
-        device : str, optional
-            PyTorch device: 'auto' (default), 'cuda', 'mps', 'cpu', or 'tpu'.
-            'auto' uses GPU if Dask client has resources={'gpu': 1}.
         debug : bool, optional
             If True, print diagnostic information. Default is False.
         **kwargs
-            Additional arguments passed to unwrap2d_irls:
-            max_iter, tol, cg_max_iter, cg_tol, epsilon. Relaxed defaults:
-            max_iter=50, tol=1e-2, cg_max_iter=10, cg_tol=1e-3, epsilon=1e-2.
-            Strong set: max_iter=200, tol=1e-3, cg_max_iter=20, cg_tol=1e-4,
-            epsilon=1e-2. A looser setting prints one WARNING per call.
+            Passed to unwrap2d_irls(): accuracy (default 2e-3; 5e-4 near the optimum,
+            about 1.9 times longer), max_iter (the safety cap, default 100), epsilon.
+            The former tol, cg_max_iter, cg_tol, device, semaphore print one WARNING.
 
         Returns
         -------
@@ -860,12 +792,6 @@ class Stack(BatchComplex):
 
         Notes
         -----
-        GPU/TPU acceleration:
-        - tpu on Google Cloud TPU (experimental, requires torch_xla)
-        - cuda on NVIDIA GPUs and AMD GPUs (via ROCm)
-        - mps on Apple Silicon (M1/M2/M3/M4)
-        - cpu fallback otherwise
-
         Component Linking (when conncomp=False):
         1. Unwraps each connected component separately
         2. Finds direct connections between components (not crossing others)
@@ -884,8 +810,8 @@ class Stack(BatchComplex):
         >>> unwrapped, conncomp = stack.unwrap2d(intfs, corr, conncomp=True)
         >>> main_component = unwrapped.where(conncomp == 1)  # largest component
 
-        Force CPU processing:
-        >>> unwrapped = stack.unwrap2d(intfs, corr, device='cpu')
+        Closer to the optimum, about 1.9 times longer:
+        >>> unwrapped = stack.unwrap2d(intfs, corr, accuracy=5e-4)
         """
         # Validate parameters
         if not conncomp and conncomp_linksize > conncomp_size:
@@ -901,13 +827,13 @@ class Stack(BatchComplex):
             return self._unwrap2d_union(
                 phase, weight, conncomp=conncomp, conncomp_size=conncomp_size,
                 conncomp_gap=conncomp_gap, conncomp_linksize=conncomp_linksize,
-                conncomp_linkcount=conncomp_linkcount, device=device,
+                conncomp_linkcount=conncomp_linkcount,
                 debug=debug, **kwargs)
 
         # Use IRLS unwrapping - always returns (unwrapped, conncomp)
         # Pass conncomp_size to filter small components during IRLS
         unwrapped, conncomp_labels = self.unwrap2d_irls(
-            phase, weight, device=device, conncomp_size=conncomp_size, debug=debug, **kwargs
+            phase, weight, conncomp_size=conncomp_size, debug=debug, **kwargs
         )
 
         if conncomp:
@@ -926,7 +852,7 @@ class Stack(BatchComplex):
     def _unwrap2d_union(self, phase, weight=None, conncomp=False,
                         conncomp_size=1000, conncomp_gap=None,
                         conncomp_linksize=5, conncomp_linkcount=30,
-                        device='auto', debug=False, **kwargs):
+                        debug=False, **kwargs):
         """One solve over the union of the bursts, returned on the burst grid.
 
         Unwrapping needs one raster, so the bursts are merged internally; the
@@ -995,7 +921,7 @@ class Stack(BatchComplex):
             conncomp=conncomp, conncomp_size=conncomp_size,
             conncomp_gap=conncomp_gap, conncomp_linksize=conncomp_linksize,
             conncomp_linkcount=conncomp_linkcount, union=False,
-            device=device, debug=debug, **kwargs)
+            debug=debug, **kwargs)
         merged = ([r[''] for r in result] if conncomp else [result['']])
 
         if not _batch_in:
@@ -1008,24 +934,16 @@ class Stack(BatchComplex):
             out = [o._view({k: v.rename(None) for k, v in dict.items(o)}) for o in out]
         return tuple(out) if conncomp else out[0]
 
-    def unwrap2d_irls(self, phase, weight=None, device='auto',
-                      max_iter=50, tol=1e-2, cg_max_iter=10, cg_tol=1e-3, epsilon=1e-2,
-                      conncomp_size=30, semaphore=8, debug=False):
+    def unwrap2d_irls(self, phase, weight=None, accuracy=2e-3, max_iter=100, epsilon=1e-2,
+                      conncomp_size=30, debug=False, **kwargs):
         """
-        Unwrap phase using GPU-accelerated IRLS algorithm (L¹ norm).
+        Unwrap phase: L¹ IRLS with a multigrid-preconditioned solver, on the CPU (numba).
 
-        This algorithm provides high-quality unwrapping with L¹ norm that
-        preserves discontinuities, and supports quality weighting from
-        correlation data. GPU-accelerated using PyTorch (MPS on Apple Silicon,
-        CUDA on NVIDIA, or CPU fallback).
-
-        Uses GPU-accelerated DCT as initial solution, then refines it through
-        weighted IRLS iterations. This handles phase residues properly by
-        down-weighting inconsistent regions based on correlation.
-
-        Disconnected components (separated by NaN regions) are unwrapped
-        independently - the algorithm naturally handles this through edge
-        weight zeroing where either adjacent pixel is invalid.
+        Each pair of each burst is one raster and one task with unwrap_threads(rasters) numba threads: one
+        raster takes every core, 8 take 2 each on 16 cores, 16 and more take one each. The result depends
+        neither on the threads nor on the chunks.
+        Disconnected components (separated by NaN regions) are unwrapped independently and aligned to the
+        input's circular mean. See `utils_unwrap2d.irls_unwrap_2d` for the algorithm.
 
         Parameters
         ----------
@@ -1034,29 +952,22 @@ class Stack(BatchComplex):
         weight : BatchUnit, optional
             Batch of correlation values for weighting. Higher values indicate
             more reliable phase measurements.
-        device : str, optional
-            PyTorch device: 'auto' (default), 'cuda', 'mps', 'cpu', or 'tpu'.
-            'auto' uses GPU if Dask client has resources={'gpu': 1}.
+        accuracy : float, optional
+            The stop: the relative decrease of the L1 objective over one step. Default 2e-3, which
+            reaches the former strong set's result in less time than the former relaxed set took;
+            5e-4 is near the optimum and takes about 1.9 times longer.
         max_iter : int, optional
-            Maximum IRLS iterations. Default is 50 (relaxed; strong: 200).
-        tol : float, optional
-            Convergence tolerance for relative change. Default is 1e-2 (relaxed; strong: 1e-3).
-        cg_max_iter : int, optional
-            Maximum conjugate gradient iterations per IRLS step. Default is 10 (relaxed; strong: 20).
-        cg_tol : float, optional
-            Conjugate gradient convergence tolerance. Default is 1e-3 (relaxed; strong: 1e-4).
+            The safety cap on the steps; reaching it before `accuracy` prints one WARNING. Default 100.
         epsilon : float, optional
-            Smoothing parameter for L¹ approximation. Larger values improve
-            numerical stability but reduce L¹ approximation quality. Default is 1e-2 (strong: 1e-2).
+            Smoothing of the L1 norm at the end of its continuation. Default 1e-2.
         conncomp_size : int, optional
             Minimum connected component size in pixels. Components smaller than this
             are marked invalid (label 0). Default is 30.
-        semaphore : int, optional
-            Maximum concurrent CPU IRLS tasks per process. Limits PyTorch thread
-            contention in high-thread configs (e.g. 1w16t). Transparent when
-            threads_per_worker < semaphore. Default is 8.
         debug : bool, optional
             If True, print diagnostic information. Default is False.
+        **kwargs
+            The former tol, cg_max_iter, cg_tol, device, semaphore: accepted and ignored
+            with one WARNING.
 
         Returns
         -------
@@ -1066,24 +977,13 @@ class Stack(BatchComplex):
             - conncomp: Batch of component labels (uint16, 0=invalid, 1=largest, 2=second, ...);
               labels, not units (a BatchUnit holds float units only, N81)
 
-        Notes
-        -----
-        - GPU/TPU-accelerated using PyTorch (TPU via XLA, CUDA/ROCm, MPS, or CPU)
-        - L¹ norm preserves discontinuities better than L² (DCT alone)
-        - Correlation weighting handles phase residues properly
-        - Provides consistent results across multi-burst data
-        - The defaults are the relaxed, fast set: max_iter=50, tol=1e-2,
-          cg_max_iter=10, cg_tol=1e-3. The strong set is the defaults of
-          `utils_unwrap2d.irls_unwrap_2d`: max_iter=200, tol=1e-3, cg_max_iter=20,
-          cg_tol=1e-4, epsilon=1e-2. Any parameter looser than the strong set
-          prints one WARNING per call naming the strong values.
-
-        **Algorithm**: Uses a novel DCT+IRLS combination. See
-        `utils_unwrap2d.irls_unwrap_2d` for algorithm details and references.
+        Examples
+        --------
+        >>> unwrapped, conncomp = stack.unwrap2d_irls(intfs, corr)
+        >>> unwrapped, conncomp = stack.unwrap2d_irls(intfs, corr, accuracy=5e-4)
         """
         import dask
         import dask.array as da
-        import torch
         import xarray as xr
         from .Batch import Batch, BatchWrap, BatchUnit
 
@@ -1096,17 +996,17 @@ class Stack(BatchComplex):
         BatchCore._require_lazy(phase, 'unwrap2d')
 
         # every unwrapping path builds its graph here, so this prints once per call
-        utils_unwrap2d.irls_relaxed_warning(max_iter=max_iter, tol=tol, cg_max_iter=cg_max_iter,
-                                            cg_tol=cg_tol, epsilon=epsilon)
+        unknown = sorted(set(kwargs) - set(utils_unwrap2d._OLD_IRLS))
+        if unknown:
+            raise TypeError(f'unwrap2d_irls() got unexpected keyword arguments: {", ".join(unknown)}')
+        utils_unwrap2d.old_irls_warning(kwargs, 'unwrap2d()')
 
-        # Resolve device using shared helper (handles Dask cluster resources)
-        # Convert to string once to avoid serialization issues and repeated resolution
-        resolved = Stack._get_torch_device(device, debug=debug)
-        device = resolved.type  # 'cpu', 'cuda', or 'mps' as string
-        device_name = device.upper()
-
+        # THE CORES OVER THE RASTERS THAT RUN AT ONCE: a raster is one pair of one grid of one burst
+        rasters = sum(da_.sizes['pair'] if 'pair' in da_.dims else 1
+                      for key in phase.keys() for da_ in BatchCore._grids_of(phase[key]).values())
+        threads = utils_unwrap2d.unwrap_threads(rasters)
         if debug:
-            print(f'Using device: {device_name}')
+            print(f'DEBUG unwrap2d: {rasters} rasters, {threads} numba threads each')
 
         # Process each burst in the batch
         unwrap_result = {}
@@ -1170,51 +1070,21 @@ class Stack(BatchComplex):
                     if weight_da is not None and 'pair' in weight_da.indexes:
                         weight_da = weight_da.reset_index('pair', drop=True)
 
-                # Use da.blockwise for efficient dask integration
-                # With chunk={'pair': 1}, dask splits (n_pairs, y, x) into n_pairs chunks of (1, y, x)
-
-                # Use da.blockwise for efficient chunk processing
                 phase_dask = phase_da.data
                 weight_dask = weight_da.data if weight_da is not None else None
-
-                # Provide meta to avoid calling process_wrapper during graph construction
-                meta = np.empty((0, 0, 0), dtype=np.float32)
-
-                # Create params tuple - simple immutable structure for reliable serialization
-                # Use str() to create a fresh string copy
-                params_tuple = (str(device), max_iter, tol, cg_max_iter, cg_tol, epsilon, conncomp_size, debug, semaphore)
-
-                if debug:
-                    print(f'DEBUG creating params tuple with device={params_tuple[0]!r}, semaphore={semaphore}')
-
-                # Use conncomp versions that return stacked (1, 2, y, x) per chunk
-                # Output shape is (n_pairs, 2, y, x)
-                meta_stacked = np.empty((0, 0, 0, 0), dtype=np.float32)
-
-                if weight_dask is None:
-                    # Pass params tuple as scalar through blockwise
-                    result_dask = dask.array.blockwise(
-                        _irls_process_no_weight_conncomp, 'pcyx',
-                        phase_dask, 'pyx',
-                        params_tuple, None,  # None index means scalar (not broadcasted)
-                        dtype=np.float32,
-                        meta=meta_stacked,
-                        new_axes={'c': 2},  # Output has new axis of size 2
-                    )
-                else:
-                    result_dask = dask.array.blockwise(
-                        _irls_process_with_weight_conncomp, 'pcyx',
-                        phase_dask, 'pyx',
-                        weight_dask, 'pyx',
-                        params_tuple, None,
-                        dtype=np.float32,
-                        meta=meta_stacked,
-                        new_axes={'c': 2},
-                    )
-
-                # Split stacked result: (n_pairs, 2, y, x) -> unwrapped (n_pairs, y, x), conncomp (n_pairs, y, x)
-                unwrapped_dask = result_dask[:, 0, :, :]  # First channel is unwrapped phase
-                conncomp_dask = result_dask[:, 1, :, :].astype(np.uint16)  # Second channel is conncomp
+                lead = 'pair' in phase_da.dims
+                params = (float(accuracy), int(max_iter), float(epsilon), int(conncomp_size), int(threads), bool(debug), lead)
+                inds, out_ind = ('pyx', 'pcyx') if lead else ('yx', 'cyx')
+                weight_arg = (weight_dask, inds) if weight_dask is not None else (None, None)
+                # ONE TASK A PAIR on its raster's one block, y and x not contracted: dask fuses the inputs' chains into
+                # the task. A layer that reads the blocks in the task (as fit1d_network() reads them) saves one transient copy
+                # but stops that fusion, and two graphs sharing the inputs then hold their keys with different specs
+                # (the scheduler's 'different run_spec' warning)
+                result_dask = dask.array.blockwise(
+                    _unwrap_task, out_ind, phase_dask, inds, *weight_arg, params, None,
+                    dtype=np.float32, meta=np.empty((0,) * len(out_ind), dtype=np.float32), new_axes={'c': 2})
+                unwrapped_dask = result_dask[:, 0] if lead else result_dask[0]
+                conncomp_dask = (result_dask[:, 1] if lead else result_dask[1]).astype(np.uint16)
 
                 # Build xarray results with proper dimensions
                 # unwrapped_dask and conncomp_dask already have (n_pairs, y, x) shape
@@ -1566,96 +1436,7 @@ class Stack(BatchComplex):
 
         return model
 
-    @staticmethod
-    @serialize_gpu
-    def _psfunction_stream(chunks, device='auto', debug=False):
-        """
-        Compute the PS function of a spatial block from its per-date SLC chunks, streaming the dates as the ADI
-        kernel does. The task holds the block's SLC chunks (its input) but no concatenated or derived copy of all
-        dates: only per-date and per-tile temporaries.
-
-        The first pass computes the mean intensity of every date over the block, to normalize every date to the mean
-        of all dates. The second pass accumulates the normalized intensity per spatial tile with Welford's running
-        mean and variance:
-
-            psfunction = mean_intensity / (2 * std_intensity)
-
-        Parameters
-        ----------
-        chunks : list of np.ndarray
-            Complex SLC chunks of the block, each of shape (height, width, n) with the dates on the last axis.
-        device : str
-            Device to use ('auto', 'mps', 'cuda', 'cpu').
-        debug : bool
-            Print debug information.
-
-        Returns
-        -------
-        np.ndarray
-            2D array of shape (height, width) containing PS function values.
-        """
-        import math
-        import torch
-        import numpy as np
-        from .utils_dask import get_dask_chunk_size_mb
-
-        # Select device using shared helper
-        dev = Stack._get_torch_device(device)
-
-        if debug:
-            print(f'DEBUG: _psfunction_stream using device={dev}')
-
-        height, width = chunks[0].shape[:2]
-        dates = [(chunk, t) for chunk in chunks for t in range(chunk.shape[-1])]
-
-        # First pass: mean intensity (|z|^2) of every date over the block
-        date_means = np.full(len(dates), np.nan, dtype=np.float32)
-        for i, (chunk, t) in enumerate(dates):
-            intensity = np.abs(chunk[..., t]).astype(np.float32) ** 2
-            if np.isfinite(intensity).any():
-                date_means[i] = np.nanmean(intensity)
-        # Normalize each date: intensity * (global_mean / date_mean)
-        global_mean = np.nanmean(date_means) if np.isfinite(date_means).any() else np.nan
-        norm_factors = global_mean / date_means
-
-        # Second pass per tile; a tile holds about 6 float32 arrays within half of the Dask chunk size
-        tile_side = int(math.sqrt(max(256, get_dask_chunk_size_mb() * 1024 * 1024 // 2 // (6 * 4))))
-        tile_h, tile_w = min(tile_side, height), min(tile_side, width)
-
-        result = np.full((height, width), np.nan, dtype=np.float32)
-        for y0 in range(0, height, tile_h):
-            for x0 in range(0, width, tile_w):
-                y1, x1 = min(y0 + tile_h, height), min(x0 + tile_w, width)
-                count = torch.zeros((y1 - y0, x1 - x0), device=dev)
-                mean = torch.zeros_like(count)
-                m2 = torch.zeros_like(count)
-                for (chunk, t), factor in zip(dates, norm_factors):
-                    if not np.isfinite(factor):
-                        continue
-                    intensity = (np.abs(chunk[y0:y1, x0:x1, t]).astype(np.float32) ** 2) * factor
-                    value = torch.from_numpy(np.ascontiguousarray(intensity)).to(dev)
-                    valid = torch.isfinite(value)
-                    count += valid.to(count.dtype)
-                    delta = torch.where(valid, value - mean, 0.0)
-                    mean += delta / count.clamp(min=1)
-                    m2 += torch.where(valid, delta * (value - mean), 0.0)
-                # Variance with Bessel's correction (n-1)
-                std = torch.sqrt(m2 / (count - 1).clamp(min=1))
-                # PS function: mean / (2 * std), invalid values (inf, nan) as nan
-                psf = torch.where(count > 0, mean, float('nan')) / (2 * std)
-                psf = torch.where(torch.isfinite(psf), psf, float('nan'))
-                result[y0:y1, x0:x1] = psf.cpu().numpy()
-                del count, mean, m2, std, psf
-
-        # Cleanup GPU memory
-        if dev.type == 'mps':
-            torch.mps.empty_cache()
-        elif dev.type == 'cuda':
-            torch.cuda.empty_cache()
-
-        return result
-
-    def psfunction(self, device='auto', allow_rechunk=True, debug=False):
+    def psfunction(self, debug=False):
         """
         Compute PS (Persistent Scatterer) function for weighting in single-look processing.
 
@@ -1671,57 +1452,30 @@ class Stack(BatchComplex):
 
         Parameters
         ----------
-        device : str
-            Device for PyTorch computation ('auto', 'mps', 'cuda', 'cpu').
-        allow_rechunk : bool
-            If True (default), automatically rechunk input data to fit within Dask chunk size
-            (dask.config['array.chunk-size']) using aligned chunk boundaries (//2, //4, etc.)
-            to prevent dask slowdowns. Output is rechunked back to original spatial chunks.
         debug : bool
             Print debug information.
 
         Returns
         -------
         BatchUnit
-            Per-burst PS function values for use as weight in phasediff_multilook() (lazy).
+            Per-burst PS function values for use as weight in pairs(...).interferogram(..., weight=psf) (lazy).
 
         Examples
         --------
         # Use PS function as weight for single-look interferograms
         psf = stack.psfunction()
-        sintf, scorr = stack.phasediff_multilook(pairs, wavelength=30, weight=psf)
-
-        # Control memory via Dask config
-        import dask.config
-        dask.config.set({'array.chunk-size': '256MiB'})
-        psf = stack.psfunction()
-
-        # Disable automatic rechunking (manual chunk control)
-        psf = stack.chunk({'y': 2048, 'x': 2048}).psfunction(allow_rechunk=False)
+        sintf, scorr = stack.pairs(pairs).interferogram(30, weight=psf)
         """
         import dask.array
         import numpy as np
-        import torch
         import xarray as xr
         from .Batch import BatchUnit
-        from .utils_dask import rechunk3d, restore_chunks, get_dask_chunk_size_mb
-
-        # Auto-detect device based on Dask cluster resources and hardware
-        # Convert to string once to avoid serialization issues and repeated resolution
-        resolved = Stack._get_torch_device(device, debug=debug)
-        device = resolved.type  # 'cpu', 'cuda', or 'mps' as string
-
-        # Get Dask chunk size from config
-        dask_chunk_mb = get_dask_chunk_size_mb()
-
-        if debug:
-            print(f"DEBUG: psfunction using device={device}, allow_rechunk={allow_rechunk}, dask.config['array.chunk-size']={dask_chunk_mb} MB")
+        from .utils_psfunction import psfunction_block
 
         print('NOTE: psfunction() takes each processing chunk as its spatial context: tune the chunk size with load().chunk2d(...).',
               flush=True)
 
         results = {}
-        note_printed = False  # Only print NOTE once for first burst
         for key, ds in self.items():
             # Get complex SLC data variable (usually 'VV' or 'VH')
             complex_vars = [v for v in ds.data_vars if ds[v].dtype.kind == 'c']
@@ -1740,9 +1494,9 @@ class Stack(BatchComplex):
                 print(f'DEBUG: psfunction for {key}: shape={slc_data.shape}, chunks={slc_data.chunks}')
 
             # Stream the date chunks of every spatial block, as adi() does: the dates are not merged into one chunk
-            def make_blockwise(dev, dbg):
+            def make_blockwise():
                 def psf_block(chunks):
-                    return Stack._psfunction_stream(chunks, device=dev, debug=dbg)
+                    return psfunction_block(chunks)
 
                 def psf_blockwise(slc):
                     # input_core_dims=[['date']] moves date to the last axis
@@ -1752,7 +1506,7 @@ class Stack(BatchComplex):
 
             # Core dim is 'date' (reduction), chunked dims are y, x
             psf_da = xr.apply_ufunc(
-                make_blockwise(device, debug),
+                make_blockwise(),
                 slc_data,
                 input_core_dims=[['date']],
                 output_core_dims=[[]],
@@ -2202,7 +1956,7 @@ class Stack(BatchComplex):
         return self._restack(data, BatchComplex(out))
 
     def optimize2(self, angle_coarse: float = 15, angle_fine: float = 5,
-                  window: 'float | tuple | None' = 40, device: str = 'auto') -> "Stack":
+                  window: 'float | tuple | None' = 40) -> "Stack":
         """
         Polarimetric optimization of amplitude and phase for dual-pol data.
 
@@ -2231,8 +1985,6 @@ class Stack(BatchComplex):
             Spatial window in METRES for the coherence estimate used by the
             phase search, one number for a square or (y, x). Default 40. None
             skips it and keeps the original co-pol phase.
-        device : str
-            PyTorch device: 'auto', 'cuda', 'mps', or 'cpu'.
 
         Returns
         -------
@@ -2274,8 +2026,7 @@ class Stack(BatchComplex):
 
         # Call internal optimize2 implementation
         s_opt_batch = _optimize2_impl(batch_complex, angle_coarse=angle_coarse,
-                                      angle_fine=angle_fine, window=window,
-                                      device=device)
+                                      angle_fine=angle_fine, window=window)
 
         # Merge S_opt back into original stack structure (preserves BPR, etc.)
         output_pol = pols[0]  # VV or HH
@@ -2290,8 +2041,7 @@ class Stack(BatchComplex):
 
     def adi2(self,
              angle_coarse: float = 15,
-             angle_fine: float = 5,
-             device: str = 'auto') -> Batch:
+             angle_fine: float = 5) -> Batch:
         """
         Dual-pol ADI: optimize2() + adi() in one call.
 
@@ -2306,8 +2056,6 @@ class Stack(BatchComplex):
             Coarse grid step in degrees. Default 15.
         angle_fine : float
             Fine grid step in degrees. Default 5.
-        device : str
-            PyTorch device: 'auto', 'cuda', 'mps', or 'cpu'.
 
         Returns
         -------
@@ -2332,18 +2080,13 @@ class Stack(BatchComplex):
             raise ValueError("Dual-pol data required (VV+VH or HH+HV)")
 
         batch_complex = self[pols]
-        return batch_complex.adi2(angle_coarse, angle_fine, device)
+        return batch_complex.adi2(angle_coarse, angle_fine)
 
-    def adi(self, device: str = 'auto') -> Batch:
+    def adi(self) -> Batch:
         """
         Compute Amplitude Dispersion Index (ADI) for calibrated σ₀ data.
 
         Wrapper that calls BatchComplex.adi() on complex variables.
-
-        Parameters
-        ----------
-        device : str
-            PyTorch device: 'auto', 'cuda', 'mps', or 'cpu'.
 
         Returns
         -------
@@ -2365,7 +2108,7 @@ class Stack(BatchComplex):
 
         # Get as BatchComplex and call adi()
         batch_complex = self[complex_vars]
-        return batch_complex.adi(device)
+        return batch_complex.adi()
 
     def to_vtk(self, path: str, data: BatchCore | dict | None = None,
                transform: Batch | None = None, overlay: "xr.DataArray" | None = None, mask: bool = True):

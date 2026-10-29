@@ -120,7 +120,8 @@ class VMF3(datagrid, progressbar_joblib, AtmosphereModel):
         """
         import math
         import requests
-        from .HTTP import send, fetch, raise_for_status, NotFound
+        import time
+        from .HTTP import send, fetch, raise_for_status, NotFound, final, attempts, returned
 
         def part(start, stop):
             """The bytes [start, stop) of the grid file, read by one range request.
@@ -147,10 +148,27 @@ class VMF3(datagrid, progressbar_joblib, AtmosphereModel):
                 raise ValueError(f'ERROR: {lat}, {lon} is not a node of the VMF3 grid')
             index[(lat, lon)] = r * self.width + c
 
-        head = send(requests.head, url, allow_redirects=True, timeout=(10, 30), check=False)
-        if head.status_code in (404, 410):
-            raise NotFound(f'{url}: HTTP {head.status_code}')
-        raise_for_status(head, url)
+        def head_answer():
+            """The HEAD answer of the file, retried as fetch() retries a GET; HTTP 404 and 410 raise NotFound at once."""
+            n = attempts(retries)
+            for attempt in range(n):
+                try:
+                    answer = send(requests.head, url, allow_redirects=True, timeout=(10, 30), check=False)
+                    if answer.status_code in (404, 410):
+                        raise NotFound(f'{url}: HTTP {answer.status_code}')
+                    raise_for_status(answer, url)
+                    return answer
+                except NotFound:
+                    raise
+                except Exception as e:
+                    stop = final(e)
+                    if stop or attempt + 1 == n:
+                        print(f'ERROR: download attempt {attempt + 1}/{n} failed{" (not retried)" if stop else ""} '
+                              f'for {url}: {returned(e) or e}')
+                        raise
+                    time.sleep(timeout_second)
+
+        head = head_answer()
         length = head.headers.get('Content-Length')
         if length is None:
             raise IOError(f'ERROR: {url}: no Content-Length in the answer')
@@ -222,7 +240,8 @@ class VMF3(datagrid, progressbar_joblib, AtmosphereModel):
         """
         import math
         import requests
-        from .HTTP import send, fetch, raise_for_status, NotFound
+        import time
+        from .HTTP import send, fetch, raise_for_status, NotFound, final, attempts, returned
 
         def part(start, stop):
             """The bytes [start, stop) of the orography file, read by one range request.
@@ -249,10 +268,27 @@ class VMF3(datagrid, progressbar_joblib, AtmosphereModel):
                 raise ValueError(f'ERROR: {lat}, {lon} is not a node of the VMF3 grid')
             index[(lat, lon)] = r * self.width + c
 
-        head = send(requests.head, self.orography_url, allow_redirects=True, timeout=(10, 30), check=False)
-        if head.status_code in (404, 410):
-            raise NotFound(f'{self.orography_url}: HTTP {head.status_code}')
-        raise_for_status(head, self.orography_url)
+        def head_answer():
+            """The HEAD answer of the file, retried as fetch() retries a GET; HTTP 404 and 410 raise NotFound at once."""
+            n = attempts(retries)
+            for attempt in range(n):
+                try:
+                    answer = send(requests.head, self.orography_url, allow_redirects=True, timeout=(10, 30), check=False)
+                    if answer.status_code in (404, 410):
+                        raise NotFound(f'{self.orography_url}: HTTP {answer.status_code}')
+                    raise_for_status(answer, self.orography_url)
+                    return answer
+                except NotFound:
+                    raise
+                except Exception as e:
+                    stop = final(e)
+                    if stop or attempt + 1 == n:
+                        print(f'ERROR: download attempt {attempt + 1}/{n} failed{" (not retried)" if stop else ""} '
+                              f'for {self.orography_url}: {returned(e) or e}')
+                        raise
+                    time.sleep(timeout_second)
+
+        head = head_answer()
         length = head.headers.get('Content-Length')
         if length is None:
             raise IOError(f'ERROR: {self.orography_url}: no Content-Length in the answer')

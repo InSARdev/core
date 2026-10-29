@@ -18,9 +18,11 @@ component detection, and component linking.
 # To unwrap a 2-D array with snaphu eagerly, write the wrapped phase to a binary file,
 # run the snaphu binary on it by subprocess with the snaphu command-line options,
 # and read the unwrapped output back into a NumPy array. Nothing is lazy in this path.
-from .utils_torch import serialize_gpu
+import math
 import numpy as np
 import numba as nb
+import rocket_fft  # noqa: F401  (the scipy.fft overloads inside numba)
+import scipy.fft
 
 # 4-connectivity structure for scipy.ndimage.label (no diagonals)
 STRUCTURE_4CONN = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
@@ -825,742 +827,859 @@ def wrapped_gradient(phase):
     return dx, dy
 
 
-@serialize_gpu
-def irls_unwrap_2d(phase, weight=None, device='auto', max_iter=200, tol=1e-3,
-                   cg_max_iter=20, cg_tol=1e-4, epsilon=1e-2, conncomp_size=30, debug=False):
+# ---------------------------------------------------------------------------------------------------------------------
+# The 2D unwrapping engine: L1 IRLS. Each step solves the weighted Laplacian system by conjugate gradients with an
+# aggregation multigrid preconditioner; the start is the unweighted least-squares solution by the 2D DCT (rocket-fft).
+# The kernels take a row range [r0, r1) (a column range for the column DCTs) and run serially without the GIL; _Blocks
+# runs them over fixed blocks of _BLOCK rows on a thread pool, so every result, sums included, is the same for any
+# number of threads. Kept per raster (float32): the filled phase and the pixel weights (the targets and the edge weights
+# are computed from them where needed), the IRLS weights, u, its best iterate and the CG's r, z, p, plus the multigrid
+# levels (a third of a raster more): about 47 bytes a pixel.
+# ---------------------------------------------------------------------------------------------------------------------
+_BLOCK = 128                        # rows of one block: the unit of work and of every partial sum
+# NO fastmath: with reassoc or contract, a vectorised loop and its scalar fallback (chosen at run time, e.g. by the
+# overlap checks on the arrays' addresses) round differently, and the result changes from call to call. The sums keep
+# four fixed accumulators instead: the same order on every path, and still several additions in flight.
+_CG_REL, _CG_MAX = 0.3, 40          # a CG solve ends at 0.3 of its starting residual, or after 40 iterations
+_EPS_START, _EPS_STEPS = 0.3, 6     # epsilon falls geometrically from 0.3 to `epsilon` over the first 6 steps
+_MG_ALPHA, _MG_MIN, _MG_COARSE = 1.5, 24, 40   # coarse correction scale, coarsest side, coarsest-level sweeps
+_MG_SERIAL = 1 << 18                # levels below this many pixels run inline (too short for a thread hand-off)
+_OLD_IRLS = ('tol', 'cg_max_iter', 'cg_tol', 'device', 'semaphore')
+
+
+@nb.njit(nogil=True, cache=True, inline='always')
+def _wrap(d):
+    return d - 2.0 * math.pi * math.floor(d / (2.0 * math.pi) + 0.5)
+
+
+@nb.njit(nogil=True, cache=True, inline='always')
+def _we(a, b):
+    """The edge weight: the mean of the two pixel weights, 0 when either pixel is invalid (weight 0)."""
+    return (a + b) / np.float32(2.0) if (a > 0 and b > 0) else np.float32(0.0)
+
+
+@nb.njit(nogil=True, cache=True)
+def _lap(x, wx, wy, i, j, H, W):
+    """(A x)[i, j] of the weighted Neumann Laplacian A = -div(w grad), at any pixel."""
+    xc = x[i, j]
+    v = 0.0
+    if j > 0:
+        v += np.float64(wx[i, j - 1]) * (xc - x[i, j - 1])
+    if j < W - 1:
+        v -= np.float64(wx[i, j]) * (x[i, j + 1] - xc)
+    if i > 0:
+        v += np.float64(wy[i - 1, j]) * (xc - x[i - 1, j])
+    if i < H - 1:
+        v -= np.float64(wy[i, j]) * (x[i + 1, j] - xc)
+    return v
+
+
+@nb.njit(nogil=True, cache=True, inline='always')
+def _lap_in(x, wx, wy, i, j):
+    """(A x)[i, j] at an interior pixel, float32, no branch."""
+    xc = x[i, j]
+    return (wx[i, j - 1] * (xc - x[i, j - 1]) - wx[i, j] * (x[i, j + 1] - xc)
+            + wy[i - 1, j] * (xc - x[i - 1, j]) - wy[i, j] * (x[i + 1, j] - xc))
+
+
+@nb.njit(nogil=True, cache=True)
+def _rhs(wx, wy, phi, i, j, H, W):
+    """b[i, j] = -div(w g), the targets g = wrap(grad phi) on the fly."""
+    v = 0.0
+    if j > 0:
+        v += np.float64(wx[i, j - 1]) * _wrap(np.float64(phi[i, j]) - phi[i, j - 1])
+    if j < W - 1:
+        v -= np.float64(wx[i, j]) * _wrap(np.float64(phi[i, j + 1]) - phi[i, j])
+    if i > 0:
+        v += np.float64(wy[i - 1, j]) * _wrap(np.float64(phi[i, j]) - phi[i - 1, j])
+    if i < H - 1:
+        v -= np.float64(wy[i, j]) * _wrap(np.float64(phi[i + 1, j]) - phi[i, j])
+    return v
+
+
+@nb.njit(nogil=True, cache=True)
+def _rhs_base(w, phi, out, r0, r1):
+    """out = -div(w_edge g): the right-hand side of the start, edge weights from the pixel weights."""
+    H, W = out.shape
+    for i in range(r0, r1):
+        for j in range(W):
+            v = 0.0
+            if j > 0:
+                v += np.float64(_we(w[i, j - 1], w[i, j])) * _wrap(np.float64(phi[i, j]) - phi[i, j - 1])
+            if j < W - 1:
+                v -= np.float64(_we(w[i, j], w[i, j + 1])) * _wrap(np.float64(phi[i, j + 1]) - phi[i, j])
+            if i > 0:
+                v += np.float64(_we(w[i - 1, j], w[i, j])) * _wrap(np.float64(phi[i, j]) - phi[i - 1, j])
+            if i < H - 1:
+                v -= np.float64(_we(w[i, j], w[i + 1, j])) * _wrap(np.float64(phi[i + 1, j]) - phi[i, j])
+            out[i, j] = v
+
+
+@nb.njit(nogil=True, cache=True)
+def _irls_weights(u, phi, w, wxi, wyi, eps_sq, r0, r1):
+    """wxi = w_edge / sqrt(r^2 + eps^2) clamped to [1e-6, 1e6], r = grad u - wrap(grad phi)."""
+    H, W = u.shape
+    for i in range(r0, r1):
+        for j in range(W):
+            if j < W - 1:
+                rx = np.float32(np.float64(u[i, j + 1] - u[i, j]) - _wrap(np.float64(phi[i, j + 1]) - phi[i, j]))
+                ax = _we(w[i, j], w[i, j + 1])
+            else:
+                rx = np.float32(0.0)
+                ax = np.float32(0.0)
+            if i < H - 1:
+                ry = np.float32(np.float64(u[i + 1, j] - u[i, j]) - _wrap(np.float64(phi[i + 1, j]) - phi[i, j]))
+                ay = _we(w[i, j], w[i + 1, j])
+            else:
+                ry = np.float32(0.0)
+                ay = np.float32(0.0)
+            wxi[i, j] = min(max(ax / np.sqrt(rx * rx + eps_sq), np.float32(1e-6)), np.float32(1e6))
+            wyi[i, j] = min(max(ay / np.sqrt(ry * ry + eps_sq), np.float32(1e-6)), np.float32(1e6))
+
+
+@nb.njit(nogil=True, cache=True)
+def _l1(u, phi, w, r0, r1):
+    """sum over the valid edges of w_edge |grad u - wrap(grad phi)|: the objective, and the sum of u (finiteness)."""
+    H, W = u.shape
+    s = 0.0
+    su = 0.0
+    for i in range(r0, r1):
+        for j in range(W):
+            su += u[i, j]
+            if j < W - 1:
+                a = _we(w[i, j], w[i, j + 1])
+                if a > 0:
+                    s += np.float64(a) * abs(np.float64(u[i, j + 1] - u[i, j]) - _wrap(np.float64(phi[i, j + 1]) - phi[i, j]))
+            if i < H - 1:
+                a = _we(w[i, j], w[i + 1, j])
+                if a > 0:
+                    s += np.float64(a) * abs(np.float64(u[i + 1, j] - u[i, j]) - _wrap(np.float64(phi[i + 1, j]) - phi[i, j]))
+    return s, su
+
+
+@nb.njit(nogil=True, cache=True, inline='always')
+def _cg_r(x, r, wxi, wyi, phi, i, j):
+    """r[i, j] = b - (A x) at an interior pixel, b = -div(w_irls g) from the targets on the fly; returns it."""
+    gl = np.float32(_wrap(np.float64(phi[i, j]) - phi[i, j - 1]))
+    gr = np.float32(_wrap(np.float64(phi[i, j + 1]) - phi[i, j]))
+    gu = np.float32(_wrap(np.float64(phi[i, j]) - phi[i - 1, j]))
+    gd = np.float32(_wrap(np.float64(phi[i + 1, j]) - phi[i, j]))
+    rv = (wxi[i, j - 1] * gl - wxi[i, j] * gr + wyi[i - 1, j] * gu - wyi[i, j] * gd) - _lap_in(x, wxi, wyi, i, j)
+    r[i, j] = rv
+    return rv
+
+
+@nb.njit(nogil=True, cache=True)
+def _cg_start(x, r, wxi, wyi, phi, r0, r1):
+    """r = b - A x, b = -div(w_irls g); returns sum r^2 and sum r (a NaN or an infinity carries into it)."""
+    H, W = x.shape
+    s2 = 0.0
+    s = 0.0
+    for i in range(r0, r1):
+        if 0 < i < H - 1 and W > 2:
+            for j in (0, W - 1):
+                v = _rhs(wxi, wyi, phi, i, j, H, W) - _lap(x, wxi, wyi, i, j, H, W)
+                r[i, j] = v
+                s2 += v * v
+                s += v
+            a0 = a1 = a2 = a3 = 0.0
+            c0 = c1 = c2 = c3 = 0.0
+            j = 1
+            while j + 3 < W - 1:
+                v0 = np.float64(_cg_r(x, r, wxi, wyi, phi, i, j))
+                v1 = np.float64(_cg_r(x, r, wxi, wyi, phi, i, j + 1))
+                v2 = np.float64(_cg_r(x, r, wxi, wyi, phi, i, j + 2))
+                v3 = np.float64(_cg_r(x, r, wxi, wyi, phi, i, j + 3))
+                a0 += v0 * v0
+                a1 += v1 * v1
+                a2 += v2 * v2
+                a3 += v3 * v3
+                c0 += v0
+                c1 += v1
+                c2 += v2
+                c3 += v3
+                j += 4
+            while j < W - 1:
+                v0 = np.float64(_cg_r(x, r, wxi, wyi, phi, i, j))
+                a0 += v0 * v0
+                c0 += v0
+                j += 1
+            s2 += (a0 + a1) + (a2 + a3)
+            s += (c0 + c1) + (c2 + c3)
+        else:
+            for j in range(W):
+                v = _rhs(wxi, wyi, phi, i, j, H, W) - _lap(x, wxi, wyi, i, j, H, W)
+                r[i, j] = v
+                s2 += v * v
+                s += v
+    return s2, s
+
+
+@nb.njit(nogil=True, cache=True)
+def _p_ap(p, wxi, wyi, r0, r1):
+    """sum p (A p)."""
+    H, W = p.shape
+    s = 0.0
+    for i in range(r0, r1):
+        if 0 < i < H - 1 and W > 2:
+            s += np.float64(p[i, 0]) * _lap(p, wxi, wyi, i, 0, H, W)
+            a0 = a1 = a2 = a3 = 0.0
+            j = 1
+            while j + 3 < W - 1:
+                a0 += np.float64(p[i, j] * _lap_in(p, wxi, wyi, i, j))
+                a1 += np.float64(p[i, j + 1] * _lap_in(p, wxi, wyi, i, j + 1))
+                a2 += np.float64(p[i, j + 2] * _lap_in(p, wxi, wyi, i, j + 2))
+                a3 += np.float64(p[i, j + 3] * _lap_in(p, wxi, wyi, i, j + 3))
+                j += 4
+            while j < W - 1:
+                a0 += np.float64(p[i, j] * _lap_in(p, wxi, wyi, i, j))
+                j += 1
+            s += ((a0 + a1) + (a2 + a3)) + np.float64(p[i, W - 1]) * _lap(p, wxi, wyi, i, W - 1, H, W)
+        else:
+            for j in range(W):
+                s += np.float64(p[i, j]) * _lap(p, wxi, wyi, i, j, H, W)
+    return s
+
+
+@nb.njit(nogil=True, cache=True, inline='always')
+def _cg_upd(x, r, p, wxi, wyi, a, i, j):
+    """x[i, j] += a p, r[i, j] -= a (A p) at an interior pixel; returns (r, x)."""
+    xv = x[i, j] + a * p[i, j]
+    x[i, j] = xv
+    rv = r[i, j] - a * _lap_in(p, wxi, wyi, i, j)
+    r[i, j] = rv
+    return rv, xv
+
+
+@nb.njit(nogil=True, cache=True)
+def _cg_step(x, r, p, wxi, wyi, alpha, r0, r1):
+    """x += alpha p, r -= alpha A p (A p recomputed); returns sum r^2 and sum x (finiteness). The rows of x and r change
+    while the stencil reads p only, so blocks do not interfere."""
+    H, W = x.shape
+    a = np.float32(alpha)
+    s = 0.0
+    sx = 0.0
+    for i in range(r0, r1):
+        if 0 < i < H - 1 and W > 2:
+            a0 = a1 = a2 = a3 = 0.0
+            b0 = b1 = b2 = b3 = 0.0
+            j = 1
+            while j + 3 < W - 1:
+                rv, xv = _cg_upd(x, r, p, wxi, wyi, a, i, j)
+                a0 += np.float64(rv * rv)
+                b0 += np.float64(xv)
+                rv, xv = _cg_upd(x, r, p, wxi, wyi, a, i, j + 1)
+                a1 += np.float64(rv * rv)
+                b1 += np.float64(xv)
+                rv, xv = _cg_upd(x, r, p, wxi, wyi, a, i, j + 2)
+                a2 += np.float64(rv * rv)
+                b2 += np.float64(xv)
+                rv, xv = _cg_upd(x, r, p, wxi, wyi, a, i, j + 3)
+                a3 += np.float64(rv * rv)
+                b3 += np.float64(xv)
+                j += 4
+            while j < W - 1:
+                rv, xv = _cg_upd(x, r, p, wxi, wyi, a, i, j)
+                a0 += np.float64(rv * rv)
+                b0 += np.float64(xv)
+                j += 1
+            s += (a0 + a1) + (a2 + a3)
+            sx += (b0 + b1) + (b2 + b3)
+            for j in (0, W - 1):
+                xv = x[i, j] + a * p[i, j]
+                x[i, j] = xv
+                rv = r[i, j] - np.float32(alpha * _lap(p, wxi, wyi, i, j, H, W))
+                r[i, j] = rv
+                s += np.float64(rv) * rv
+                sx += xv
+        else:
+            for j in range(W):
+                xv = x[i, j] + a * p[i, j]
+                x[i, j] = xv
+                rv = r[i, j] - np.float32(alpha * _lap(p, wxi, wyi, i, j, H, W))
+                r[i, j] = rv
+                s += np.float64(rv) * rv
+                sx += xv
+    return s, sx
+
+
+@nb.njit(nogil=True, cache=True)
+def _dot(a, b, r0, r1):
+    W = a.shape[1]
+    s = 0.0
+    for i in range(r0, r1):
+        a0 = a1 = a2 = a3 = 0.0
+        j = 0
+        while j + 3 < W:
+            a0 += np.float64(a[i, j]) * b[i, j]
+            a1 += np.float64(a[i, j + 1]) * b[i, j + 1]
+            a2 += np.float64(a[i, j + 2]) * b[i, j + 2]
+            a3 += np.float64(a[i, j + 3]) * b[i, j + 3]
+            j += 4
+        while j < W:
+            a0 += np.float64(a[i, j]) * b[i, j]
+            j += 1
+        s += (a0 + a1) + (a2 + a3)
+    return s
+
+
+@nb.njit(nogil=True, cache=True)
+def _p_update(p, z, beta, r0, r1):
+    """p = z + beta p."""
+    for i in range(r0, r1):
+        for j in range(p.shape[1]):
+            p[i, j] = z[i, j] + np.float32(beta) * p[i, j]
+
+
+@nb.njit(nogil=True, cache=True)
+def _masked_sum(u, w, r0, r1):
+    """the sum of u over the valid pixels (weight > 0) and their count."""
+    s = 0.0
+    n = 0
+    for i in range(r0, r1):
+        for j in range(u.shape[1]):
+            if w[i, j] > 0:
+                s += u[i, j]
+                n += 1
+    return s, n
+
+
+@nb.njit(nogil=True, cache=True)
+def _shift(u, m, r0, r1):
+    for i in range(r0, r1):
+        for j in range(u.shape[1]):
+            u[i, j] -= np.float32(m)
+
+
+@nb.njit(nogil=True, cache=True)
+def _copy(dst, src, r0, r1):
+    for i in range(r0, r1):
+        for j in range(dst.shape[1]):
+            dst[i, j] = src[i, j]
+
+
+@nb.njit(nogil=True, cache=True)
+def _zero(x, r0, r1):
+    for i in range(r0, r1):
+        for j in range(x.shape[1]):
+            x[i, j] = 0.0
+
+
+@nb.njit(nogil=True, cache=True)
+def _dct_rows(x, out, r0, r1):
+    out[r0:r1] = scipy.fft.dct(x[r0:r1], 2, None, 1, None, False, 1)
+
+
+@nb.njit(nogil=True, cache=True)
+def _dct_cols(x, out, c0, c1):
+    out[:, c0:c1] = scipy.fft.dct(x[:, c0:c1], 2, None, 0, None, False, 1)
+
+
+@nb.njit(nogil=True, cache=True)
+def _idct_rows(x, out, r0, r1):
+    out[r0:r1] = scipy.fft.idct(x[r0:r1], 2, None, 1, None, False, 1)
+
+
+@nb.njit(nogil=True, cache=True)
+def _idct_cols(x, out, c0, c1):
+    out[:, c0:c1] = scipy.fft.idct(x[:, c0:c1], 2, None, 0, None, False, 1)
+
+
+@nb.njit(nogil=True, cache=True)
+def _eig_scale(t, ey, ex, r0, r1):
+    """t /= -(ey[i] + ex[j]), the mean mode set to 0; float64 eigenvalues ey = -4 sin^2(pi i / 2H): no cancellation."""
+    for i in range(r0, r1):
+        for j in range(t.shape[1]):
+            t[i, j] = -(t[i, j] / (ey[i] + ex[j])) if (i > 0 or j > 0) else 0.0
+
+
+@nb.njit(nogil=True, cache=True)
+def _coarsen(wx, wy):
+    """The coarse edge weights of 2 x 2 aggregation: the Galerkin operator of a piecewise constant prolongation is again
+    a weighted 5-point Laplacian whose edges are the sums of the fine edges crossing between two aggregates."""
+    H, W = wx.shape
+    H1, W1 = (H + 1) // 2, (W + 1) // 2
+    wx1 = np.zeros((H1, W1), np.float32)
+    wy1 = np.zeros((H1, W1), np.float32)
+    for I in range(H1):
+        for J in range(W1):
+            if J < W1 - 1:
+                j = 2 * J + 1
+                s = np.float32(0.0)
+                for i in (2 * I, 2 * I + 1):
+                    if i < H and j < W - 1:
+                        s += wx[i, j]
+                wx1[I, J] = s
+            if I < H1 - 1:
+                i = 2 * I + 1
+                s = np.float32(0.0)
+                for j in (2 * J, 2 * J + 1):
+                    if j < W and i < H - 1:
+                        s += wy[i, j]
+                wy1[I, J] = s
+    return wx1, wy1
+
+
+@nb.njit(nogil=True, cache=True)
+def _gs_rows(x, b, wx, wy, color, r0, r1):
+    """One red (0) or black (1) Gauss-Seidel half-sweep of A x = b over the rows r0..r1: a pixel of one colour reads the
+    other colour only, so the blocks of a half-sweep are independent."""
+    H, W = x.shape
+    for i in range(r0, r1):
+        j0 = (i + color) % 2
+        if 0 < i < H - 1 and W > 2:
+            j = j0
+            if j == 0:
+                d = np.float64(wx[i, 0]) + wy[i - 1, 0] + wy[i, 0]
+                if d > 0:
+                    x[i, 0] = (np.float64(b[i, 0]) + np.float64(wx[i, 0]) * x[i, 1] + np.float64(wy[i - 1, 0]) * x[i - 1, 0]
+                               + np.float64(wy[i, 0]) * x[i + 1, 0]) / d
+                j = 2
+            while j < W - 1:
+                a0, a1, a2, a3 = wx[i, j - 1], wx[i, j], wy[i - 1, j], wy[i, j]
+                d = np.float64(a0) + a1 + a2 + a3
+                if d > 0:
+                    x[i, j] = (np.float64(b[i, j]) + np.float64(a0) * x[i, j - 1] + np.float64(a1) * x[i, j + 1]
+                               + np.float64(a2) * x[i - 1, j] + np.float64(a3) * x[i + 1, j]) / d
+                j += 2
+            if j == W - 1:
+                d = np.float64(wx[i, j - 1]) + wy[i - 1, j] + wy[i, j]
+                if d > 0:
+                    x[i, j] = (np.float64(b[i, j]) + np.float64(wx[i, j - 1]) * x[i, j - 1] + np.float64(wy[i - 1, j]) * x[i - 1, j]
+                               + np.float64(wy[i, j]) * x[i + 1, j]) / d
+        else:
+            for j in range(j0, W, 2):
+                s = np.float64(b[i, j])
+                d = 0.0
+                if j > 0:
+                    s += np.float64(wx[i, j - 1]) * x[i, j - 1]
+                    d += wx[i, j - 1]
+                if j < W - 1:
+                    s += np.float64(wx[i, j]) * x[i, j + 1]
+                    d += wx[i, j]
+                if i > 0:
+                    s += np.float64(wy[i - 1, j]) * x[i - 1, j]
+                    d += wy[i - 1, j]
+                if i < H - 1:
+                    s += np.float64(wy[i, j]) * x[i + 1, j]
+                    d += wy[i, j]
+                if d > 0:
+                    x[i, j] = s / d
+
+
+@nb.njit(nogil=True, cache=True)
+def _res_rows(x, b, wx, wy, out, r0, r1):
+    """out = b - A x."""
+    H, W = x.shape
+    for i in range(r0, r1):
+        if 0 < i < H - 1 and W > 2:
+            out[i, 0] = b[i, 0] - _lap(x, wx, wy, i, 0, H, W)
+            for j in range(1, W - 1):
+                out[i, j] = b[i, j] - _lap_in(x, wx, wy, i, j)
+            out[i, W - 1] = b[i, W - 1] - _lap(x, wx, wy, i, W - 1, H, W)
+        else:
+            for j in range(W):
+                out[i, j] = b[i, j] - _lap(x, wx, wy, i, j, H, W)
+
+
+@nb.njit(nogil=True, cache=True)
+def _restrict_rows(res, rc, R0, R1):
+    """rc = the 2 x 2 sums of res (the transpose of the piecewise constant prolongation), coarse rows R0..R1."""
+    H, W = res.shape
+    for I in range(R0, R1):
+        i0 = 2 * I
+        i1 = i0 + 1
+        for J in range(rc.shape[1]):
+            j0 = 2 * J
+            j1 = j0 + 1
+            s = np.float64(res[i0, j0])
+            if j1 < W:
+                s += res[i0, j1]
+            if i1 < H:
+                s += res[i1, j0]
+                if j1 < W:
+                    s += res[i1, j1]
+            rc[I, J] = s
+
+
+@nb.njit(nogil=True, cache=True)
+def _prolong_rows(xc, x, alpha, r0, r1):
+    """x += alpha P xc: each coarse value into its 2 x 2 aggregate."""
+    a = np.float32(alpha)
+    for i in range(r0, r1):
+        I = i // 2
+        for j in range(x.shape[1]):
+            x[i, j] += a * xc[I, j // 2]
+
+
+@nb.njit(nogil=True, cache=True)
+def _sum_rows(x, r0, r1):
+    W = x.shape[1]
+    s = 0.0
+    for i in range(r0, r1):
+        a0 = a1 = a2 = a3 = 0.0
+        j = 0
+        while j + 3 < W:
+            a0 += x[i, j]
+            a1 += x[i, j + 1]
+            a2 += x[i, j + 2]
+            a3 += x[i, j + 3]
+            j += 4
+        while j < W:
+            a0 += x[i, j]
+            j += 1
+        s += (a0 + a1) + (a2 + a3)
+    return s
+
+
+def _cores():
+    """The CPU cores this process may use: os.process_cpu_count() (Python 3.13+), else the affinity mask, else
+    os.cpu_count()."""
+    import os
+    count = getattr(os, 'process_cpu_count', None)
+    if count is not None:
+        return max(1, count() or 1)
+    if hasattr(os, 'sched_getaffinity'):
+        return max(1, len(os.sched_getaffinity(0)))
+    return max(1, os.cpu_count() or 1)
+
+
+def unwrap_threads(rasters):
     """
-    Unwrap 2D phase using GPU/TPU-accelerated Iteratively Reweighted Least Squares (L¹ norm).
+    Numba threads for each of `rasters` rasters unwrapped together: the cores over the rasters that run at once.
 
-    This algorithm solves the L¹ phase unwrapping problem:
-        min Σ w_ij |∇φ_ij - wrap(∇ψ_ij)|
+    The cores are the Dask cluster's declared 'cpu' resource, else this process's own count (as fit1d_network() counts them);
+    at most the cluster's worker threads (without a cluster, the cores) run at once. One raster takes every core, 8
+    take 2 each on 16 cores, 16 and more take 1. The result does not depend on it.
 
-    by iteratively solving weighted L² problems using preconditioned
-    conjugate gradient. Accelerated using PyTorch (TPU via XLA, CUDA on NVIDIA/AMD,
-    MPS on Apple Silicon, or CPU fallback).
+    Examples
+    --------
+    >>> unwrap_threads(1)
+    """
+    cores, slots = None, None
+    try:
+        from dask.distributed import get_client
+        workers = get_client().scheduler_info().get('workers', {})
+        if workers:
+            slots = sum(int(w.get('nthreads', 1)) for w in workers.values())
+            declared = [w.get('resources', {}).get('cpu') for w in workers.values()]
+            declared = [d for d in declared if d]
+            if declared:
+                cores = int(max(declared))
+    except (ValueError, ImportError):
+        pass
+    if cores is None:
+        cores = _cores()
+    if slots is None:
+        slots = cores
+    return max(1, cores // max(1, min(int(rasters), slots)))
+
+
+class _Blocks:
+    """Fixed blocks of _BLOCK rows (and of _BLOCK columns for the column transforms) over a pool of `threads` Python
+    threads; results come back in block order, so a sum of them does not depend on the number of threads."""
+
+    def __init__(self, H, W, threads):
+        import concurrent.futures
+        self.threads = max(1, int(threads))
+        self.rows = [(a, min(a + _BLOCK, H)) for a in range(0, H, _BLOCK)]
+        self.cols = [(a, min(a + _BLOCK, W)) for a in range(0, W, _BLOCK)]
+        self.ex = concurrent.futures.ThreadPoolExecutor(self.threads) if self.threads > 1 else None
+
+    def run(self, fn, args, blocks, inline=False):
+        if self.ex is None or inline:
+            return [fn(*args, a, b) for a, b in blocks]
+        return list(self.ex.map(lambda ab: fn(*args, ab[0], ab[1]), blocks))
+
+    def map(self, fn, *args):
+        return self.run(fn, args, self.rows)
+
+    def map_cols(self, fn, *args):
+        return self.run(fn, args, self.cols)
+
+    def close(self):
+        if self.ex is not None:
+            self.ex.shutdown()
+
+
+class _Multigrid:
+    """The aggregation multigrid V-cycle of one IRLS step's system, z = M^-1 r: red-black Gauss-Seidel (red then black
+    before the coarse correction, black then red after: symmetric, so it preconditions CG), 2 x 2 restriction and
+    injection, the coarse correction scaled by _MG_ALPHA, the coarsest level by _MG_COARSE symmetric sweeps, and the
+    mean of z removed (the constant null space)."""
+
+    def __init__(self, wx, wy, blocks):
+        self.levels = [(wx, wy)]
+        while min(self.levels[-1][0].shape) > _MG_MIN:
+            self.levels.append(_coarsen(*self.levels[-1]))
+        self.blocks = blocks
+        self.x = [None] + [np.zeros(l[0].shape, np.float32) for l in self.levels[1:]]
+        self.b = [None] + [np.zeros(l[0].shape, np.float32) for l in self.levels[1:]]
+        self.res = [np.zeros(l[0].shape, np.float32) for l in self.levels[:-1]]
+
+    def _run(self, k, fn, args, n, step=_BLOCK):
+        inline = self.levels[k][0].size < _MG_SERIAL
+        return self.blocks.run(fn, args, [(a, min(a + step, n)) for a in range(0, n, step)], inline)
+
+    def _cycle(self, k, b, x):
+        wx, wy = self.levels[k]
+        H = x.shape[0]
+        self._run(k, _zero, (x,), H)
+        if k == len(self.levels) - 1:
+            for _ in range(_MG_COARSE):
+                for c in (0, 1, 1, 0):
+                    self._run(k, _gs_rows, (x, b, wx, wy, c), H)
+            return
+        for c in (0, 1):
+            self._run(k, _gs_rows, (x, b, wx, wy, c), H)
+        self._run(k, _res_rows, (x, b, wx, wy, self.res[k]), H)
+        bc, xc = self.b[k + 1], self.x[k + 1]
+        self._run(k, _restrict_rows, (self.res[k], bc), bc.shape[0], _BLOCK // 2)
+        self._cycle(k + 1, bc, xc)
+        self._run(k, _prolong_rows, (xc, x, _MG_ALPHA), H)
+        for c in (1, 0):
+            self._run(k, _gs_rows, (x, b, wx, wy, c), H)
+
+    def apply(self, r, z):
+        self._cycle(0, r, z)
+        m = sum(self._run(0, _sum_rows, (z,), z.shape[0])) / z.size
+        self._run(0, _shift, (z, m), z.shape[0])
+
+
+def _raster(phase, weight):
+    """The valid bounding box of a raster given as a 2D array or as nested blocks ([rows][columns], dask's
+    concatenate=False form; a block may carry a leading axis of 1), and its filled float32 phase (NaN 0), NaN mask and
+    pixel weights (clipped to [0.01, 1], 0 where the phase is NaN; 1 without a weight), assembled block by block: no
+    merged copy of the raster."""
+    def grid(x):
+        if x is None:
+            return None
+        if isinstance(x, np.ndarray):
+            return [[x]]
+        return x if isinstance(x[0], (list, tuple)) else [x]
+    pb, wb = grid(phase), grid(weight)
+
+    def two_d(a):
+        a = np.asarray(a)
+        return a.reshape(a.shape[-2:]) if a.ndim > 2 else a
+    heights = [two_d(row[0]).shape[0] for row in pb]
+    widths = [two_d(b).shape[1] for b in pb[0]]
+    y0s, x0s = np.cumsum([0] + heights), np.cumsum([0] + widths)
+    shape = (int(y0s[-1]), int(x0s[-1]))
+    rows_ok, cols_ok = np.zeros(shape[0], bool), np.zeros(shape[1], bool)
+    for bi, row in enumerate(pb):
+        for bj, blk in enumerate(row):
+            ok = ~np.isnan(two_d(blk))
+            rows_ok[y0s[bi]:y0s[bi + 1]] |= ok.any(axis=1)
+            cols_ok[x0s[bj]:x0s[bj + 1]] |= ok.any(axis=0)
+    if not rows_ok.any():
+        return shape, None, None, None, None
+    r0, r1 = int(np.argmax(rows_ok)), shape[0] - int(np.argmax(rows_ok[::-1]))
+    c0, c1 = int(np.argmax(cols_ok)), shape[1] - int(np.argmax(cols_ok[::-1]))
+    H, W = r1 - r0, c1 - c0
+    phi, w = np.zeros((H, W), np.float32), np.zeros((H, W), np.float32)
+    nan_mask = np.ones((H, W), bool)
+    for bi, row in enumerate(pb):
+        for bj, blk in enumerate(row):
+            ya, yb = max(y0s[bi], r0), min(y0s[bi + 1], r1)
+            xa, xb = max(x0s[bj], c0), min(x0s[bj + 1], c1)
+            if ya >= yb or xa >= xb:
+                continue
+            src = two_d(blk)[ya - y0s[bi]:yb - y0s[bi], xa - x0s[bj]:xb - x0s[bj]]
+            bad = np.isnan(src)
+            dst = (slice(ya - r0, yb - r0), slice(xa - c0, xb - c0))
+            phi[dst] = np.where(bad, 0.0, src)
+            nan_mask[dst] = bad
+            if wb is None:
+                w[dst] = np.where(bad, 0.0, 1.0)
+            else:
+                ws = two_d(wb[bi][bj])[ya - y0s[bi]:yb - y0s[bi], xa - x0s[bj]:xb - x0s[bj]]
+                w[dst] = np.where(bad, 0.0, np.clip(np.nan_to_num(ws, nan=0.0), 0.01, 1.0))
+    return shape, (r0, r1, c0, c1), phi, nan_mask, w
+
+
+def _irls(phi, w, accuracy, max_iter, epsilon, threads, debug):
+    """The solve on the filled raster: the unwrapped float32 solution (the valid pixels' values; any value elsewhere)."""
+    import time
+    t0 = time.time()
+    H, W = phi.shape
+    blocks = _Blocks(H, W, threads)
+    try:
+        wxi, wyi, u, u_best, r, z, p = (np.empty((H, W), np.float32) for _ in range(7))
+        # the start: the unweighted Neumann least-squares solution by the 2D DCT, in place on u
+        ey = -4.0 * np.sin(np.pi * np.arange(H) / (2 * H)) ** 2
+        ex = -4.0 * np.sin(np.pi * np.arange(W) / (2 * W)) ** 2
+        blocks.map(_rhs_base, w, phi, r)
+        blocks.map(_dct_rows, r, u)
+        blocks.map_cols(_dct_cols, u, u)
+        blocks.map(_eig_scale, u, ey, ex)
+        blocks.map_cols(_idct_cols, u, u)
+        blocks.map(_idct_rows, u, u)
+        np.nan_to_num(u, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        parts = blocks.map(_masked_sum, u, w)
+        count = sum(n for _, n in parts)
+        l1_prev, l1_best, cg_total, step, reached = None, None, 0, -1, False
+        for step in range(max_iter):
+            if count > 0:
+                parts = blocks.map(_masked_sum, u, w)
+                blocks.map(_shift, u, sum(s for s, _ in parts) / count)
+            parts = blocks.map(_l1, u, phi, w)
+            l1 = sum(s for s, _ in parts)
+            if not math.isfinite(sum(su for _, su in parts)):
+                blocks.map(_copy, u, u_best)
+                break
+            if l1_best is None or l1 < l1_best:
+                l1_best = l1
+                blocks.map(_copy, u_best, u)
+            # THE STOP: the objective's relative decrease over one step, once epsilon is at its target
+            if l1_prev is not None and step > _EPS_STEPS and (l1_prev - l1) <= accuracy * l1:
+                reached = True
+                break
+            l1_prev = l1
+            eps = epsilon * (_EPS_START / epsilon) ** max(0.0, 1.0 - step / _EPS_STEPS) if _EPS_START > epsilon else epsilon
+            blocks.map(_irls_weights, u, phi, w, wxi, wyi, np.float32(eps * eps))
+            mg = _Multigrid(wxi, wyi, blocks)
+            parts = blocks.map(_cg_start, u, r, wxi, wyi, phi)
+            r0n = math.sqrt(sum(s2 for s2, _ in parts))
+            if not math.isfinite(sum(s for _, s in parts)) or r0n == 0.0:
+                continue
+            mg.apply(r, z)
+            blocks.map(_copy, p, z)
+            rz = sum(blocks.map(_dot, r, z))
+            for k in range(_CG_MAX):
+                cg_total += 1
+                pap = sum(blocks.map(_p_ap, p, wxi, wyi))
+                if not (abs(pap) > 1e-30) or not math.isfinite(pap):
+                    break
+                alpha = min(max(rz / pap, -1e6), 1e6)
+                parts = blocks.map(_cg_step, u, r, p, wxi, wyi, alpha)
+                rn = math.sqrt(sum(s for s, _ in parts))
+                if not math.isfinite(sum(sx for _, sx in parts)) or not math.isfinite(rn) or rn <= _CG_REL * r0n:
+                    break
+                mg.apply(r, z)
+                rz_new = sum(blocks.map(_dot, r, z))
+                if not (abs(rz) > 1e-30):
+                    break
+                blocks.map(_p_update, p, z, min(max(rz_new / rz, -1e6), 1e6))
+                rz = rz_new
+            del mg
+            if debug:
+                print(f'  unwrap step {step}: L1 {l1:.6g}, eps {eps:.3g}, CG {k + 1}', flush=True)
+        else:
+            parts = blocks.map(_l1, u, phi, w)
+            if math.isfinite(sum(su for _, su in parts)) and sum(s for s, _ in parts) <= l1_best:
+                l1_best = sum(s for s, _ in parts)
+                blocks.map(_copy, u_best, u)
+        result = u_best
+    finally:
+        blocks.close()
+    if debug:
+        print(f'  unwrap {H}x{W}: {step + 1} steps, {cg_total} CG iterations, L1 {l1_best:.6g}, '
+              f'{"accuracy reached" if reached else "max_iter reached"}, {time.time() - t0:.2f} s', flush=True)
+    return result, reached, step + 1
+
+
+def _postprocess(unwrapped, phi, nan_mask, conncomp_size):
+    """The 2 pi cycle of the median pixel, the input's circular mean per 4-connected component, the labels by size
+    (0 invalid, 1 the largest)."""
+    import cv2
+    unwrapped[nan_mask] = np.nan
+    valid = ~nan_mask
+    conncomp = np.zeros(unwrapped.shape, dtype=np.uint16)
+    if not np.any(valid):
+        return unwrapped, conncomp
+    k = np.round((unwrapped[valid] - phi[valid]) / (2 * np.pi))
+    unwrapped[valid] -= np.median(k) * 2 * np.pi
+    n_labels, labeled = cv2.connectedComponents(valid.astype(np.uint8), connectivity=4, ltype=cv2.CV_32S)
+    labeled_flat = np.ascontiguousarray(labeled.ravel(), dtype=np.int32)
+    unwrapped_flat = unwrapped.ravel()
+    sin_in, cos_in, sin_out, cos_out, count = _accum_sincos_count(labeled_flat, np.ascontiguousarray(phi.ravel()),
+                                                                  unwrapped_flat.astype(np.float32), n_labels)
+    cf = np.maximum(count.astype(np.float64), 1)
+    d = np.arctan2(sin_in / cf, cos_in / cf) - np.arctan2(sin_out / cf, cos_out / cf)
+    adjustment = np.arctan2(np.sin(d), np.cos(d))
+    adjustment[0] = 0
+    _apply_adjustment(unwrapped_flat, labeled_flat, adjustment)
+    sizes = count[1:n_labels]
+    old_to_new = np.zeros(n_labels, dtype=np.uint16)
+    new_label = 1
+    for old in np.argsort(sizes)[::-1]:
+        if sizes[old] >= conncomp_size:
+            old_to_new[old + 1] = new_label
+            new_label += 1
+    return unwrapped, old_to_new[labeled].astype(np.uint16)
+
+
+def old_irls_warning(given, where):
+    """ONE warning naming the parameters of the former solver that `where` accepts and ignores."""
+    if given:
+        print(f'WARNING: {where} ignores {", ".join(sorted(given))}: the solver stops at `accuracy` '
+              f'(max_iter is its safety cap).', flush=True)
+
+
+def irls_unwrap_2d(phase, weight=None, accuracy=2e-3, max_iter=100, epsilon=1e-2, conncomp_size=30, threads=None,
+                   debug=False, **kwargs):
+    """
+    Unwrap 2D phase: min sum w |grad u - wrap(grad phase)| (L1) by iteratively reweighted least squares.
+
+    Each step solves its weighted least-squares system by conjugate gradients preconditioned with an aggregation
+    multigrid built from that step's weights; the start is the unweighted least-squares solution by the 2D DCT, and
+    epsilon (the L1 smoothing) falls from 0.3 to `epsilon` over the first 6 steps. The solve stops when one step lowers
+    the L1 objective by less than `accuracy` of it: 2e-3 (the default) reaches the former strong set's result in less
+    time than the former relaxed set took; 5e-4 is near the optimum and takes about 1.9 times longer. Then the 2 pi
+    cycle of the median pixel is the input's, and every 4-connected component gets the input's circular mean.
 
     Parameters
     ----------
-    phase : np.ndarray
-        2D array of wrapped phase values in radians.
-    weight : np.ndarray, optional
-        2D array of quality weights (e.g., correlation). Higher values
-        indicate more reliable phase. If None, uniform weights are used.
-    device : str or torch.device, optional
-        PyTorch device: 'auto' (default), 'cuda', 'mps', 'cpu', or 'tpu'.
-        'auto' uses GPU if Dask client has resources={'gpu': 1}.
+    phase : np.ndarray or nested list of np.ndarray
+        Wrapped phase (radians), 2D, NaN where invalid; or its blocks as dask's concatenate=False passes them.
+    weight : like phase, optional
+        Quality weight (correlation), clipped to [0.01, 1]; uniform without it.
+    accuracy : float, optional
+        The stop: the relative decrease of the L1 objective over one step. Default 2e-3.
     max_iter : int, optional
-        Maximum IRLS iterations. Default is 200.
-    tol : float, optional
-        Convergence tolerance for relative change in solution. Default is 1e-3.
-    cg_max_iter : int, optional
-        Maximum conjugate gradient iterations per IRLS step. Default is 20.
-    cg_tol : float, optional
-        Conjugate gradient convergence tolerance. Default is 1e-4.
+        The safety cap on the steps; reaching it before `accuracy` prints one WARNING. Default 100.
     epsilon : float, optional
-        Smoothing parameter for L¹ approximation. Default is 1e-2.
+        The L1 smoothing at the end of the continuation. Default 1e-2.
     conncomp_size : int, optional
-        Minimum connected component size in pixels. Components smaller than this
-        are marked invalid (label 0). Default is 30. Set to 1 to keep all components.
+        Components smaller than this many pixels get the label 0. Default 30.
+    threads : int, optional
+        Numba threads; the result is the same for any value. Default: the cores (unwrap_threads(1)).
     debug : bool, optional
-        If True, print convergence information. Default is False.
+        Print every step's objective.
+    **kwargs
+        The former solver's tol, cg_max_iter, cg_tol, device, semaphore: accepted and ignored with one WARNING.
 
     Returns
     -------
     tuple of (np.ndarray, np.ndarray)
-        - unwrapped: 2D float32 array of unwrapped phase values
-        - conncomp: 2D uint16 array of component labels (0=invalid, 1=largest, 2=second, ...)
+        The unwrapped phase (float32, NaN where invalid) and the component labels (uint16, 0 invalid, 1 the largest).
 
-    Notes
-    -----
-    **Algorithm novelty**: This implementation uses DCT to solve the weighted
-    least squares subproblem within each IRLS iteration. This specific combination
-    does not appear in the literature:
-
-    - **DCT for phase unwrapping** (Ghiglia & Romero): Uses DCT to solve least
-      squares, but with static weights only (not iteratively reweighted).
-    - **IRLS for phase unwrapping** (arXiv:2401.09961): Uses IRLS iterations,
-      but with preconditioned conjugate gradient as the inner solver, not DCT.
-    - **Weighted DCT (WDCT)**: Uses weights but they are fixed, not iteratively
-      updated based on residuals.
-
-    This implementation combines DCT's efficiency with IRLS's robustness by
-    using DCT as the fast solver within each IRLS iteration, updating weights
-    based on residuals after each step.
-
-    References
-    ----------
-    - Ghiglia & Romero, "Robust two-dimensional weighted and unweighted phase
-      unwrapping that uses fast transforms and iterative methods", JOSA A (1994)
-    - Dubois-Taine et al., "Iteratively Reweighted Least Squares for Phase
-      Unwrapping", arXiv:2401.09961 (2024), https://arxiv.org/abs/2401.09961
-
-    Performance
-    -----------
-    Achieves 10-20x speedup over SNAPHU on GPU/TPU.
-
-    The defaults are the strong set (see irls_strong()):
-    - max_iter=200, cg_max_iter=20: iteration budgets.
-    - tol=1e-3, cg_tol=1e-4: tight tolerances.
-    - epsilon=1e-2: Balances L¹ approximation quality with stability.
-
-    The Stack and Batch unwrap2d() and unwrap2d_irls() methods default to the
-    relaxed, faster set max_iter=50, tol=1e-2, cg_max_iter=10, cg_tol=1e-3
-    (epsilon=1e-2) and print one WARNING per call when any parameter is looser
-    than the strong set (see irls_relaxed_warning()). The relaxed set here:
-    >>> irls_unwrap_2d(phase, weight, max_iter=50, tol=1e-2, cg_max_iter=10, cg_tol=1e-3)
+    Examples
+    --------
+    >>> unwrapped, conncomp = irls_unwrap_2d(phase, corr)
+    >>> unwrapped, conncomp = irls_unwrap_2d(phase, corr, accuracy=5e-4)
     """
-    import torch
-    import time
-    from .BatchCore import BatchCore
-
-    # Validate input is 2D
-    if debug:
-        print(f"DEBUG irls_unwrap_2d: input phase.shape={phase.shape}, weight.shape={weight.shape if weight is not None else None}")
-    if phase.ndim != 2:
-        raise ValueError(f"irls_unwrap_2d expects 2D phase array, got shape {phase.shape}")
-
-    # Validate and set device
-    if isinstance(device, str):
-        if device == 'tpu':
-            # TPU uses torch_xla device
-            import torch_xla.core.xla_model as xm
-            device = xm.xla_device()
-        elif device == 'auto':
-            # Only call helper for auto-detection (respects Dask cluster resources)
-            device = BatchCore._get_torch_device(device, debug=debug)
-        else:
-            # Explicit device ('cpu', 'cuda', 'mps') - use directly without re-detection
-            if debug:
-                print(f"DEBUG: using device={device}")
-            device = torch.device(device)
-
-    device_name = str(device)
-    device_type = device.type if hasattr(device, 'type') else str(device).split(':')[0]
-
-    # Use float32 for all devices - sufficient for phase unwrapping
-    dtype = torch.float32
-    np_dtype = np.float32
-
-    _t_start = time.time()
-    original_shape = phase.shape
-
-    # Handle NaN values
-    nan_mask = np.isnan(phase)
-    if np.all(nan_mask):
-        return np.full_like(phase, np.nan), np.zeros(phase.shape, dtype=np.uint16)
-
-    # Find bounding box of valid pixels efficiently (only creates small 1D arrays)
-    valid_rows = np.any(~nan_mask, axis=1)  # shape: (height,)
-    valid_cols = np.any(~nan_mask, axis=0)  # shape: (width,)
-    r0, r1 = np.argmax(valid_rows), len(valid_rows) - np.argmax(valid_rows[::-1])
-    c0, c1 = np.argmax(valid_cols), len(valid_cols) - np.argmax(valid_cols[::-1])
-    del valid_rows, valid_cols
-
-    # Crop to bounding box if it saves significant space
-    crop_applied = False
-    if (r1 - r0) < phase.shape[0] or (c1 - c0) < phase.shape[1]:
-        crop_applied = True
-        phase = phase[r0:r1, c0:c1]  # view, no copy yet
-        nan_mask = nan_mask[r0:r1, c0:c1]  # view
-        if weight is not None:
-            weight = weight[r0:r1, c0:c1]  # view
-        if debug:
-            print(f'  Cropped to bbox [{r0}:{r1}, {c0}:{c1}] = {r1-r0}x{c1-c0} '
-                  f'(from {original_shape[0]}x{original_shape[1]})', flush=True)
-
-    # Get dimensions after cropping
-    height, width = phase.shape
-
-    # Create valid mask for computation
-    valid_mask = ~nan_mask
-
-    # Fill NaN with 0 for computation (avoid np.where temp array)
-    phase_filled = phase.copy()  # now copies only cropped region
-    np.copyto(phase_filled, 0.0, where=nan_mask)
-
-    # Prepare weights (avoid np.where temp arrays)
-    if weight is not None:
-        # Handle NaN in weights (both from phase nan_mask AND from weight itself)
-        weight_filled = weight.copy()
-        np.copyto(weight_filled, 0.0, where=np.isnan(weight))
-        np.copyto(weight_filled, 0.0, where=nan_mask)
-        np.clip(weight_filled, 0.01, 1.0, out=weight_filled)
-    else:
-        # 1 where valid, 0 where NaN (avoid ~nan_mask temp bool array)
-        weight_filled = np.subtract(1.0, nan_mask, dtype=np.float32)
-
-    # Note: circular mean restoration is now done per-component at the end
-    # to automatically align disconnected components
-
-    # Convert to torch tensors
-    phi = torch.from_numpy(phase_filled.astype(np_dtype)).to(device)
-    w = torch.from_numpy(weight_filled.astype(np_dtype)).to(device)
-    valid = torch.from_numpy(valid_mask).to(device)
-
-    # Free numpy arrays - no longer needed
-    del phase_filled, weight_filled
-
-    # Compute wrapped phase differences (target gradients)
-    dx_target = torch.zeros_like(phi)
-    dy_target = torch.zeros_like(phi)
-    dx_target[:, :-1] = phi[:, 1:] - phi[:, :-1]
-    dy_target[:-1, :] = phi[1:, :] - phi[:-1, :]
-
-    # Wrap to [-π, π] - in-place to avoid temporaries
-    torch.atan2(torch.sin(dx_target), torch.cos(dx_target), out=dx_target)
-    torch.atan2(torch.sin(dy_target), torch.cos(dy_target), out=dy_target)
-
-    # phi no longer needed after target gradients computed
-    del phi
-
-    # Edge weights (average of adjacent pixel weights)
-    wx = torch.zeros_like(w)
-    wy = torch.zeros_like(w)
-    wx[:, :-1] = (w[:, :-1] + w[:, 1:]) / 2
-    wy[:-1, :] = (w[:-1, :] + w[1:, :]) / 2
-
-    # Zero out weights at invalid edges
-    wx[:, :-1] *= (valid[:, :-1] & valid[:, 1:]).to(dtype)
-    wy[:-1, :] *= (valid[:-1, :] & valid[1:, :]).to(dtype)
-
-    # w no longer needed after edge weights computed
+    unknown = sorted(set(kwargs) - set(_OLD_IRLS))
+    if unknown:
+        raise TypeError(f'irls_unwrap_2d() got unexpected keyword arguments: {", ".join(unknown)}')
+    old_irls_warning(kwargs, 'irls_unwrap_2d()')
+    shape, box, phi, nan_mask, w = _raster(phase, weight)
+    if box is None:
+        return np.full(shape, np.nan, np.float32), np.zeros(shape, np.uint16)
+    r0, r1, c0, c1 = box
+    u, reached, steps = _irls(phi, w, float(accuracy), int(max_iter), float(epsilon),
+                              unwrap_threads(1) if threads is None else int(threads), debug)
+    if not reached:
+        print(f'WARNING: unwrapping stopped at max_iter={max_iter} before accuracy={accuracy:g}.', flush=True)
     del w
-
-    # Precompute DCT eigenvalues for preconditioner
-    # IMPORTANT: Trigonometric functions require float64 precision!
-    # Small errors in cos() accumulate through thousands of preconditioner
-    # applications in the CG solver. Compute on CPU with float64, then transfer.
-    i_idx = torch.arange(height, dtype=torch.float64)
-    j_idx = torch.arange(width, dtype=torch.float64)
-    cos_i = torch.cos(torch.pi * i_idx / height)
-    cos_j = torch.cos(torch.pi * j_idx / width)
-    eigenvalues = (2 * cos_i.unsqueeze(1) + 2 * cos_j.unsqueeze(0) - 4).to(dtype).to(device)
-    eigenvalues[0, 0] = 1.0  # Avoid division by zero
-    del i_idx, j_idx, cos_i, cos_j
-    # Pre-allocate buffers - MINIMIZED count to reduce memory
-    # Laplacian/gradient buffers (reused for dx_u, dy_u in IRLS)
-    _dx_buf = torch.zeros((height, width), dtype=dtype, device=device)
-    _dy_buf = torch.zeros((height, width), dtype=dtype, device=device)
-    _result_buf = torch.zeros((height, width), dtype=dtype, device=device)
-
-    # CG solver buffers (_cg_Ap eliminated - reuse _result_buf from apply_laplacian)
-    _cg_r = torch.zeros((height, width), dtype=dtype, device=device)
-    _cg_z = torch.zeros((height, width), dtype=dtype, device=device)
-    _cg_p = torch.zeros((height, width), dtype=dtype, device=device)
-
-    # IRLS buffers - rx, ry hold residuals needed for IRLS weights
-    rx = torch.zeros((height, width), dtype=dtype, device=device)
-    ry = torch.zeros((height, width), dtype=dtype, device=device)
-    wx_irls = torch.zeros((height, width), dtype=dtype, device=device)
-    wy_irls = torch.zeros((height, width), dtype=dtype, device=device)
-    b = torch.zeros((height, width), dtype=dtype, device=device)
-    u_prev = torch.zeros((height, width), dtype=dtype, device=device)
-
-    # Use scalar for epsilon squared (saves 1.6GB vs full tensor)
-    eps_sq = epsilon * epsilon
-
-    # DCT work buffer
-    _dct_work = torch.zeros((height, width), dtype=dtype, device=device)
-
-    # Adaptive DCT chunking based on 2D pixels per chunk:
-    # - Row DCT chunk: dct_chunk rows × width cols
-    # - Col DCT chunk: height rows × dct_chunk cols
-    # - CPU: no chunking (fastest)
-    # - GPU/MPS: ~10M pixels per chunk (optimal for parallelism)
-    if device_type == 'cpu':
-        target_pixels = 1_000_000_000  # 1B = no chunking
-    else:
-        target_pixels = 10_000_000  # 10M pixels per chunk
-
-    total_pixels = height * width
-    if total_pixels < 2 * target_pixels:
-        # Small array - no chunking needed
-        dct_chunk = max(height, width)
-    else:
-        # Large array - chunk to target_pixels per operation
-        dct_chunk = target_pixels // max(height, width)
-
-    from torch_dct import dct as torch_dct_fn, idct as torch_idct_fn
-    _dct_col_buf = torch.zeros((min(dct_chunk, width), height), dtype=dtype, device=device)
-
-    def dct_2d_chunked(x, out):
-        """2D DCT with adaptive chunking."""
-        H, W = x.shape
-        # Row DCT in chunks
-        for i in range(0, H, dct_chunk):
-            i_end = min(i + dct_chunk, H)
-            out[i:i_end] = torch_dct_fn(x[i:i_end])
-        # Column DCT via transpose buffer
-        for j in range(0, W, dct_chunk):
-            j_end = min(j + dct_chunk, W)
-            cw = j_end - j
-            _dct_col_buf[:cw, :].copy_(out[:, j:j_end].T)
-            _dct_col_buf[:cw, :] = torch_dct_fn(_dct_col_buf[:cw, :])
-            out[:, j:j_end].copy_(_dct_col_buf[:cw, :].T)
-
-    def idct_2d_chunked(x, out):
-        """2D IDCT with adaptive chunking."""
-        H, W = x.shape
-        # Column IDCT first
-        for j in range(0, W, dct_chunk):
-            j_end = min(j + dct_chunk, W)
-            cw = j_end - j
-            _dct_col_buf[:cw, :].copy_(x[:, j:j_end].T)
-            _dct_col_buf[:cw, :] = torch_idct_fn(_dct_col_buf[:cw, :])
-            out[:, j:j_end].copy_(_dct_col_buf[:cw, :].T)
-        # Row IDCT
-        for i in range(0, H, dct_chunk):
-            i_end = min(i + dct_chunk, H)
-            out[i:i_end] = torch_idct_fn(out[i:i_end])
-
-    def apply_laplacian(x, wx_irls, wy_irls):
-        """Apply weighted Laplacian operator: -∇·(w·∇x)"""
-        # Forward differences (reuse buffers)
-        _dx_buf.zero_()
-        _dy_buf.zero_()
-        _dx_buf[:, :-1] = x[:, 1:] - x[:, :-1]
-        _dy_buf[:-1, :] = x[1:, :] - x[:-1, :]
-
-        # Weight the gradients in-place
-        _dx_buf.mul_(wx_irls)
-        _dy_buf.mul_(wy_irls)
-
-        # Backward differences (divergence)
-        _result_buf.zero_()
-        _result_buf[:, 1:].sub_(_dx_buf[:, :-1])
-        _result_buf[:, :-1].add_(_dx_buf[:, :-1])
-        _result_buf[1:, :].sub_(_dy_buf[:-1, :])
-        _result_buf[:-1, :].add_(_dy_buf[:-1, :])
-
-        # In-place negation to avoid creating new tensor
-        _result_buf.neg_()
-        return _result_buf
-
-    def apply_preconditioner(r, out):
-        """Apply DCT-based preconditioner (approximate inverse Laplacian) into out buffer."""
-        with torch.no_grad():
-            # DCT-2D using chunked implementation
-            dct_2d_chunked(r, _dct_work)
-
-            # Divide by negative eigenvalues
-            _dct_work.div_(eigenvalues)
-            _dct_work.neg_()
-            _dct_work[0, 0] = 0.0
-
-            # IDCT-2D using chunked implementation
-            idct_2d_chunked(_dct_work, out)
-        return out
-
-    def conjugate_gradient(b, wx_irls, wy_irls, x0, max_iter_cg, tol_cg):
-        """Preconditioned conjugate gradient solver for IRLS using pre-allocated buffers.
-
-        Returns (x, n_iters) where n_iters is the number of CG iterations performed.
-        """
-        x = x0  # No clone - modify in place, caller provides buffer
-        n_iters = 0
-
-        # r = b - A*x (use _cg_r buffer)
-        _cg_r.copy_(b)
-        _cg_r.sub_(apply_laplacian(x, wx_irls, wy_irls))
-
-        # Check for NaN in initial residual
-        if not torch.isfinite(_cg_r).all():
-            return x0, 0
-
-        # z = preconditioner(r) (use _cg_z buffer)
-        apply_preconditioner(_cg_r, _cg_z)
-
-        # p = z.clone() (use _cg_p buffer)
-        _cg_p.copy_(_cg_z)
-
-        # Use dot product to avoid creating height*width temporary tensor
-        rz = torch.dot(_cg_r.view(-1), _cg_z.view(-1))
-
-        for i in range(max_iter_cg):
-            n_iters = i + 1
-            # Ap = A*p (apply_laplacian returns _result_buf directly - no copy needed)
-            Ap = apply_laplacian(_cg_p, wx_irls, wy_irls)
-
-            # Use dot product to avoid creating height*width temporary tensor
-            pAp = torch.dot(_cg_p.view(-1), Ap.view(-1))
-            if pAp.abs() < 1e-15 or not torch.isfinite(pAp):
-                break
-            alpha = rz / pAp
-
-            # Clamp alpha to prevent explosion
-            alpha = torch.clamp(alpha, -1e6, 1e6)
-            alpha_val = alpha.item()
-
-            # Update x in-place
-            x.add_(_cg_p, alpha=alpha_val)
-
-            # Update r in-place (Ap is _result_buf, will be overwritten next iteration)
-            _cg_r.sub_(Ap, alpha=alpha_val)
-
-            # Check for numerical issues mid-iteration
-            if not torch.isfinite(x).all():
-                break
-
-            # norm() is efficient and doesn't create intermediate tensor
-            r_norm = _cg_r.norm()
-            if r_norm < tol_cg or not torch.isfinite(r_norm):
-                break
-
-            # z = preconditioner(r) (reuse _cg_z buffer)
-            apply_preconditioner(_cg_r, _cg_z)
-
-            # Use dot product to avoid creating height*width temporary tensor
-            rz_new = torch.dot(_cg_r.view(-1), _cg_z.view(-1))
-            if rz.abs() < 1e-15:
-                break
-            beta = rz_new / rz
-            beta = torch.clamp(beta, -1e6, 1e6)
-
-            # p = z + beta*p (in-place)
-            _cg_p.mul_(beta.item()).add_(_cg_z)
-            rz = rz_new
-
-        return x, n_iters
-
-    # Initialize with DCT solution (L² result)
-    # Use _result_buf temporarily for rho to avoid extra allocation
-    rho = _result_buf
-    rho.zero_()
-    rho[:, 1:] += wx[:, :-1] * dx_target[:, :-1]
-    rho[:, :-1] -= wx[:, :-1] * dx_target[:, :-1]
-    rho[1:, :] += wy[:-1, :] * dy_target[:-1, :]
-    rho[:-1, :] -= wy[:-1, :] * dy_target[:-1, :]
-
-    # DCT initialization using chunked implementation
-    dct_2d_chunked(rho, _dct_work)
-
-    # Divide by negative eigenvalues
-    _dct_work.div_(eigenvalues)
-    _dct_work.neg_()
-    _dct_work[0, 0] = 0.0
-
-    # IDCT to get initial solution (use rho buffer as temporary output, then clone)
-    idct_2d_chunked(_dct_work, rho)
-    u = rho.clone()
-
-    # Check DCT initialization for NaN/inf - fix in-place to avoid temp allocation
-    if not torch.isfinite(u).all():
-        if debug:
-            nan_count = (~torch.isfinite(u)).sum().item()
-            print(f'  DCT init produced {nan_count} NaN/inf values, filling with zeros')
-        u.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
-
-    # Pre-compute valid mask as float and count for efficient mean computation
-    # (avoids creating 1GB+ temporary from u[valid] indexing on each iteration)
-    valid_float = valid.to(dtype)
-    valid_count = valid_float.sum()
-
-    # Re-center DCT result to improve float32 precision
-    # This keeps values near zero where float32 has best precision
-    if valid_count > 0:
-        u_mean = (u * valid_float).sum() / valid_count
-        u.sub_(u_mean)
-
-    _t_init = time.time()
-
-    if debug:
-        # Handle case where weights might still have issues
-        edge_valid = valid[:, :-1] & valid[:, 1:]
-        valid_wx = wx[:, :-1][edge_valid]
-        if valid_wx.numel() > 0:
-            w_min, w_max = valid_wx.min().item(), valid_wx.max().item()
-        else:
-            w_min, w_max = 0.0, 0.0
-        print(f'  Input: {height}x{width}, valid pixels: {valid_mask.sum().item()}, '
-              f'weight range: [{w_min:.3f}, {w_max:.3f}]')
-        print(f'  DCT init range: [{u.min().item():.2f}, {u.max().item():.2f}]')
-
-    # IRLS iterations - keep track of last good solution
-    u_best = u.clone()
-    best_residual = float('inf')
-
-    # the debug TIMING line counts iteration + 1, also for max_iter=0 (no iteration)
-    iteration = -1
-    for iteration in range(max_iter):
-        u_prev.copy_(u)
-
-        # Re-center u to prevent numerical drift (important for float32)
-        # Phase unwrapping only cares about gradients, so mean is arbitrary
-        # Use pre-computed valid_float to avoid creating 1GB+ temporary from u[valid]
-        if valid_count > 0:
-            u_mean = (u * valid_float).sum() / valid_count
-            u.sub_(u_mean)
-
-        # Compute current gradients into rx, ry directly (will subtract target next)
-        rx.zero_()
-        ry.zero_()
-        rx[:, :-1] = u[:, 1:] - u[:, :-1]
-        ry[:-1, :] = u[1:, :] - u[:-1, :]
-
-        # Compute residuals in-place: rx = grad_x(u) - dx_target
-        rx.sub_(dx_target)
-        ry.sub_(dy_target)
-
-        # Track best solution by residual magnitude
-        # Use dot product to avoid creating height*width temporary tensors from pow(2)
-        current_residual = (torch.dot(rx.view(-1), rx.view(-1)) + torch.dot(ry.view(-1), ry.view(-1))).item()
-        if current_residual < best_residual and torch.isfinite(u).all():
-            best_residual = current_residual
-            u_best.copy_(u)
-
-        # Update IRLS weights: w_irls = w / sqrt(r² + ε²)
-        # Use scalar eps_sq to avoid 1.6GB tensor
-        torch.mul(rx, rx, out=wx_irls)  # wx_irls = rx²
-        wx_irls.add_(eps_sq)             # wx_irls = rx² + ε²
-        wx_irls.sqrt_()                  # wx_irls = sqrt(rx² + ε²)
-        torch.div(wx, wx_irls, out=wx_irls)  # wx_irls = wx / sqrt(...)
-
-        torch.mul(ry, ry, out=wy_irls)  # wy_irls = ry²
-        wy_irls.add_(eps_sq)             # wy_irls = ry² + ε²
-        wy_irls.sqrt_()                  # wy_irls = sqrt(ry² + ε²)
-        torch.div(wy, wy_irls, out=wy_irls)  # wy_irls = wy / sqrt(...)
-
-        # Clamp weights in-place
-        wx_irls.clamp_(min=1e-6, max=1e6)
-        wy_irls.clamp_(min=1e-6, max=1e6)
-
-        # Compute right-hand side: -∇·(w_irls · ∇target)
-        b.zero_()
-        b[:, 1:].addcmul_(wx_irls[:, :-1], dx_target[:, :-1])
-        b[:, :-1].addcmul_(wx_irls[:, :-1], dx_target[:, :-1], value=-1)
-        b[1:, :].addcmul_(wy_irls[:-1, :], dy_target[:-1, :])
-        b[:-1, :].addcmul_(wy_irls[:-1, :], dy_target[:-1, :], value=-1)
-
-        # Free rx, ry before CG - they're not needed during CG solve
-        # This reduces peak memory during preconditioner calls by 3.2 GB
-        del rx, ry
-        if device_type == 'mps':
-            torch.mps.synchronize()
-            torch.mps.empty_cache()
-        elif device_type == 'cuda':
-            torch.cuda.empty_cache()
-
-        # Solve weighted Laplacian system using CG
-        u, cg_iters = conjugate_gradient(b, wx_irls, wy_irls, u, cg_max_iter, cg_tol)
-
-        # Recreate rx, ry for next iteration
-        rx = torch.zeros((height, width), dtype=dtype, device=device)
-        ry = torch.zeros((height, width), dtype=dtype, device=device)
-
-        # Check for numerical issues during iteration
-        if not torch.isfinite(u).all():
-            if debug:
-                print(f'  IRLS iter {iteration}: NaN/inf detected, reverting to best solution')
-            u.copy_(u_best)
-            break
-
-        # Check convergence using pre-allocated buffer
-        u_prev.sub_(u)  # u_prev now holds diff
-        diff = torch.norm(u_prev)
-        norm_u = torch.norm(u) + 1e-10
-        rel_change = (diff / norm_u).item()
-
-        if debug and iteration % 5 == 0:
-            print(f'  IRLS iter {iteration}: rel_change = {rel_change:.2e}, residual = {current_residual:.2e}, cg_iters = {cg_iters}')
-
-        # Aggressive memory cleanup to prevent accumulation from DCT temporaries
-        # torch_dct creates ~15GB of intermediates per DCT/IDCT pair
-        if device_type == 'mps':
-            torch.mps.synchronize()
-            torch.mps.empty_cache()
-        elif device_type == 'cuda':
-            torch.cuda.empty_cache()
-
-        if rel_change < tol:
-            if debug:
-                print(f'  IRLS converged at iteration {iteration}')
-            break
-    else:
-        # no break: all max_iter iterations ran without meeting tol
-        if debug and max_iter > 0:
-            print(f'  IRLS not converged: {max_iter} iterations, last rel_change = {rel_change:.2e} >= tol = {tol:g}')
-
-    # Use best solution found during iterations if current is invalid
-    if not torch.isfinite(u).all():
-        if debug:
-            print(f'  Final solution has NaN/inf, reverting to best solution')
-        u = u_best
-
-    _t_end = time.time()
-
-    # Convert back to numpy before cleanup
-    unwrapped = u.cpu().numpy().astype(np.float32)
-
-    # Explicit cleanup of all GPU tensors to free memory
-    del u, u_best, u_prev
-    del dx_target, dy_target, wx, wy, eigenvalues
-    del _dx_buf, _dy_buf, _result_buf, _dct_work
-    del _cg_r, _cg_z, _cg_p
-    del rx, ry, wx_irls, wy_irls, b
-    del valid, valid_float, valid_count
-
-    # Force synchronization and clear GPU cache
-    if device_type == 'mps':
-        torch.mps.synchronize()
-        torch.mps.empty_cache()
-    elif device_type == 'cuda':
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-
-    # Force Python garbage collection
-    import gc
-    gc.collect()
-
-    # Check for NaN/inf from numerical issues - return NaN array (no hidden fallback)
-    if not np.isfinite(unwrapped[~nan_mask]).all():
-        import warnings
-        nan_count = np.sum(~np.isfinite(unwrapped[~nan_mask]))
-        total_valid = np.sum(~nan_mask)
-        warnings.warn(f'IRLS produced {nan_count}/{total_valid} NaN/inf values - returning NaN for this component', RuntimeWarning)
-        return np.full(original_shape, np.nan, dtype=np.float32), np.zeros(original_shape, dtype=np.uint16)
-
-    # Restore NaN values
-    unwrapped[nan_mask] = np.nan
-
-    # Validate and correct: rewrapped phase should match input
-    valid_mask = ~nan_mask
-    if np.any(valid_mask):
-        diff = unwrapped[valid_mask] - phase[valid_mask]
-        k_values = np.round(diff / (2 * np.pi))
-        k_median = np.median(k_values)
-        unwrapped[valid_mask] = unwrapped[valid_mask] - k_median * 2 * np.pi
-
-    # Restore input circular mean PER COMPONENT (not global) - VECTORIZED
-    # Each disconnected component should be aligned to its own input circular mean
-    # This automatically aligns components with sub-π offsets without needing ILP
-    _t_align_start = time.time()
-    n_components = 0
-    conncomp = np.zeros(unwrapped.shape, dtype=np.uint16)
-
-    if np.any(valid_mask):
-        # Use cv2.connectedComponents (faster than WithStats - counts come from numba)
-        import cv2
-        _t0 = time.time()
-        n_labels, labeled = cv2.connectedComponents(
-            valid_mask.astype(np.uint8), connectivity=4, ltype=cv2.CV_32S
-        )
-        n_components = n_labels - 1  # cv2 counts background as label 0
-        _t1 = time.time()
-
-        # Prepare contiguous arrays for numba
-        labeled_flat = np.ascontiguousarray(labeled.ravel(), dtype=np.int32)
-        phase_flat = np.ascontiguousarray(phase.ravel(), dtype=np.float32)
-        unwrapped_flat = unwrapped.ravel()  # Will modify in-place
-        _t2 = time.time()
-
-        # Single-pass numba accumulation: sin/cos sums AND counts (6x faster than bincounts)
-        sin_sum, cos_sum, sin_sum_out, cos_sum_out, count_per_label = _accum_sincos_count(
-            labeled_flat, phase_flat, unwrapped_flat.astype(np.float32), n_labels
-        )
-        _t2b = time.time()
-
-        # Circular mean per component: atan2(mean(sin), mean(cos))
-        count_float = count_per_label.astype(np.float64)
-        count_float[count_float == 0] = 1  # Avoid division by zero
-        input_mean = np.arctan2(sin_sum / count_float, cos_sum / count_float)
-        output_mean = np.arctan2(sin_sum_out / count_float, cos_sum_out / count_float)
-        _t3 = time.time()
-
-        # Adjustment per label - wrap to [-π, π] to avoid adding/removing full cycles
-        diff = input_mean - output_mean
-        adjustment = np.arctan2(np.sin(diff), np.cos(diff))  # wrap to [-π, π]
-        adjustment[0] = 0
-        # Apply adjustment using numba (faster than numpy fancy indexing)
-        _apply_adjustment(unwrapped_flat, labeled_flat, adjustment)
-        _t4 = time.time()
-
-        # Relabel by size: 0=invalid, 1=largest, 2=second largest, etc.
-        # Filter out components smaller than conncomp_size
-        sizes_1_to_n = count_per_label[1:n_labels]  # sizes for labels 1..n_labels-1
-        # argsort descending: largest first
-        sorted_indices = np.argsort(sizes_1_to_n)[::-1]  # indices 0..n-1, sorted by size desc
-        # Build mapping: old_label -> new_label (0 for small components)
-        old_to_new = np.zeros(n_labels, dtype=np.uint16)
-        new_label = 1
-        for old_idx in sorted_indices:
-            old_label = old_idx + 1  # labels are 1-indexed
-            if sizes_1_to_n[old_idx] >= conncomp_size:
-                old_to_new[old_label] = new_label
-                new_label += 1
-            # else: old_to_new[old_label] stays 0 (invalid)
-        n_components = new_label - 1  # Update to count only kept components
-        _t5 = time.time()
-
-        if debug:
-            n_filtered = np.sum(sizes_1_to_n < conncomp_size)
-            print(f'  align timing: label={(_t1-_t0)*1000:.0f}ms, prep={(_t2-_t1)*1000:.0f}ms, '
-                  f'accum={(_t2b-_t2)*1000:.0f}ms, mean={(_t3-_t2b)*1000:.0f}ms, '
-                  f'adjust={(_t4-_t3)*1000:.0f}ms, relabel={(_t5-_t4)*1000:.0f}ms')
-            print(f'  conncomp: {n_components} kept, {n_filtered} filtered (size<{conncomp_size})')
-        # Apply relabeling vectorized
-        conncomp = old_to_new[labeled].astype(np.uint16)
-
-    _t_align_end = time.time()
-
-    # Place cropped result back into full-size output if cropping was applied
-    if crop_applied:
-        result = np.full(original_shape, np.nan, dtype=np.float32)
-        result[r0:r1, c0:c1] = unwrapped
-        unwrapped = result
-        conncomp_full = np.zeros(original_shape, dtype=np.uint16)
-        conncomp_full[r0:r1, c0:c1] = conncomp
-        conncomp = conncomp_full
-
-    if debug:
-        print(f'TIMING irls_unwrap_2d ({height}x{width}) on {device_name}:')
-        print(f'  init (DCT):   {(_t_init - _t_start)*1000:.1f} ms')
-        print(f'  IRLS iters:   {(_t_end - _t_init)*1000:.1f} ms ({iteration+1} iterations)')
-        print(f'  align comps:  {(_t_align_end - _t_align_start)*1000:.1f} ms ({n_components} components)')
-        print(f'  TOTAL:        {(_t_align_end - _t_start)*1000:.1f} ms')
-
-    return unwrapped, conncomp
-
-
-# The IRLS parameters of the strong set and the direction that is looser:
-# -1 for fewer iterations, +1 for a larger tolerance or smoothing.
-_IRLS_LOOSER = {'max_iter': -1, 'tol': +1, 'cg_max_iter': -1, 'cg_tol': +1, 'epsilon': +1}
-
-
-def irls_strong():
-    """The strong IRLS set: the defaults of irls_unwrap_2d(), as a dict."""
-    import inspect
-    params = inspect.signature(irls_unwrap_2d).parameters
-    return {name: params[name].default for name in _IRLS_LOOSER}
-
-
-def _format_param(value):
-    """1e-3 for 0.001, 20 for 20."""
-    if isinstance(value, float) and 0 < abs(value) < 0.1:
-        mantissa, exponent = f'{value:.12e}'.split('e')
-        return f'{mantissa.rstrip("0").rstrip(".")}e{int(exponent)}'
-    return repr(value)
-
-
-def irls_relaxed_warning(max_iter, tol, cg_max_iter, cg_tol, epsilon):
-    """Print ONE warning when an IRLS parameter is looser than the strong set.
-
-    Looser is fewer iterations (max_iter, cg_max_iter) or a larger tolerance or
-    smoothing (tol, cg_tol, epsilon) than the defaults of irls_unwrap_2d().
-    The warning names only those parameters, with their strong values. Call it
-    once per unwrapping call in the calling process, never per burst or pair.
-
-    Returns
-    -------
-    list of str
-        The looser parameter names; empty for the strong set or a stricter one.
-    """
-    given = dict(max_iter=max_iter, tol=tol, cg_max_iter=cg_max_iter, cg_tol=cg_tol, epsilon=epsilon)
-    strong = irls_strong()
-    looser = [name for name, sign in _IRLS_LOOSER.items() if sign * (given[name] - strong[name]) > 0]
-    if looser:
-        text = ', '.join(f'{name}={_format_param(strong[name])}' for name in looser)
-        print(f'WARNING: relaxed unwrapping may not converge. Strong parameters: {text}.', flush=True)
-    return looser
+    unwrapped, conncomp = _postprocess(u, phi, nan_mask, conncomp_size)
+    if box == (0, shape[0], 0, shape[1]):
+        return unwrapped, conncomp
+    out, cc = np.full(shape, np.nan, np.float32), np.zeros(shape, np.uint16)
+    out[r0:r1, c0:c1] = unwrapped
+    cc[r0:r1, c0:c1] = conncomp
+    return out, cc
 
 
 def detect_discontinuity_hough_focal(phase, grad_threshold=2.0, mask_width=3, debug=False):
@@ -1734,6 +1853,12 @@ def _warmup_numba_cache():
     _adj = np.array([0.0, 0.0], dtype=np.float64)
     _accum_sincos_count(_l, _p, _u, 2)
     _apply_adjustment(_u, _l, _adj)
+    # the engine's kernels, on a small raster with an invalid corner (every branch); no warning
+    _ph = np.linspace(-3.0, 3.0, 40 * 48, dtype=np.float32).reshape(40, 48)
+    _ph[:3, :5] = np.nan
+    _shape, _box, _phi, _nan, _w = _raster(_ph, np.full((40, 48), 0.5, np.float32))
+    _uw, _, _ = _irls(_phi, _w, 2e-3, 2, 1e-2, 1, False)
+    _postprocess(_uw, _phi, _nan, 30)
 
 _warmup_numba_cache()
 

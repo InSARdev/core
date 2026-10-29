@@ -581,8 +581,8 @@ def _control(y, x, crs, k=9):
 
     Returns
     -------
-    tuple or None - (ri, ci, lat, lon): the control rows and columns (indices) and the latitudes and longitudes in degrees,
-    shape (len(ri), len(ci)).
+    tuple or None - (ri, ci, lat, lon): the control rows and columns (indices) and the latitudes and longitudes in degrees
+    (the longitudes unwrapped across +/-180), shape (len(ri), len(ci)).
 
     Examples
     --------
@@ -598,7 +598,15 @@ def _control(y, x, crs, k=9):
     cy, cx = (y[ri][:, None], x[ci][None, :]) if y.ndim == 1 else (y[np.ix_(ri, ci)], x[np.ix_(ri, ci)])
     cy, cx = np.broadcast_arrays(np.asarray(cy, dtype=np.float64), np.asarray(cx, dtype=np.float64))
     lon, lat = Transformer.from_crs(crs, 'EPSG:4326', always_xy=True).transform(cx, cy)
-    return ri, ci, np.asarray(lat, dtype=np.float64), np.asarray(lon, dtype=np.float64)
+    # unwrap across the +/-180 seam (period 360) about the circular mean of the mesh, cell by cell: a NaN stays local
+    # (np.unwrap would spread it over the rows after it) and a mesh inside one turn is unchanged bitwise
+    lon = np.asarray(lon, dtype=np.float64)
+    ok = np.isfinite(lon)
+    if ok.any():
+        rad = np.radians(lon[ok])
+        ref = np.degrees(np.arctan2(np.sin(rad).mean(), np.cos(rad).mean()))
+        lon = lon - 360.0 * np.round((lon - ref) / 360.0)
+    return ri, ci, np.asarray(lat, dtype=np.float64), lon
 
 
 def _lerp(vals, ri, ci, rows, cols):
@@ -638,8 +646,8 @@ def _pierce_offset(yy, xx, ele, inc, look, shell, control, geocentric, rows, col
 
     Returns
     -------
-    tuple of numpy.ndarray - (lat, lon, zeff): the pierce point in degrees and the effective incidence z' in radians,
-    shape (ny, nx).
+    tuple of numpy.ndarray - (lat, lon, zeff): the pierce point in degrees (the longitude in [-180, 180]) and the effective
+    incidence z' in radians, shape (ny, nx).
 
     Raises
     ------
@@ -686,7 +694,10 @@ def _pierce_offset(yy, xx, ele, inc, look, shell, control, geocentric, rows, col
     b = _A_WGS * np.sqrt(1.0 - _E2_WGS)
     th = np.arctan2(zz * _A_WGS, p * b)
     lat_g = np.arctan2(zz + _E2_WGS / (1.0 - _E2_WGS) * b * np.sin(th) ** 3, p - _E2_WGS * _A_WGS * np.cos(th) ** 3)
-    return np.degrees(lat_g), lon + np.degrees(dl), zeff
+    lon = lon + np.degrees(dl)
+    # the seam: the IONEX node lattice runs from -180 to +180, so the longitude is wrapped into [-180, 180] (in-range values kept)
+    lon = np.where((lon < -180.0) | (lon > 180.0), np.mod(lon + 180.0, 360.0) - 180.0, lon)
+    return np.degrees(lat_g), lon, zeff
 
 
 def _chunk_cells(y, x, ny, nx, yoff, xoff, chunk, nodes, index, pier=None):

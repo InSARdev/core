@@ -100,9 +100,8 @@ def cluster_cores():
     if _cores is None:
         if not hasattr(_os, 'process_cpu_count'):
             raise RuntimeError(
-                "fit3d() cannot count the CPU cores. Use Python 3.13+, or "
-                "declare the cores in the Dask cluster init: Client(..., "
-                "resources={'cpu': N}) with N the machine's CPU cores.")
+                "Cannot count the CPU cores. Use Python 3.13+, or declare "
+                "them in the Dask cluster: Client(..., resources={'cpu': N}).")
         _cores = max(1, _os.process_cpu_count() or 1)
     return _slots, _cores
 

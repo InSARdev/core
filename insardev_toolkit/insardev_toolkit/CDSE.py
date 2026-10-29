@@ -979,7 +979,8 @@ class CDSE(progressbar_joblib):
                     print(f'ERROR: download attempt {retry+1} failed{" (not retried)" if stop else ""} '
                           f'for {burst_id}: {e}')
                     if stop or retry + 1 == n:
-                        return False
+                        # a failed burst returns its item and last error on one line: the raise of the download names them
+                        return burst_id, ' '.join(str(e).split())
                 time.sleep(timeout_second)
 
         from .HTTP import download_jobs
@@ -1011,9 +1012,11 @@ class CDSE(progressbar_joblib):
 
         # the idle joblib workers keep their memory: stop them, the next parallel step starts its own
         release_workers()
-        failed_count = sum(1 for s in statuses if s is False)
-        if failed_count > 0:
-            raise Exception(f'Bursts downloading failed for {failed_count} items.')
+        # the raise names every failed item and its last error, one line each (the causes stay in the log too)
+        failed = [status for status in statuses if isinstance(status, tuple)]
+        if failed:
+            raise Exception('\n'.join([f'Bursts downloading failed for {len(failed)} items.'] +
+                                      [f'{item}: {error}' for item, error in failed]))
 
         return pd.DataFrame(bursts_missed, columns=['burst'])
 

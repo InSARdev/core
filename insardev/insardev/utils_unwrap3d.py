@@ -296,7 +296,7 @@ def unwrap3d_dates_array(scenes, date_values, duration=90.0, max_iter=40,
     needed. min_dates is the floor on surviving dates per pixel: closure is
     structural here, so a resolved triplet is already usable and the default
     is 3 -- there is no statistical sample-size argument for a larger floor. Requires closure-exact input (single-look scenes with per-date
-    corrections only), which is what fit3d() + predict() produce.
+    corrections only), which is what fit1d_network() + predict() produce.
     """
     if isinstance(scenes, list):
         scenes = np.asarray(scenes[0]) if len(scenes) == 1 else np.concatenate(

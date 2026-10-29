@@ -94,10 +94,10 @@ class Baseline(pd.DataFrame):
         return self._burst_id
 
     def tolist(self) -> list[list[int]]:
-        """Convert baseline pairs to date indices for use with phasediff_multilook.
+        """Convert baseline pairs to date indices for use with stack.pairs().
 
         Returns a list of [ref_index, rep_index] pairs that can be passed directly
-        to stack.phasediff_multilook() as the first argument.
+        to stack.pairs().
 
         Returns
         -------
@@ -108,7 +108,7 @@ class Baseline(pd.DataFrame):
         --------
         >>> baseline = stack.baseline(days=48)
         >>> pairs = baseline.tolist()
-        >>> intf, corr = stack.phasediff_multilook(pairs, wavelength=100)
+        >>> intf, corr = stack.pairs(pairs).interferogram(100)
         """
         if self._dates is None:
             raise ValueError("Dates not available. Baseline must be created from Stack.baseline()")

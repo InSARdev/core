@@ -151,10 +151,7 @@ TREND2D_PROFILE = 64          # coarse cells per axis for the ramp-start scan
 # `resolution` is the HALF-POWER width of the sampling's own transform: |W|/n is
 # an amplitude, so half of the power is this level of it
 TREND2D_RESOLUTION_LEVEL = float(np.sqrt(0.5))
-# the searched start reads each covariate's whole reach on a lattice this many
-# times finer than a turn; False leaves the starts at zero and the axis profiles
-TREND2D_SEARCH_OVER = 8
-TREND2D_SEARCHED_START = True
+TREND2D_GLOBAL_OVER = 4      # global lattice step cells / N = 1/4 cycle (pi/2 across the extent)
 
 
 @nb.njit(parallel=False, cache=True, fastmath=True)
@@ -586,13 +583,6 @@ def trend2d_kernel(cells):
     return gr[0] + 1j * gi[0]
 
 
-def trend2d_nodes(cells):
-    """Where each cell of the grid sits in the variable, in [-1/2, 1/2]."""
-    import numpy as _np
-    M = int(cells) + 2 * TREND2D_W
-    return (_np.arange(M) - TREND2D_W) / float(cells) - 0.5
-
-
 def trend2d_reach(cells):
     """Turns the grid can carry, in cycles across the extent.
 
@@ -894,6 +884,15 @@ def trend2d_moment_width(k):
     return 1 + k + k * (k + 1) // 2
 
 
+def trend2d_noise_level(cells, k, n):
+    """The coherence a trend must beat to be proved, sqrt(ln(1000 M) / n), with
+    M = (2 cells)^k the lattice points of the k covariates (cells = ceil(2 range / pi),
+    so M = (4 range / pi)^k when range / pi is an integer); k = 0 at degree 0, M = 1.
+    A noise coherence reaches it with probability 1 / (1000 M), as trend3d's threshold."""
+    import numpy as _np
+    return float(_np.sqrt(_np.log(1000.0 * (2.0 * int(cells)) ** k) / max(float(n), 1.0)))
+
+
 def trend2d_fit(acc, cells, k, axes=(), maxiter=1000, tol=1e-10, degree=1):
     """The accumulator -> one gradient and one constant per date, SOLVED.
 
@@ -903,7 +902,8 @@ def trend2d_fit(acc, cells, k, axes=(), maxiter=1000, tol=1e-10, degree=1):
 
     degree=0 fits the constant alone: the same closed form the constant has at
     any gradient, read at zero, so the gradients come back zero and the
-    coherence is the zero-trend one; no ascent and no limit. Its error bar is
+    coherence is the zero-trend one; no ascent and no limit, and the noise level
+    applies with M = 1. Its error bar is
     the same halves' disagreement, of the constant, in radians, in the first
     error column.
 
@@ -913,7 +913,7 @@ def trend2d_fit(acc, cells, k, axes=(), maxiter=1000, tol=1e-10, degree=1):
     one unit. That is the same bounded influence the phasor form has always
     bought, written as a regression.
 
-    IT IS SOLVED, AND THE SEARCH ONLY OFFERS STARTS. The old code took the
+    IT IS SOLVED, AND THE GRID ONLY OFFERS STARTS. The old code took the
     global argmax over a lattice reaching `range`. Where the samples crowd
     into a fraction of the variable's extent -- real topography -- the
     sampling's own transform keeps grating lobes far out in the band, and the
@@ -923,10 +923,10 @@ def trend2d_fit(acc, cells, k, axes=(), maxiter=1000, tol=1e-10, degree=1):
     strong trend on a smooth slope still reaches; a peak across a dip of the
     objective it does not. So the ascent is given more starts and the highest
     stationary point wins: the ramp read off the axis covariates' profiles,
-    and the date's own grid SEARCHED over every covariate's whole reach
-    (trend2d_search) -- the latter only where the two checkerboard halves,
-    independent pixels of the same sampling, searched on their own, land
-    within the sampling's resolution of the same point. A lobe lifted by
+    and the date's own grid's strongest lattice point inside the range
+    (trend2d_global(): the padded FFT of the same grid) -- the latter only
+    where the two checkerboard halves, independent pixels of the same
+    sampling, land within the sampling's resolution of it. A lobe lifted by
     noise is not lifted in both halves, and a date whose halves disagree keeps
     the starts it had. The reported `limit` is that resolution.
 
@@ -947,12 +947,17 @@ def trend2d_fit(acc, cells, k, axes=(), maxiter=1000, tol=1e-10, degree=1):
     per-variable one-sigma from the two checkerboard halves) -- the pair
     of coherences is the verification: the ascent starts at zero, so the
     solution's coherence can only exceed the zero-trend one, and their
-    difference is what removing the trend actually bought. why: 0 solved; 1 no pixels; 2 the
+    difference is what removing the trend actually bought. why: 0 solved; 1 no pixels, or a checkerboard half with none; 2 the
     trend walked out of the grid's domain (`range`); 3 the covariate is
     degenerate on this date (singular moments, or no phasor sum at all);
     4 the iteration did not meet `tol` within `maxiter` -- returned as NaN,
-    because an unconverged number is a plausible wrong value. `limit` is
-    REPORTED, never applied: the half-power width of the sampling's own
+    because an unconverged number is a plausible wrong value; 5 a different
+    trend beats the answer on the global lattice (trend2d_global()); 6 the
+    answer's coherence is not above the noise level (trend2d_noise_level()).
+    EVERY unresolved date (1 to 6) has NaN in its intercept, slopes, their errors,
+    coherence, coherence0 and gain: NaN means no data, and a coherence is
+    proved only by a trend that stands. pixels and resolution stay as measured.
+    `limit` is REPORTED, never applied: the half-power width of the sampling's own
     transform per variable, the closest two gradients can be and still be
     told apart.
     """
@@ -979,6 +984,7 @@ def trend2d_fit(acc, cells, k, axes=(), maxiter=1000, tol=1e-10, degree=1):
 
     g = np.full((nd, k), np.nan)
     c = np.full(nd, np.nan)
+    Rg = trend2d_global_setup(cells, k) if degree else None
     coh = np.zeros(nd)
     coh0 = np.zeros(nd)
     why = np.zeros(nd, np.int64)
@@ -1000,6 +1006,11 @@ def trend2d_fit(acc, cells, k, axes=(), maxiter=1000, tol=1e-10, degree=1):
             lim[d, a] = _trend2d_resolution_kernel(
                 np.ascontiguousarray(H[d, a]), M, float(cells), TREND2D_W, kgr,
                 float(n[d]), float(reach), 0.02, TREND2D_RESOLUTION_LEVEL)
+        # A CHECKERBOARD HALF WITH NO SAMPLES: the spatial split is too weak to
+        # confirm a trend, so the date has no answer (why 1, as no pixels).
+        if halves[0][d, 2 * K] <= 0 or halves[1][d, 2 * K] <= 0:
+            why[d] = 1
+            continue
         # THE NORMAL MATRIX OF THE SLOPE, which is the CENTRED second
         # moment of A: the constant is not iterated, it is profiled out, so
         # what the step divides by is the lever the slope actually has.
@@ -1027,6 +1038,9 @@ def trend2d_fit(acc, cells, k, axes=(), maxiter=1000, tol=1e-10, degree=1):
             g[d] = 0.0
             c[d] = float(np.angle(T0))
             coh[d] = coh0[d]
+            # THE NOISE LEVEL AT DEGREE 0 TOO (the user, 2026-10-27): no covariate, M = 1
+            if coh[d] <= trend2d_noise_level(cells, 0, n[d]):
+                why[d] = 6
             continue
 
         # branch starts: always zero; plus the profile-scan ramp start for
@@ -1041,27 +1055,21 @@ def trend2d_fit(acc, cells, k, axes=(), maxiter=1000, tol=1e-10, degree=1):
                 gs[ai] = sv[j]
             if np.max(np.abs(gs)) > 1e-9:
                 starts.append(gs)
-        # A SEARCHED START FOR EVERY COVARIATE, PROVED BY THE HALVES. The
-        # date's own grid is searched over each covariate's whole reach -- a
-        # raster like elevation has no profile to scan, and its peak can sit
-        # across a dip from zero. What the old global argmax got wrong is that
-        # a weak date's largest peak may be a lobe of the SAMPLING lifted by
-        # noise: so the search is repeated on the two checkerboard halves,
-        # independent pixels of the same sampling, and its point is a start
-        # only where both halves' own searches land within the sampling's
+        # THE GRID'S OWN START, PROVED BY THE HALVES. The strongest lattice point
+        # inside the range (trend2d_global(): the padded FFT of the grid, no
+        # search) is a start only where both checkerboard halves' own in-range
+        # peaks, one padded FFT of each half's grid, land within the sampling's
         # resolution of it. A lobe that noise lifted is not lifted twice.
-        if TREND2D_SEARCHED_START and halves[0][d, 2 * K] > 0 \
-                and halves[1][d, 2 * K] > 0:
-            gs = trend2d_search(Sd, cells, k, kg, reach)
-            if np.max(np.abs(gs)) > 1e-9:
-                for tot_h in (halves[0][d], halves[1][d]):
-                    gh = trend2d_search((np.ascontiguousarray(tot_h[:K]),
-                                         np.ascontiguousarray(tot_h[K:2 * K])),
-                                        cells, k, kg, reach)
-                    if np.any(np.abs(gh - gs) > lim[d]):
-                        break
-                else:
-                    starts.append(gs)
+        gin, gl, gstep = trend2d_global(Sd, cells, k, Rg, reach)
+        if np.max(np.abs(gin)) > 1e-9:
+            for tot_h in (halves[0][d], halves[1][d]):
+                gh = trend2d_global((np.ascontiguousarray(tot_h[:K]),
+                                     np.ascontiguousarray(tot_h[K:2 * K])),
+                                    cells, k, Rg, reach)[0]
+                if np.any(np.abs(gh - gin) > lim[d]):
+                    break
+            else:
+                starts.append(gin)
 
         best = None
         failed0 = 0
@@ -1080,6 +1088,28 @@ def trend2d_fit(acc, cells, k, axes=(), maxiter=1000, tol=1e-10, degree=1):
         g[d] = best[0]
         c[d] = float(np.angle(best[1]))
         coh[d] = float(best[2] / max(n[d], 1.0))
+        # THE NOISE LEVEL (why 6): an answer whose coherence is not above
+        # trend2d_noise_level() is what the largest noise lattice point reaches
+        # by chance, so it is not proved. A date the global check rejects (why 5)
+        # is not resolved either; every unresolved date has NaN coherence, after the loop.
+        if coh[d] <= trend2d_noise_level(cells, k, n[d]):
+            why[d] = 6
+            continue
+        # THE GLOBAL CHECK, INSIDE THE RANGE ONLY: the answer stands when the
+        # global lattice's largest value is the same trend, within one step
+        # on every variable. Otherwise its height, read exactly with
+        # trend2d_read(), must beat the answer's by more than 1/sqrt(2n) in
+        # coherence, or the date is not resolved.
+        if degree:
+            if np.any(np.abs(gl - g[d]) > gstep + 1e-9):
+                hg = abs(trend2d_read(Sd, cells, k, gl, kg)[0]) / max(n[d], 1.0)
+                bar = 1.0 / np.sqrt(2.0 * max(n[d], 1.0))
+                if np.isfinite(hg) and hg - coh[d] > bar:
+                    why[d] = 5
+                    print(f"trend2d(): a different trend at {np.round(gl, 3).tolist()} "
+                          f"cycles (coherence {hg:.3f}) beats the answer "
+                          f"{np.round(g[d], 3).tolist()} ({coh[d]:.3f}) by more than "
+                          f"{bar:.3f} -- not resolved", flush=True)
     # THE ERROR BAR IS MEASURED, NOT DERIVED: the same fit on two coarse
     # checkerboard halves, each started from the full solution so the halves
     # answer for noise and not for basins; half the disagreement is the
@@ -1095,8 +1125,6 @@ def trend2d_fit(acc, cells, k, axes=(), maxiter=1000, tol=1e-10, degree=1):
                 Sh = (np.ascontiguousarray(tot_h[:K]),
                       np.ascontiguousarray(tot_h[K:2 * K]))
                 nh = tot_h[2 * K]
-                if nh <= 0:
-                    break
                 m1h = tot_h[2 * K + 1:2 * K + 1 + k]
                 m2h = np.empty((k, k))
                 pp = 2 * K + 1 + k
@@ -1120,8 +1148,6 @@ def trend2d_fit(acc, cells, k, axes=(), maxiter=1000, tol=1e-10, degree=1):
                 continue
             ch = []
             for tot_h in (halves[0][d], halves[1][d]):
-                if tot_h[2 * K] <= 0:
-                    break
                 Th = trend2d_read((np.ascontiguousarray(tot_h[:K]),
                                    np.ascontiguousarray(tot_h[K:2 * K])),
                                   cells, k, np.zeros(k), kg)[0]
@@ -1133,58 +1159,93 @@ def trend2d_fit(acc, cells, k, axes=(), maxiter=1000, tol=1e-10, degree=1):
     resolved = why == 0
     g[~resolved] = np.nan
     c[~resolved] = np.nan
+    # EVERY UNRESOLVED DATE HAS NaN COHERENCE, coherence0 too (so gain is NaN):
+    # the trend is what proves a coherence, so a date with no proved trend has
+    # none. Zero would claim a well determined coherence under the noise level.
+    # pixels and resolution are the sampling's and stay.
+    coh[~resolved] = np.nan
+    coh0[~resolved] = np.nan
     return g, c, coh, coh0, resolved, why, lim, err
 
 
-def trend2d_search(Sd, cells, k, kg, reach):
-    """One spread grid searched for a START, every covariate over its whole reach.
-
-    The grid holds the coherent sum at every gradient, so along one covariate,
-    through the current point, it is a one-dimensional transform: the other
-    axes are contracted at the current gradients and ONE padded FFT reads the
-    whole line. Each round reads every covariate's line from the same point and
-    takes only the single change that raises the sum most, until none does --
-    so the order the covariates were named in cannot matter. Starts from zero
-    and returns zero when nothing is higher. A lattice point, not a solution:
-    the ascent still produces the number.
-    """
-    import numpy as np
-    Sr, Si = _trend2d_parts(Sd)
+def trend2d_global_length(cells):
+    """The padded length N of the global lattice: TREND2D_GLOBAL_OVER x cells,
+    at least the grid's own M so the zero padding never wraps."""
     cells = int(cells)
-    M = cells + 2 * TREND2D_W
-    S = (Sr + 1j * Si).reshape((M,) * k)
-    N = TREND2D_SEARCH_OVER * cells
-    while N < 2 * M:
+    N = TREND2D_GLOBAL_OVER * cells
+    while N < cells + 2 * TREND2D_W:
         N *= 2
-    gj = np.fft.fftfreq(N) * cells                 # turns across the extent
-    # the kernel's own transform on the same lattice divides out of the line
-    Kf = np.abs(np.fft.fft(np.asarray(kg).real, N))
-    band = (np.abs(gj) <= reach - 0.25) & (Kf > 1e-12)
-    Am = trend2d_nodes(cells)
-    gd = np.zeros(k)
-    best = abs(_trend2d_read_parts(Sr, Si, cells, k, gd, kg)[0])
-    if not np.isfinite(best):
-        return gd
-    for _ in range(4 * k):
-        pick = None
-        for a in range(k):
-            line = S
-            for b in range(k - 1, -1, -1):
-                if b != a:
-                    line = np.tensordot(line, np.exp(-2j * np.pi * gd[b] * Am),
-                                        axes=([b], [0]))
-            F = np.abs(np.fft.fft(line, N))
-            F = np.where(band, F / np.where(band, Kf, 1.0), 0.0)
-            cand = gd.copy()
-            cand[a] = gj[int(np.argmax(F))]
-            val = abs(_trend2d_read_parts(Sr, Si, cells, k, cand, kg)[0])
-            if np.isfinite(val) and val > best * (1.0 + 1e-9) \
-                    and (pick is None or val > pick[0]):
-                pick = (val, cand)
-        if pick is None:
-            break
-        best, gd = pick
-    return gd
+    return N
+
+
+def trend2d_global_setup(cells, k):
+    """The global lattice's kernel, once per call: the reciprocal of the kernel's
+    own transform on the padded lattice (one covariate, all alike), and the mask
+    of the lattice points where the product over the k covariates has decayed
+    below 1e-12, the rule trend2d_read() keeps."""
+    import numpy as _np
+    N = trend2d_global_length(cells)
+    Kf = _np.abs(_np.fft.fft(trend2d_kernel(cells).real, N))
+    r = _np.zeros(N, _np.float32)
+    r[Kf > 0] = 1.0 / Kf[Kf > 0]
+    P = Kf
+    for _ in range(k - 1):
+        P = _np.multiply.outer(P, Kf)
+    return r, P >= 1e-12
+
+
+def trend2d_global(Sd, cells, k, setup, reach):
+    """The grid's own largest coherent sum over the whole global lattice, out to
+    +-cells/2 in cycles across the extent, and the strongest lattice point inside
+    `reach` on every covariate: ONE padded FFT of the grid, axis by axis, the kernel
+    divided out on each axis as it is transformed. The last axes are transformed a
+    slab of the first axis at a time, so the work arrays stay small and no
+    full-size absolute value is made.
+    Returns (g_in, g, step): g_in the start of the ascent, g the global peak (the
+    check of trend2d_fit), both in cycles; step the lattice step cells / N, pi/2 across the extent.
+    """
+    import numpy as _np
+    import scipy.fft as _sf
+    r, mask = setup
+    N = trend2d_global_length(cells)
+    M = int(cells) + 2 * TREND2D_W
+    Sr, Si = _trend2d_parts(Sd)
+    X = _np.empty((M,) * k, _np.complex64)
+    X.real = Sr.reshape((M,) * k)
+    X.imag = Si.reshape((M,) * k)
+    Y = _sf.fft(X, n=N, axis=0)
+    del X
+    Y *= r.reshape((N,) + (1,) * (k - 1))
+    gj = _np.fft.fftfreq(N) * cells
+    inr = _np.abs(gj) <= reach
+    B = max(1, 2 ** 22 // N ** (k - 1))
+    bestv, at = -1.0, None
+    bestin, atin = -1.0, None
+    for i0 in range(0, N, B):
+        Z = Y[i0:i0 + B]
+        for a in range(1, k):
+            Z = _sf.fft(Z, n=N, axis=a)
+            Z *= r.reshape([N if b == a else 1 for b in range(k)])
+        V = _np.abs(Z)
+        V *= mask[i0:i0 + B]
+        box = inr[i0:i0 + B].reshape((-1,) + (1,) * (k - 1))
+        for a in range(1, k):
+            box = box & inr.reshape([N if b == a else 1 for b in range(k)])
+        v = V.reshape(-1)
+        j = int(_np.argmax(v))
+        if v[j] > bestv:
+            bestv = float(v[j])
+            idx = _np.unravel_index(j, V.shape)
+            at = (i0 + int(idx[0]),) + tuple(int(x) for x in idx[1:])
+        vi = _np.where(box, V, -1.0).reshape(-1)
+        j = int(_np.argmax(vi))
+        if vi[j] > bestin:
+            bestin = float(vi[j])
+            idx = _np.unravel_index(j, V.shape)
+            atin = (i0 + int(idx[0]),) + tuple(int(x) for x in idx[1:])
+    g = _np.array([gj[i] for i in at])
+    gin = _np.array([gj[i] for i in atin]) if atin is not None else _np.zeros(k)
+    return gin, g, cells / N
 
 
 def _trend2d_ascend(Sd, cells, k, g_init, kg, Xg, nd_, reach, maxiter, tol):

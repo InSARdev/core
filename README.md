@@ -26,8 +26,8 @@ The Cache APIs at insar.dev provide fast access to Sentinel-1 data via NASA ASF 
 - **Per-burst/swath processing** — each Sentinel-1 TOPS burst and NISAR swaths processed independently on a geocoded grid, no frame stitching required
 - **Geometric and xcorr coregistration** — bursts and swaths aligned to a reference via radar-to-geographic transforms and refined by xcorr with differential topo phase correction between reference and repeat geometries
 - **Cloud-native storage** — Zarr v3 with chunked arrays, works with local disk or GCS/S3 via fsspec
-- **GPU-accelerated** — interferogram generation, filtering, detrending, phase unwrapping (1D and 2D) on Apple MPS and NVIDIA CUDA
-- **Fast 2D phase unwrapping** — DCT+IRLS L1-norm solver handles grids up to 40,000×40,000 pixels, robust to phase discontinuities and noise
+- **Multi-core CPU** — interferogram generation, filtering, detrending, phase unwrapping (1D and 2D) on all CPU cores (numba kernels in dask tasks), no GPU required
+- **Fast 2D phase unwrapping** — L1-norm IRLS solver with a multigrid preconditioner that stops at the requested accuracy, robust to phase discontinuities and noise; the grid size is limited only by memory (about 55 bytes per pixel)
 - **Time series analysis** — SBAS and PSI with least-squares and STL decomposition
 - **Dual-polarization support** — all polarization channels (VV+VH or HH+HV) processed separately or together for PolSAR analysis
 - **Ascending and descending on the same grid** — both orbit directions processed in common geocoded coordinates for straightforward vertical and east-west displacement decomposition
@@ -37,9 +37,11 @@ The Cache APIs at insar.dev provide fast access to Sentinel-1 data via NASA ASF 
 
 ## Interactive Examples on Google Colab
 
-All examples are tested to work even on FREE Google Colab instances (2 slow vCPU, 12GB RAM, very slow disk access). For faster processing, preprocess Sentinel-1 or NISAR data at lower resolution and store and reuse preprocessed Zarr stacks to complete InSAR analysis in just 10–15 minutes. You can easily share your results publicly or with selected users, and everyone can reproduce your results fast and for free. That's ideal for educators and students.
+All examples have been tested on free Google Colab instances (2 slow vCPUs, 12 GB of RAM, and very slow disk access), which are temporary and can disconnect at any time. Not every long run succeeds, and Google Colab does not guarantee that processing will complete. A $10/month Google Colab subscription provides access to larger runtimes, where complete PolSAR and InSAR analyses can often be performed in just a few minutes. However, resources are still not guaranteed, so shorter processing runs reduce the risk of interruption.
 
-For a $10/month Google Colab subscription, you get approximately 60 hours of L4 GPU instances—enough to run the NISAR processing example at full resolution 100–300 times (depending on NASA ASF portal download speed) with the full pipeline including SLC data downloading and preprocessing, or more than 500 times using preprocessed Zarr datasets stored on Zenodo, GitHub, etc. Often, complete PolSAR and InSAR analysis can be done in a few minutes. For NISAR, use frequency B to reduce download size and processing time; if better resolution is needed, just rerun the same pipeline with frequency A.
+For faster processing, preprocess Sentinel-1 or NISAR data at a lower resolution, then save and reuse the preprocessed Zarr stacks to complete InSAR analysis in minutes. For NISAR, use frequency B to reduce download size and processing time. If you need higher resolution, simply rerun the same proven pipeline with frequency A.
+
+You can easily share your results publicly or with selected users, allowing others to reproduce them quickly and for free. This makes the examples ideal for educators and students.
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1Sl0gUW693FNRuyZlePR-gy3IFaybmMlX?usp=sharing) NISAR L-band FrequencyA/B Split-Spectrum HH Time Series Analysis for Mexico City Subsidence.
 

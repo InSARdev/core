@@ -53,7 +53,7 @@ def _parse_budget(budget):
 
 def _nodata_of(dtype):
     """THE NODATA VALUE OF A MERGED GRID, by its dtype (to_dataset()): NaN for float and
-    complex grids, -1 for signed integers (fit3d level and conncomp), 0 for unsigned
+    complex grids, -1 for signed integers (fit1d_network level and conncomp), 0 for unsigned
     integers (unwrap2d conncomp: 0 is no component) and False for bool. Not the dtype's
     maximum: 0 and -1 are the values a plot and a colormap handle easily."""
     dtype = np.dtype(dtype)
@@ -287,60 +287,6 @@ def _dissolve_raw_for_dask(current_arr, current_y, current_x,
         return _dissolve_pol_for_dask(da_c, das_o, wrap, extend, weight)
 
 
-
-
-def _apply_gaussian_2d_for_dask(block, weight_block=None, sigmas=None, threshold=0.5,
-                                 device='cpu', pixel_sizes=None, out_dtype=np.float32,
-                                 grid=None, halo=None, block_info=None):
-    """
-    Module-level function for gaussian map_overlap operation.
-
-    Defined at module level to avoid dask serialization issues with nested functions.
-    Handles both 2D (y, x) and 3D (1, y, x) blocks - gaussian_numpy() handles squeeze/unsqueeze.
-
-    THE DECIMATION GRID BELONGS TO THE WHOLE ARRAY, NOT TO THE BLOCK (a filter that decimates, see
-    utils_gaussian.decimation_plan). The decimation cells sit at multiples of `grid` pixels counted from pixel 0 of
-    the array, so every pixel is filtered through the same cells whatever the dask chunks are. A block starts at
-    (chunk start - halo), halo is the overlap depth map_overlap was given (gaussian() passes it here, so the two
-    cannot drift apart), and the rows and columns before its first cell of the array grid are overlap that
-    map_overlap trims: gaussian_numpy leaves them out (skip). block_info locates the block in the OVERLAPPED array,
-    where an inner chunk edge has grown by halo on both sides, so the block starts at location - 2 * halo * chunk
-    index. block_info is None only for dask's zero-size probe of the output type.
-
-    Parameters
-    ----------
-    block : np.ndarray
-        Data block from dask, shape (y, x) or (1, y, x)
-    weight_block : np.ndarray or None
-        Weight block from dask, shape (y, x) or (1, y, x) or None
-    sigmas : tuple
-        Gaussian sigmas (sigma_y, sigma_x)
-    threshold : float
-        Threshold for weighted convolution
-    device : str
-        PyTorch device
-    pixel_sizes : tuple
-        Pixel sizes (dy, dx) in meters
-    out_dtype : np.dtype
-        Output dtype
-    grid : tuple of int or None
-        The decimation cell (y, x) in pixels, None when the filter does not decimate
-    halo : tuple of int
-        The overlap depth (y, x) of the map_overlap that cut this block
-    block_info : dict
-        Supplied by dask.
-    """
-    from .utils_gaussian import gaussian_numpy
-    skip = (0, 0)
-    if grid is not None and block_info is not None:
-        info = block_info[0]
-        skip = tuple((2 * h * i - loc[0]) % g
-                     for loc, i, h, g in zip(info['array-location'][-2:], info['chunk-location'][-2:], halo, grid))
-    # gaussian_numpy handles (1, y, x) -> squeeze -> process -> unsqueeze
-    return gaussian_numpy(block, weight_block, sigma=sigmas, truncate=4.0, threshold=threshold,
-                          device=device, pixel_sizes=pixel_sizes, skip=skip).astype(out_dtype)
-
-
 # rasterio rasterizes in memory inside warnings.catch_warnings, which is process-wide: dask threads entering it together leak its
 # NotGeoreferencedWarning to the display (rasterio 1.4.3, GDAL 3.9.3); one rasterization at a time per process keeps the values
 _GEOMETRY_MASK_LOCK = threading.Lock()
@@ -427,12 +373,6 @@ class BatchCore(dict):
             return self._ds.coords.values()
         def items(self):
             return self._ds.coords.items()
-
-    @staticmethod
-    def _get_torch_device(device='auto', debug=False):
-        """Get PyTorch device. Delegates to utils_torch to avoid circular imports."""
-        from .utils_torch import get_torch_device
-        return get_torch_device(device, debug)
 
     @property
     def is_lazy(self) -> bool:
@@ -1066,7 +1006,7 @@ class BatchCore(dict):
         """predict() and mix() take the Batch a fit returned: None (the name of a fit that did not run, or an
         argument left out) raises the short error here, not an AttributeError or a TypeError of `in None`."""
         if model is None:
-            raise TypeError(f'ERROR: {what}() needs a model, got None. Pass what fit1d(), fit3d() or trend2d() returned.')
+            raise TypeError(f'ERROR: {what}() needs a model, got None. Pass what fit1d(), fit1d_network() or trend2d() returned.')
 
     @staticmethod
     def _needs_vars(batch, what, names, action='Call it on the Dataset batch x.'):
@@ -1121,7 +1061,7 @@ class BatchCore(dict):
     @staticmethod
     def _acquisition_order(batch, who='to_dataset') -> list:
         """THE BURSTS IN ACQUISITION ORDER, earliest first: the one order of every merge
-        of bursts, to_dataset() and fit3d()'s seams, where the MOST RECENT burst wins.
+        of bursts, to_dataset() and fit1d_network()'s seams, where the MOST RECENT burst wins.
 
         Read from each burst's OWN startTime variable (decided 2026-10-01), the one
         a stack loads per date and pairs() gives per pair (the earlier of its two
@@ -1165,7 +1105,7 @@ class BatchCore(dict):
         The class and the grids stay as they are; a burst or a source without startTime is
         left as it is. Not for a transform's grids: they carry no time by design and merge
         in the fullBurstID order, and a startTime there collides with a scalar date
-        coordinate of the data (a fit3d model's)."""
+        coordinate of the data (a fit1d_network model's)."""
         out = {}
         for k, v in dict.items(self):
             s = dict.get(source, k)
@@ -2231,7 +2171,7 @@ class BatchCore(dict):
 
         Examples
         --------
-        >>> disp = (stack.chunk1d('0.5GB').fit3d()
+        >>> disp = (stack.chunk1d('0.5GB').fit1d_network()
         ...              .unwrap3d()
         ...              .displacement_los(stack.transform()))
         """
@@ -3755,7 +3695,7 @@ class BatchCore(dict):
         Examples
         --------
         >>> stack = Stack().load(zarr_path).chunk2d('128MiB')
-        >>> phase, corr = stack.phasediff_multilook(pairs, wavelength=200)
+        >>> intf, corr = stack.pairs(pairs).interferogram(200)
         >>> # Partial merge for faster snapshot + read:
         >>> intfcorr2d.chunk2d('5MB', 20).snapshot('intfcorr2d')
         """
@@ -4279,7 +4219,7 @@ class BatchCore(dict):
         value; pixels no burst covers hold the nodata value.
 
         THE NODATA VALUE IS SET BY THE DTYPE: NaN for float and complex grids,
-        -1 for signed integers (fit3d level and conncomp), 0 for unsigned
+        -1 for signed integers (fit1d_network level and conncomp), 0 for unsigned
         integers (unwrap2d conncomp) and False for bool; every grid keeps its
         own dtype. Integer or bool grids, of one burst or many, print one
         WARNING naming them: replace the nodata value or convert the dtype
@@ -4808,7 +4748,7 @@ class BatchCore(dict):
 
         Every pixel holding a value becomes a point in its burst's layer,
         carrying the batch's variables as attributes. Pixels where every
-        variable is NaN are not written -- a fit3d() model is mostly unsolved,
+        variable is NaN are not written -- a fit1d_network() model is mostly unsolved,
         and those rows would multiply the file by the coverage it does not
         have. A third dimension becomes COLUMNS, one per date or pair, which
         is how a time series is carried in a vector table. A complex variable
@@ -5811,17 +5751,19 @@ class BatchCore(dict):
         wavelength: float,
         weight: BatchUnit | None = None,
         threshold: float = 0.5,
-        device: str = 'auto',
         debug: bool = False
     ) -> Batch:
         """
         2D (yx) Gaussian kernel smoothing (multilook) on each dataset in this Batch.
 
-        A wavelength large against the 67 m processing resolution is filtered on a decimated grid (about 134 m and
-        up on the CPU, 1600 m and up on a GPU). The decimation cells sit at multiples of the decimation step counted
-        from pixel 0 of each burst's grid, so the result depends on the wavelength and on the burst's grid, and does
-        not depend on the dask chunks (up to float rounding). It does depend on cropping the burst: a crop starts its
-        own decimation grid.
+        A wavelength long against the pixels is filtered through a decimated grid (utils_gaussian.decimation_plan):
+        cells of at most a sixteenth of the wavelength reached in steps of 2, the weights carried through, interpolated
+        back bilinearly, so that any wavelength costs about one pass over the data. The cells sit at multiples of the cell
+        counted from pixel 0 of each burst's grid and every block is computed from the window of input it needs, so the
+        result depends on the wavelength and on the burst's grid, and does not depend on the dask chunks. It does depend
+        on cropping the burst: a crop starts its own decimation grid. With a weight, a pixel whose 4 sigma neighbourhood
+        has no weight is NaN directly, while the decimated filter, which reaches a little farther, gives it the weighted
+        mean of its far tail.
 
         Parameters
         ----------
@@ -5839,9 +5781,6 @@ class BatchCore(dict):
             If None, no weighting is applied.
         threshold : float
             Drop-off threshold for the kernel.
-        device : str, optional
-            PyTorch device: 'auto' (default), 'cuda', 'mps', or 'cpu'.
-            'auto' uses GPU if Dask client has resources={'gpu': 1}.
         debug : bool
             Print sigma values if True.
 
@@ -5854,7 +5793,7 @@ class BatchCore(dict):
         import numpy as np
         from .Batch import BatchUnit
         # the cutoff defines half-gain at filter_wavelength
-        from .utils_gaussian import GAUSSIAN_CUTOFF
+        from .utils_gaussian import GAUSSIAN_CUTOFF, gaussian_dask
 
         # A WEIGHT WHERE THE WAVELENGTH GOES is the old argument order, and it
         # would otherwise reach the `wavelength <= 0` test and fail there with
@@ -5893,28 +5832,10 @@ class BatchCore(dict):
             print(f'DEBUG: multilooking sigmas ({sig_y:.2f}, {sig_x:.2f}), wavelength {wavelength:.1f}')
         sigmas = (sig_y, sig_x)
 
-        import dask.array as da
-
-        # Resolve device ONCE here, not in every task
-        # This avoids repeated get_client()/scheduler_info() calls inside workers
-        if device == 'auto':
-            resolved_device = BatchCore._get_torch_device(device, debug=debug)
-            device = resolved_device.type  # 'cpu', 'cuda', or 'mps' as string
-
-        # The decimation the kernel applies (None: direct filtering): it sets the overlap depth and the grid of the
-        # blocks below
-        from .utils_gaussian import decimation_plan
-        plan = decimation_plan(sigmas, (dy, dx), BatchCore._get_torch_device(device).type)
-
-        # THE OVERLAP DEPTH OF THE FILTER (pixels, y and x; truncate=4.0 is used in gaussian_numpy). A decimating filter
-        # takes the depth that makes a block's results those of the whole array and works on the decimation grid of the
-        # whole array (_apply_gaussian_2d_for_dask)
+        # THE REACH OF THE FILTER (pixels, y and x; gaussian_dask truncates at 4 sigmas). A filter that reaches farther
+        # than a burst is long has no room in it: the crop is too small
         truncate = 4.0
-        if plan is None:
-            depth_y, depth_x = int(np.ceil(sigmas[0] * truncate)), int(np.ceil(sigmas[1] * truncate))
-        else:
-            depth_y, depth_x = plan['halo']
-        # A filter that reaches farther than a burst is long has no room in it: the crop is too small
+        depth_y, depth_x = int(np.ceil(sigmas[0] * truncate)), int(np.ceil(sigmas[1] * truncate))
         for key, ds in self.items():
             if depth_y > ds.sizes['y'] or depth_x > ds.sizes['x']:
                 raise ValueError(
@@ -5939,9 +5860,6 @@ class BatchCore(dict):
                     new_vars[var] = data_arr
                     continue
 
-                is_complex = np.issubdtype(data_arr.dtype, np.complexfloating)
-                out_dtype = np.complex64 if is_complex else np.float32
-
                 # Get weight dask array for this variable: the grid of the same name (_weight)
                 weight_dask = BatchCore._weight_of(w, var).data if w is not None else None
 
@@ -5950,91 +5868,28 @@ class BatchCore(dict):
                 if data_arr.ndim == 3 and dask_data.chunks[0][0] != 1:
                     dask_data = dask_data.rechunk({0: 1})
 
-                # the decimation grid of the whole array (_apply_gaussian_2d_for_dask) when the filter decimates
-                grid = plan['scale'] if plan is not None else None
-                overlap_kw = dict(grid=grid, halo=(depth_y, depth_x))
+                # a 2-D weight on 3-D data is shared by every item; otherwise it has the data's shape and chunks
+                if weight_dask is not None and data_arr.ndim == 3 and weight_dask.ndim == 2:
+                    if weight_dask.chunks != dask_data[0].chunks:
+                        raise ValueError(
+                            f"gaussian() weight chunks {weight_dask.chunks} "
+                            f"must match data chunks {dask_data[0].chunks}")
+                elif weight_dask is not None:
+                    if data_arr.ndim == 3 and weight_dask.shape != dask_data.shape:
+                        raise ValueError(
+                            f"gaussian() weight shape {weight_dask.shape} "
+                            f"must match data shape {dask_data.shape}")
+                    if weight_dask.chunks != dask_data.chunks:
+                        raise ValueError(
+                            f"gaussian() weight chunks {weight_dask.chunks} "
+                            f"must match data chunks {dask_data.chunks}")
 
                 if debug:
-                    if data_arr.ndim == 3:
-                        _nc = (len(dask_data.chunks[1]), len(dask_data.chunks[2]))
-                    else:
-                        _nc = (len(dask_data.chunks[0]), len(dask_data.chunks[1]))
-                    print(f'DEBUG: gaussian depth=({depth_y}, {depth_x}), n_chunks={_nc}')
+                    print(f'DEBUG: gaussian depth=({depth_y}, {depth_x}), '
+                          f'n_chunks={(len(dask_data.chunks[-2]), len(dask_data.chunks[-1]))}')
 
-                if data_arr.ndim == 3:
-                    depth_3d = {0: 0, 1: depth_y, 2: depth_x}
-                    depth_2d = {0: depth_y, 1: depth_x}
-                    if weight_dask is not None and weight_dask.ndim == 2:
-                        # 3D data with 2D weight: loop approach (process each date separately)
-                        if weight_dask.chunks != dask_data[0].chunks:
-                            raise ValueError(
-                                f"gaussian() weight chunks {weight_dask.chunks} "
-                                f"must match data chunks {dask_data[0].chunks}")
-                        slices = []
-                        for i in range(dask_data.shape[0]):
-                            result_slice = da.map_overlap(
-                                _apply_gaussian_2d_for_dask,
-                                dask_data[i], weight_dask,
-                                depth=depth_2d, boundary='none',
-                                dtype=out_dtype,
-                                sigmas=sigmas, threshold=threshold,
-                                device=device, pixel_sizes=(dy, dx),
-                                out_dtype=out_dtype, **overlap_kw)
-                            slices.append(result_slice)
-                        result_dask = da.stack(slices, axis=0)
-                    elif weight_dask is not None:
-                        # 3D data with 3D weight: require matching shape/chunks
-                        if weight_dask.shape != dask_data.shape:
-                            raise ValueError(
-                                f"gaussian() weight shape {weight_dask.shape} "
-                                f"must match data shape {dask_data.shape}")
-                        if weight_dask.chunks != dask_data.chunks:
-                            raise ValueError(
-                                f"gaussian() weight chunks {weight_dask.chunks} "
-                                f"must match data chunks {dask_data.chunks}")
-                        result_dask = da.map_overlap(
-                            _apply_gaussian_2d_for_dask,
-                            dask_data, weight_dask,
-                            depth=depth_3d, boundary='none',
-                            dtype=out_dtype,
-                            sigmas=sigmas, threshold=threshold,
-                            device=device, pixel_sizes=(dy, dx),
-                            out_dtype=out_dtype, **overlap_kw)
-                    else:
-                        # No weight: single map_overlap on 3D data
-                        result_dask = da.map_overlap(
-                            _apply_gaussian_2d_for_dask,
-                            dask_data,
-                            depth=depth_3d, boundary='none',
-                            dtype=out_dtype, weight_block=None,
-                            sigmas=sigmas, threshold=threshold,
-                            device=device, pixel_sizes=(dy, dx),
-                            out_dtype=out_dtype, **overlap_kw)
-                else:
-                    # 2D data (y, x)
-                    depth_2d = {0: depth_y, 1: depth_x}
-                    if weight_dask is not None:
-                        if weight_dask.chunks != dask_data.chunks:
-                            raise ValueError(
-                                f"gaussian() weight chunks {weight_dask.chunks} "
-                                f"must match data chunks {dask_data.chunks}")
-                        result_dask = da.map_overlap(
-                            _apply_gaussian_2d_for_dask,
-                            dask_data, weight_dask,
-                            depth=depth_2d, boundary='none',
-                            dtype=out_dtype,
-                            sigmas=sigmas, threshold=threshold,
-                            device=device, pixel_sizes=(dy, dx),
-                            out_dtype=out_dtype, **overlap_kw)
-                    else:
-                        result_dask = da.map_overlap(
-                            _apply_gaussian_2d_for_dask,
-                            dask_data,
-                            depth=depth_2d, boundary='none',
-                            dtype=out_dtype, weight_block=None,
-                            sigmas=sigmas, threshold=threshold,
-                            device=device, pixel_sizes=(dy, dx),
-                            out_dtype=out_dtype, **overlap_kw)
+                result_dask = gaussian_dask(dask_data, weight_dask, sigmas, (dy, dx), threshold=threshold,
+                                            truncate=truncate)
 
                 new_vars[var] = xr.DataArray(
                     result_dask,
@@ -6581,7 +6436,15 @@ class BatchCore(dict):
         import dask.array as _da
 
         # Collect burst data + coordinates (coordinates are numpy, not dask)
-        burst_data = [self[bid][polarization].data for bid in ids]
+        # One delayed block per burst (to_delayed of a single-chunk array): dask.delayed(array) finalises each
+        # array on its own and copies its whole upstream into the graph under renamed keys, once per burst and
+        # per solve step (measured on tur: the input chain 28 times in the graph of align(degree=1)).
+        burst_data = []
+        for bid in ids:
+            arr = self[bid][polarization].data
+            if hasattr(arr, 'to_delayed'):
+                arr = arr.rechunk(arr.shape).to_delayed(optimize_graph=False).ravel()[0]
+            burst_data.append(arr)
         burst_y = [self[bid][polarization].y.values for bid in ids]
         burst_x = [self[bid][polarization].x.values for bid in ids]
 
