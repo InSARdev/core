@@ -63,7 +63,7 @@ class NCubeVTK:
         # https://corteva.github.io/rioxarray/stable/getting_started/getting_started.html
         #import rioxarray as rio
 
-        print ('NOTE: Function is deprecated. Convert Xarray dataset to VTK using Stack.as_vtk()')
+        print ('NOTE: Function is deprecated. Export a Stack or a Batch to VTK using to_vtk()')
 
         if band_mask is not None:
             if band_mask not in dataset.data_vars:

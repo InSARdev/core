@@ -118,7 +118,9 @@ def unzip(url: str, target_dir: str|None = None, buffer_size: int = 4 << 20, ret
           timeout_second: float = 3, min_rate='100KB', min_rate_window: float = 60):
     """
     Stream-download unpacking remote ZIP content via HTTP Range requests.
-    Skips already-extracted files (filling the bar by the compressed size).
+    Skips already-extracted files (filling the bar by the compressed size). Each member is written under a temporary
+    name and renamed when complete (utils_files.write_atomic): an interrupted unzip keeps the members it completed and
+    leaves no partial member.
     Works well with large files on Zenodo not hummering the server.
 
     A range slower than min_rate (bytes per second over min_rate_window seconds, a size string such as '100KB' or
@@ -131,6 +133,7 @@ def unzip(url: str, target_dir: str|None = None, buffer_size: int = 4 << 20, ret
         target_dir = os.path.expanduser(target_dir)
     os.makedirs(target_dir, exist_ok=True)
 
+    from .utils_files import write_atomic
     raw = HTTPRangeReader(url, retries=retries, timeout_second=timeout_second,
                           min_rate=min_rate, min_rate_window=min_rate_window)
     buf = io.BufferedReader(raw, buffer_size=buffer_size)
@@ -157,8 +160,11 @@ def unzip(url: str, target_dir: str|None = None, buffer_size: int = 4 << 20, ret
 
             # extract creating non-empty unlisted directories for all files
             os.makedirs(os.path.dirname(out_path), exist_ok=True)
-            with zf.open(info) as src, open(out_path, "wb") as dst:
-                shutil.copyfileobj(src, dst, length=64 << 10)
+            with zf.open(info) as src:
+                def write(tmp):
+                    with open(tmp, "wb") as dst:
+                        shutil.copyfileobj(src, dst, length=64 << 10)
+                write_atomic(out_path, write)
 
     # downloaded size does not include zip header, central directory, etc.
     # to make progress bar complete, we need to add the remaining size
@@ -630,22 +636,43 @@ def fetch(url: str, session=None, headers=None, magic=None, retries: int = 30, t
             time.sleep(timeout_second)
 
 
-def download_jobs(n_jobs):
-    """
-    The parallel downloads to run for `n_jobs`: at most two per CPU this process may use. Each download unpacks its
-    data in its own process, so more of them than that hold memory and gain nothing: 8 on one CPU took 1 GiB of a
-    2 GB container. A cap is noted. None, 1 and joblib's negative counts are returned as they are.
-    """
+def _cpus():
+    """The CPUs this process may use (os.process_cpu_count, else the affinity mask, else os.cpu_count), at least 1."""
     import os
-    if n_jobs is None or n_jobs <= 1:
-        return n_jobs
     if hasattr(os, 'process_cpu_count'):
         cpus = os.process_cpu_count()
     elif hasattr(os, 'sched_getaffinity'):
         cpus = len(os.sched_getaffinity(0))
     else:
         cpus = os.cpu_count()
-    limit = 2 * max(1, cpus or 1)
+    return max(1, cpus or 1)
+
+
+def joblib_jobs(n_jobs):
+    """
+    The number of jobs for `n_jobs` in joblib's convention: a positive count as it is, -1 all CPUs this process may
+    use, -2 all but one, and so on (at least one); None as it is. 0 raises ValueError, as joblib does.
+
+    >>> joblib_jobs(None) is None
+    True
+    """
+    if n_jobs is None or n_jobs > 0:
+        return n_jobs
+    if n_jobs == 0:
+        raise ValueError('ERROR: n_jobs=0 has no meaning: use a positive count, or a negative one (-1 all CPUs, -2 all but one)')
+    return max(_cpus() + 1 + n_jobs, 1)
+
+
+def download_jobs(n_jobs):
+    """
+    The parallel downloads to run for `n_jobs` (joblib's convention, see joblib_jobs): at most two per CPU this process
+    may use. Each download unpacks its data in its own process, so more of them than that hold memory and gain nothing:
+    8 on one CPU took 1 GiB of a 2 GB container. A cap is noted. None and 1 are returned as they are.
+    """
+    n_jobs = joblib_jobs(n_jobs)
+    if n_jobs is None or n_jobs <= 1:
+        return n_jobs
+    limit = 2 * _cpus()
     if n_jobs > limit:
         print(f'NOTE: {n_jobs} parallel downloads capped at {limit}, two per CPU.')
         return limit
@@ -656,7 +683,8 @@ def download(url: str, dst: str, retries: int = 30, timeout_second: float = 3, t
              min_rate='100KB', min_rate_window: float = 60):
     """
     Download url into the file dst, written as the body arrives (iter_body), so that the memory used is one
-    network read whatever the size of the file.
+    network read whatever the size of the file. The body is written under the temporary name dst + '.tmp' and renamed
+    to dst when complete (utils_files.write_atomic): an interrupted transfer leaves no file under dst.
 
     A dst whose size reaches the Content-Length is kept; an incomplete one is removed and downloaded again. Every
     failure that a retry can change, also a transfer slower than min_rate, restarts the download from its first
@@ -684,6 +712,7 @@ def download(url: str, dst: str, retries: int = 30, timeout_second: float = 3, t
     import time
     import requests
     from tqdm.auto import tqdm
+    from .utils_files import write_atomic
 
     downloaded = os.path.getsize(dst) if os.path.exists(dst) else 0
     head = send(requests.head, url, allow_redirects=True, timeout=timeout)
@@ -700,11 +729,13 @@ def download(url: str, dst: str, retries: int = 30, timeout_second: float = 3, t
         try:
             with send(requests.get, url, stream=True, timeout=timeout) as resp:
                 total = int(resp.headers.get('content-length', 0))
-                with open(dst, 'wb') as f, \
-                     tqdm(total=total, unit="B", unit_scale=True, unit_divisor=1024,
-                          desc=os.path.basename(dst)) as bar:
-                    for chunk in iter_body(resp, min_rate, min_rate_window, progress=bar.update):
-                        f.write(chunk)
+                def write(tmp):
+                    with open(tmp, 'wb') as f, \
+                         tqdm(total=total, unit="B", unit_scale=True, unit_divisor=1024,
+                              desc=os.path.basename(dst)) as bar:
+                        for chunk in iter_body(resp, min_rate, min_rate_window, progress=bar.update):
+                            f.write(chunk)
+                write_atomic(dst, write)
             return
         except Exception as e:
             stop = final(e)

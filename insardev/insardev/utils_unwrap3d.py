@@ -17,17 +17,17 @@ construction and no network inversion follows.
 """
 import numpy as np
 import numba as nb
+from .utils_circular import wrap_phase, wrap_phase_scalar
 
 
 def wrap(data_pairs):
     """Wrap phase to [-pi, pi] range."""
     import xarray as xr
-    import dask
 
     if isinstance(data_pairs, xr.DataArray):
-        return xr.DataArray(dask.array.mod(data_pairs.data + np.pi, 2 * np.pi) - np.pi, data_pairs.coords)\
+        return xr.DataArray(wrap_phase(data_pairs.data), data_pairs.coords)\
             .rename(data_pairs.name)
-    return np.mod(data_pairs + np.pi, 2 * np.pi) - np.pi
+    return wrap_phase(data_pairs)
 
 
 
@@ -112,7 +112,7 @@ def _unwrap3d_dates_kernel(phi, ok, i1, i2, wgt, tyr, max_iter, search,
                     dt = tyr[bb] - tyr[aa]
                     if dt > 1e-9 and dt <= dtcut:
                         dif = phi[bb, px] - phi[aa, px]
-                        dif = dif - 2 * np.pi * np.floor((dif + np.pi) / (2 * np.pi))
+                        dif = wrap_phase_scalar(dif)
                         rate[nd1] = dif / dt
                         nd1 += 1
                 if nd1 >= 3:
@@ -127,7 +127,7 @@ def _unwrap3d_dates_kernel(phi, ok, i1, i2, wgt, tyr, max_iter, search,
         for _tr in range(n_trend):
             for d in range(n_dates):
                 phid[d] = phi[d, px] - vhat * tyr[d]
-                phid[d] = phid[d] - 2 * np.pi * np.floor((phid[d] + np.pi) / (2 * np.pi))
+                phid[d] = wrap_phase_scalar(phid[d])
             # at most one date can be dropped per attempt, and dropping stops
             # at min_dates, so that bound IS the iteration bound -- no separate
             # max_drop knob to disagree with it
@@ -143,7 +143,7 @@ def _unwrap3d_dates_kernel(phi, ok, i1, i2, wgt, tyr, max_iter, search,
                         nn[d] = 0.0
                     else:
                         dif = phid[d] - phid[prev]
-                        dif = dif - 2 * np.pi * np.floor((dif + np.pi) / (2 * np.pi))
+                        dif = wrap_phase_scalar(dif)
                         run = run + dif
                         nn[d] = np.rint((run - phid[d]) / (2 * np.pi))
                         run = phid[d] + 2 * np.pi * nn[d]
@@ -197,7 +197,7 @@ def _unwrap3d_dates_kernel(phi, ok, i1, i2, wgt, tyr, max_iter, search,
                         if abs(tyr[q] - tyr[d]) > short_yr:
                             continue
                         dif = phid[d] - phid[q]
-                        dif = dif - 2 * np.pi * np.floor((dif + np.pi) / (2 * np.pi))
+                        dif = wrap_phase_scalar(dif)
                         pred[nc] = np.rint((Phi[q] + dif - phid[d]) / (2 * np.pi))
                         nc += 1
                     if nc < 3:

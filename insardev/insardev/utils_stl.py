@@ -70,6 +70,61 @@ def stl1d(ts, dt, dt_periodic, periods=52, robust=False):
     return res.trend, res.seasonal, res.resid
 
 
+def stl_block(data_block, dt, dt_periodic, periods=52, robust=False, *, budget_bytes):
+    """
+    Decompose each pixel of a (date, y, x) block by stl1d, tile by tile.
+
+    A tile holds as many pixels as fit in budget_bytes (at least 256 pixels).
+
+    Parameters
+    ----------
+    data_block : numpy.ndarray
+        Input block with dimensions (date, y, x).
+    dt : numpy.ndarray
+        Original dates as int64 nanoseconds (see stl_periodic).
+    dt_periodic : numpy.ndarray
+        Periodic dates as int64 nanoseconds (see stl_periodic).
+    periods : int, optional
+        Number of periods for seasonal decomposition (default 52).
+    robust : bool, optional
+        Whether to use a robust fitting procedure (default False).
+    budget_bytes : int
+        Memory budget of one tile in bytes.
+
+    Returns
+    -------
+    numpy.ndarray
+        float32 array with dimensions (component, date, y, x): trend, seasonal and residual.
+    """
+    import math
+    n_dates_out = len(dt_periodic)
+    ny, nx = data_block.shape[1], data_block.shape[2]
+    n_dates_in_local = data_block.shape[0]
+    result = np.empty((3, n_dates_out, ny, nx), dtype=np.float32)
+    vec_stl = np.vectorize(
+        lambda ts: stl1d(ts, dt, dt_periodic, periods, robust),
+        signature='(n)->(m),(m),(m)'
+    )
+    per_pixel_bytes = (n_dates_in_local + 3 * n_dates_out) * 4
+    max_sub_pixels = max(256, budget_bytes // max(1, per_pixel_bytes))
+    sub_side = int(math.sqrt(max_sub_pixels))
+    sub_h = min(sub_side, ny)
+    sub_w = min(sub_side, nx)
+    for ty0 in range(0, ny, sub_h):
+        ty1 = min(ty0 + sub_h, ny)
+        for tx0 in range(0, nx, sub_w):
+            tx1 = min(tx0 + sub_w, nx)
+            tile = data_block[:, ty0:ty1, tx0:tx1]
+            tile_t = tile.transpose(1, 2, 0)
+            del tile
+            block = np.asarray(vec_stl(tile_t))
+            del tile_t
+            result[:, :, ty0:ty1, tx0:tx1] = block.transpose(0, 3, 1, 2)
+            del block
+    del vec_stl
+    return result
+
+
 def stl_periodic(dates, freq='W'):
     """
     Compute periodic time values for STL decomposition.
@@ -85,7 +140,7 @@ def stl_periodic(dates, freq='W'):
     -------
     dt : numpy.ndarray
         Original dates as int64 nanoseconds.
-    dt_periodic : xarray.DataArray
+    dt_periodic : numpy.ndarray
         Periodic time values as int64 nanoseconds.
     """
     import pandas as pd
@@ -99,4 +154,4 @@ def stl_periodic(dates, freq='W'):
     dates_weekly = pd.date_range(dates[0], dates[-1], freq=freq)
     dt_weekly = xr.DataArray(dates_weekly, dims=['date'])
     dt_periodic = dt_weekly.astype(np.int64)
-    return (dt, dt_periodic)
+    return (dt, dt_periodic.values)

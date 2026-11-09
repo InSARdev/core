@@ -54,14 +54,17 @@ def _welford(chunk, factors, count, mean, m2):
 
 @_numba.njit(nogil=True, cache=True)
 def _finish(count, mean, m2, out):
-    """psfunction = mean / (2 std), std with n - 1; NaN where no value or the ratio is not finite."""
+    """psfunction = mean / (2 std), std with n - 1; NaN where no value, where the std is 0 (one finite date or a constant
+    pixel) or where the ratio is not finite."""
     H, W = count.shape
     for y in range(H):
         for x in range(W):
             c = count[y, x]
             v = np.nan
             if c > 0:
-                v = mean[y, x] / (2.0 * np.sqrt(m2[y, x] / max(c - 1.0, 1.0)))
+                std = np.sqrt(m2[y, x] / max(c - 1.0, 1.0))
+                if std > 0.0:
+                    v = mean[y, x] / (2.0 * std)
             out[y, x] = np.float32(v) if np.isfinite(v) else np.float32(np.nan)
 
 
@@ -109,3 +112,25 @@ def psfunction_block(chunks):
     out = np.empty((H, W), np.float32)
     _finish(count, mean, m2, out)
     return out
+
+
+def psfunction_dyx(chunks):
+    """
+    psfunction_block() of the (date, height, width) chunks of a spatial block: each chunk is viewed with the dates on the
+    last axis (no copy), so the kernels get the arrays they always got.
+
+    Parameters
+    ----------
+    chunks : list of np.ndarray
+        Complex SLC chunks of the block, each (date, height, width).
+
+    Returns
+    -------
+    np.ndarray
+        (height, width) float32.
+
+    Examples
+    --------
+    >>> psf = psfunction_dyx([slc])
+    """
+    return psfunction_block([c.transpose(1, 2, 0) for c in chunks])

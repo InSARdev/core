@@ -244,7 +244,7 @@ def goldstein(phase_np, corr_np, psize_y, psize_x, threshold=0.5, skip=(0, 0)):
     n_patches_x = (padded_nx - psize_x) // step_x + 1
 
     # Patch rows per strip: about 40 bytes per patch pixel within half of the Dask chunk size
-    budget = get_dask_chunk_size_mb() * 1024 * 1024 // 2
+    budget = int(get_dask_chunk_size_mb() * 2 ** 20) // 2
     rows_per_strip = max(1, budget // (n_patches_x * psize_y * psize_x * 40))
 
     out = np.zeros((sy + padded_ny, sx + padded_nx), dtype=np.complex64)

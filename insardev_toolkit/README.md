@@ -10,7 +10,7 @@ Utility functions and helper tools for the InSAR.dev ecosystem.
 - Map tile downloading (XYZ, OpenStreetMap, Google Maps)
 - ERA5 pressure-level downloading: the ECMWF reanalysis on 37 pressure levels from the Google ARCO v3 copy (ERA5T for the latest hours), cut to 1-degree tiles
 - VMF3 tropospheric grid downloading (TU Wien): 6-hourly grids cut to 1-degree tiles by byte ranges, node heights kept
-- IONEX global ionosphere maps downloading (CODE final, NASA CDDIS): one NetCDF4 file per UTC day
+- IONEX global ionosphere maps downloading (CODE final, NASA CDDIS): one file per UTC day, stored and read as published
 - Tropospheric and ionospheric phase of the stores through one evaluator (`utils_atmosphere.py`, with the tables of `utils_tropo.py` and `utils_iono.py`)
 - Progress bars with parallel processing support
 - NetCDF and xarray data grid operations
@@ -32,11 +32,12 @@ from insardev_toolkit import ERA5, IONEX, VMF3
 ERA5().download('atmosphere', scenes)                 # hourly epochs, 37 pressure levels, one VRT index
 ERA5().download('atmosphere', names, geometry=area)   # the same from a list of scene names
 VMF3().download('atmosphere', scenes, product='OP')   # 6-hourly grids: OP, EI or FC; n_jobs=8 by default
-IONEX().download('atmosphere', scenes, username='<earthdata user>', password='<earthdata password>')  # daily CODE final maps
-IONEX().download('atmosphere', names, username='<earthdata user>', password='<earthdata password>')   # the same from a list of scene names
+IONEX().download('atmosphere', scenes)               # daily CODE final maps through the insar.dev cache, no account
+IONEX().download('atmosphere', names)                # the same from a list of scene names
+IONEX('<earthdata user>', '<earthdata password>').download('atmosphere', scenes)  # the same from CDDIS with an Earthdata Login account
 ```
 
-IONEX needs the Earthdata Login account in its `username` and `password` arguments, and raises when either is missing.
+IONEX takes an optional Earthdata Login account in its constructor, `IONEX(username, password)`: without it the day files come through the insar.dev cache (no account), with it they come from CDDIS directly. A day file already held in the download folder is never fetched again, and `download` raises for a username without its password.
 
 Tiles: a tile is a 1-degree cell, lon -180..180, half-open, named by its lower-left corner. One NetCDF4 file per tile and
 epoch, in `basedir/<SOURCE>/`; the index is `basedir/<SOURCE>.vrt`, one GDAL multidimensional VRT with the dimensions
@@ -60,9 +61,8 @@ atmosphere/
   VMF3_OP.vrt                           one multidimensional index: ah, aw, zhd, zwd and orography over (epoch, lat, lon)
   VMF3_EI/, VMF3_EI.vrt                 the same for the EI product
   VMF3_FC/, VMF3_FC.vrt                 the same for the FC product
-  IONEX/<name as published>             the file as served, verified in memory before it is kept
-  IONEX/<yyyymmdd>.nc                   one NetCDF4 file per UTC day, 25 maps, values as published
-  IONEX.vrt                             one multidimensional index over the day files present: tec (Int32, as published) over (epoch, lat, lon); epoch in seconds since 1970, the maps in order
+  IONEX/<name as published>             one file per UTC day as served (COD0OPSFIN_<yyyy><ddd>0000_01D_01H_GIM.INX.gz; before 2022-11-27 codg<ddd>0.<yy>i.Z), verified in memory before it is kept; the maps are read from it (gzip, or compress through ncompress)
+  IONEX.vrt                             one multidimensional index over the day files present, from their headers: tec (Int32, as published) over (epoch, lat, lon); epoch in seconds since 1970, the maps in order
 ```
 
 Append mode: a tile file that exists and reads is kept and listed as `existing`, and no byte of it is requested. New tiles
@@ -82,7 +82,7 @@ The atmosphere modules are not exported by the package; they are imported as mod
 
 ### Atmosphere delays
 
-`model_class(folder)().open(folder, times, crs, wavelength, factor)` (module `utils_atmosphere`) opens a model folder once per stack and returns an `OpenedModel`. `phase(times, y, x, ele, inc, look)` gives the phase of one burst on one output chunk: numpy in, numpy out. `look` (degrees) is needed by IONEX only. A dask array of `ele` (ellipsoidal height, m) or `inc` (incidence, rad) gives a lazy `(time, y, x)` float32 array with the chunks of `ele`, one task per output chunk. `folder` is the download `basedir`, the folder that holds `ERA5.vrt`, `VMF3_OP.vrt` or `IONEX.vrt`.
+`model_class(folder)().open(folder, times, crs, wavelength, factor, heights)` (module `utils_atmosphere`) opens a model folder once per stack and returns an `OpenedModel`. `heights` is `(lo, hi)`, the ellipsoidal metres of the caller's pixels: the ERA5 and VMF3 zenith tables then cover that range (one row beyond each end, on the global grid); `None` gives the envelope -500 m to 9000 m at the model's table step (ERA5 2 m, VMF3 5 m). IONEX ignores it. `phase(times, y, x, ele, inc, look)` gives the phase of one burst on one output chunk: numpy in, numpy out. `look` (degrees) is needed by IONEX only. A dask array of `ele` (ellipsoidal height, m) or `inc` (incidence, rad) gives a lazy `(time, y, x)` float32 array with the chunks of `ele`, one task per output chunk. `folder` is the download `basedir`, the folder that holds `ERA5.vrt`, `VMF3_OP.vrt` or `IONEX.vrt`.
 
 ```python
 from insardev_toolkit.utils_atmosphere import model_class
@@ -91,7 +91,7 @@ opened = model_class('atmosphere')().open('atmosphere', times, 32637, 299792458.
 phase = opened.phase(times, y, x, ele, inc, look)   # ele in metres, inc in radians, look in degrees
 ```
 
-- Per node and stack time, the zenith delays are tables over the ellipsoidal height (-500 m to 9000 m, 10 m step), in phase units. `utils_tropo.zenith_tiles` builds them for ERA5 and VMF3, `utils_iono.zenith_tiles` for IONEX. Each tile is read once per opened model and computed only when a phase chunk needs it.
+- Per node and stack time, the zenith delays are tables over the ellipsoidal height (the caller's height range, or the envelope -500 m to 9000 m; step 2 m for ERA5, 5 m for VMF3), in phase units. `utils_tropo.zenith_tiles` builds them for ERA5 and VMF3, `utils_iono.zenith_tiles` for IONEX. Each tile is read once per opened model and computed only when a phase chunk needs it.
 - The mapping coefficients (`a`, `b`, `c`) are kept per node and time and applied at the pixel: GMF for ERA5, VMF3 for VMF3. IONEX is a table of one entry with the shell mapping `1 / sqrt(1 - (k sin z)^2)`, `k = R / (R + H)`.
 - A pixel is bilinear over the 4 reprojected nodes of its lattice cell. For ERA5 and VMF3 the cell is the pixel's, and each node is evaluated at the pixel height (the tables interpolated linearly) and incidence. IONEX is evaluated at the line-of-sight pierce point of the pixel, which needs the look azimuth: its cell and its mapping (at the effective incidence z' of TN-200 Eq. 22) are those of the pierce point. One kernel serves all three.
 - A pixel height outside the table range (ERA5, VMF3) or an incidence outside [0, 90) degrees raises one `ERROR:` line, and so does a non-finite pixel coordinate, for every model. A NaN height or incidence gives NaN for every model; a NaN look gives NaN for IONEX, the only model that uses the look. A pixel deeper below a node's surface than the ERA5 tables reach is NaN, with a warning.

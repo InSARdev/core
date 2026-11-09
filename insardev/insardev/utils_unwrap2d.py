@@ -21,6 +21,7 @@ component detection, and component linking.
 import math
 import numpy as np
 import numba as nb
+from .utils_circular import wrap_phase, wrap_phase_scalar
 import rocket_fft  # noqa: F401  (the scipy.fft overloads inside numba)
 import scipy.fft
 
@@ -811,7 +812,7 @@ def connect_components_ilp_fast(unwrapped, labeled_array, components, connection
 
 def wrap(phase):
     """Wrap phase to [-π, π]."""
-    return np.arctan2(np.sin(phase), np.cos(phase))
+    return wrap_phase(phase)
 
 
 def wrapped_gradient(phase):
@@ -849,7 +850,7 @@ _OLD_IRLS = ('tol', 'cg_max_iter', 'cg_tol', 'device', 'semaphore')
 
 @nb.njit(nogil=True, cache=True, inline='always')
 def _wrap(d):
-    return d - 2.0 * math.pi * math.floor(d / (2.0 * math.pi) + 0.5)
+    return wrap_phase_scalar(d)
 
 
 @nb.njit(nogil=True, cache=True, inline='always')
@@ -1597,7 +1598,7 @@ def _postprocess(unwrapped, phi, nan_mask, conncomp_size):
                                                                   unwrapped_flat.astype(np.float32), n_labels)
     cf = np.maximum(count.astype(np.float64), 1)
     d = np.arctan2(sin_in / cf, cos_in / cf) - np.arctan2(sin_out / cf, cos_out / cf)
-    adjustment = np.arctan2(np.sin(d), np.cos(d))
+    adjustment = wrap_phase(d)
     adjustment[0] = 0
     _apply_adjustment(unwrapped_flat, labeled_flat, adjustment)
     sizes = count[1:n_labels]
@@ -1684,6 +1685,8 @@ def irls_unwrap_2d(phase, weight=None, accuracy=2e-3, max_iter=100, epsilon=1e-2
 
 def detect_discontinuity_hough_focal(phase, grad_threshold=2.0, mask_width=3, debug=False):
     """
+    Experimental (not tested): discontinuity detection of one wrapped phase (Hough focal method); no test or notebook calls it yet.
+
     Detect discontinuity using Hough transform with focal point (tip) detection.
 
     Finds the fault direction via Hough transform, then locates the tip
@@ -1863,3 +1866,106 @@ def _warmup_numba_cache():
 _warmup_numba_cache()
 
 
+def irls_unwrap_block(phase_blocks, weight_blocks, params):
+    """One raster of Stack.unwrap2d_irls(): the result and the labels stacked as (2, y, x) float32, (1, 2, y, x) with a
+    pair axis."""
+    accuracy, max_iter, epsilon, conncomp_size, threads, debug, lead = params
+    unwrapped, conncomp = irls_unwrap_2d(phase_blocks, weight_blocks, accuracy=accuracy, max_iter=max_iter,
+                                                         epsilon=epsilon, conncomp_size=conncomp_size, threads=threads,
+                                                         debug=debug)
+    out = np.stack([unwrapped, conncomp.astype(np.float32)])
+    return out[np.newaxis] if lead else out
+
+
+def link_components_2d(phase, conncomp=None, conncomp_size=100, conncomp_gap=None,
+                       conncomp_linksize=5, conncomp_linkcount=30, debug=False):
+    """Link the disconnected components of one 2D raster by their 2 pi offsets (ILP, connect_components_ilp_fast).
+
+    conncomp: the size-ordered labels of IRLS (1=largest), or None to label the raster here.
+    Components smaller than conncomp_size are set to NaN before the linking.
+    """
+    import time
+    from scipy import ndimage
+
+    # Find connected components - use pre-computed or compute fresh
+    valid_mask = ~np.isnan(phase)
+    if not np.any(valid_mask):
+        return phase
+
+    min_size = max(conncomp_size, 4)
+    if debug:
+        print(f'  Component filtering: conncomp_size={conncomp_size}, min_size={min_size}')
+
+    if conncomp is not None:
+        # Use pre-computed conncomp from IRLS (size-ordered: 1=largest, 2=second, etc.)
+        labeled = conncomp.astype(np.int32)
+        n_total = int(labeled.max())
+        sizes = np.bincount(labeled.ravel(), minlength=n_total + 1)
+        slices = ndimage.find_objects(labeled)
+        # Build components list - already size-ordered, just filter by min_size
+        components = [
+            {'label': i, 'size': sizes[i], 'slices': slices[i - 1] if i > 0 and i <= len(slices) else None}
+            for i in range(1, n_total + 1)
+            if sizes[i] >= min_size and (i <= len(slices) and slices[i - 1] is not None)
+        ]
+        if debug:
+            print(f'  Using pre-computed conncomp: {n_total} components, {len(components)} after size filter')
+    else:
+        labeled, components, n_total, sizes = get_connected_components(valid_mask, min_size)
+
+    # Filter small components BEFORE linking - set to NaN
+    linked_labels = np.array([comp['label'] for comp in components])
+    is_linked = np.isin(labeled, linked_labels) | (labeled == 0)
+    phase = phase.copy()
+    phase[~is_linked] = np.nan
+
+    if debug:
+        n_filtered = n_total - len(components)
+        print(f'  Filtered {n_filtered} small components (< {min_size} pixels)')
+
+    if len(components) < 2:
+        return phase
+
+    if debug:
+        gap_str = 'unlimited' if conncomp_gap is None else str(conncomp_gap)
+        print(f'  Linking {len(components)} components (conncomp_gap={gap_str})...')
+        t0 = time.time()
+
+    # Find connections using labeled array (memory efficient - no boolean masks)
+    connections = find_component_connections_fast(
+        labeled, phase, components,
+        conncomp_gap=conncomp_gap, max_neighbors=conncomp_linkcount,
+        n_neighbors=conncomp_linksize
+    )
+
+    if debug:
+        print(f'    Found {len(connections)} connections')
+
+    if len(connections) == 0:
+        return phase
+
+    # Apply ILP to find optimal offsets (using labeled array, memory efficient)
+    result = connect_components_ilp_fast(
+        phase, labeled, components, connections,
+        max_time=60.0, debug=debug
+    )
+
+    if debug:
+        elapsed = time.time() - t0
+        print(f'  Component linking done ({elapsed:.2f}s)')
+
+    return result
+
+
+def link_components_block(phase, conncomp=None, conncomp_size=100, conncomp_gap=None,
+                          conncomp_linksize=5, conncomp_linkcount=30, debug=False):
+    """link_components_2d() of one dask block: a (1, y, x) block is one raster and comes back with its axis."""
+    squeeze = phase.ndim == 3 and phase.shape[0] == 1
+    if squeeze:
+        phase = phase[0]
+    if conncomp is not None and conncomp.ndim == 3 and conncomp.shape[0] == 1:
+        conncomp = conncomp[0]
+    result = link_components_2d(phase, conncomp, conncomp_size=conncomp_size, conncomp_gap=conncomp_gap,
+                                conncomp_linksize=conncomp_linksize, conncomp_linkcount=conncomp_linkcount,
+                                debug=debug)
+    return result[np.newaxis, ...] if squeeze else result

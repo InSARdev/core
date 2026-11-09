@@ -295,7 +295,8 @@ class Tiles(datagrid, progressbar_joblib):
             Resolution of the tiles: '1s' (30 m) or '3s' (90 m); any other value raises an AssertionError.
         n_jobs : int or None
             Parallel tile downloads (joblib), at most two per CPU this process may use (a larger number is capped,
-            with a note). None runs them one after another.
+            with a note). Negative values follow joblib: -1 all CPUs, -2 all but one, and so on; 0 raises ValueError.
+            None runs them one after another.
         joblib_backend : str
             Backend of the parallel tile downloads; replaced by 'sequential' when n_jobs is None or debug is True.
         skip_exist : bool
@@ -486,6 +487,9 @@ class Tiles(datagrid, progressbar_joblib):
         """
         Download land mask tiles.
 
+        n_jobs follows joblib: -1 all CPUs, -2 all but one, and so on; 0 raises ValueError (the parallel
+        downloads of Tiles.download).
+
         from pygmtsar import Tiles
         landmask = Tiles().download_landmask(AOI)
         landmask.plot.imshow()
@@ -517,6 +521,9 @@ class Tiles(datagrid, progressbar_joblib):
                          timeout_second=3, min_rate='100KB', min_rate_window=60, debug=False):
         """
         Download Copernicus GLO-30/GLO-90 Digital Elevation Model tiles from open AWS storage.
+
+        n_jobs follows joblib: -1 all CPUs, -2 all but one, and so on; 0 raises ValueError (the parallel
+        downloads of Tiles.download).
 
         from pygmtsar import Tiles
         dem = Tiles().download_dem_glo(AOI)
@@ -554,6 +561,9 @@ class Tiles(datagrid, progressbar_joblib):
                           timeout_second=3, min_rate='100KB', min_rate_window=60, debug=False):
         """
         Download NASA SRTM Digital Elevation Model tiles from open AWS storage.
+
+        n_jobs follows joblib: -1 all CPUs, -2 all but one, and so on; 0 raises ValueError (the parallel
+        downloads of Tiles.download).
 
         from pygmtsar import Tiles
         dem = Tiles().download_dem_srtm(AOI)
@@ -595,6 +605,9 @@ class Tiles(datagrid, progressbar_joblib):
                           timeout_second=3, min_rate='100KB', min_rate_window=60, debug=False):
             """
             Download JAXA ALOS Digital Elevation Model tiles from open JAXA storage.
+
+        n_jobs follows joblib: -1 all CPUs, -2 all but one, and so on; 0 raises ValueError (the parallel
+        downloads of Tiles.download).
 
             from pygmtsar import Tiles
             Tiles().download_dem_alos(AOI, filename='dem.vrt').plot.imshow(cmap='terrain')
@@ -650,7 +663,8 @@ class Tiles(datagrid, progressbar_joblib):
             If True, keeps the tiles already downloaded. Default is True.
         n_jobs : int, optional
             The number of concurrent download jobs, at most two per CPU this process may use (a larger number is
-            capped, with a note). Default is 8.
+            capped, with a note). Negative values follow joblib: -1 all CPUs, -2 all but one, and so on; 0 raises
+            ValueError. Default is 8.
         retries : int, optional
             Download attempts per tile. Default is 30.
         timeout_second : float, optional

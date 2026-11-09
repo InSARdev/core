@@ -12,7 +12,7 @@ Tropospheric delays of a model folder: model() names its index, verify() checks 
 zenith delay tables per tile as lazy dask chunks.
 
 The folder holds one index written by utils_epochs.store(): VMF3_OP, VMF3_EI or VMF3_FC (6-hourly) or ERA5 (hourly,
-pressure levels). Tables are in metres over the ellipsoidal height _TABLE_H0 + k _TABLE_STEP.
+pressure levels). Tables are in metres over the ellipsoidal heights of the caller's range on the global grid _TABLE_H0 + k step (_table_rows).
 """
 import datetime
 from collections import namedtuple
@@ -299,6 +299,37 @@ def _plan(times, hours):
         else:
             out.append((e0, e0 + step, (t - e0) / step))
     return out
+
+
+def _epoch_groups(plan):
+    """
+    The times grouped by shared bracketing epochs: the connected components of the times through their epochs, in the order of
+    their first time. A stack gives one group per date (the bursts of one date together).
+
+    Parameters: plan (list of (e0, e1, w), see _plan). Returns: list of lists of time indices, each list in time order.
+
+    Examples
+    --------
+    >>> _epoch_groups(_plan([pd.Timestamp('2016-05-11 08:30'), pd.Timestamp('2016-05-11 08:45')], 1))
+    """
+    parent = {}
+
+    def find(e):
+        parent.setdefault(e, e)
+        while parent[e] != e:
+            parent[e] = parent[parent[e]]
+            e = parent[e]
+        return e
+
+    for e0, e1, w in plan:
+        if e1 is not None:
+            parent[find(e0)] = find(e1)
+        else:
+            find(e0)
+    groups = {}
+    for k, (e0, e1, w) in enumerate(plan):
+        groups.setdefault(find(e0), []).append(k)
+    return list(groups.values())
 
 
 def _tiles(index, name):
@@ -728,8 +759,9 @@ def _zenith_kernel(sp, phis, geo, tt, qq, cl, P, und, g0, c1, h0, step, hyd, wet
 
 def _zenith_warnings(counts):
     """
-    The warning lines for the nonzero counts of _zenith_kernel: the held heights, and the table entries below the
-    surface law that are NaN.
+    The warning lines for the nonzero counts of _zenith_kernel from counts[1:]: the levels out of pressure order, the
+    pressure not monotone, the heights held at the level beneath, and the NaN table entries below the surface law.
+    counts[0] (levels above the surface held at the surface geopotential) is the specified processing and is not warned.
 
     Parameters: counts (int64 array). Returns: None.
 
@@ -737,13 +769,12 @@ def _zenith_warnings(counts):
     --------
     >>> _zenith_warnings(np.zeros(_ZENITH_COUNTS, dtype=np.int64))
     """
-    texts = ('the ERA5 geopotential of {} levels above the surface lies below the surface geopotential; they are held at the surface value',
-             'the ERA5 levels are not in pressure order: {} levels above the surface take the values of the level at the surface index',
+    texts = ('the ERA5 levels are not in pressure order: {} levels above the surface take the values of the level at the surface index',
              'the ERA5 levels are not in pressure order: {} levels have a pressure above the surface pressure; they are held at the surface pressure',
              'the ERA5 pressure is not monotone in {} levels; they are held at the level beneath',
              'the ERA5 geometric heights fell below the level beneath in {} node sub-steps (the geopotential is not monotone); they are held at that level',
              'the ERA5 zenith tables have {} entries deeper below the node surface than the law below the surface reaches (the entries are NaN)')
-    for n, text in zip(counts, texts):
+    for n, text in zip(counts[1:], texts):
         if n:
             warnings.warn(text.format(int(n)))
 
@@ -1041,10 +1072,41 @@ def vmf3_zenith_tables(ah, aw, zhd, zwd, orography, lat, lon, epochs, first, sec
                         _fold(mapping, first, second, w0, w1), np.array([1e-3, *_HT_COEF]))
 
 
-# _TABLE_COUNT entries of _TABLE_STEP m from _TABLE_H0: the global envelope (ellipsoidal heights)
+# the global envelope of the zenith tables (ellipsoidal heights, m; the domain of the ruling U18) and the table step of each
+# model (m), by measurement (gfa4 design section 2.6: the finest step whose node time stays at or below the envelope's 10 m cost)
 _TABLE_H0 = -500.0
-_TABLE_STEP = 10.0
-_TABLE_COUNT = 951
+_TABLE_TOP = 9000.0
+_ERA5_STEP = 2.0
+_VMF3_STEP = 5.0
+
+
+def _table_rows(heights, step):
+    """
+    The rows of the zenith tables of one model over a height range: the first height h0 and the number of entries of
+    h0 + k step on the global grid _TABLE_H0 + k step, with one row beyond each end of the range (clipped to the domain
+    _TABLE_H0 to _TABLE_TOP). heights None is the envelope, the whole domain.
+
+    Parameters: heights ((lo, hi), ellipsoidal metres of the caller's pixels, or None); step (m, positive). Returns: (h0, count):
+    h0 (m, float) and count (int). Raises: ValueError, one ERROR: line, for a step that is not positive and for a range that
+    is not inside the domain.
+
+    Examples
+    --------
+    >>> _table_rows(None, 10.0)
+    (-500.0, 951)
+    >>> _table_rows((800.0, 1000.0), 2.0)
+    (798.0, 103)
+    """
+    if not step > 0.0:
+        raise ValueError('ERROR: the zenith tables need a positive height step')
+    lo, hi = (_TABLE_H0, _TABLE_TOP) if heights is None else (float(heights[0]), float(heights[1]))
+    if not _TABLE_H0 <= lo <= hi <= _TABLE_TOP:
+        raise ValueError(f'ERROR: the height range {lo:.1f} to {hi:.1f} m of the atmosphere tables is outside the model domain '
+                         f'{_TABLE_H0:.0f} to {_TABLE_TOP:.0f} m')
+    last = int(math.floor((_TABLE_TOP - _TABLE_H0) / step))
+    k0 = max(0, int(math.floor((lo - _TABLE_H0) / step)) - 1)
+    k1 = min(last, int(math.ceil((hi - _TABLE_H0) / step)) + 1)
+    return _TABLE_H0 + k0 * step, k1 - k0 + 1
 
 
 def _era5_fields(got, flat, levels):
@@ -1099,13 +1161,15 @@ def _zenith_tile(index, name, epochs, row0, col0, lat_b, lon_b, levels, undulati
     return hydro, wet, mapping
 
 
-def zenith_tiles(path, times, wavelength):
+def zenith_tiles(path, times, wavelength, heights=None):
     """
-    The zenith delay tables of a tropospheric model folder per tile, lazily: one dask chunk per tile, holding the tile's
-    full node set for all times. The tables are in phase units (-4 pi / wavelength times the delay).
+    The zenith delay tables of a tropospheric model folder per tile, lazily: one dask chunk per tile and time group (the times
+    grouped by shared bracketing epochs, see _epoch_groups; one group per date), each reading only its group's epochs. The tables
+    are in phase units (-4 pi / wavelength times the delay).
 
     Parameters: path (str, folder of the downloaded model fields); times (list of str or pandas.Timestamp, UTC; the
-    first axis of the result); wavelength (float, metres). Returns: lazy xarray.Dataset: hydro and wet with dims (time,
+    first axis of the result); wavelength (float, metres); heights ((lo, hi) ellipsoidal metres of the caller's pixels, or None: the envelope at the model's
+    table step, _table_rows). Returns: lazy xarray.Dataset: hydro and wet with dims (time,
     tile, ty, tx, height); mapping with dims (time, tile, ty, tx, component, coef); coordinates time, lat and lon
     (degrees), tile y0 and x0 (lattice row and column of each tile's first node), height (m); attributes h0, step,
     count, niell, shell_k. Raises: ValueError, one ERROR: line, for a wavelength that is not positive, a folder without
@@ -1131,23 +1195,34 @@ def zenith_tiles(path, times, wavelength):
         undulation = None
     corners = sorted((int(round((c[1] - lat[0]) / step)), int(round((c[0] - lon[0]) / step))) for c in _tiles(index, name))
     plan = _plan(stamps, utils_epochs.SOURCES[name]['hours'])
-    uniq = sorted({e for e0, e1, w in plan for e in ((e0,) if e1 is None else (e0, e1))})
-    position = {e: k for k, e in enumerate(uniq)}
-    first = np.array([position[e0] for e0, e1, w in plan])
-    second = np.array([-1 if e1 is None else position[e1] for e0, e1, w in plan])
-    w0 = np.array([1.0 if e1 is None else 1.0 - w for e0, e1, w in plan], dtype=float)
-    w1 = np.array([0.0 if e1 is None else w for e0, e1, w in plan], dtype=float)
     ntime = len(plan)
     scale = -4.0 * np.pi / float(wavelength)
-    count = _TABLE_COUNT
+    tstep = _ERA5_STEP if name == _NAME_ERA5 else _VMF3_STEP
+    h0, count = _table_rows(heights, tstep)
+    groups = _epoch_groups(plan)
+    order = [k for group in groups for k in group]
+    inv = None if order == list(range(ntime)) else np.argsort(np.array(order))
     hydro_t, wet_t, mapping_t = [], [], []
     for j0, i0 in corners:
         und = None if undulation is None else undulation[j0:j0 + n, i0:i0 + n]
-        node = dask.delayed(_zenith_tile, nout=3)(index, name, uniq, j0, i0, lat[j0:j0 + n], lon[i0:i0 + n], levels, und,
-                                                  first, second, w0, w1, _TABLE_H0, _TABLE_STEP, count, scale)
-        hydro_t.append(da.from_delayed(node[0], shape=(ntime, n, n, count), dtype=float))
-        wet_t.append(da.from_delayed(node[1], shape=(ntime, n, n, count), dtype=float))
-        mapping_t.append(da.from_delayed(node[2], shape=(ntime, n, n, 2, 3), dtype=float))
+        hydro_g, wet_g, mapping_g = [], [], []
+        for group in groups:
+            gplan = [plan[k] for k in group]
+            uniq = sorted({e for e0, e1, w in gplan for e in ((e0,) if e1 is None else (e0, e1))})
+            position = {e: k for k, e in enumerate(uniq)}
+            first = np.array([position[e0] for e0, e1, w in gplan])
+            second = np.array([-1 if e1 is None else position[e1] for e0, e1, w in gplan])
+            w0 = np.array([1.0 if e1 is None else 1.0 - w for e0, e1, w in gplan], dtype=float)
+            w1 = np.array([0.0 if e1 is None else w for e0, e1, w in gplan], dtype=float)
+            node = dask.delayed(_zenith_tile, nout=3)(index, name, uniq, j0, i0, lat[j0:j0 + n], lon[i0:i0 + n], levels, und,
+                                                      first, second, w0, w1, h0, tstep, count, scale)
+            size = len(group)
+            hydro_g.append(da.from_delayed(node[0], shape=(size, n, n, count), dtype=float))
+            wet_g.append(da.from_delayed(node[1], shape=(size, n, n, count), dtype=float))
+            mapping_g.append(da.from_delayed(node[2], shape=(size, n, n, 2, 3), dtype=float))
+        for part_t, parts in ((hydro_t, hydro_g), (wet_t, wet_g), (mapping_t, mapping_g)):
+            joined = da.concatenate(parts, axis=0)
+            part_t.append(joined if inv is None else joined[inv])
     ds = xr.Dataset(
         {'hydro': (('time', 'tile', 'ty', 'tx', 'height'), da.stack(hydro_t, axis=1)),
          'wet': (('time', 'tile', 'ty', 'tx', 'height'), da.stack(wet_t, axis=1)),
@@ -1155,7 +1230,7 @@ def zenith_tiles(path, times, wavelength):
         coords={'time': pd.DatetimeIndex(stamps), 'lat': lat, 'lon': lon,
                 'tile y0': ('tile', np.array([j for j, i in corners], dtype=np.int64)),
                 'tile x0': ('tile', np.array([i for j, i in corners], dtype=np.int64)),
-                'height': _TABLE_H0 + _TABLE_STEP * np.arange(count),
+                'height': h0 + tstep * np.arange(count),
                 'component': ['hydrostatic', 'wet'], 'coef': ['a', 'b', 'c']},
-        attrs={'h0': _TABLE_H0, 'step': _TABLE_STEP, 'count': count, 'niell': [1e-3, *_HT_COEF], 'shell_k': 1.0})
+        attrs={'h0': h0, 'step': tstep, 'count': count, 'niell': [1e-3, *_HT_COEF], 'shell_k': 1.0})
     return ds

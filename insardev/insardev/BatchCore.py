@@ -9,16 +9,22 @@
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
 from __future__ import annotations
-from . import utils_io,  utils_xarray
+from . import utils_io,  utils_xarray, utils_align
+from .utils_circular import wrap_phase, dissolve_pol
 import operator
-import threading
 from types import FunctionType
 import numpy as np
 import xarray as xr
+from . import utils_complex, utils_export, utils_stats
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
+from .utils_dask import graph_check
 if TYPE_CHECKING:
-    from .Batch import Batch, BatchWrap, BatchUnit, BatchComplex, BatchVar
+    from .Batch import Batch
+    from .BatchWrap import BatchWrap
+    from .BatchUnit import BatchUnit
+    from .BatchComplex import BatchComplex
+    from .Batch import BatchVar
     from .Stack import Stack
     import rasterio as rio
     import pandas as pd
@@ -26,6 +32,8 @@ if TYPE_CHECKING:
 
 # the scalar operands of the Batch operators (a complex scalar included: ph * 1j)
 _SCALARS = (int, float, complex, np.number)
+# the other operand of a binary operator, by type (GKB U5): a scalar or an xarray array of the operator rule (_binary_vars)
+_RULE_OPERANDS = _SCALARS + (xr.DataArray, xr.Dataset)
 
 # the points projected on each edge of a crop() bounding box in another CRS, as the preprocessors' bbox_grid_bounds()
 # (insardev_pygmtsar utils_satellite.BBOX_EDGE_POINTS): the extreme of a curved edge between two of them is missed by
@@ -34,7 +42,12 @@ BBOX_EDGE_POINTS = 1025
 
 
 def _parse_budget(budget):
-    """Parse budget string like '128MiB', '256MB', '1GiB' to integer MB."""
+    """
+    A budget string such as 128MiB, 256MB, 0.5MB, 64KiB or 1GiB in MiB, a float (KB and KiB / 1024, GB and GiB x 1024; MB is read as MiB).
+
+    >>> _parse_budget('0.5MB')
+    0.5
+    """
     import re
     s = budget.strip().upper()
     m = re.match(r'^([\d.]+)\s*(MIB|MB|GIB|GB|KIB|KB)$', s)
@@ -43,12 +56,10 @@ def _parse_budget(budget):
     val = float(m.group(1))
     unit = m.group(2)
     if unit in ('GIB', 'GB'):
-        return int(val * 1024)
+        return val * 1024
     elif unit in ('MIB', 'MB'):
-        return int(val)
-    elif unit in ('KIB', 'KB'):
-        return max(1, int(val / 1024))
-    return int(val)
+        return val
+    return val / 1024
 
 
 def _nodata_of(dtype):
@@ -117,68 +128,21 @@ def _decimate_on_lattice(batch, var, factor_y, factor_x, dy, dx):
     return batch._view(BatchCore._drop_empty(out))
 
 
-def _merge_tiles_for_dask(tiles, offsets, out_shape, fill_dtype, nodata=np.nan):
-    """
-    Module-level function for merging tiles in to_dataset().
+def _tile_for_dask(block, s0, s1, y0, y1, x0, x1):
+    """One tile of to_dataset(): dates [s0, s1) of a 3-D input block cut to rows [y0, y1) and columns [x0, x1); a 2-D block cut (s0 None)."""
+    if s0 is None:
+        return block[y0:y1, x0:x1]
+    return block[s0:s1, y0:y1, x0:x1]
 
-    Defined at module level to avoid dask serialization issues with nested functions.
-    When using dask distributed, closures with nested functions may not serialize correctly,
-    causing random/incorrect behavior on workers.
 
-    THE OVERLAP RULE: the tiles come in the bursts' acquisition order and each one is laid
-    over the ones before it, so the MOST RECENT burst's valid value wins; its nodata
-    (_nodata_of: NaN, or -1, 0, False for an integer or bool grid) is transparent and
-    never hides an earlier burst's valid value; a pixel no tile covers stays nodata.
-
-    Args:
-        tiles: list of 3D arrays (1, ny, nx), the tiles of _tile_for_dask(), earliest burst first
-        offsets: list of (y_offset, x_offset) tuples for each tile
-        out_shape: (ny, nx) output shape
-        fill_dtype: output dtype, the grid's own
-        nodata: the grid's nodata value, _nodata_of(fill_dtype)
-
-    Returns:
-        merged 2D numpy array
-    """
-    out = np.full(out_shape, nodata, dtype=fill_dtype)
-    nan = isinstance(nodata, float) and np.isnan(nodata)
-
-    for tile_3d, (y_off, x_off) in zip(tiles, offsets):
-        # Tiles arrive as 3D (1, ny, nx), squeeze to 2D
-        tile = tile_3d[0]
-
-        # Tile position in output chunk
-        y0, x0 = y_off, x_off
-        y1, x1 = y0 + tile.shape[0], x0 + tile.shape[1]
-
-        # Clip to output bounds
-        y0c, x0c = max(0, y0), max(0, x0)
-        y1c, x1c = min(out_shape[0], y1), min(out_shape[1], x1)
-
-        if y1c > y0c and x1c > x0c:
-            # Tile slice corresponding to clipped output region
-            ty0, tx0 = y0c - y0, x0c - x0
-            ty1, tx1 = ty0 + (y1c - y0c), tx0 + (x1c - x0c)
-
-            # the later burst's valid values over the earlier ones; its nodata is transparent
-            view = out[y0c:y1c, x0c:x1c]
-            src = tile[ty0:ty1, tx0:tx1]
-            np.copyto(view, src, where=~np.isnan(src) if nan else src != nodata)
-
+def _merge_stack_for_dask(offsets, picks, out_shape, fill_dtype, nodata, n_dates, *tiles):
+    """One output block of to_dataset(): merge_tiles() of each of its n_dates dates, the dates looped in numpy inside, as (n_dates, ny, nx).
+    picks[d][j] = (tile, date) of tile j of date d (date None: a 2-D tile); a tile is a cut of an input block or the whole block."""
+    out = np.empty((n_dates,) + tuple(out_shape), dtype=fill_dtype)
+    for d in range(n_dates):
+        out[d] = utils_xarray.merge_tiles([tiles[t][np.newaxis] if s is None else tiles[t][s:s + 1] for t, s in picks[d]],
+                                          offsets, out_shape, fill_dtype, nodata)
     return out
-
-
-def _tile_for_dask(block, s, y0, y1, x0, x1):
-    """One tile of to_dataset(): rows [y0, y1) and columns [x0, x1) of one input block, as (1, ny, nx) --
-    slice s of a 3-D block, or the 2-D block itself (s None)."""
-    if s is None:
-        return block[np.newaxis, y0:y1, x0:x1]
-    return block[s:s + 1, y0:y1, x0:x1]
-
-
-def _merge_parts_for_dask(offsets, out_shape, fill_dtype, nodata, *tiles):
-    """One output block of to_dataset(): _merge_tiles_for_dask() of its tiles, as (1, ny, nx)."""
-    return _merge_tiles_for_dask(tiles, offsets, out_shape, fill_dtype, nodata)[np.newaxis]
 
 
 def _dissolve_pol_for_dask(da_current, das_others, wrap, extend, weight):
@@ -199,18 +163,9 @@ def _dissolve_pol_for_dask(da_current, das_others, wrap, extend, weight):
     Returns:
         numpy array with dissolved values
     """
-    import warnings
-
     # Use exact coordinates from da_current - do NOT modify them
     ys = da_current.y.values
     xs = da_current.x.values
-    n_others = len(das_others)
-
-    if weight is None:
-        w_current, w_other = 1.0, 1.0
-    else:
-        w_current = weight
-        w_other = (1.0 - weight) / n_others if n_others > 0 else 0.0
 
     # Reindex das_others to match da_current coordinates
     # Grids are consistent with exactly matched coordinates in overlap areas
@@ -218,37 +173,8 @@ def _dissolve_pol_for_dask(da_current, das_others, wrap, extend, weight):
     for d in das_others:
         das_reindexed.append(d.reindex(y=ys, x=xs, fill_value=np.nan))
 
-    current_vals = da_current.values
-    current_valid = np.isfinite(current_vals)
-
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore', RuntimeWarning)
-
-        if wrap:
-            weighted_sum = np.where(current_valid, np.exp(1j * current_vals).astype(np.complex64) * w_current, np.complex64(0))
-            weight_sum = np.where(current_valid, w_current, 0.0)
-            for d in das_reindexed:
-                vals = d.values
-                valid = np.isfinite(vals)
-                weighted_sum += np.where(valid, np.exp(1j * vals).astype(np.complex64) * w_other, np.complex64(0))
-                weight_sum += np.where(valid, w_other, 0.0)
-            valid_weights = weight_sum > 0
-            normalized = np.divide(weighted_sum, weight_sum, out=np.zeros_like(weighted_sum), where=valid_weights)
-            out = np.where(valid_weights, np.arctan2(normalized.imag, normalized.real), np.nan)
-        else:
-            weighted_sum = np.where(current_valid, current_vals * w_current, 0.0)
-            weight_sum = np.where(current_valid, w_current, 0.0)
-            for d in das_reindexed:
-                vals = d.values
-                valid = np.isfinite(vals)
-                weighted_sum += np.where(valid, vals * w_other, 0.0)
-                weight_sum += np.where(valid, w_other, 0.0)
-            out = np.divide(weighted_sum, weight_sum, out=np.full_like(weighted_sum, np.nan), where=weight_sum > 0)
-
-        if not extend:
-            out = np.where(current_valid, out, np.nan)
-
-    return out.astype(da_current.dtype)
+    # the weighted mean on the common grid (utils_circular.dissolve_pol)
+    return dissolve_pol(da_current.values, [d.values for d in das_reindexed], wrap, extend, weight, da_current.dtype)
 
 
 
@@ -287,11 +213,6 @@ def _dissolve_raw_for_dask(current_arr, current_y, current_x,
         return _dissolve_pol_for_dask(da_c, das_o, wrap, extend, weight)
 
 
-# rasterio rasterizes in memory inside warnings.catch_warnings, which is process-wide: dask threads entering it together leak its
-# NotGeoreferencedWarning to the display (rasterio 1.4.3, GDAL 3.9.3); one rasterization at a time per process keeps the values
-_GEOMETRY_MASK_LOCK = threading.Lock()
-
-
 def _geometry_mask_block(block, y=None, x=None, geoms=None, block_info=None, res=None):
     """
     The polygon test of one block of a burst, lazily: True where the pixel centre of the block lies inside the geometries,
@@ -299,14 +220,10 @@ def _geometry_mask_block(block, y=None, x=None, geoms=None, block_info=None, res
     block_info; its transform is built from the burst's own coordinates y and x and their resolution res, so no array
     larger than the block is built.
     """
-    from rasterio import features
-    from rasterio.transform import Affine
+    from . import utils_geometry as ug
     (y0, y1), (x0, x1) = block_info[None]['array-location']
     dx, dy = res
-    transform = Affine(dx, 0.0, x[x0] - dx / 2, 0.0, dy, y[y0] - dy / 2)
-    with _GEOMETRY_MASK_LOCK:
-        return features.geometry_mask(geoms, out_shape=(y1 - y0, x1 - x0), transform=transform,
-                                      all_touched=False, invert=True)
+    return ug.geometry_mask((y1 - y0, x1 - x0), x[x0], y[y0], dx, dy, geoms)
 
 
 class BatchCore(dict):
@@ -448,7 +365,10 @@ class BatchCore(dict):
 
     def __init__(self, mapping: Mapping[str, xr.Dataset] | Stack | BatchComplex | None = None):
         from .Stack import Stack
-        from .Batch import Batch, BatchWrap, BatchUnit, BatchComplex
+        from .Batch import Batch
+        from .BatchWrap import BatchWrap
+        from .BatchUnit import BatchUnit
+        from .BatchComplex import BatchComplex
         #print('BatchCore __init__', 0 if mapping is None else len(mapping))
         # Batch/etc. initialization won't filter out the data when it's a child class of BatchCore
         if isinstance(mapping, (Stack, BatchComplex)) and not isinstance(self, (Batch, BatchWrap, BatchUnit, BatchComplex)):
@@ -504,13 +424,18 @@ class BatchCore(dict):
             data = BatchCore._mask_of_dataarray(data, first, 'from_dataset', what='data')
 
         def rechunk_like(arr, src):
-            """`arr` in the chunks of this burst's `src`, where they differ."""
+            """`arr` in the chunks of this burst's `src`: only the dims whose chunks differ are rechunked, a dim
+            that matches (the pair dim) gets no layer."""
             if src is None or not hasattr(src.data, 'chunks'):
                 return None
             chunks = dict(zip(src.dims, src.data.chunks))
-            if isinstance(arr.data, np.ndarray) or \
-               (hasattr(arr.data, 'chunks') and dict(zip(arr.dims, arr.data.chunks)) != chunks):
+            if isinstance(arr.data, np.ndarray):
                 return arr.chunk(chunks)
+            if hasattr(arr.data, 'chunks'):
+                current = dict(zip(arr.dims, arr.data.chunks))
+                differ = {dim: c for dim, c in chunks.items() if dim in current and current[dim] != c}
+                if differ:
+                    return arr.chunk(differ)
             return None
 
         out = {}
@@ -748,10 +673,20 @@ class BatchCore(dict):
         ------
         KeyError
             if the key is neither a burst nor a name any burst carries.
+        TypeError
+            if a list names only non-spatial variables, or x[[]] on a batch of DataArrays.
+
+        Notes
+        -----
+        A list keeps the listed spatial variables, every non-spatial one and the attributes: x[['VV']].
+        x[[]] keeps the non-spatial ones alone, for x[[]].assign(VV=...).
         """
-        # Handle list/tuple keys for dataset selection
+        # Handle list/tuple keys for variable selection (x[['VV']]): the listed spatial variables, every non-spatial
+        # one (no y or x among its dims) and the attributes; x[[]] keeps the non-spatial ones alone. Lazy, as a selection.
         if isinstance(key, (list, tuple)):
+            key = list(key)
             out = {}
+            spatial = False
             for burst_id, ds in self.items():
                 miss = [k for k in key
                         if isinstance(k, str) and k.endswith('²')
@@ -759,7 +694,23 @@ class BatchCore(dict):
                 if miss:
                     ds = ds.assign({k: self._square_of(ds, k, burst_id)
                                     for k in miss})
-                out[burst_id] = ds[list(key)]
+                if not isinstance(ds, xr.Dataset):
+                    # a batch of DataArrays holds no variables to keep: x[[]] selects nothing
+                    if not key:
+                        raise TypeError("ERROR: x[[]] on a batch of DataArrays selects nothing: a DataArray is one variable. "
+                                        "Select the grid itself, e.g. x['VV'].")
+                    out[burst_id] = ds[key]
+                    continue
+                absent = [k for k in key if k not in ds.variables]
+                if absent:
+                    raise KeyError(absent[0])
+                spatial = spatial or any('y' in ds[k].dims or 'x' in ds[k].dims for k in key)
+                out[burst_id] = ds.drop_vars([v for v in ds.data_vars if v not in key
+                                              and ('y' in ds[v].dims or 'x' in ds[v].dims)])
+            # a list of non-spatial names only (x[['date']], x[['BPR']]): one line, the variable and the metadata named
+            if self and key and not spatial:
+                raise TypeError(f"ERROR: x[{key!r}] names no spatial variable (1-D variables and scalars only). "
+                                f"Select one alone, e.g. {', '.join(f'x[{k!r}]' for k in key)}; x[[]] returns the metadata.")
             return self._view(out)
 
         # Try to access as a dataset key first
@@ -898,13 +849,13 @@ class BatchCore(dict):
                 f"'{name}' is unknown. Squaring about a measured midpoint "
                 f"instead would make the variable depend on which crop it was "
                 f"built from -- write the attribute.")
-        c = 0.5 * (float(ar[0]) + float(ar[1]))
-        q = ((v.astype('float64') - c) ** 2).astype('float32')
+        from . import utils_detrend
+        q_data, c, new_range = utils_detrend.centred_square(v.data, ar)
+        q = v.copy(data=q_data)
         q.attrs = {k: val for k, val in v.attrs.items() if k != 'actual_range'}
         q.attrs['square_of'] = base
         q.attrs['square_centre'] = c
-        _hi = (max(abs(float(ar[0]) - c), abs(float(ar[1]) - c))) ** 2
-        q.attrs['actual_range'] = [0.0, float(_hi)]
+        q.attrs['actual_range'] = new_range
         return q
 
     def __getattr__(self, name: str):
@@ -1258,7 +1209,7 @@ class BatchCore(dict):
         to be picked (weight['VV']) -- as a DataArray takes a Dataset mask.
         """
         import xarray as xr
-        from .Batch import BatchUnit
+        from .BatchUnit import BatchUnit
         if weight is None and not required:
             return None
         if not isinstance(weight, BatchUnit):
@@ -1316,6 +1267,12 @@ class BatchCore(dict):
         return weight
 
     @staticmethod
+    def _no_common_grids(grids, ogrids):
+        """RAISES the one-line TypeError of two Datasets with no gridded variable name in common, naming both sides."""
+        raise TypeError(f"ERROR: no common (y, x) variables to operate on: {[str(v) for v in grids]} "
+                        f"and {[str(v) for v in ogrids]}. Select one: y['{ogrids[0]}'].")
+
+    @staticmethod
     def _binary_vars(ds, other, op):
         """`op(ds, other)` by THE OPERATOR RULE (N81), for every operator on a burst.
 
@@ -1344,8 +1301,7 @@ class BatchCore(dict):
         if isinstance(other, xr.Dataset):
             ogrids = BatchCore._grid_vars(other)
             if not set(grids) & set(ogrids):
-                raise TypeError(f"ERROR: no common (y, x) variables to operate on: {[str(v) for v in grids]} "
-                                f"and {[str(v) for v in ogrids]}. Select one: y['{ogrids[0]}'].")
+                BatchCore._no_common_grids(grids, ogrids)
             rhs = other[ogrids]
         res = op(ds[grids], rhs)
         for v in ds.data_vars:
@@ -1355,11 +1311,11 @@ class BatchCore(dict):
         return res
 
     def __add__(self, other):
-        if BatchCore._is_stack(other):
+        if not BatchCore._is_operand(other):
             return NotImplemented
         # scalar + batch. Routed through _binary_vars like the Dataset case:
         # a bare `v + other` hits the string metadata and raises UFuncTypeError
-        if isinstance(other, _SCALARS):
+        if isinstance(other, _RULE_OPERANDS):
             import operator as _operator
             return self._result({k: BatchCore._binary_vars(v, other, _operator.add)
                                for k, v in self.items()})
@@ -1401,10 +1357,10 @@ class BatchCore(dict):
         return BatchCore._binary_vars(ds, self._view({k: ds}).polyval({k: val})[k], _operator.sub)
 
     def __sub__(self, other):
-        if BatchCore._is_stack(other):
+        if not BatchCore._is_operand(other):
             return NotImplemented
         # batch - scalar
-        if isinstance(other, _SCALARS):
+        if isinstance(other, _RULE_OPERANDS):
             import operator as _operator
             return self._result({k: BatchCore._binary_vars(v, other, _operator.sub)
                                for k, v in self.items()})
@@ -1418,16 +1374,16 @@ class BatchCore(dict):
 
     def __rsub__(self, other):
         # scalar - batch: the operand order is flipped, the metadata rule is not
-        if isinstance(other, _SCALARS):
+        if isinstance(other, _RULE_OPERANDS):
             return self._result({k: BatchCore._binary_vars(v, other, lambda a, b: b - a)
                                for k, v in self.items()})
         return NotImplemented
 
     def __mul__(self, other):
-        if BatchCore._is_stack(other):
+        if not BatchCore._is_operand(other):
             return NotImplemented
         # batch * scalar
-        if isinstance(other, _SCALARS):
+        if isinstance(other, _RULE_OPERANDS):
             import operator as _operator
             return self._result({k: BatchCore._binary_vars(v, other, _operator.mul)
                                for k, v in self.items()})
@@ -1437,17 +1393,17 @@ class BatchCore(dict):
                               if k in other else self[k]) for k in keys})
 
     def __rmul__(self, other):
-        if BatchCore._is_stack(other):
+        if not isinstance(other, _RULE_OPERANDS):
             return NotImplemented
         # scalar * batch
         return self._result({k: BatchCore._binary_vars(v, other, lambda a, b: b * a)
                            for k, v in self.items()})
 
     def __truediv__(self, other):
-        if BatchCore._is_stack(other):
+        if not BatchCore._is_operand(other):
             return NotImplemented
         # batch / scalar
-        if isinstance(other, _SCALARS):
+        if isinstance(other, _RULE_OPERANDS):
             import operator as _operator
             return self._result({k: BatchCore._binary_vars(v, other, _operator.truediv)
                                for k, v in self.items()})
@@ -1458,7 +1414,7 @@ class BatchCore(dict):
 
     def __rtruediv__(self, other):
         # scalar / batch: flipped operands, same metadata rule
-        if isinstance(other, _SCALARS):
+        if isinstance(other, _RULE_OPERANDS):
             return self._result({k: BatchCore._binary_vars(v, other, lambda a, b: b / a)
                                for k, v in self.items()})
         return NotImplemented
@@ -1473,11 +1429,11 @@ class BatchCore(dict):
         return self.abs()
 
     @staticmethod
-    def _is_stack(other):
-        # a Stack takes part in no math (user, 2026-10-27): the binary operators return
-        # NotImplemented for it, so Python raises its own TypeError
-        from .Stack import Stack
-        return isinstance(other, Stack)
+    def _is_operand(other):
+        """The other operand of a binary operator, by type (GKB U5): a scalar or an array of the operator rule, or a dict -- a
+        BatchCore is one, and align() passes its per-burst coefficients as a plain dict. Any other object, a Stack or a list,
+        is not an operand: the operator returns NotImplemented and Python raises its own TypeError."""
+        return isinstance(other, _RULE_OPERANDS + (dict,))
 
     def _binop(self, other, op):
         """
@@ -1490,9 +1446,7 @@ class BatchCore(dict):
         CONSTRUCTION, and not a phase or a unit either: a boolean result of any
         class is a plain Batch (_as_class), never wrapped into floats.
         """
-        if BatchCore._is_stack(other):
-            return NotImplemented
-        if isinstance(other, _SCALARS):
+        if isinstance(other, _RULE_OPERANDS):
             return self._result({k: BatchCore._binary_vars(ds, other, op) for k, ds in self.items()}, view=True)
         elif isinstance(other, BatchCore):
             return self._result({k: BatchCore._binary_vars(self[k], other[k], op) for k in self if k in other},
@@ -2098,148 +2052,6 @@ class BatchCore(dict):
 
 
 
-    def unwrap3d(self, duration: float = 90.0, max_iter: int = 40,
-                 search: int = 2, short_days: float = 40.0,
-                 n_short: int = 6, min_disagree: int = 2,
-                 min_dates: int = 3, n_trend: int = 3) -> 'Batch':
-        """
-        Unwrapped per-date phase DIRECTLY from the complex scenes.
-
-        Replaces pairs() -> interferogram() -> unwrap2d() -> lstsq(). Single-look
-        pair phase is exactly phi_ref - phi_rep, so the pair ambiguities are not
-        free: k_ij = n_i - n_j. The network has one unknown integer per DATE
-        instead of one per pair, every triplet closes by construction, and the
-        dates are the unknowns, so no network inversion follows.
-
-        Requires closure-exact input -- single-look scenes carrying per-date
-        corrections only.
-        Any per-PAIR correction upstream breaks closure and makes the per-date
-        form invalid -- anything fitted or filtered on the interferograms rather
-        than on the dates, goldstein() for instance, since what it removes from
-        pair (i,j) is not the difference of anything it removed from i and j.
-
-        Dates that cannot be reconciled with their neighbours are dropped to
-        NaN and bridged with the longer interval to the next good date, so one
-        bad acquisition does not corrupt everything after it.
-
-        Rates outside the range the sampling can represent, +-lambda/(4 dt_min)
-        taken over each pixel's surviving dates, come back as NaN rather than
-        as a folded value: wrapped phase pins the rate only modulo 2*pi/dt_min
-        and the siblings fit the observations exactly, so a solution is only
-        knowable when its siblings are outside what the acquisition plan can
-        express. No user prior is involved -- dt_min decides it.
-
-        Parameters
-        ----------
-        duration : float
-            Temporal baseline of the date pairs used as smoothness
-            constraints. Default 90.
-        max_iter : int
-            Coordinate-descent sweeps over the integers. Default 40.
-        search : int
-            Integer offsets tried per date per sweep, +-search. Default 2.
-        short_days, n_short, min_disagree :
-            The recoverability test. Each of the up-to-n_short partners within
-            short_days predicts the date's integer from its wrapped
-            difference, which is right whenever the motion over that interval
-            stays inside a half cycle; the date is dropped when at least
-            min_disagree of them dissent from the majority. This assumes
-            nothing about the shape of the trajectory, unlike a smoothness or
-            curvature test, so an accelerating site is not read as defective.
-            Widening short_days admits intervals where real motion can exceed
-            a half cycle and drops more.
-        min_dates : int
-            Floor on surviving dates per pixel (default 3). Closure is
-            structural here, so a resolved triplet is usable; there is no
-            sample-size argument for a larger floor. Dropping stops at this
-            floor, and since at most one date goes per pass it also bounds the
-            work -- there is no separate max_drop to contradict it.
-        n_trend : int
-            Trend refinement passes (default 3). The rate is seeded from the
-            shortest available intervals -- long gaps are excluded because a
-            wrapped increment over dt only resolves rates below
-            lambda/(4 dt), so a 120-day winter gap aliases anything above
-            42 mm/yr while a 12-day one holds to 422 -- then re-fit over the
-            whole unwrapped span and re-solved. Without this the smoothness
-            objective drags fast pixels toward zero: a synthetic -150 mm/yr
-            site was recovered as +19.
-
-        Returns
-        -------
-        Batch
-            Unwrapped per-date phase in radians; use displacement_los().
-
-        Examples
-        --------
-        >>> disp = (stack.chunk1d('0.5GB').fit1d_network()
-        ...              .unwrap3d()
-        ...              .displacement_los(stack.transform()))
-        """
-        import dask.array as da
-        import numpy as np
-        import xarray as xr
-        from .Batch import Batch
-        from . import utils_unwrap3d
-
-        BatchCore._require_lazy(self, 'unwrap3d')
-
-        result = {}
-        for key in self.keys():
-            ds = self[key]
-            # a Dataset's variables, or a DataArray as its own one (N81)
-            vars_ = BatchCore._vars_of(ds)
-            for a in vars_.values():
-                if 'pair' in a.dims:
-                    raise TypeError(
-                        'unwrap3d() operates on the per-DATE stack, not on '
-                        'per-pair data. It replaces the per-pair unwrap + lstsq route.')
-            pols = [v for v, a in vars_.items()
-                    if a.dtype.kind == 'c' and 'date' in a.dims
-                    and 'y' in a.dims and 'x' in a.dims]
-            if not pols:
-                raise TypeError(
-                    f'unwrap3d() found no complex (date, y, x) variables in '
-                    f'burst {key}')
-            date_values = np.asarray(ds.coords['date'].values)
-            out_vars = {}
-            for pol in pols:
-                da_xr = vars_[pol]
-                if da_xr.dims[0] != 'date':
-                    da_xr = da_xr.transpose('date', ...)
-                if len(da_xr.data.chunks[0]) != 1:
-                    raise ValueError(
-                        "unwrap3d() requires the date dimension in one chunk. "
-                        "Use chunk1d() first.")
-
-                def _make(_d, _bd, _mi, _se, _sd, _ns, _mdis, _mdt, _ntr):
-                    def kernel(block):
-                        return utils_unwrap3d.unwrap3d_dates_array(
-                            block, _d, duration=_bd, max_iter=_mi,
-                            search=_se, short_days=_sd, n_short=_ns,
-                            min_disagree=_mdis, min_dates=_mdt,
-                            n_trend=_ntr)
-                    return kernel
-
-                out = da.map_blocks(
-                    _make(date_values, float(duration), int(max_iter),
-                          int(search), float(short_days),
-                          int(n_short), int(min_disagree), int(min_dates),
-                          int(n_trend)),
-                    da_xr.data, dtype=np.float32,
-                    meta=np.empty((0, 0, 0), dtype=np.float32))
-                out_vars[pol] = xr.DataArray(out, dims=da_xr.dims,
-                                             coords=da_xr.coords, name=pol)
-            if isinstance(ds, xr.DataArray):
-                # a DataArray in, a DataArray out (N81): its coordinates are its own
-                result[key] = BatchCore._form(ds, out_vars)
-                continue
-            new_ds = xr.Dataset(out_vars, attrs=ds.attrs)
-            if 'spatial_ref' in ds.coords:
-                new_ds = new_ds.assign_coords(spatial_ref=ds.spatial_ref)
-            result[key] = new_ds
-        return Batch(result)
-
-
     def crop(self, geometry):
         """
         Crop each burst to the bounding rectangle of a geometry.
@@ -2291,13 +2103,8 @@ class BatchCore(dict):
         # corners, and the corners alone lost that strip (50 m for the Mexico City notebook AOI).
         crs = self.crs
         if crs is not None and geom_crs is not None and geom_crs != crs:
-            from pyproj import CRS, Transformer
-            t = np.linspace(0.0, 1.0, BBOX_EDGE_POINTS)
-            xs = np.r_[minx + (maxx - minx) * t, np.full(t.size, maxx), maxx - (maxx - minx) * t, np.full(t.size, minx)]
-            ys = np.r_[np.full(t.size, miny), miny + (maxy - miny) * t, np.full(t.size, maxy), maxy - (maxy - miny) * t]
-            xs, ys = Transformer.from_crs(CRS.from_user_input(geom_crs), CRS.from_user_input(crs),
-                                          always_xy=True).transform(xs, ys)
-            minx, miny, maxx, maxy = np.min(xs), np.min(ys), np.max(xs), np.max(ys)
+            from . import utils_geometry as ug
+            minx, miny, maxx, maxy = ug.reproject_bbox((minx, miny, maxx, maxy), geom_crs, crs, BBOX_EDGE_POINTS)
 
         out = {}
         for key, ds in self.items():
@@ -2316,13 +2123,13 @@ class BatchCore(dict):
         return type(self)(out)
 
     def __pow__(self, exponent, **kwargs):
-        if BatchCore._is_stack(exponent):
+        if not BatchCore._is_operand(exponent):
             return NotImplemented
         return self.map_da(lambda da: da**exponent, **kwargs)
 
     def power(self, **kwargs):
         """ element-wise |x|², i.e. signal intensity """
-        return self.map_da(lambda da: xr.ufuncs.abs(da)**2, **kwargs)
+        return self.map_da(lambda da: utils_complex.abs_squared(da), **kwargs)
 
     # def abs(self):
     #     """ element-wise absolute value """
@@ -3072,7 +2879,24 @@ class BatchCore(dict):
         return type(self)({k: ds.reindex(**kw) for k, ds in self.items()})
 
     def interp(self, **kw):
-        return type(self)({k: ds.interp(**kw) for k, ds in self.items()})
+        """xarray's interp() of every burst, the interpolated dims first merged into one chunk (the merge xarray's
+        allow_rechunk makes, without its split of the other dims), so every other dim keeps its chunks:
+        >>> half = batch.interp(y=batch[key].y.values[::2])"""
+        import dask.array as da
+        opts = ('coords', 'method', 'assume_sorted', 'kwargs', 'method_non_numeric')
+        dims = {*(kw.get('coords') or {}), *(k for k in kw if k not in opts)}
+
+        def merged(burst):
+            new = {}
+            for name, a in BatchCore._vars_of(burst).items():
+                axes = {a.dims.index(d): -1 for d in dims if d in a.dims}
+                if axes and isinstance(a.data, da.Array):
+                    new[name] = a.copy(data=a.data.rechunk(axes))
+            if isinstance(burst, xr.DataArray):
+                return new.get(burst.name, burst)
+            return burst.assign(new) if new else burst
+
+        return type(self)({k: merged(ds).interp(**kw) for k, ds in self.items()})
 
     def reindex_like(self, other: Batch, **reindex_kwargs):
         return type(self)({k: ds.reindex_like(other[k], **reindex_kwargs) for k, ds in self.items() if k in other})
@@ -3080,15 +2904,15 @@ class BatchCore(dict):
     def transpose(self, *dims, **kw):
         return type(self)({k: ds.transpose(*dims, **kw) for k, ds in self.items()})
 
-    def _restored(self, out: dict, wrap: bool = True):
+    def _restored(self, out: dict):
         """The results `out` of a reduction of this batch, each burst given back its OWN exact input chunks: along every dim
         its result keeps, a variable has the chunk tuple of the same variable of that burst's input (a stored edge block stays
         the stored one, so a later mix with the input's grid needs no rechunk). A result that already has them gets no
         rechunk. The dims of a coarsen() window are not given back: that result is in coarse units and already in the blocks
         of whole windows coarsen() made, the input's blocks scaled by the window. The reference is each burst's own input,
         never the first burst's: a burst of ten blocks was cut into hundreds by a small first one.
-        wrap=False: the results are wrapped already (the angle of a complex mean) and are not wrapped again (_like)."""
-        batch = type(self)(out) if wrap else self._like(out)
+        The results are built by _like(): a BatchWrap keeps them as they are (the wrap is done by the reduction, not here)."""
+        batch = self._like(out)
         restored = {}
         for key, res in dict.items(batch):
             obj = dict.__getitem__(self, key)
@@ -3172,6 +2996,13 @@ class BatchCore(dict):
         solution's grid as xarray broadcasts it. The solution needs a (y, x)
         grid: it gives the form and the pixels of the result.
 
+        A pair-based or velocity solution: the observed, the solution and the
+        weight join in ONE task per (y, x) chunk, the output keeps the chunks of
+        the input. A solution or weight in other (y, x) chunks is rechunked to
+        the observed's, with one WARNING per call; other pair chunks raise one
+        line. A date-based solution is reconstructed per pair first; its own date
+        chunks are kept (GMT U3).
+
         Parameters
         ----------
         solution : Batch or BatchWrap
@@ -3187,15 +3018,16 @@ class BatchCore(dict):
         Batch
             Per-pixel RMSE on (y, x) grid.
         """
-        import dask.array as da
         import numpy as np
         import xarray as xr
-        from .Batch import Batch, BatchComplex
+        from .Batch import Batch
+        from .BatchComplex import BatchComplex
+        from .BatchWrap import BatchWrap
 
         # a BatchUnit (N81), for every burst this computes: those of both self and solution
         weight = BatchCore._weight(weight, {k: dict.__getitem__(self, k) for k in self if k in solution})
-
-        nanoseconds_per_year = np.float64(365.25 * 24 * 60 * 60 * 1e9)
+        from .utils_dask import warn_secondary
+        moved = []
 
         # Detect solution type: pair-based, date-based, or velocity (spatial-only).
         # Every burst's variables through _vars_of: a DataArray is its own one (N81)
@@ -3220,7 +3052,7 @@ class BatchCore(dict):
         is_complex = isinstance(self, BatchComplex)
 
         if is_velocity:
-            # Fused kernel: accumulate per-pair residuals, O(y_chunk * x_chunk) memory
+            # One blockwise task per (y, x) chunk: the residuals against vel * dt, the weight and the rms
             out = {}
             for key in self:
                 if key not in solution:
@@ -3234,7 +3066,7 @@ class BatchCore(dict):
                     if sol_var not in sol_vars:
                         continue
                     obs_da = obs_vars[var]
-                    vel_da = sol_vars[sol_var]
+                    vel_da = sol_vars[sol_var].transpose('y', 'x')
                     if not BatchCore._is_grid(obs_da):
                         # a DataArray without (y, x): on the rate's grid, as xarray broadcasts it
                         obs_da = obs_da.broadcast_like(vel_da).transpose(..., *vel_da.dims)
@@ -3243,23 +3075,16 @@ class BatchCore(dict):
                         tdim = 'pair'
                         refs = obs_ds['ref'].values.astype('datetime64[ns]').astype(np.int64)
                         reps = obs_ds['rep'].values.astype('datetime64[ns]').astype(np.int64)
-                        dt_np = ((reps.astype(np.float64) - refs.astype(np.float64))
-                                 / nanoseconds_per_year).astype(np.float32)
+                        dt_np = utils_stats.years_between(refs, reps)
                     elif 'date' in obs_da.dims:
                         tdim = 'date'
                         dates = obs_da.coords['date'].values.astype('datetime64[ns]').astype(np.int64)
-                        dt_np = ((dates.astype(np.float64) - np.float64(dates[0]))
-                                 / nanoseconds_per_year).astype(np.float32)
+                        dt_np = utils_stats.years_between(dates[0], dates)
                     else:
                         continue
 
                     if obs_da.dims[0] != tdim:
                         obs_da = obs_da.transpose(tdim, ...)
-
-                    obs_dask = obs_da.data
-                    vel_data = vel_da.data
-                    if not isinstance(vel_data, da.Array):
-                        vel_data = da.from_array(vel_da.values, chunks=obs_dask.chunks[1:])
 
                     w_dask = None
                     if weight is not None and key in weight:
@@ -3269,39 +3094,7 @@ class BatchCore(dict):
                             w_da = w_da.transpose(tdim, ...)
                         w_dask = w_da.data
 
-                    def _kernel(obs_blk, vel_blk, *args,
-                                _dt=dt_np, _cplx=is_complex):
-                        weight_blk = args[0] if args else None
-                        P = obs_blk.shape[0]
-                        sh = obs_blk.shape[1:]
-                        accum = np.zeros(sh, dtype=np.float64)
-                        if weight_blk is not None:
-                            w_sum = np.zeros(sh, dtype=np.float64)
-                        for p in range(P):
-                            pred = vel_blk * _dt[p]
-                            if _cplx:
-                                resid = np.angle(
-                                    obs_blk[p] * np.conj(np.exp(1j * pred)))
-                            else:
-                                resid = obs_blk[p].astype(np.float32) - pred
-                            if weight_blk is not None:
-                                w = weight_blk[p].astype(np.float64)
-                                accum += w * resid.astype(np.float64) ** 2
-                                w_sum += w
-                            else:
-                                accum += resid.astype(np.float64) ** 2
-                        denom = w_sum if weight_blk is not None else np.float64(P)
-                        return np.sqrt(accum / denom).astype(np.float32)
-
-                    bw_args = [obs_dask, 'pyx', vel_data, 'yx']
-                    if w_dask is not None:
-                        bw_args += [w_dask, 'pyx']
-                    rmse_dask = da.blockwise(
-                        _kernel, 'yx', *bw_args,
-                        concatenate=True,
-                        dtype=np.float32,
-                        meta=np.empty((0, 0), dtype=np.float32))
-
+                    rmse_dask = utils_stats.rmse_velocity(obs_da.data, vel_da.data, w_dask, dt=dt_np, circular=is_complex, moved=moved)
                     coords = {k: v for k, v in obs_da.coords.items()
                               if k in ('y', 'x', 'spatial_ref')}
                     rmse_vars[var] = xr.DataArray(
@@ -3311,36 +3104,95 @@ class BatchCore(dict):
                     continue
                 # a DataArray in, a DataArray out (N81)
                 out[key] = BatchCore._form(obs_ds, rmse_vars, attrs=obs_ds.attrs)
+            warn_secondary('rmse', moved)
+            graph_check('rmse', out, [self, solution, weight])
             return Batch(out)
 
-        # --- Non-velocity: date-based or pair-based solution ---
-        if is_date_based:
-            # Reconstruct pairs from date-based solution
-            recon = {}
+        if not is_date_based:
+            # Pair-based solution: the observed, the solution and the weight in ONE task per (y, x) chunk
+            mode = 'circular' if is_complex else ('wrap' if isinstance(self, BatchWrap) else 'plain')
+            out = {}
             for key in self:
                 if key not in solution:
                     continue
                 obs_ds = self[key]
                 obs_vars = vars_of(obs_ds)
                 sol_vars = vars_of(solution[key])
-                recon_vars = {}
-                for var, obs_da in obs_vars_of(obs_ds).items():
-                    if var not in sol_vars:
-                        continue
-                    refs = obs_da.coords['ref'].values
-                    reps = obs_da.coords['rep'].values
-                    recon_list = []
-                    for p in range(len(refs)):
-                        recon_list.append(
-                            sol_vars[var].sel(date=reps[p]) - sol_vars[var].sel(date=refs[p])
-                        )
-                    recon_vars[var] = xr.concat(recon_list, dim='pair')
-                if isinstance(obs_ds, xr.DataArray) and not recon_vars:
+                rmse_vars = {}
+                obs_names = list(obs_vars_of(obs_ds))
+                sol_names = [v for v, a in sol_vars.items() if 'y' in a.dims]
+                # a Dataset of a real pair compares its grids of the same name: no common name RAISES, as before the fusion
+                by_name = isinstance(obs_ds, xr.Dataset) and not is_complex
+                if by_name and not set(obs_names) & set(sol_names):
+                    BatchCore._no_common_grids(obs_names, sol_names)
+                # a real DataArray observation against a Dataset solution gives a Dataset keyed by the solution's grids, as the
+                # difference of the two did before the fusion (measured on HEAD); every other form is keyed by the observed variables
+                split = isinstance(obs_ds, xr.DataArray) and not is_complex
+                for var in obs_names:
+                    if split:
+                        targets = [(sv, sv) for sv in sol_names]
+                    else:
+                        if var in sol_vars:
+                            sol_var = var
+                        elif by_name:
+                            # a grid the solution lacks is left out, as the Dataset operator leaves it
+                            sol_var = None
+                        else:
+                            sol_var = next((v for v, a in sol_vars.items() if 'y' in a.dims), None)
+                        targets = [] if sol_var is None else [(var, sol_var)]
+                    for out_var, sol_var in targets:
+                        obs_da = obs_vars[var]
+                        sol_da = sol_vars[sol_var]
+                        if not BatchCore._is_grid(obs_da):
+                            obs_da = obs_da.broadcast_like(sol_da)
+                        obs_da = obs_da.transpose('pair', 'y', 'x')
+                        sol_da = sol_da.transpose('pair', 'y', 'x')
+                        w_data = None
+                        if weight is not None and key in weight:
+                            # the grid of the same name: _weight() raised for one it lacks
+                            w_data = BatchCore._weight_of(weight[key], out_var).transpose('pair', 'y', 'x').data
+                        rmse_dask = utils_stats.rmse_pairs(obs_da.data, sol_da.data, w_data, mode=mode, moved=moved)
+                        coords = {k: v for k, v in obs_da.coords.items()
+                                  if k in ('y', 'x', 'spatial_ref')}
+                        rmse_vars[out_var] = xr.DataArray(
+                            rmse_dask, dims=('y', 'x'), coords=coords)
+                if isinstance(obs_ds, xr.DataArray) and not rmse_vars:
                     continue
-                recon[key] = BatchCore._form(obs_ds, recon_vars)
-            solution_pairs = Batch(recon)
-        else:
-            solution_pairs = solution
+                if split:
+                    out[key] = xr.Dataset(rmse_vars, attrs=self[key].attrs)
+                else:
+                    # a DataArray in, a DataArray out (N81)
+                    out[key] = BatchCore._form(obs_ds, rmse_vars, attrs=self[key].attrs)
+            warn_secondary('rmse', moved)
+            graph_check('rmse', out, [self, solution, weight])
+            return Batch(out)
+
+        # --- Date-based solution: pairs reconstructed as sol[rep] - sol[ref] (not fused: the reconstruction has its own chunks)
+        recon = {}
+        for key in self:
+            if key not in solution:
+                continue
+            obs_ds = self[key]
+            obs_vars = vars_of(obs_ds)
+            sol_vars = vars_of(solution[key])
+            recon_vars = {}
+            for var, obs_da in obs_vars_of(obs_ds).items():
+                if var not in sol_vars:
+                    continue
+                # the solution (a field of dates, read by sel per pair) on the observed's (y, x) chunks; its date chunks are its own
+                sol_da = utils_stats.align_da(obs_da, sol_vars[var], 'solution', moved)
+                refs = obs_da.coords['ref'].values
+                reps = obs_da.coords['rep'].values
+                recon_list = []
+                for p in range(len(refs)):
+                    recon_list.append(
+                        utils_complex.difference(sol_da.sel(date=reps[p]), sol_da.sel(date=refs[p]))
+                    )
+                recon_vars[var] = xr.concat(recon_list, dim='pair')
+            if isinstance(obs_ds, xr.DataArray) and not recon_vars:
+                continue
+            recon[key] = BatchCore._form(obs_ds, recon_vars)
+        solution_pairs = Batch(recon)
 
         # Compute error — angle-based for complex phase, direct for real
         if is_complex:
@@ -3358,9 +3210,7 @@ class BatchCore(dict):
                     if sol_var is None:
                         continue
                     err_vars[var] = xr.apply_ufunc(
-                        lambda obs, pred: np.angle(
-                            obs * np.conj(np.exp(1j * pred))
-                        ).astype(np.float32),
+                        lambda obs, pred: utils_stats.phase_error(obs, pred).astype(np.float32),
                         obs_vars[var], sol_vars[sol_var],
                         dask='parallelized', output_dtypes=[np.float32])
                 if isinstance(obs_ds, xr.DataArray) and not err_vars:
@@ -3368,7 +3218,7 @@ class BatchCore(dict):
                 error_dict[key] = BatchCore._form(obs_ds, err_vars)
             error = Batch(error_dict)
         else:
-            error = self - solution_pairs
+            error = utils_complex.difference(self, solution_pairs)
 
         # Compute per-pixel RMSE across temporal dimension (pair or date)
         out = {}
@@ -3381,19 +3231,20 @@ class BatchCore(dict):
                 tdim = next((d for d in ('pair', 'date') if d in err_da.dims), None)
                 if tdim is None:
                     continue
-                err_sq = err_da ** 2
-                if weight is not None and key in weight:
-                    # the grid of the same name: _weight() raised for one it lacks
-                    w_da = BatchCore._weight_of(weight[key], var)
-                    rmse_val = np.sqrt((w_da * err_sq).sum(tdim) / w_da.sum(tdim))
-                else:
-                    rmse_val = np.sqrt(err_sq.mean(tdim))
-                rmse_vars[var] = rmse_val.astype('float32')
+                # the grid of the same name: _weight() raised for one it lacks
+                w_da = BatchCore._weight_of(weight[key], var) if weight is not None and key in weight else None
+                if w_da is not None and var in vars_of(self[key]):
+                    # the weight on the observed's (y, x) chunks; its pair (date) chunks must equal the observed's (GMT U3)
+                    w_da = utils_stats.align_da(vars_of(self[key])[var], w_da, 'weight', moved)
+                rmse_vars[var] = utils_stats.rms(err_da, tdim, w_da).astype('float32')
             if isinstance(err_ds, xr.DataArray) and not rmse_vars:
                 continue
             # a DataArray in, a DataArray out (N81)
             out[key] = BatchCore._form(err_ds, rmse_vars, attrs=self[key].attrs)
 
+        warn_secondary('rmse', moved)
+
+        graph_check('rmse', out, [self, solution, weight])
         return Batch(out)
 
     def polyval(self, coeffs: dict[str, list | xr.DataArray], dim: str = 'x') -> BatchCore:
@@ -3475,7 +3326,7 @@ class BatchCore(dict):
                     # Multi-pair degree=1: [[ramp0, off0], [ramp1, off1], ...]
                     corrections = []
                     for pair_coeff in coeff:
-                        corr = pair_coeff[0] * coord + pair_coeff[1]
+                        corr = utils_align.ramp(coord, pair_coeff[0], pair_coeff[1])
                         corrections.append(corr)
                     # Stack along pair dimension
                     correction = xr.concat(corrections, dim='pair')
@@ -3485,7 +3336,7 @@ class BatchCore(dict):
                     # Check if it looks like [ramp, offset] for single pair (2 elements, no pair dim wouldn't reach here)
                     if len(coeff) == 2 and not has_pair_dim:
                         # Single pair degree=1: [ramp, offset]
-                        correction = coeff[0] * coord + coeff[1]
+                        correction = utils_align.ramp(coord, coeff[0], coeff[1])
                     else:
                         # Multi-pair degree=0
                         corrections = [xr.full_like(coord, off, dtype=float) for off in coeff]
@@ -3493,7 +3344,7 @@ class BatchCore(dict):
 
                 else:
                     # Single pair degree=1: [ramp, offset]
-                    correction = coeff[0] * coord + coeff[1]
+                    correction = utils_align.ramp(coord, coeff[0], coeff[1])
 
             elif isinstance(coeff, xr.DataArray):
                 # General case using xr.polyval
@@ -3544,16 +3395,15 @@ class BatchCore(dict):
         the window grid (coarsen() trims to it first), so every boundary is a multiple of the window or the end; two blocks
         smaller than a window merge. A dimension in one block keeps it."""
         sizes = {}
+        from . import utils_dask
         for dim, (_, count) in BatchCore._largest_blocks(ds, window).items():
             if count < 2:
                 continue
             blocks = next(b for v in BatchCore._vars_of(ds).values() for d, b in v.variable.chunksizes.items()
                           if d == dim and len(b) == count)
-            n, w = int(sum(blocks)), int(window[dim])
-            inner = sorted({-(-int(b) // w) * w for b in np.cumsum(blocks)[:-1]} - {0})
-            inner = [b for b in inner if b < n]
-            if inner:
-                sizes[dim] = tuple(int(s) for s in np.diff([0] + inner + [n]))
+            inner = utils_dask.coarsen_chunks(blocks, window[dim])
+            if inner is not None:
+                sizes[dim] = inner
         return sizes
 
     def coarsen(self, window: dict[str, int], **kwargs) -> Batch:
@@ -3621,7 +3471,8 @@ class BatchCore(dict):
         >>> # Auto: date=1, y/x=uniform based on dask.config['array.chunk-size']
         >>> batch.chunk('auto')
         """
-        from .utils_dask import rechunk2d
+        from .utils_dask import rechunk2d, warn_floor
+        floors = []
 
         def rechunk(arr, dims):
             """one spatial variable rechunked; `dims` are the dims of its burst"""
@@ -3630,7 +3481,7 @@ class BatchCore(dict):
                 y_size, x_size = arr.shape[-2], arr.shape[-1]
                 element_bytes = arr.dtype.itemsize
                 in_chunks = (arr.data.chunks[-2], arr.data.chunks[-1]) if hasattr(arr.data, 'chunks') else None
-                optimal = rechunk2d((y_size, x_size), element_bytes, input_chunks=in_chunks)
+                optimal = rechunk2d((y_size, x_size), element_bytes, input_chunks=in_chunks, floors=floors)
                 if arr.ndim == 3:
                     var_chunks = {arr.dims[0]: 1, 'y': optimal['y'], 'x': optimal['x']}
                 else:
@@ -3668,20 +3519,23 @@ class BatchCore(dict):
             if rechunked_vars:
                 ds = ds.assign(rechunked_vars)
             result[k] = ds
-        return type(self)(result)
+        chunked = type(self)(result)
+        warn_floor('chunk', floors)
+        graph_check('chunk', chunked, self)
+        return chunked
 
     def chunk2d(self, budget=None, chunks=1):
         """
         Rechunk for pair-based (2D) processing: dim-0=chunks, spatial dims sized to budget.
 
-        Computes optimal spatial chunk sizes so that each 2D slice (one pair/date)
-        fits within the specified memory budget.
+        Computes spatial chunk sizes close to the memory budget for each 2D slice (one pair/date):
+        the budget is a target, a chunk is at most 1.2 times it (27 KiB or more per date).
         Prints one WARNING line per call when a data variable's output has more than 2000 chunks.
 
         Parameters
         ----------
         budget : str or None
-            Memory budget per chunk, e.g. '128MiB', '256MB', '1GiB'.
+            Target memory per chunk, e.g. '128MiB', '256MB', '1GiB' (MB is read as MiB, GB as GiB).
             If None (default), uses dask.config['array.chunk-size'].
         chunks : int
             Chunk size for the first (pair/date) dimension. Default 1.
@@ -3700,16 +3554,16 @@ class BatchCore(dict):
         >>> intfcorr2d.chunk2d('5MB', 20).snapshot('intfcorr2d')
         """
         import dask
-        from .utils_dask import rechunk2d
+        from .utils_dask import rechunk2d, get_dask_chunk_size_mb, warn_floor
 
-        target_mb = _parse_budget(budget) if budget is not None else None
+        target_mb = _parse_budget(budget) if budget is not None else get_dask_chunk_size_mb()
 
         # the tasks rechunk: under a client, dask picks p2p for a large one by itself
         ctx = dask.config.set({"array.rechunk.method": "tasks"})
 
         with ctx:
             result = {}
-            most = (0, None, None)  # the largest output chunk count of a data variable: (count, variable, key)
+            floors = []
             for k, ds in self.items():
                 # Compute spatial chunks once per burst using 8 bytes (complex64)
                 # so all variables get identical spatial chunks.
@@ -3729,13 +3583,13 @@ class BatchCore(dict):
                 if sample is None:
                     result[k] = ds
                     continue
-                # Scale budget by chunks so total chunk memory stays within budget
+                # the budget is per chunk: a chunk of `chunks` dates gives each date budget / chunks
                 dim0 = chunks if chunks != -1 else (n_stack if n_stack > 0 else 1)
-                per_slice_mb = (target_mb / dim0) if target_mb is not None else None
+                per_slice_mb = target_mb / dim0
                 y_size, x_size = sample.shape[-2], sample.shape[-1]
                 in_chunks = (sample.data.chunks[-2], sample.data.chunks[-1]) if hasattr(sample.data, 'chunks') else None
                 optimal = rechunk2d((y_size, x_size), element_bytes=8,
-                                   input_chunks=in_chunks, target_mb=per_slice_mb, merge=True)
+                                   input_chunks=in_chunks, target_mb=per_slice_mb, merge=True, floors=floors)
                 rechunked_vars = {}
                 for var, arr in vars_.items():
                     if not (arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x')):
@@ -3745,31 +3599,27 @@ class BatchCore(dict):
                     else:
                         var_chunks = {'y': optimal['y'], 'x': optimal['x']}
                     rechunked_vars[var] = arr.chunk(var_chunks)
-                    n_chunks = int(np.prod(rechunked_vars[var].data.numblocks))
-                    if n_chunks > most[0]:
-                        most = (n_chunks, var, k)
                 if isinstance(ds, xr.DataArray):
                     ds = rechunked_vars[ds.name]
                 elif rechunked_vars:
                     ds = ds.assign(rechunked_vars)
                 result[k] = ds
-            # one line per call: the chunk count drives the memory of the chain, not the chunk size
-            if most[0] > 2000:
-                print(f"WARNING: chunk2d(): {most[0]} output chunks of {most[1]} in {most[2]} (more than 2000): "
-                      "use a larger budget or keep the stored chunks")
+        warn_floor('chunk2d', floors)
+        graph_check('chunk2d', result, self)
         return type(self)(result)
 
     def chunk1d(self, budget=None, chunks=-1):
         """
         Rechunk for date-based (1D) processing: dim-0=chunks, spatial dims sized to budget.
 
-        Computes optimal spatial chunk sizes so that the date/pair stack
-        fits within the specified memory budget per spatial tile.
+        Computes spatial chunk sizes so that the date/pair stack of a spatial tile is close to the
+        memory budget: a target, a tile is at most 1.2 times it (27 KiB or more per date).
 
         Parameters
         ----------
-        budget : str
-            Memory budget per chunk, e.g. '128MiB', '256MB', '1GiB'.
+        budget : str or None
+            Target memory per chunk, e.g. '128MiB', '256MB', '1GiB' (MB is read as MiB, GB as GiB).
+            If None (default), uses dask.config['array.chunk-size'].
         chunks : int
             Chunk size for the first (pair/date) dimension. Default -1 (all).
             Use e.g. 20 for partial merge — much faster rechunk/snapshot
@@ -3788,15 +3638,16 @@ class BatchCore(dict):
         >>> intfcorr2d.chunk1d('1GB', 20).snapshot('intfcorr')
         """
         import dask
-        from .utils_dask import rechunk2d
+        from .utils_dask import rechunk2d, get_dask_chunk_size_mb, warn_floor
 
-        target_mb = _parse_budget(budget) if budget is not None else None
+        target_mb = _parse_budget(budget) if budget is not None else get_dask_chunk_size_mb()
 
         # the tasks rechunk: under a client, dask picks p2p for a large one by itself
         ctx = dask.config.set({"array.rechunk.method": "tasks"})
 
         with ctx:
             result = {}
+            floors = []
             for k, ds in self.items():
                 # Find the largest dim-0 among 3D variables (a DataArray is its own one, N81)
                 vars_ = BatchCore._vars_of(ds)
@@ -3814,11 +3665,11 @@ class BatchCore(dict):
                 dim0 = n_stack if chunks == -1 else chunks
                 # Divide budget by dim0 to get per-slice budget,
                 # then use rechunk2d (a 2D function) with per-slice element_bytes=8.
-                per_slice_mb = (target_mb / dim0) if target_mb is not None else None
+                per_slice_mb = target_mb / dim0
                 y_size, x_size = sample.shape[1], sample.shape[2]
                 in_chunks = (sample.data.chunks[1], sample.data.chunks[2]) if hasattr(sample.data, 'chunks') else None
                 optimal = rechunk2d((y_size, x_size), element_bytes=8,
-                                   input_chunks=in_chunks, target_mb=per_slice_mb, merge=True)
+                                   input_chunks=in_chunks, target_mb=per_slice_mb, merge=True, floors=floors)
                 rechunked_vars = {}
                 for var, arr in vars_.items():
                     if not (arr.ndim in (2, 3) and arr.dims[-2:] == ('y', 'x')):
@@ -3833,6 +3684,8 @@ class BatchCore(dict):
                 elif rechunked_vars:
                     ds = ds.assign(rechunked_vars)
                 result[k] = ds
+        warn_floor('chunk1d', floors)
+        graph_check('chunk1d', result, self)
         return type(self)(result)
 
     def pipe(self, func, *args, **kwargs):
@@ -4172,8 +4025,15 @@ class BatchCore(dict):
         if all(ds.sizes['y'] < yscale or ds.sizes['x'] < xscale for ds in self.values()):
             raise ValueError(f'ERROR: downsample({new_spacing[0]:g}, {new_spacing[1]:g}): every burst is smaller than one '
                              f'cell of {yscale} x {xscale} pixels. Use a smaller spacing.')
-        result = self._like(spatial).coarsen(
-            {'y': yscale, 'x': xscale}, boundary='trim').mean()
+        from .BatchWrap import BatchWrap
+
+        def mean64(a, axis, **kwargs):
+            # the window mean with a float64 (complex128) accumulator, back in the input's dtype (the user, 11-08)
+            acc = np.complex128 if a.dtype.kind == 'c' else np.float64
+            return np.nanmean(a, axis=axis, dtype=acc).astype(a.dtype) if a.dtype.kind in 'fc' else np.mean(a, axis=axis, dtype=acc)
+        coarse = self._like(spatial).coarsen({'y': yscale, 'x': xscale}, boundary='trim')
+        # wrapped phase keeps its circular mean (BatchWrap._agg)
+        result = coarse.mean() if isinstance(self, BatchWrap) else coarse._agg('reduce', func=mean64)
         for key in list(result.keys()):
             md = meta_keys.get(key)
             if md is not None and len(md.data_vars):
@@ -4235,11 +4095,13 @@ class BatchCore(dict):
             Specific (y, x) variable to merge. If None, merges every (y, x) variable.
         chunks : str, int, or tuple, optional
             Spatial chunk size for processing. Options:
-            - 'auto' (default): automatically determine chunk size based on memory
+            - 'auto' (default): the output blocks follow the input blocks: a boundary where every burst has a block
+              boundary, joined up to the dask chunk size; where the bursts disagree, blocks of at most max(the chunk size,
+              twice the largest input block) per side, split at a burst's block boundary
             - int: use same chunk size for both y and x dimensions
             - tuple (y_chunk, x_chunk): explicit chunk sizes for each dimension
             Note: Only 2D spatial chunks are supported. The stack dimension
-            (date/pair) is always processed one slice at a time.
+            (date/pair) keeps the first burst's chunks.
         compute : bool, optional
             Whether to compute the result immediately. Default is False (lazy).
         debug : bool, optional
@@ -4367,127 +4229,35 @@ class BatchCore(dict):
                 datas_by_pol[pol] = [datas_by_pol[pol][i] for i in nonempty_indices]
             first_datas = datas_by_pol[first_pol]
 
-        # Ensure coordinates are concrete values (important for data from delayed computations)
+        # THE PLAN OF THE OUTPUT GRID (utils_xarray.mosaic_plan): the signed spacing of the first burst,
+        # the union axes, the output blocks and the bursts of each block, from the coordinates and the input blocks
         dy = float(first_datas[0].y.diff('y').values[0])  # Signed spacing
         dx = float(first_datas[0].x.diff('x').values[0])
-
-        # Find global min/max across all bursts
-        # Use explicit float conversion to handle any lazy coordinate types
-        y_min = min(float(np.asarray(ds.y.values).min()) for ds in first_datas)
-        y_max = max(float(np.asarray(ds.y.values).max()) for ds in first_datas)
-        x_min = min(float(np.asarray(ds.x.values).min()) for ds in first_datas)
-        x_max = max(float(np.asarray(ds.x.values).max()) for ds in first_datas)
-
-        # Determine first/last based on sign of spacing
-        # If dy > 0 (increasing): first = min, last = max
-        # If dy < 0 (decreasing): first = max, last = min
-        y_first = y_min if dy > 0 else y_max
-        y_last = y_max if dy > 0 else y_min
-        x_first = x_min if dx > 0 else x_max
-        x_last = x_max if dx > 0 else x_min
-
-        # Build output grid using arange with signed spacing
-        # Add dy/2 to last to ensure it's included (arange excludes endpoint)
-        ys = np.arange(y_first, y_last + dy/2, dy)
-        xs = np.arange(x_first, x_last + dx/2, dx)
+        # each burst's merged grids' (y, x) input blocks: the 'auto' output blocks follow them
+        yx_chunks = [[tuple((datas_by_pol[pol][i].chunks or tuple((s,) for s in datas_by_pol[pol][i].shape))[-2:])
+                      for pol in polarizations] for i in range(len(first_datas))]
+        plan = utils_xarray.mosaic_plan([d.y.values for d in first_datas], [d.x.values for d in first_datas],
+                                        dy, dx, chunks, yx_chunks=yx_chunks)
+        ys, xs = plan['ys'], plan['xs']
+        y_sizes, x_sizes = plan['y_sizes'], plan['x_sizes']
+        n_y_chunks, n_x_chunks = plan['n_y_chunks'], plan['n_x_chunks']
+        burst_info = plan['burst_info']
+        chunk_index = plan['chunk_index']
 
         fill_dtype = first_datas[0].dtype
-
-        # Determine chunk sizes for spatial dimensions
-        # Stack dimension is always processed one slice at a time (chunked to 1)
-        if chunks == 'auto':
-            # Use rechunk2d for uniform chunk sizes
-            # Use 16 bytes to account for memory overhead (output + overlapping inputs)
-            from .utils_dask import rechunk2d
-            # to_dataset creates a new output grid — no input chunks to align to
-            optimal = rechunk2d((ys.size, xs.size), element_bytes=16)
-            y_chunk_size = optimal['y']
-            x_chunk_size = optimal['x']
-        elif isinstance(chunks, (int, np.integer)):
-            # Single int: use same size for both dimensions
-            y_chunk_size = min(int(chunks), ys.size)
-            x_chunk_size = min(int(chunks), xs.size)
-        elif isinstance(chunks, (tuple, list)) and len(chunks) == 2:
-            # Tuple/list of (y_chunk, x_chunk)
-            y_chunk_size = min(int(chunks[0]), ys.size)
-            x_chunk_size = min(int(chunks[1]), xs.size)
-        else:
-            raise ValueError(
-                f"chunks must be 'auto', int, or 2-tuple (y, x), got {type(chunks).__name__}: {chunks}. "
-                "Note: 3D chunks are not supported; stack dimension is always processed per-slice."
-            )
-
-        # Number of chunks in each dimension
-        n_y_chunks = (ys.size + y_chunk_size - 1) // y_chunk_size
-        n_x_chunks = (xs.size + x_chunk_size - 1) // x_chunk_size
-
-        # Extract extents and build spatial index for O(1) chunk lookup
-        burst_info = []
-        # chunk_index[(yi, xi)] = list of (burst_idx, coverage) sorted by coverage desc
-        from collections import defaultdict
-        chunk_index = defaultdict(list)
-
-        # Index formula: idx = (coord - y_first) / dy
-        # Works for both increasing (dy > 0) and decreasing (dy < 0) coords
-        for burst_idx, d in enumerate(first_datas):
-            # Ensure coordinates are concrete numpy arrays (not dask or other lazy types)
-            # This is important when data comes from delayed computations like dissolve()
-            burst_ys = np.asarray(d.y.values, dtype=np.float64)
-            burst_xs = np.asarray(d.x.values, dtype=np.float64)
-            info = {
-                'y_coords': burst_ys,
-                'x_coords': burst_xs,
-            }
-            burst_info.append(info)
-
-            # Convert burst first/last coordinates to global array indices
-            burst_y_start_idx = int(round((burst_ys[0] - y_first) / dy))
-            burst_y_end_idx = int(round((burst_ys[-1] - y_first) / dy)) + 1
-            burst_x_start_idx = int(round((burst_xs[0] - x_first) / dx))
-            burst_x_end_idx = int(round((burst_xs[-1] - x_first) / dx)) + 1
-
-            # Which output chunks does this burst overlap? (using array indices)
-            y_chunk_start = max(0, burst_y_start_idx // y_chunk_size)
-            y_chunk_end = min(n_y_chunks, (burst_y_end_idx + y_chunk_size - 1) // y_chunk_size)
-            x_chunk_start = max(0, burst_x_start_idx // x_chunk_size)
-            x_chunk_end = min(n_x_chunks, (burst_x_end_idx + x_chunk_size - 1) // x_chunk_size)
-
-            # Register this burst for all overlapping chunks
-            for yi in range(y_chunk_start, y_chunk_end):
-                for xi in range(x_chunk_start, x_chunk_end):
-                    # Compute coverage (number of pixels in overlap)
-                    chunk_y0 = yi * y_chunk_size
-                    chunk_y1 = min(chunk_y0 + y_chunk_size, ys.size)
-                    chunk_x0 = xi * x_chunk_size
-                    chunk_x1 = min(chunk_x0 + x_chunk_size, xs.size)
-
-                    # Overlap in array index space
-                    ov_y0 = max(chunk_y0, burst_y_start_idx)
-                    ov_y1 = min(chunk_y1, burst_y_end_idx)
-                    ov_x0 = max(chunk_x0, burst_x_start_idx)
-                    ov_x1 = min(chunk_x1, burst_x_end_idx)
-
-                    coverage = max(0, ov_y1 - ov_y0) * max(0, ov_x1 - ov_x0)
-                    if coverage > 0:
-                        chunk_index[(yi, xi)].append((burst_idx, coverage))
-
-        # Each chunk's bursts in acquisition order (burst_idx follows it): the most recent
-        # is laid last and wins the overlaps
-        for key in chunk_index:
-            chunk_index[key].sort()
 
         # Debug output
         if debug:
             print(f"=== to_dataset() debug ===")
             print(f"Number of bursts: {len(first_datas)}")
             print(f"Output grid: y={ys.size}, x={xs.size} (total {ys.size * xs.size:,} pixels)")
-            print(f"Chunk size: y={y_chunk_size}, x={x_chunk_size} ({y_chunk_size * x_chunk_size:,} pixels/chunk)")
+            print(f"Largest block: y={max(y_sizes)}, x={max(x_sizes)} ({max(y_sizes) * max(x_sizes):,} pixels)")
             print(f"Number of chunks: {n_y_chunks} y × {n_x_chunks} x = {n_y_chunks * n_x_chunks} total")
             print(f"Stack dimension: {stackvar}={n_stack} slices")
             print(f"Data type: {fill_dtype} ({np.dtype(fill_dtype).itemsize} bytes/pixel)")
 
             # Memory estimate per chunk
-            chunk_mem_mb = y_chunk_size * x_chunk_size * np.dtype(fill_dtype).itemsize / 1024 / 1024
+            chunk_mem_mb = max(y_sizes) * max(x_sizes) * np.dtype(fill_dtype).itemsize / 1024 / 1024
             print(f"Memory per chunk: ~{chunk_mem_mb:.1f} MB")
 
             # Burst distribution across chunks
@@ -4508,22 +4278,15 @@ class BatchCore(dict):
                 print(f"  [{idx}] y=[{by.min():.1f}, {by.max():.1f}] "
                       f"x=[{bx.min():.1f}, {bx.max():.1f}] ({len(by)}×{len(bx)} pixels)")
 
-        # Build result for each polarization: ONE TASK PER OUTPUT BLOCK, and one per tile it
-        # reads, on the inputs' own blocks. The merge functions are module level
-        # (_tile_for_dask, _merge_parts_for_dask).
+        # Build result for each polarization: ONE TASK PER OUTPUT BLOCK, and one per input-block piece it
+        # cuts (the dates of its stack chunk in one task); a whole input block is read as itself. The merge
+        # functions are module level
+        # (_tile_for_dask, _merge_stack_for_dask). THE STACK CHUNKS ARE THE INPUT'S (the user, 2026-10-31):
+        # a block of the output holds the dates of one input stack chunk, looped inside its task.
         from dask.base import tokenize
         from dask._task_spec import Task, TaskRef
         from dask.highlevelgraph import HighLevelGraph
 
-        def _overlap(edges, lo, hi):
-            """[(chunk, start, stop within it)] of the chunks the range [lo, hi) overlaps."""
-            first = int(np.searchsorted(edges, lo, 'right')) - 1
-            last = int(np.searchsorted(edges, hi, 'left')) - 1
-            return [(i, max(lo, edges[i]) - edges[i], min(hi, edges[i + 1]) - edges[i])
-                    for i in range(first, last + 1)]
-
-        y_sizes = tuple(min(y_chunk_size, ys.size - yi * y_chunk_size) for yi in range(n_y_chunks))
-        x_sizes = tuple(min(x_chunk_size, xs.size - xi * x_chunk_size) for xi in range(n_x_chunks))
         results = {}
         # AN INTEGER OR BOOLEAN GRID KEEPS ITS DTYPE (decided): no NaN, so its nodata value
         # is set by the dtype (_nodata_of: -1 signed, 0 unsigned, False bool), transparent
@@ -4542,104 +4305,54 @@ class BatchCore(dict):
             arrays = [d.data if isinstance(d.data, da.Array) else da.from_array(d.data, chunks=d.data.shape)
                       for d in datas]
             edges = [[np.cumsum((0,) + tuple(c)).tolist() for c in a.chunks] for a in arrays]
+            # the output's stack chunks: the first burst's (a 2-D grid is one 'fake' slice)
+            stack_chunks = tuple(arrays[0].chunks[0]) if stackvar != 'fake' else (1,)
+            s_edges = np.cumsum((0,) + stack_chunks).tolist()
             # the same merge of the same inputs on the same grid is the same keys
-            token = tokenize(pol, stackvar, n_stack, ys, xs, y_chunk_size, x_chunk_size, str(fill_dtype), str(nodata),
+            token = tokenize(pol, stackvar, n_stack, stack_chunks, ys, xs, y_sizes, x_sizes, str(fill_dtype),
+                             str(nodata),
                              [(a.name, a.chunks, info['y_coords'], info['x_coords'])
                               for a, info in zip(arrays, burst_info)])
             name = f'to_dataset-{token}'
             tname = f'to_dataset-tile-{token}'
             layer = {}
 
-            for s_idx in range(n_stack):
-                for yi in range(n_y_chunks):
-                    yb0 = yi * y_chunk_size
-                    yb1 = min(yb0 + y_chunk_size, ys.size)
-                    for xi in range(n_x_chunks):
-                        xb0 = xi * x_chunk_size
-                        xb1 = min(xb0 + x_chunk_size, xs.size)
-
-                        # O(1) lookup of overlapping bursts via spatial index
-                        overlapping = chunk_index.get((yi, xi), [])
-
-                        out_shape = (yb1 - yb0, xb1 - xb0)
-
-                        # Output chunk coordinates
-                        out_ys = ys[yb0:yb1]
-                        out_xs = xs[xb0:xb1]
-
-                        # the tiles (a tile over several input blocks: one part per block) and
-                        # their offsets within this chunk; none gives a NaN block
-                        parts = []
-                        offsets = []
-
-                        # Output chunk coordinate bounds (with small tolerance for floating point)
-                        # Use tiny tolerance (1e-6 * spacing) to handle floating point precision
-                        # Apply tolerance to expand bounds (not shrink), regardless of coord direction
-                        tol_y = abs(dy) * 1e-6
-                        tol_x = abs(dx) * 1e-6
-                        y_lo = min(out_ys[0], out_ys[-1]) - tol_y
-                        y_hi = max(out_ys[0], out_ys[-1]) + tol_y
-                        x_lo = min(out_xs[0], out_xs[-1]) - tol_x
-                        x_hi = max(out_xs[0], out_xs[-1]) + tol_x
-
-                        for burst_idx, _ in overlapping:
-                            info = burst_info[burst_idx]
-                            burst_ys = info['y_coords']
-                            burst_xs = info['x_coords']
-
-                            # Find burst indices that fall within output chunk bounds
-                            mask_y = (burst_ys >= y_lo) & (burst_ys <= y_hi)
-                            mask_x = (burst_xs >= x_lo) & (burst_xs <= x_hi)
-                            idx_y = np.where(mask_y)[0]
-                            idx_x = np.where(mask_x)[0]
-
-                            if len(idx_y) > 0 and len(idx_x) > 0:
-                                by0, by1 = int(idx_y[0]), int(idx_y[-1]) + 1
-                                bx0, bx1 = int(idx_x[0]), int(idx_x[-1]) + 1
-
-                                # Compute tile offset within this output chunk
-                                # Tile's first coord -> global array index -> offset in chunk
-                                tile_y0_coord = burst_ys[by0]
-                                tile_x0_coord = burst_xs[bx0]
-                                # Global array index of tile start
-                                tile_global_yi = int(round((tile_y0_coord - y_first) / dy))
-                                tile_global_xi = int(round((tile_x0_coord - x_first) / dx))
-                                # Offset within this chunk (yb0, xb0 is chunk start in global)
-                                y_off = tile_global_yi - yb0
-                                x_off = tile_global_xi - xb0
-
-                                # Validate offset is within reasonable bounds
-                                # (should be within chunk ± 1 for floating point tolerance)
-                                tile_h, tile_w = by1 - by0, bx1 - bx0
-                                if y_off < -1 or y_off + tile_h > out_shape[0] + 1:
-                                    continue  # Skip misaligned tiles
-                                if x_off < -1 or x_off + tile_w > out_shape[1] + 1:
-                                    continue  # Skip misaligned tiles
-
-                                # the tile, cut from each input block it overlaps
-                                arr = arrays[burst_idx]
-                                ey, ex = edges[burst_idx][-2], edges[burst_idx][-1]
+            yx_edges = [(e[-2], e[-1]) for e in edges]
+            for yi in range(n_y_chunks):
+                for xi in range(n_x_chunks):
+                    out_shape, tiles = utils_xarray.mosaic_tiles(plan, yi, xi, yx_edges)
+                    offsets = tuple((off_y, off_x) for *_, off_y, off_x in tiles)
+                    for sb, (s0, s1) in enumerate(zip(s_edges[:-1], s_edges[1:])):
+                        # per tile and stack chunk: the input block itself when the tile is the whole block, else one cut
+                        args, index, picks = [], {}, [[None] * len(tiles) for _ in range(s1 - s0)]
+                        for j, (burst_idx, iy, py0, py1, ix, px0, px1, _, _) in enumerate(tiles):
+                            arr = arrays[burst_idx]
+                            ey, ex = edges[burst_idx][-2], edges[burst_idx][-1]
+                            whole = (py0, py1, px0, px1) == (0, ey[iy + 1] - ey[iy], 0, ex[ix + 1] - ex[ix])
+                            for s_idx in range(s0, s1):
                                 if arr.ndim == 3:
                                     es = edges[burst_idx][0]
                                     sc = int(np.searchsorted(es, s_idx, 'right')) - 1
-                                    lead, s_local = (sc,), s_idx - es[sc]
+                                    lo, hi = max(s0, es[sc]) - es[sc], min(s1, es[sc + 1]) - es[sc]
+                                    src, full = (arr.name, sc, iy, ix), whole and lo == 0 and hi == es[sc + 1] - es[sc]
                                 else:
-                                    lead, s_local = (), None
-                                for iy, py0, py1 in _overlap(ey, by0, by1):
-                                    for ix, px0, px1 in _overlap(ex, bx0, bx1):
-                                        key = (tname, s_idx, yi, xi, len(parts))
-                                        layer[key] = Task(key, _tile_for_dask,
-                                                          TaskRef((arr.name,) + lead + (iy, ix)),
-                                                          s_local, py0, py1, px0, px1)
-                                        parts.append(TaskRef(key))
-                                        offsets.append((y_off + ey[iy] + py0 - by0, x_off + ex[ix] + px0 - bx0))
-
-                        key = (name, s_idx, yi, xi)
-                        layer[key] = Task(key, _merge_parts_for_dask, tuple(offsets), out_shape,
-                                          fill_dtype, nodata, *parts)
+                                    sc, lo, hi = None, None, None
+                                    src, full = (arr.name, iy, ix), whole
+                                if (j, sc) not in index:
+                                    index[(j, sc)] = len(args)
+                                    if full:
+                                        args.append(TaskRef(src))
+                                    else:
+                                        key = (tname, sb, yi, xi, j, -1 if sc is None else sc)
+                                        layer[key] = Task(key, _tile_for_dask, TaskRef(src), lo, hi, py0, py1, px0, px1)
+                                        args.append(TaskRef(key))
+                                picks[s_idx - s0][j] = (index[(j, sc)], None if sc is None else s_idx - es[sc] - lo)
+                        key = (name, sb, yi, xi)
+                        layer[key] = Task(key, _merge_stack_for_dask, offsets, tuple(tuple(p) for p in picks), out_shape,
+                                          fill_dtype, nodata, s1 - s0, *args)
 
             graph = HighLevelGraph.from_collections(name, layer, dependencies=arrays)
-            data = da.Array(graph, name, chunks=((1,) * n_stack, y_sizes, x_sizes), dtype=fill_dtype,
+            data = da.Array(graph, name, chunks=(stack_chunks, y_sizes, x_sizes), dtype=fill_dtype,
                             meta=np.empty((0, 0, 0), dtype=fill_dtype))
 
             result = xr.DataArray(data, coords={stackvar: stackval, 'y': ys, 'x': xs})\
@@ -4686,59 +4399,7 @@ class BatchCore(dict):
         travels with them -- so what comes back is the sparse points rather
         than the raster they came from.
         """
-        import numpy as np
-        cols, keep = {}, None
-        for name, v in blocks.items():
-            v = np.asarray(v)
-            if v.ndim == 2:
-                cols[name] = v
-            else:
-                for i in range(v.shape[0]):
-                    cols[f'{name}#{i}'] = v[i]
-        for v in cols.values():
-            if np.issubdtype(v.dtype, np.floating):
-                m = np.isfinite(v)
-            elif np.issubdtype(v.dtype, np.complexfloating):
-                m = np.isfinite(v.real) & np.isfinite(v.imag)
-            else:
-                continue
-            keep = m if keep is None else (keep | m)
-        if keep is None:
-            keep = np.ones((len(yv), len(xv)), bool)
-        if not keep.any():
-            return None
-        yy, xx = np.nonzero(keep)
-        out = {'y': np.asarray(yv)[yy], 'x': np.asarray(xv)[xx]}
-        for k, v in cols.items():
-            v = v[yy, xx]
-            if np.issubdtype(v.dtype, np.complexfloating):
-                # A GEOPACKAGE HAS NO COMPLEX COLUMN, and `real`/`imag` are
-                # the FIT'S basis, not a quantity: the annual term is
-                # `real*cos(2 pi t) + imag*sin(2 pi t)`, so neither half means
-                # anything alone. AMPLITUDE AND PHASE are what the same
-                # quantity is called everywhere it is read -- amplitude is the
-                # size of the seasonal swing, in whatever unit the variable
-                # carries, and phase is WHEN it peaks. Phase costs one column
-                # and is what makes the pair lossless: amplitude alone cannot
-                # rebuild the model, nor say whether two points peak in the
-                # same season, which is what separates a real seasonal signal
-                # from a fitting artefact. Degrees, as the products this is
-                # compared against report it.
-                # ROUND IN FLOAT64, whatever came in. A float32 rounded to
-                # 6 decimals cannot HOLD 6 decimals -- the nearest float32 to
-                # -12.294427 is -12.29442691802978..., and the GeoPackage
-                # column is an 8-byte REAL, so every reader displays that
-                # full tail as if nothing had been rounded at all.
-                out[f'{k}_amp'] = np.round(np.abs(v).astype(np.float64),
-                                           decimals)
-                out[f'{k}_phase'] = np.round(
-                    np.degrees(np.angle(v)).astype(np.float64),
-                    min(decimals, 3))
-            elif np.issubdtype(v.dtype, np.floating):
-                out[k] = np.round(v.astype(np.float64), decimals)
-            else:
-                out[k] = v
-        return out
+        return utils_export.gpkg_block(blocks, yv, xv, decimals)
 
     def to_geopackage(self, filename: str, crs: str | int | None = None,
                       decimals: int = 3, overwrite: bool = True,
@@ -5002,19 +4663,13 @@ class BatchCore(dict):
         # Get pixel spacing
         dy, dx = self.spacing
 
-        # Create rectangles in projected coordinates
-        def point_to_rectangle(row, half_y, half_x):
-            return shapely.geometry.Polygon([
-                (row.x - half_x, row.y - half_y),
-                (row.x + half_x, row.y - half_y),
-                (row.x + half_x, row.y + half_y),
-                (row.x - half_x, row.y + half_y)
-            ])
+        rectangles = utils_export.pixel_rectangles(df['x'].values, df['y'].values, abs(dx)/2, abs(dy)/2,
+                                                   dtype=df.values.dtype)
 
         # Build GeoDataFrame with rectangles
         gdf = gpd.GeoDataFrame(
             df[['y', 'x'] + data_vars],
-            geometry=[point_to_rectangle(row, abs(dy)/2, abs(dx)/2) for _, row in df.iterrows()],
+            geometry=[shapely.geometry.Polygon(r) for r in rectangles],
             crs=self.crs
         )
 
@@ -5026,8 +4681,8 @@ class BatchCore(dict):
         if crs is not None:
             gdf = gdf.to_crs(crs)
         for col in data_vars:
-            gdf[col] = gdf[col].astype(float).round(decimals)
-        gdf.geometry = shapely.set_precision(gdf.geometry, grid_size=1e-6)
+            gdf[col] = utils_export.rounded(gdf[col], decimals)
+        gdf.geometry = utils_export.snap_geometry(gdf.geometry)
 
         # Add CRS for GIS software compatibility
         crs_urn = gdf.crs.to_string().replace(':', '::')
@@ -5060,6 +4715,14 @@ class BatchCore(dict):
         mask : bool, optional
             If True, mask topography by valid data pixels.
 
+        Notes
+        -----
+        The topography is the NEAREST pixel of the transform's ``ele``: a given or the default transform is decimated to the
+        data grid by nearest index; with ``data=None`` and an ``overlay``, each overlay node takes the nearest pixel of each
+        burst (the first burst with a value gives it; overlapping bursts share the DEM). With an overlay on the data, the
+        topography of the data grid is interpolated linearly to the overlay grid. For more precision downsample the
+        transform's ``ele`` to the grid of the data or of the overlay.
+
         Examples
         --------
         >>> velocity.to_vtk('velocity', transform=stack)
@@ -5068,7 +4731,6 @@ class BatchCore(dict):
         """
         import os
         import numpy as np
-        import pandas as pd
         from tqdm.auto import tqdm
         from vtk import vtkStructuredGridWriter, VTK_BINARY
         from .utils_vtk import as_vtk
@@ -5082,15 +4744,16 @@ class BatchCore(dict):
         # Handle overlay-only case (export just overlay on topography)
         if not self and overlay is not None and transform is not None:
             tfm = transform if isinstance(transform, BatchCore) else Batch(transform)
-            topo_merged = tfm[['ele']].to_dataset()
-            topo_da = topo_merged['ele'] if 'ele' in topo_merged else None
-            if topo_da is None:
+            bursts = [ds['ele'] for ds in tfm.values() if 'ele' in ds]
+            if not bursts:
                 raise ValueError("transform must contain 'ele' variable")
 
             ov = overlay
             if 'band' not in ov.dims:
                 ov = ov.expand_dims('band')
-            topo_da = topo_da.interp(y=ov.y, x=ov.x, method='linear')
+            # the elevation at the overlay nodes: each burst's nearest pixel, burst by burst (the first burst with a value gives it)
+            z = utils_xarray.overlay_height(ov.y.values, ov.x.values, bursts)
+            topo_da = xr.DataArray(z, coords={'y': ov.y.values, 'x': ov.x.values}, dims=('y', 'x'), name='ele')
 
             if mask:
                 topo_da = topo_da.where(np.isfinite(ov.isel(band=0)))
@@ -5117,20 +4780,11 @@ class BatchCore(dict):
 
         tfm = transform if transform is None or isinstance(transform, BatchCore) else Batch(transform)
 
-        def _format_dt(val):
-            try:
-                ts = pd.to_datetime(val)
-                if pd.isna(ts):
-                    return str(val)
-                return ts.strftime('%Y%m%d')
-            except Exception:
-                return str(val)
-
         def _format_pair(da, idx):
             if 'ref' in da.coords and 'rep' in da.coords:
                 ref_val = da.coords['ref'].values[idx]
                 rep_val = da.coords['rep'].values[idx]
-                return f"{_format_dt(ref_val)}_{_format_dt(rep_val)}"
+                return f"{utils_xarray.format_date(ref_val)}_{utils_xarray.format_date(rep_val)}"
             return str(idx)
 
         os.makedirs(path, exist_ok=True)
@@ -5146,28 +4800,14 @@ class BatchCore(dict):
         topo_merged = None
         if tfm is not None:
             # Decimate each burst's transform to match corresponding input burst
-            def _nearest_indices(source_coords, target_coords):
-                descending = len(source_coords) > 1 and source_coords[0] > source_coords[-1]
-                if descending:
-                    source_coords = source_coords[::-1]
-                indices = np.searchsorted(source_coords, target_coords)
-                indices = np.clip(indices, 0, len(source_coords) - 1)
-                prev_indices = np.clip(indices - 1, 0, len(source_coords) - 1)
-                prev_diff = np.abs(source_coords[prev_indices] - target_coords)
-                curr_diff = np.abs(source_coords[indices] - target_coords)
-                indices = np.where(prev_diff < curr_diff, prev_indices, indices)
-                if descending:
-                    indices = len(source_coords) - 1 - indices
-                return indices
-
             decimated = {}
             for k in self.keys():
                 if k not in tfm:
                     continue
                 tfm_ds = tfm[k][['ele']]
                 tgt_ds = self[k]
-                y_idx = _nearest_indices(tfm_ds.y.values, tgt_ds.y.values)
-                x_idx = _nearest_indices(tfm_ds.x.values, tgt_ds.x.values)
+                y_idx = utils_xarray.nearest_indices(tfm_ds.y.values, tgt_ds.y.values)
+                x_idx = utils_xarray.nearest_indices(tfm_ds.x.values, tgt_ds.x.values)
                 selected = tfm_ds.isel(y=y_idx, x=x_idx)
                 selected = selected.assign_coords(y=tgt_ds.y, x=tgt_ds.x)
                 decimated[k] = selected
@@ -5192,7 +4832,7 @@ class BatchCore(dict):
                         da_slice = da.isel({stackdim: i})
                         if stackdim in da_slice.dims:
                             da_slice = da_slice.squeeze(stackdim, drop=True)
-                        label = _format_pair(da, i) if stackdim == 'pair' else _format_dt(da['date'].values[i])
+                        label = _format_pair(da, i) if stackdim == 'pair' else utils_xarray.format_date(da['date'].values[i])
                         export_items.append((label, da_slice))
                 else:
                     export_items = [(None, da)]
@@ -5258,6 +4898,43 @@ class BatchCore(dict):
 
                 pbar.update(1)
 
+    def to_vtm(self, path: str, transform: 'BatchCore | Stack | None' = None,
+               overlay: "xr.DataArray | None" = None, mask: bool = True):
+        """Export to a seamless multiblock VTK tree for data larger than memory.
+
+        Writes, per variable, ``<path>/<var>.vtm`` (the index: one block per burst, one dataset per dask block) and
+        ``<path>/<var>/<burst>_<ci>_<cj>.vts``, one structured-grid piece per dask block, written inside the task of its block.
+        Each piece has the shared one-pixel edge of its neighbours and the to_dataset() value of every pixel (the most recent
+        burst wins). z is the transform's ``ele`` by nearest pixel, as in ``to_vtk()``. ``to_vtk()`` stays the in-memory export.
+
+        Parameters
+        ----------
+        path : str
+            Output directory of the VTK tree.
+        transform : BatchCore, Stack, or None, optional
+            Topography (``ele``), or a Stack (its ``transform()``). Without it, z is zero.
+        overlay : None
+            Not built: raises. Use ``to_vtk()`` for an overlay.
+        mask : bool, optional
+            If True, z is NaN where the first pair has no data.
+
+        Examples
+        --------
+        >>> velocity.to_vtm('velocity', transform=stack)
+        """
+        from .utils_vtk import write_vtm
+        from .Batch import Batch
+        from .Stack import Stack
+
+        if overlay is not None:
+            raise ValueError("ERROR: to_vtm(): an overlay is not built; use to_vtk() for an overlay")
+        if isinstance(transform, Stack):
+            transform = transform.transform()
+        if not self:
+            return
+        tfm = transform if transform is None or isinstance(transform, BatchCore) else Batch(transform)
+        write_vtm(self, path, transform=tfm, mask=mask)
+
     def to_vtks(self, path: str, transform: 'BatchCore | Stack | None' = None,
                 overlay: "xr.DataArray | None" = None, mask: bool = True):
         """Export to VTK per-burst (separate file per burst).
@@ -5281,7 +4958,6 @@ class BatchCore(dict):
         """
         import os
         import numpy as np
-        import pandas as pd
         from tqdm.auto import tqdm
         from vtk import vtkStructuredGridWriter, VTK_BINARY
         from .utils_vtk import as_vtk
@@ -5306,19 +4982,10 @@ class BatchCore(dict):
                 return source.rename({'lat': 'y', 'lon': 'x'}).interp(y=target_da.y, x=target_da.x, method='linear')
             return source
 
-        def _format_dt(val):
-            try:
-                ts = pd.to_datetime(val)
-                if pd.isna(ts):
-                    return str(val)
-                return ts.strftime('%Y%m%d')
-            except Exception:
-                return str(val)
-
         def _format_pair(val):
             if isinstance(val, (list, tuple)) and len(val) == 2:
-                return f"{_format_dt(val[0])}_{_format_dt(val[1])}"
-            return _format_dt(val)
+                return f"{utils_xarray.format_date(val[0])}_{utils_xarray.format_date(val[1])}"
+            return utils_xarray.format_date(val)
 
         os.makedirs(path, exist_ok=True)
 
@@ -5460,7 +5127,7 @@ class BatchCore(dict):
             - Green: volume scattering (vegetation, high cross-pol)
             - White/gray: mixed scattering
             Requires exactly 2 polarizations (e.g., HH+HV or VV+VH).
-            For best results: backscatter(decibels=False).lee().
+            For best results: the linear sigma0 stack (not decibels), speckle-filtered before the call.
         gamma : float, optional
             Gamma correction for composite tone curve. Default 1.0.
             Values > 1 brighten dark areas, < 1 increase contrast.
@@ -5478,15 +5145,17 @@ class BatchCore(dict):
 
         Examples
         --------
-        >>> # Single polarization plot
-        >>> stack[['VV']].backscatter().plot(quantile=[0.02, 0.98])
+        sigma0 is the stack of calibrated sigma0 values computed before the call (linear for the composite).
 
-        >>> # Dual-pol RGB composite with Lee filter (recommended)
-        >>> stack[['HH', 'HV']].backscatter(decibels=False).lee().plot(
+        >>> # Single polarization plot
+        >>> sigma0[['VV']].plot(quantile=[0.02, 0.98])
+
+        >>> # Dual-pol RGB composite (recommended)
+        >>> sigma0[['HH', 'HV']].plot(
         ...     composite=True)  # default brightness=2.0
 
         >>> # Adjust brightness while preserving colors
-        >>> stack[['HH', 'HV']].backscatter(decibels=False).lee().plot(
+        >>> sigma0[['HH', 'HV']].plot(
         ...     composite=True, brightness=2.5)
         """
         import xarray as xr
@@ -5495,7 +5164,7 @@ class BatchCore(dict):
         import matplotlib.ticker as mticker
         from matplotlib.ticker import FuncFormatter
         import matplotlib.pyplot as plt
-        from .Batch import BatchWrap
+        from .BatchWrap import BatchWrap
 
         # no data means no plot and no error
         if not len(self):
@@ -5790,10 +5459,9 @@ class BatchCore(dict):
             A new Batch with the same keys, each smoothed by its corresponding weight.
         """
         import xarray as xr
-        import numpy as np
-        from .Batch import BatchUnit
+        from .BatchUnit import BatchUnit
         # the cutoff defines half-gain at filter_wavelength
-        from .utils_gaussian import GAUSSIAN_CUTOFF, gaussian_dask
+        from .utils_gaussian import GAUSSIAN_CUTOFF, gaussian_dask, sigma_of_wavelength
 
         # A WEIGHT WHERE THE WAVELENGTH GOES is the old argument order, and it
         # would otherwise reach the `wavelength <= 0` test and fail there with
@@ -5826,22 +5494,20 @@ class BatchCore(dict):
         if wavelength is None or wavelength <= 0:
             raise ValueError(
                 f'gaussian() needs a positive wavelength in metres, got {wavelength!r}')
-        sig_y = wavelength / (dy * GAUSSIAN_CUTOFF)
-        sig_x = wavelength / (dx * GAUSSIAN_CUTOFF)
-        if debug:
-            print(f'DEBUG: multilooking sigmas ({sig_y:.2f}, {sig_x:.2f}), wavelength {wavelength:.1f}')
-        sigmas = (sig_y, sig_x)
-
         # THE REACH OF THE FILTER (pixels, y and x; gaussian_dask truncates at 4 sigmas). A filter that reaches farther
         # than a burst is long has no room in it: the crop is too small
         truncate = 4.0
-        depth_y, depth_x = int(np.ceil(sigmas[0] * truncate)), int(np.ceil(sigmas[1] * truncate))
+        sigmas, (depth_y, depth_x) = sigma_of_wavelength(wavelength, dy, dx, GAUSSIAN_CUTOFF, truncate)
+        if debug:
+            print(f'DEBUG: multilooking sigmas ({sigmas[0]:.2f}, {sigmas[1]:.2f}), wavelength {wavelength:.1f}')
         for key, ds in self.items():
             if depth_y > ds.sizes['y'] or depth_x > ds.sizes['x']:
                 raise ValueError(
                     f"gaussian() wavelength {wavelength:g} m reaches {depth_y} x {depth_x} pixels, farther than burst {key} "
                     f"of {ds.sizes['y']} x {ds.sizes['x']} pixels: crop a larger area or use a shorter wavelength")
 
+        from .utils_dask import align_secondary, warn_secondary
+        moved = []
         out = {}
         # loop over each key
         for key, ds in self.items():
@@ -5863,26 +5529,21 @@ class BatchCore(dict):
                 # Get weight dask array for this variable: the grid of the same name (_weight)
                 weight_dask = BatchCore._weight_of(w, var).data if w is not None else None
 
-                # Ensure first dimension chunked as 1 for per-item spatial processing
+                # the chunks as they are: a block loops over its dates in numpy (gaussian_dask), no rechunk here
                 dask_data = data_arr.data
-                if data_arr.ndim == 3 and dask_data.chunks[0][0] != 1:
-                    dask_data = dask_data.rechunk({0: 1})
 
-                # a 2-D weight on 3-D data is shared by every item; otherwise it has the data's shape and chunks
-                if weight_dask is not None and data_arr.ndim == 3 and weight_dask.ndim == 2:
-                    if weight_dask.chunks != dask_data[0].chunks:
-                        raise ValueError(
-                            f"gaussian() weight chunks {weight_dask.chunks} "
-                            f"must match data chunks {dask_data[0].chunks}")
-                elif weight_dask is not None:
-                    if data_arr.ndim == 3 and weight_dask.shape != dask_data.shape:
+                # a SECONDARY weight (GMT U3): a 2-D weight on 3-D data is shared by every item; its (y, x) chunks go to the
+                # data's (one WARNING per call), a weight with other date chunks raises one line (align_secondary)
+                if weight_dask is not None:
+                    if weight_dask.ndim != dask_data.ndim and not (weight_dask.ndim == 2 and dask_data.ndim == 3):
+                        raise ValueError(f"gaussian(): the weight has {weight_dask.ndim} dimensions, the data {dask_data.ndim}")
+                    if data_arr.ndim == 3 and weight_dask.ndim == 3 and weight_dask.shape != dask_data.shape:
                         raise ValueError(
                             f"gaussian() weight shape {weight_dask.shape} "
                             f"must match data shape {dask_data.shape}")
-                    if weight_dask.chunks != dask_data.chunks:
-                        raise ValueError(
-                            f"gaussian() weight chunks {weight_dask.chunks} "
-                            f"must match data chunks {dask_data.chunks}")
+                    weight_dask, changed = align_secondary(dask_data, weight_dask, 'gaussian', 'weight')
+                    if changed:
+                        moved.append('weight')
 
                 if debug:
                     print(f'DEBUG: gaussian depth=({depth_y}, {depth_x}), '
@@ -5907,34 +5568,9 @@ class BatchCore(dict):
             new_ds.attrs = ds.attrs
             out[key] = new_ds
 
+        warn_secondary('gaussian', moved)
+        graph_check('gaussian', out, self)
         return type(self)(out)
-
-    @staticmethod
-    def _overlap_residual(diff, circular: bool):
-        """One burst overlap's term of residuals(): (|median phase difference|, valid pixel count, median).
-
-        `diff` is the overlap's phase difference, burst 2 minus burst 1; `circular` wraps it and its median to
-        [-pi, pi) first. None when no pixel is valid. align() takes the same term from the overlaps its solve
-        already holds, so its 'residual' is this measure without a second pass over the grids.
-        """
-        wrap = (lambda x: (x + np.pi) % (2*np.pi) - np.pi) if circular else (lambda x: x)
-        valid = np.asarray(diff).ravel()
-        valid = valid[np.isfinite(valid)]
-        if len(valid) == 0:
-            return None
-        median_diff = np.median(wrap(valid))
-        return np.abs(wrap(median_diff)), len(valid), median_diff
-
-    @staticmethod
-    def _residual_mean(terms, n_pairs: int) -> list:
-        """residuals() per pair from (pair index, |median|, weight) overlap terms, in overlap order: the weighted
-        mean rounded to 3 decimals, 0.0 for a pair without a valid overlap."""
-        sums = [0.0] * n_pairs
-        weights = [0.0] * n_pairs
-        for p, value, weight in terms:
-            sums[p] += value * weight
-            weights[p] += weight
-        return [0.0 if weights[p] == 0 else round(sums[p] / weights[p], 3) for p in range(n_pairs)]
 
     def residuals(self, polarization: str | None = None, debug: bool = False) -> float | list[float]:
         """
@@ -5974,7 +5610,8 @@ class BatchCore(dict):
         >>> after = aligned.residuals()
         >>> print(f'Discrepancy reduced from {before} to {after}')
         """
-        from .Batch import Batch, BatchWrap
+        from .Batch import Batch
+        from .BatchWrap import BatchWrap
         import dask
 
         # Determine if we need circular statistics based on class type
@@ -6024,25 +5661,10 @@ class BatchCore(dict):
             # Get coordinates from Dataset if not on DataArray
             y_coords = da.coords['y'].values if 'y' in da.coords else ds.coords['y'].values
             x_coords = da.coords['x'].values if 'x' in da.coords else ds.coords['x'].values
-            extents[bid] = (y_coords.min(), y_coords.max(), x_coords.min(), x_coords.max())
-
-        def extents_overlap(e1, e2):
-            y1_min, y1_max, x1_min, x1_max = e1
-            y2_min, y2_max, x2_min, x2_max = e2
-            y_overlap = not (y1_max < y2_min or y2_max < y1_min)
-            x_overlap = not (x1_max < x2_min or x2_max < x1_min)
-            return y_overlap and x_overlap
+            extents[bid] = utils_align.extent(y_coords, x_coords)
 
         # Find all overlapping burst pairs
-        overlap_pairs = []
-        for i, id1 in enumerate(ids):
-            e1 = extents[id1]
-            for j, id2 in enumerate(ids):
-                if i >= j:
-                    continue
-                e2 = extents[id2]
-                if extents_overlap(e1, e2):
-                    overlap_pairs.append((id1, id2))
+        overlap_pairs = [(ids[i], ids[j]) for i, j in utils_align.overlap_pairs([extents[bid] for bid in ids])]
 
         if not overlap_pairs:
             return [0.0] * n_pairs if has_pair_dim else 0.0
@@ -6060,7 +5682,7 @@ class BatchCore(dict):
             for pair_idx in range(n_pairs):
                 i1_p = i1.isel(pair=pair_idx) if 'pair' in i1.dims else i1
                 i2_p = i2.isel(pair=pair_idx) if 'pair' in i2.dims else i2
-                phase_diff = i2_p - i1_p
+                phase_diff = utils_align.overlap_difference(i1_p, i2_p)
                 jobs.append((id1, id2, pair_idx))
                 lazy_diffs.append(phase_diff)
 
@@ -6072,64 +5694,16 @@ class BatchCore(dict):
         # Process computed results
         results = []
         for (id1, id2, pair_idx), phase_diff in zip(jobs, computed_diffs):
-            term = BatchCore._overlap_residual(phase_diff.values, use_circular)
+            term = utils_align.overlap_residual(phase_diff.values, use_circular)
             if term is None:
                 continue
             abs_discrepancy, weight, median_diff = term
             results.append((pair_idx, abs_discrepancy, weight, id1, id2, median_diff))
 
-        # Per-subswath tracking for debug
-        subswath_stats = {}  # {(subswath, pair_idx): {'sum': float, 'weight': float, 'count': int, 'values': []}}
-        per_overlap_discrepancies = {p: [] for p in range(n_pairs)}  # For computing std
-
-        for result in results:
-            if result is None:
-                continue
-            pair_idx, abs_discrepancy, weight, id1, id2, median_diff = result
-            per_overlap_discrepancies[pair_idx].append(abs_discrepancy)
-
-            # Extract track info for debug stats
-            if debug:
-                track1 = burst_track[id1]
-                track2 = burst_track[id2]
-
-                # Categorize: same track or cross-track
-                if track1 == track2:
-                    track_key = track1
-                else:
-                    track_key = f'{track1}-{track2}'
-
-                key = (track_key, pair_idx)
-                if key not in subswath_stats:
-                    subswath_stats[key] = {'sum': 0.0, 'weight': 0.0, 'count': 0, 'values': []}
-                subswath_stats[key]['sum'] += abs_discrepancy * weight
-                subswath_stats[key]['weight'] += weight
-                subswath_stats[key]['count'] += 1
-                subswath_stats[key]['values'].append(abs_discrepancy)
-
-        discrepancies = BatchCore._residual_mean([(r[0], r[1], r[2]) for r in results], n_pairs)
+        discrepancies = utils_align.residual_mean([(r[0], r[1], r[2]) for r in results], n_pairs)
 
         if debug:
-            # Compute std for overall discrepancy
-            for p in range(n_pairs):
-                vals = per_overlap_discrepancies[p]
-                if len(vals) > 1:
-                    std = np.std(vals)
-                    print(f'Pair {p} discrepancy: {discrepancies[p]:.3f} ± {std:.3f} rad ({len(vals)} overlaps)', flush=True)
-                else:
-                    print(f'Pair {p} discrepancy: {discrepancies[p]:.3f} rad ({len(vals)} overlaps)', flush=True)
-
-            # Print per-track stats (only for pair_idx=0 to avoid clutter)
-            print('Per-track discrepancy (pair 0):', flush=True)
-            for (track, pair_idx), stats in sorted(subswath_stats.items()):
-                if pair_idx == 0 and stats['weight'] > 0:
-                    track_disc = stats['sum'] / stats['weight']
-                    vals = stats['values']
-                    if len(vals) > 1:
-                        track_std = np.std(vals)
-                        print(f'  {track}: {track_disc:.3f} ± {track_std:.3f} rad ({stats["count"]} overlaps)', flush=True)
-                    else:
-                        print(f'  {track}: {track_disc:.3f} rad ({stats["count"]} overlaps)', flush=True)
+            utils_align.residual_report(results, burst_track, n_pairs, discrepancies)
 
         # Return single value for single pair, list for multiple
         if n_pairs == 1 and not has_pair_dim:
@@ -6200,11 +5774,11 @@ class BatchCore(dict):
         >>> coeffs = {b: [ramps[b][0], ramps[b][1] + offsets1[b] + offsets2[b]] for b in offsets1}
         >>> aligned = intfs - intfs.polyval(coeffs)
         """
-        from .Batch import Batch, BatchWrap
+        from .Batch import Batch
+        from .BatchWrap import BatchWrap
         import dask
-        from scipy import sparse
-        from scipy.sparse.linalg import lsqr
-        from scipy.sparse.csgraph import connected_components
+        import dask.array as _da
+        import itertools
 
         # Determine if we need circular statistics based on class type
         if isinstance(self, BatchWrap):
@@ -6216,41 +5790,9 @@ class BatchCore(dict):
         if lazy_residual and degree != 0:
             raise ValueError(f'_align_coeffs(): lazy_residual needs degree=0, got degree={degree}')
 
-        # Constants
-        MIN_OVERLAP_PIXELS = 50
-        MIN_ROW_PIXELS = 10
-        MIN_VALID_ROWS = 5
-        MIN_INLIER_SAMPLES = 10
-        MAD_OUTLIER_THRESHOLD = 2.5
-        OUTPUT_PRECISION = 3
-        RAMP_PRECISION = 9
-
-        def maybe_wrap(x):
-            """Wrap to [-π, π) for circular stats, identity otherwise."""
-            if use_circular:
-                return (x + np.pi) % (2*np.pi) - np.pi
-            return x
-
-        def phase_diff(a, center):
-            """Circular or linear difference from center."""
-            if use_circular:
-                return maybe_wrap(a - center)
-            return a - center
-
-        def phase_mean(a):
-            """Circular or linear mean."""
-            if use_circular:
-                return np.arctan2(np.mean(np.sin(a)), np.mean(np.cos(a)))
-            return np.mean(a)
-
-        def phase_mad(a, center):
-            """Circular or linear MAD."""
-            return np.median(np.abs(phase_diff(a, center)))
-
         # Collect burst extents and x-centers
         ids = sorted(self.keys())
         n_bursts = len(ids)
-        id_to_idx = {bid: i for i, bid in enumerate(ids)}
 
         # Auto-detect polarization if not specified
         sample_ds = self[ids[0]]
@@ -6294,111 +5836,12 @@ class BatchCore(dict):
             # Get coordinates from Dataset if not on DataArray
             y_coords = da.coords['y'].values if 'y' in da.coords else ds.coords['y'].values
             x_coords = da.coords['x'].values if 'x' in da.coords else ds.coords['x'].values
-            extents[bid] = (y_coords.min(), y_coords.max(), x_coords.min(), x_coords.max())
-            x_centers[bid] = float(np.mean(x_coords))
+            extents[bid] = utils_align.extent(y_coords, x_coords)
+            x_centers[bid] = utils_align.x_centre(x_coords)
 
         # Detect coordinate ordering for .sel() slicing
         _sample_y = self[ids[0]].coords['y'].values
         _y_descending = len(_sample_y) > 1 and _sample_y[0] > _sample_y[-1]
-
-        def extents_overlap(e1, e2):
-            y1_min, y1_max, x1_min, x1_max = e1
-            y2_min, y2_max, x2_min, x2_max = e2
-            y_overlap = not (y1_max < y2_min or y2_max < y1_min)
-            x_overlap = not (x1_max < x2_min or x2_max < x1_min)
-            return y_overlap and x_overlap
-
-        def process_phase_diff(diff_np, x_coords, id1, id2, pair_idx):
-            """Process overlap numpy array to extract offset and optionally ramp.
-
-            Parameters
-            ----------
-            diff_np : numpy.ndarray
-                2D array of phase differences in the overlap region.
-            x_coords : numpy.ndarray
-                1D array of x coordinate values for columns.
-            id1 : str
-                Burst id of the first scene of the overlap pair.
-            id2 : str
-                Burst id of the second scene of the overlap pair.
-            pair_idx : int
-                Index of the interferometric pair along the 'pair' dimension.
-            """
-            all_valid = diff_np.ravel()
-            all_valid = all_valid[np.isfinite(all_valid)]
-
-            if len(all_valid) < MIN_OVERLAP_PIXELS:
-                return None
-
-            if diff_np.ndim < 2:
-                return None
-
-            # Row-wise processing
-            row_phases = []
-            row_x_centroids = []
-            row_weights = []
-
-            for y_idx in range(diff_np.shape[0]):
-                row = diff_np[y_idx, :]
-                valid_mask = np.isfinite(row)
-                n_valid = np.sum(valid_mask)
-                if n_valid >= MIN_ROW_PIXELS:
-                    x_valid = x_coords[valid_mask]
-                    phase_valid = row[valid_mask]
-                    # Unwrap for row mean computation (needed for both circular and linear)
-                    if use_circular:
-                        phase_unwrapped = np.unwrap(phase_valid)
-                        row_mean = maybe_wrap(np.mean(phase_unwrapped))
-                    else:
-                        row_mean = np.mean(phase_valid)
-                    row_phases.append(row_mean)
-                    row_x_centroids.append(np.mean(x_valid))
-                    row_weights.append(n_valid)
-
-            if len(row_phases) < MIN_VALID_ROWS:
-                return None
-
-            a = np.array(row_phases)
-            x_row = np.array(row_x_centroids)
-            weights = np.array(row_weights)
-            a = maybe_wrap(a)
-
-            # Outlier rejection
-            if method == 'median':
-                offset_initial = np.median(a)
-                mad = phase_mad(a, offset_initial)
-                if mad > 0:
-                    inliers = np.abs(phase_diff(a, offset_initial)) <= MAD_OUTLIER_THRESHOLD * mad
-                    if np.sum(inliers) >= MIN_INLIER_SAMPLES:
-                        a = a[inliers]
-                        x_row = x_row[inliers]
-                        weights = weights[inliers]
-
-            n_valid = int(np.sum(weights))
-            x_centroid = float(np.average(x_row, weights=weights))
-
-            # Compute offset
-            if method == 'median':
-                sorted_idx = np.argsort(a)
-                cumsum = np.cumsum(weights[sorted_idx])
-                median_idx = np.searchsorted(cumsum, cumsum[-1] / 2)
-                offset = a[sorted_idx[median_idx]]
-            else:
-                offset = phase_mean(a)
-
-            # Compute ramp if degree=1
-            ramp_val = None
-            if degree == 1 and len(a) >= MIN_VALID_ROWS:
-                x_centered = x_row - x_centroid
-                x_range = np.max(x_row) - np.min(x_row)
-                if x_range > 100:
-                    residuals = a - offset
-                    Swxx = np.sum(weights * x_centered**2)
-                    Swxr = np.sum(weights * x_centered * residuals)
-                    if Swxx > 1e-10:
-                        ramp_val = Swxr / Swxx
-
-            return (id1, id2, pair_idx, maybe_wrap(offset), ramp_val, x_centroid, n_valid)
 
         # Find overlapping burst pairs
         # For degree=1 (ramp), skip same-path cross-subswath overlaps (small x-extent, diagonal)
@@ -6406,23 +5849,19 @@ class BatchCore(dict):
         # For degree=0 (offset), use all overlaps including cross-subswath
         all_overlap_pairs = []
         cross_subswath_skipped = 0
-        for i, id1 in enumerate(ids):
-            e1 = extents[id1]
-            for j, id2 in enumerate(ids):
-                if i >= j:
+        for i, j in utils_align.overlap_pairs([extents[bid] for bid in ids]):
+            id1, id2 = ids[i], ids[j]
+            if degree == 1:
+                # For ramp estimation, skip same-path cross-subswath overlaps (diagonal, small x-extent)
+                # but allow cross-path overlaps - they have large x-extent with iono ramp differences
+                path1, path2 = burst_path[id1], burst_path[id2]
+                sw1, sw2 = burst_subswath[id1], burst_subswath[id2]
+                if path1 == path2 and sw1 != sw2:
+                    # Same path, different subswath: diagonal overlap, skip
+                    cross_subswath_skipped += 1
                     continue
-                if extents_overlap(e1, extents[id2]):
-                    if degree == 1:
-                        # For ramp estimation, skip same-path cross-subswath overlaps (diagonal, small x-extent)
-                        # but allow cross-path overlaps - they have large x-extent with iono ramp differences
-                        path1, path2 = burst_path[id1], burst_path[id2]
-                        sw1, sw2 = burst_subswath[id1], burst_subswath[id2]
-                        if path1 == path2 and sw1 != sw2:
-                            # Same path, different subswath: diagonal overlap, skip
-                            cross_subswath_skipped += 1
-                            continue
-                        # Same path + same subswath (along-track) or different paths: allow
-                    all_overlap_pairs.append((id1, id2))
+                # Same path + same subswath (along-track) or different paths: allow
+            all_overlap_pairs.append((id1, id2))
 
         if debug:
             print(f'Found {len(all_overlap_pairs)} overlapping burst pairs', flush=True)
@@ -6433,201 +5872,127 @@ class BatchCore(dict):
         # delayed task. This creates N_bursts graph dependencies instead of
         # N_overlaps*3 layers from xarray diff operations, keeping the graph
         # minimal for downstream dissolve().
-        import dask.array as _da
 
-        # Collect burst data + coordinates (coordinates are numpy, not dask)
-        # One delayed block per burst (to_delayed of a single-chunk array): dask.delayed(array) finalises each
-        # array on its own and copies its whole upstream into the graph under renamed keys, once per burst and
-        # per solve step (measured on tur: the input chain 28 times in the graph of align(degree=1)).
+        # Each burst goes to the solve as the strips it needs: the exact union of its overlap windows with its partners
+        # in all_overlap_pairs (a window is the box of the overlap in the burst's own index space; a burst without
+        # overlaps reads nothing). The union is cut into disjoint boxes, and ONE kernel per burst joins the stored blocks
+        # those boxes cross, as numpy inside its task: the chunks are read as they are, no rechunk layer.
+        def _span(coord, lo, hi):
+            """The slice of the monotonic coordinates inside [lo, hi]."""
+            idx = np.nonzero((coord >= lo) & (coord <= hi))[0]
+            return slice(int(idx[0]), int(idx[-1]) + 1) if idx.size else slice(0, 0)
+
+        def _minus(p, o):
+            """The boxes (y0, y1, x0, x1) of p outside the box o: disjoint, up to four."""
+            if p[0] >= o[1] or o[0] >= p[1] or p[2] >= o[3] or o[2] >= p[3]:
+                return [p]
+            out = []
+            if p[0] < o[0]:
+                out.append((p[0], o[0], p[2], p[3]))
+            if o[1] < p[1]:
+                out.append((o[1], p[1], p[2], p[3]))
+            y0, y1 = max(p[0], o[0]), min(p[1], o[1])
+            if p[2] < o[2]:
+                out.append((y0, y1, p[2], o[2]))
+            if o[3] < p[3]:
+                out.append((y0, y1, o[3], p[3]))
+            return out
+
+        def _disjoint(boxes):
+            """The boxes cut into disjoint boxes that cover exactly their union."""
+            out = []
+            for b in boxes:
+                pieces = [b]
+                for o in out:
+                    pieces = [q for p in pieces for q in _minus(p, o)]
+                out.extend(pieces)
+            return out
+
+        def _crossings(chunks, lo, hi):
+            """Per stored block of one axis that [lo, hi) crosses: (block, slice in the block, slice in the box)."""
+            out, off = [], 0
+            for k, n in enumerate(chunks):
+                a, z = max(off, lo), min(off + n, hi)
+                if a < z:
+                    out.append((k, slice(a - off, z - off), slice(a - lo, z - lo)))
+                off += n
+            return out
+
+        def _strips(da, boxes):
+            """The boxes of a burst's array as [(box, numpy array)]. The stored blocks the boxes cross are the inputs of
+            ONE task (no rechunk, no copy of the whole burst); a numpy array is sliced."""
+            if not boxes:
+                return []
+            arr = da.data
+            ydim, xdim = da.dims.index('y'), da.dims.index('x')
+            if not hasattr(arr, 'to_delayed'):
+                index = [slice(None)] * da.ndim
+                out = []
+                for b in boxes:
+                    index[ydim], index[xdim] = slice(b[0], b[1]), slice(b[2], b[3])
+                    out.append((b, np.asarray(arr)[tuple(index)]))
+                return out
+            blocks = arr.to_delayed(optimize_graph=False)
+            need, pos, shapes, plans = [], {}, [], []
+            for b in boxes:
+                rng = [(0, sum(c)) for c in arr.chunks]
+                rng[ydim], rng[xdim] = (b[0], b[1]), (b[2], b[3])
+                per_dim = [_crossings(arr.chunks[d], lo, hi) for d, (lo, hi) in enumerate(rng)]
+                plan = []
+                for combo in itertools.product(*per_dim):
+                    idx = tuple(c[0] for c in combo)
+                    if idx not in pos:
+                        pos[idx] = len(need)
+                        need.append(blocks[idx])
+                    plan.append((pos[idx], tuple(c[1] for c in combo), tuple(c[2] for c in combo)))
+                shapes.append(tuple(hi - lo for lo, hi in rng))
+                plans.append(plan)
+
+            def _join(*blocks_in):
+                out = []
+                for b, shape, plan in zip(boxes, shapes, plans):
+                    res = np.empty(shape, dtype=arr.dtype)
+                    for p, src, dst in plan:
+                        res[dst] = np.asarray(blocks_in[p])[src]
+                    out.append((b, res))
+                return out
+            return dask.delayed(_join, pure=False)(*need)
+
+        coords = {}
+        for bid in ids:
+            da = self[bid][polarization]
+            coords[bid] = (da.y.values, da.x.values)
+        pair_boxes = []  # per overlap pair: the window box in the index space of its first and of its second burst
+        burst_boxes = {bid: [] for bid in ids}
+        for id1, id2 in all_overlap_pairs:
+            e1, e2 = extents[id1], extents[id2]
+            win = (max(e1[0], e2[0]), min(e1[1], e2[1]), max(e1[2], e2[2]), min(e1[3], e2[3]))
+            pb = []
+            for bid in (id1, id2):
+                y, x = coords[bid]
+                sy, sx = _span(y, win[0], win[1]), _span(x, win[2], win[3])
+                box = (sy.start, sy.stop, sx.start, sx.stop)
+                pb.append(box)
+                burst_boxes[bid].append(box)
+            pair_boxes.append(tuple(pb))
+
         burst_data = []
         for bid in ids:
-            arr = self[bid][polarization].data
-            if hasattr(arr, 'to_delayed'):
-                arr = arr.rechunk(arr.shape).to_delayed(optimize_graph=False).ravel()[0]
-            burst_data.append(arr)
-        burst_y = [self[bid][polarization].y.values for bid in ids]
-        burst_x = [self[bid][polarization].x.values for bid in ids]
+            cover = _disjoint([b for b in burst_boxes[bid] if b[1] > b[0] and b[3] > b[2]])
+            burst_data.append(_strips(self[bid][polarization], cover))
+        burst_y = [coords[bid][0] for bid in ids]
+        burst_x = [coords[bid][1] for bid in ids]
 
         if debug:
             print(f'Building lazy graph for {len(all_overlap_pairs)} overlap pairs, {len(ids)} bursts...', flush=True)
 
-        # Single delayed task: receives resolved burst numpy arrays,
-        # computes overlaps + diffs internally, then solves.
-        def _align_coeffs_all(*burst_data_arrays):
-            import xarray as xr
-            from scipy import sparse as _sparse
-            from scipy.sparse.linalg import lsqr as _lsqr
-            from scipy.sparse.csgraph import connected_components as _cc
+        # Single delayed task: receives resolved burst strips, computes overlaps + diffs internally, then solves.
+        def _align_coeffs_all(*burst_strips):
+            return utils_align.solve_coefficients(burst_strips, ids, burst_y, burst_x, all_overlap_pairs, pair_boxes,
+                                                  n_pairs, has_pair_dim, degree, method, use_circular, x_centers,
+                                                  return_residuals, lazy_residual)
 
-            def _overlap_diff(i1_idx, i2_idx, pair_idx):
-                """The overlap's phase difference, burst 2 minus burst 1, on the common coordinates."""
-                d1 = np.asarray(burst_data_arrays[i1_idx])
-                d2 = np.asarray(burst_data_arrays[i2_idx])
-                d1_p = d1[pair_idx] if has_pair_dim else d1
-                d2_p = d2[pair_idx] if has_pair_dim else d2
-
-                # Build xarray DataArrays for coordinate-aware overlap
-                da1 = xr.DataArray(d1_p, dims=['y', 'x'],
-                                   coords={'y': burst_y[i1_idx],
-                                           'x': burst_x[i1_idx]})
-                da2 = xr.DataArray(d2_p, dims=['y', 'x'],
-                                   coords={'y': burst_y[i2_idx],
-                                           'x': burst_x[i2_idx]})
-                return da2 - da1
-
-            # Compute overlap diffs and process statistics
-            _pbp = {p: [] for p in range(n_pairs)}
-            for id1, id2 in all_overlap_pairs:
-                i1_idx = id_to_idx[id1]
-                i2_idx = id_to_idx[id2]
-
-                for pair_idx in range(n_pairs):
-                    diff = _overlap_diff(i1_idx, i2_idx, pair_idx)
-                    stat = process_phase_diff(diff.values,
-                                              diff.coords['x'].values,
-                                              id1, id2, pair_idx)
-                    if stat is None:
-                        continue
-                    _id1s, _id2s, _pidxs, _off, _rv, _xcent, _nu = stat
-                    _w = np.sqrt(_nu)
-                    if degree == 0:
-                        _pbp[_pidxs].append((_id1s, _id2s, _off, _w))
-                    else:
-                        if _rv is not None:
-                            _pbp[_pidxs].append((_id1s, _id2s, _off, _rv, _xcent, _w))
-
-            def _solve_one(pidx):
-                pairs = _pbp[pidx]
-                if len(pairs) == 0:
-                    if degree == 0:
-                        return {bid: np.float32(0.0) for bid in ids}
-                    else:
-                        return {bid: [np.float32(0.0), np.float32(0.0)] for bid in ids}
-
-                adj = _sparse.lil_matrix((n_bursts, n_bursts))
-                for p in pairs:
-                    adj[id_to_idx[p[0]], id_to_idx[p[1]]] = 1
-                    adj[id_to_idx[p[1]], id_to_idx[p[0]]] = 1
-                n_comp_all, labels = _cc(adj.tocsr(), directed=False)
-
-                if degree == 0:
-                    out = {}
-                    for comp in range(n_comp_all):
-                        ci = np.where(labels == comp)[0]
-                        cids = [ids[ii] for ii in ci]
-                        cmap = {bid: ii for ii, bid in enumerate(cids)}
-                        nc = len(cids)
-                        if nc == 1:
-                            out[cids[0]] = np.float32(0.0)
-                            continue
-                        cp = [(a, b, o, w) for a, b, o, w in pairs
-                              if a in cmap and b in cmap]
-                        if not cp:
-                            for bid in cids:
-                                out[bid] = np.float32(0.0)
-                            continue
-                        ncp = len(cp)
-                        Am = _sparse.lil_matrix((ncp + 1, nc))
-                        bv = np.zeros(ncp + 1)
-                        Wv = np.zeros(ncp + 1)
-                        for kk, (a, b, o, w) in enumerate(cp):
-                            Am[kk, cmap[a]] = -1
-                            Am[kk, cmap[b]] = +1
-                            bv[kk] = o
-                            Wv[kk] = w
-                        cw = np.sum(Wv[:-1]) * 100 if np.sum(Wv[:-1]) > 0 else 1e6
-                        Am[ncp, 0] = 1
-                        Wv[ncp] = cw
-                        sqW = np.sqrt(Wv)
-                        res = _lsqr(_sparse.diags(sqW) @ Am.tocsr(), sqW * bv)
-                        for ii, bid in enumerate(cids):
-                            out[bid] = np.float32(round(float(maybe_wrap(res[0][ii])),
-                                                        OUTPUT_PRECISION))
-                    return out
-                else:
-                    out = {}
-                    for comp in range(n_comp_all):
-                        ci = np.where(labels == comp)[0]
-                        cids = [ids[ii] for ii in ci]
-                        cmap = {bid: ii for ii, bid in enumerate(cids)}
-                        nc = len(cids)
-                        if nc == 1:
-                            out[cids[0]] = [np.float32(0.0), np.float32(0.0)]
-                            continue
-                        cp = [(a, b, o, r, xc, w) for a, b, o, r, xc, w in pairs
-                              if a in cmap and b in cmap]
-                        if not cp:
-                            for bid in cids:
-                                out[bid] = [np.float32(0.0), np.float32(0.0)]
-                            continue
-                        ncp = len(cp)
-                        Am = _sparse.lil_matrix((ncp + 1, nc))
-                        bv = np.zeros(ncp + 1)
-                        Wv = np.zeros(ncp + 1)
-                        for kk, (a, b, o, rd, xc, w) in enumerate(cp):
-                            Am[kk, cmap[a]] = -1
-                            Am[kk, cmap[b]] = +1
-                            bv[kk] = rd
-                            Wv[kk] = w
-                        cw = np.sum(Wv[:-1]) * 100 if np.sum(Wv[:-1]) > 0 else 1e6
-                        Am[ncp, 0] = 1
-                        Wv[ncp] = cw
-                        sqW = np.sqrt(Wv)
-                        res = _lsqr(_sparse.diags(sqW) @ Am.tocsr(), sqW * bv)
-                        for ii, bid in enumerate(cids):
-                            ramp = np.float32(round(float(res[0][ii]), RAMP_PRECISION))
-                            intercept = np.float32(round(-ramp * x_centers[bid],
-                                                         OUTPUT_PRECISION))
-                            out[bid] = [ramp, intercept]
-                    return out
-
-            rpp = [_solve_one(p) for p in range(n_pairs)]
-
-            # Format output
-            if n_pairs == 1 and not has_pair_dim:
-                offsets = rpp[0]
-            else:
-                offsets = {bid: [rpp[p][bid] for p in range(n_pairs)] for bid in ids}
-
-            # Residuals (if requested)
-            residuals = None
-            if return_residuals:
-                disc = []
-                for p in range(n_pairs):
-                    pp = _pbp[p]
-                    if not pp:
-                        disc.append(0.0)
-                        continue
-                    if degree == 0:
-                        offs = [abs(maybe_wrap(t[2])) for t in pp]
-                        ws = [t[3] for t in pp]
-                    else:
-                        offs = [abs(maybe_wrap(t[2])) for t in pp]
-                        ws = [t[5] for t in pp]
-                    tw = sum(ws)
-                    disc.append(round(sum(o * w for o, w in zip(offs, ws)) / tw, 3)
-                                if tw > 0 else 0.0)
-                residuals = disc[0] if (n_pairs == 1 and not has_pair_dim) else disc
-
-            # Residual after the correction (degree 0): residuals()' measure on the
-            # overlaps this task already holds, each shifted by its offset difference
-            residual_after = None
-            if lazy_residual:
-                terms = []
-                for id1, id2 in all_overlap_pairs:
-                    for pair_idx in range(n_pairs):
-                        diff = _overlap_diff(id_to_idx[id1], id_to_idx[id2], pair_idx)
-                        shift = rpp[pair_idx][id2] - rpp[pair_idx][id1]
-                        term = BatchCore._overlap_residual(diff.values - shift, use_circular)
-                        if term is not None:
-                            terms.append((pair_idx, term[0], term[1]))
-                disc = BatchCore._residual_mean(terms, n_pairs)
-                residual_after = np.asarray(disc if has_pair_dim else disc[0], dtype=np.float32)
-
-            return {'offsets': offsets, 'residuals': residuals, 'residual_after': residual_after}
-
-        # Single delayed call — dask resolves burst data arrays before calling.
-        # Graph has ~N_bursts layers (not ~N_overlaps*3 from xarray diffs).
+        # Single delayed call — dask resolves the burst strips before calling.
         # A UNIQUE KEY PER CALL (pure=False, N81): the arrays reach the task through
         # finalize keys that dask names anew in every graph, so a pure key named the
         # same task over different dependencies in two consecutive computes. When the
@@ -6778,7 +6143,9 @@ class BatchCore(dict):
         methods because it separates the offset and ramp estimation, avoiding
         cross-contamination between the two.
         """
-        from .Batch import Batch, BatchWrap, BatchComplex
+        from .Batch import Batch
+        from .BatchWrap import BatchWrap
+        from .BatchComplex import BatchComplex
 
         # Validate class type
         is_complex = isinstance(self, BatchComplex)
@@ -6848,6 +6215,7 @@ class BatchCore(dict):
                     print(f'Output residuals: {res_out}', flush=True)
 
             aligned = with_residual(aligned, residual)
+            graph_check('align', aligned, self)
             if return_residuals:
                 return aligned, res_out
             return aligned
@@ -6889,17 +6257,9 @@ class BatchCore(dict):
             is_multi_pair = isinstance(offsets1[sample_bid], list)
 
             if is_multi_pair:
-                n_pairs = len(offsets1[sample_bid])
-                coeffs = {
-                    b: [[ramps[b][p][0], ramps[b][p][1] + offsets1[b][p] + offsets2[b][p]]
-                        for p in range(n_pairs)]
-                    for b in offsets1
-                }
+                coeffs = utils_align.combine_coefficients(ramps, offsets1, offsets2, len(offsets1[sample_bid]))
             else:
-                coeffs = {
-                    b: [ramps[b][0], ramps[b][1] + offsets1[b] + offsets2[b]]
-                    for b in offsets1
-                }
+                coeffs = utils_align.combine_coefficients(ramps, offsets1, offsets2, None)
 
             aligned = rotate(coeffs) if is_complex else self - self.polyval(coeffs)
 
@@ -6909,6 +6269,7 @@ class BatchCore(dict):
                     print(f'Final residuals: {res_out}', flush=True)
 
             aligned = with_residual(aligned, residual)
+            graph_check('align', aligned, self)
             if return_residuals:
                 return aligned, res_out
             return aligned
@@ -6963,12 +6324,12 @@ class BatchCore(dict):
         - For BatchWrap (wrapped phase): uses circular mean via exp(1j*phase)
         - For Batch/BatchUnit (unwrapped phase, correlation): uses arithmetic mean
         - Returns lazy data, processes per burst replacing polarization variables
+        - The output keeps the input's pair (date) chunks: one task per pair chunk and burst
         """
         import warnings
         import dask
         import dask.array as da
-        from shapely import box, STRtree
-        from .Batch import BatchWrap
+        from .BatchWrap import BatchWrap
 
         if len(self) <= 1:
             return type(self)(self)
@@ -6994,19 +6355,14 @@ class BatchCore(dict):
              float(vars_of[bid][first_pol].x.min()), float(vars_of[bid][first_pol].x.max()))
             for bid in burst_ids
         )
-        burst_boxes = [box(xmin, ymin, xmax, ymax) for ymin, ymax, xmin, xmax in burst_extents]
-        tree = STRtree(burst_boxes)
-
-        overlapping_map = {
-            burst_idx: tuple(int(idx) for idx in tree.query(burst_boxes[burst_idx]) if idx != burst_idx)
-            for burst_idx in range(len(burst_ids))
-        }
+        overlapping_map = utils_xarray.burst_overlaps(burst_extents)
 
         if debug:
             total_overlaps = sum(len(v) for v in overlapping_map.values())
             print(f'dissolve: STRtree found {total_overlaps} burst overlaps', flush=True)
 
-        # Build output — one dask.delayed task per burst per pol.
+        # Build output — one dask.delayed task per burst, per pol and per input pair (date) chunk: the output keeps the
+        # input's pair chunks (GUM U1, 2026-11-05; one task per burst and pol before, so one pair chunk per burst).
         # Pass raw dask arrays (not xarray DataArrays) to avoid expensive
         # xarray __dask_graph__() calls during dask.delayed graph construction.
         # The _dissolve_raw_for_dask function receives numpy arrays (dask resolves
@@ -7052,16 +6408,36 @@ class BatchCore(dict):
 
                 # a unique key per call (pure=False): the arrays arrive through finalize
                 # keys named anew in every graph, see _align_coeffs (N81)
-                delayed_result = dask.delayed(_dissolve_raw_for_dask, pure=False)(
-                    current_arr, current_y, current_x,
-                    others_arrs, others_ys, others_xs,
-                    wrap, extend, weight
-                )
-                delayed_array = da.from_delayed(
-                    delayed_result,
-                    shape=da_current.shape,
-                    dtype=da_current.dtype
-                )
+                # a stack (pair axis) gets one call per input pair chunk, so the output keeps the input's pair chunks;
+                # a 2-D variable has no pair axis and stays one call
+                if current_arr.ndim > 2:
+                    pieces = []
+                    p0 = 0
+                    for n_pairs in current_arr.chunks[0]:
+                        p1 = p0 + n_pairs
+                        delayed_result = dask.delayed(_dissolve_raw_for_dask, pure=False)(
+                            current_arr[p0:p1], current_y, current_x,
+                            [arr[p0:p1] for arr in others_arrs], others_ys, others_xs,
+                            wrap, extend, weight
+                        )
+                        pieces.append(da.from_delayed(
+                            delayed_result,
+                            shape=(n_pairs,) + da_current.shape[1:],
+                            dtype=da_current.dtype
+                        ))
+                        p0 = p1
+                    delayed_array = pieces[0] if len(pieces) == 1 else da.concatenate(pieces, axis=0)
+                else:
+                    delayed_result = dask.delayed(_dissolve_raw_for_dask, pure=False)(
+                        current_arr, current_y, current_x,
+                        others_arrs, others_ys, others_xs,
+                        wrap, extend, weight
+                    )
+                    delayed_array = da.from_delayed(
+                        delayed_result,
+                        shape=da_current.shape,
+                        dtype=da_current.dtype
+                    )
                 if is_array:
                     new_ds = da_current.copy(data=delayed_array)
                 else:

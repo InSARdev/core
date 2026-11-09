@@ -52,7 +52,11 @@ _install_safe_restart()
 # processing functions
 from .Stack import Stack
 from .BatchCore import BatchCore
-from .Batch import Batch, BatchWrap, BatchUnit, BatchComplex, Batches
+from .Batch import Batch
+from .BatchWrap import BatchWrap
+from .BatchUnit import BatchUnit
+from .BatchComplex import BatchComplex
+from .Batches import Batches
 from .Baseline import Baseline
 
 # Auto-load extensions if available
@@ -63,13 +67,5 @@ except ImportError:
 
 try:
     import insardev_backscatter
-except ImportError:
-    pass
-
-try:
-    import insardev_io
-    import multiprocessing
-    if multiprocessing.current_process().name == 'MainProcess':
-        print('NOTE: insardev_io extension loaded for zarr I/O.')
 except ImportError:
     pass

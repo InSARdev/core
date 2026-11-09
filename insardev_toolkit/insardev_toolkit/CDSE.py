@@ -604,7 +604,8 @@ class CDSE(progressbar_joblib):
             Authenticated session.
         n_jobs : int, optional
             Parallel download jobs, at most two per CPU this process may use (a larger number is capped, with a
-            note). Default is 4.
+            note). Negative values follow joblib: -1 all CPUs, -2 all but one, and so on; 0 raises ValueError.
+            Default is 4.
         joblib_backend : str, optional
             Joblib backend (default 'loky').
         skip_exist : bool, optional

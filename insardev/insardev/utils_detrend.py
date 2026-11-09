@@ -16,6 +16,7 @@ trend fitting.
 """
 import numpy as np
 import numba as nb
+from .utils_circular import wrap_phase
 
 
 def _warmup_numba_cache():
@@ -531,6 +532,62 @@ def trend2d_grid_shape(cells):
     """The cells the samples can reach: the extent plus the kernel's footprint."""
     import numpy as _np
     return _np.atleast_1d(_np.asarray(cells, _np.int64)) + 2 * TREND2D_W
+
+
+def trend2d_legal(s, cells):
+    """True where every tap of the kernel for a scaled value s is on the grid (the kernel's own arithmetic).
+
+    _trend2d_spread_rows writes tap j when -1 < 2 (j - t) / w < 1, t = (s + 1/2) cells + w, from
+    j = ceil(t - w/2) on; the grid holds j in 0 .. M-1, M = cells + 2w. Decided per value with the
+    kernel's float expressions; NaN and inf are no data.
+    """
+    import numpy as np
+    w = TREND2D_W
+    c = float(cells)
+    M = int(cells) + 2 * w
+    s = np.asarray(s, np.float64)
+    idx = np.flatnonzero(np.isfinite(s).reshape(-1))
+    ok = np.ones(s.size, bool)
+    if idx.size:
+        t = (s.reshape(-1)[idx] + 0.5) * c + w
+        # no tap of the window on the grid at all
+        out = ~((t > -w) & (t < M + w))
+        # the whole window lies on the grid by a half width
+        edge = (t - w >= 0) & (t + w <= M)
+        todo = np.flatnonzero(~out & ~edge)
+        if todo.size:
+            tt = t[todo]
+            i0 = np.ceil(tt - 0.5 * w).astype(np.int64)
+            bad = np.zeros(todo.size, bool)
+            for d in range(w):
+                j = i0 + d
+                z = 2.0 * (j - tt) / w
+                bad |= (-1.0 < z) & (z < 1.0) & ((j < 0) | (j > M - 1))
+            out[todo] = bad
+        ok[idx] = ~out
+    return ok.reshape(s.shape)
+
+
+def trend2d_check(values, name, mu, span, cells, who='trend2d()', whole=None):
+    """The scaled values of a covariate, or one ValueError line when a finite one has a tap off the grid
+    (trend2d_legal()). `whole`: the covariate's full block, for its data range. Nothing is clamped."""
+    import numpy as np
+    s = (np.asarray(values, np.float64) - mu) / span
+    if trend2d_legal(s, cells).all():
+        return s
+    fin = np.asarray(values if whole is None else whole)
+    fin = fin[np.isfinite(fin)]
+    c, w = float(mu), float(span)
+    raise ValueError(
+        f"ERROR: {who}: covariate '{name}' has data in "
+        f"[{float(fin.min()):.8g}, {float(fin.max()):.8g}], outside its stored range "
+        f"[{c - 0.5 * w:.8g}, {c + 0.5 * w:.8g}]; nothing is clamped")
+
+
+def trend2d_check_block(block, who, covariate, mu, span, cells):
+    """trend2d_check() of one dask block, the block returned unchanged: the check runs in the task that reads it."""
+    trend2d_check(block, covariate, mu, span, cells, who)
+    return block
 
 
 def trend2d_spread(z, A, cells):
@@ -1155,7 +1212,7 @@ def trend2d_fit(acc, cells, k, axes=(), maxiter=1000, tol=1e-10, degree=1):
                     break
                 ch.append(float(np.angle(Th)))
             if len(ch) == 2:
-                err[d, 0] = 0.5 * abs(float(np.angle(np.exp(1j * (ch[0] - ch[1])))))
+                err[d, 0] = 0.5 * abs(float(wrap_phase(ch[0] - ch[1])))
     resolved = why == 0
     g[~resolved] = np.nan
     c[~resolved] = np.nan
@@ -1364,7 +1421,7 @@ def trend2d_accumulate_samples(u, A, cells, par=None, axes=()):
 
 
 def trend2d_accumulate(data_blk, transform_blk, stats, cells, dims=None,
-                       extent=None, coords=None):
+                       extent=None, coords=None, names=None):
     """One spatial block, every date it is handed -> the sums the fit reads,
     (dates, 1, 1, trend2d_width()), laid out as trend2d_layout() says.
 
@@ -1449,8 +1506,10 @@ def trend2d_accumulate(data_blk, transform_blk, stats, cells, dims=None,
     xs = [i for i, d in enumerate(dims) if d == 'x']
     rs = [i for i, d in enumerate(dims) if d == 'yx']
 
-    def scaled(i, values):
-        return (np.asarray(values, np.float64) - mu[i]) / span[i]
+    def scaled(i, values, whole=None):
+        # refused here, before any write, when a scaled value leaves trend2d_legal()
+        return trend2d_check(values, names[i] if names is not None else f'#{i}',
+                             mu[i], span[i], cells, whole=whole)
     WY = np.zeros((max(len(ys), 1), ny, w))
     BY = np.zeros((max(len(ys), 1), ny), np.int64)
     AY = np.zeros((max(len(ys), 1), ny))
@@ -1467,7 +1526,7 @@ def trend2d_accumulate(data_blk, transform_blk, stats, cells, dims=None,
     xhi = np.ascontiguousarray(BX.max(axis=1) + w)
     AR = np.zeros((max(len(rs), 1), npts))
     for j, i in enumerate(rs):
-        AR[j] = scaled(i, V[i].reshape(-1)[idx])
+        AR[j] = scaled(i, V[i].reshape(-1)[idx], whole=V[i])
     vclass = np.array([0 if d == 'y' else 1 if d == 'x' else 2 for d in dims], np.int64)
     vslot = np.array([(ys if d == 'y' else xs if d == 'x' else rs).index(i)
                       for i, d in enumerate(dims)], np.int64)
@@ -1703,7 +1762,7 @@ def _accumulate_chunk(phase_chunk, weight_chunk, var_chunks,
 
     # Batch size: keep A_std_batch + WA under half dask chunk budget
     from .utils_dask import get_dask_chunk_size_mb
-    _budget = get_dask_chunk_size_mb() * 1024 * 1024 // 2
+    _budget = int(get_dask_chunk_size_mb() * 2 ** 20) // 2
     batch_size = max(1024, _budget // max(1, 2 * n_feat * 8))
     n_batches = (n_pixels + batch_size - 1) // batch_size
 
@@ -1876,7 +1935,7 @@ def _apply_chunk(phase_chunk, coeffs_packed, var_chunks,
 
     # Batch size: keep A_std under half dask chunk budget
     from .utils_dask import get_dask_chunk_size_mb
-    _budget = get_dask_chunk_size_mb() * 1024 * 1024 // 2
+    _budget = int(get_dask_chunk_size_mb() * 2 ** 20) // 2
     batch_size = max(1024, _budget // max(1, n_feat * 8))
     n_batches = (n_pixels + batch_size - 1) // batch_size
 
@@ -1942,3 +2001,472 @@ def _apply_chunk(phase_chunk, coeffs_packed, var_chunks,
 
 
 _warmup_numba_cache()
+
+
+def _cover_join(blocks, lo, hi):
+    """The stored covariate blocks of one data block, joined in numpy and cut to the data block's cells."""
+    if len(lo) == 1:
+        return np.concatenate([b[l:h] for b, l, h in zip(blocks, lo[0], hi[0])])
+    return np.concatenate([np.concatenate([b[ly:hy, lx:hx] for b, lx, hx in zip(row, lo[1], hi[1])], axis=1)
+                           for row, ly, hy in zip(blocks, lo[0], hi[0])], axis=0)
+
+
+def trend2d_cover(var, chunks):
+    """The covariate `var` (dask, one axis per dim) on the data's block grid `chunks`, with no rechunk layer: each block
+    of the result is ONE task that joins the stored blocks it overlaps and slices them in numpy."""
+    import itertools
+    import dask.array as da
+    from dask.base import tokenize
+    from dask.highlevelgraph import HighLevelGraph
+    chunks = tuple(tuple(int(c) for c in ax) for ax in chunks)
+    name = 'trend2d-cover-' + tokenize(var.name, chunks)
+    src = [np.concatenate([[0], np.cumsum(ax)]) for ax in var.chunks]
+    tgt = [np.concatenate([[0], np.cumsum(ax)]) for ax in chunks]
+    # per axis and target block: the stored blocks it overlaps, with the local start and stop in each
+    spans = [[[(a, int(max(tgt[ax][p], src[ax][a]) - src[ax][a]), int(min(tgt[ax][p + 1], src[ax][a + 1]) - src[ax][a]))
+               for a in range(len(var.chunks[ax]))
+               if max(tgt[ax][p], src[ax][a]) < min(tgt[ax][p + 1], src[ax][a + 1])]
+              for p in range(len(chunks[ax]))] for ax in range(var.ndim)]
+    dsk = {}
+    for idx in itertools.product(*[range(len(c)) for c in chunks]):
+        s = [spans[ax][idx[ax]] for ax in range(var.ndim)]
+        if var.ndim == 1:
+            keys = [(var.name, a) for a, _, _ in s[0]]
+        else:
+            keys = [[(var.name, a, b) for b, _, _ in s[1]] for a, _, _ in s[0]]
+        lo = [[l for _, l, _ in s[ax]] for ax in range(var.ndim)]
+        hi = [[h for _, _, h in s[ax]] for ax in range(var.ndim)]
+        dsk[(name,) + idx] = (_cover_join, keys, lo, hi)
+    graph = HighLevelGraph.from_collections(name, dsk, dependencies=[var])
+    return da.Array(graph, name, chunks, dtype=var.dtype, meta=np.empty((0,) * var.ndim, var.dtype))
+
+
+def _trend2d_accumulate_for_dask(data_blk, *args, stats=None, n_vars=0, **kwargs):
+    """Module-level entry point of the trend2d() accumulator of union=True (rule (3)).
+
+    One date chunk with ALL its YX blocks: dask joins the blocks as numpy before the call, so the
+    kernel's sums over pixels are those of the whole burst, whatever the YX chunking is. blockwise
+    hands over the covariate blocks and then the block's own y and x coordinates (the checkerboard
+    halves are read off them). Returns (dates, width): the kernel's (dates, 1, 1, width) without its
+    two singleton axes.
+    """
+    acc = trend2d_accumulate(
+        data_blk, tuple(args[:n_vars]), stats,
+        coords=(args[n_vars], args[n_vars + 1]), **kwargs)
+    return acc.reshape(acc.shape[0], -1)
+
+
+def _trend2d_accumulate_partial_for_dask(data_blk, *args, stats=None, n_vars=0, **kwargs):
+    """The trend2d() accumulator of union=False: one YX block's partial sums, the kernel's (dates, 1, 1, width).
+
+    The blocks are not joined: blockwise keeps one partial per block and the caller sums them over the
+    blocks, as the per-burst fit always has. The arguments are those of _trend2d_accumulate_for_dask.
+    """
+    return trend2d_accumulate(
+        data_blk, tuple(args[:n_vars]), stats,
+        coords=(args[n_vars], args[n_vars + 1]), **kwargs)
+
+
+def _trend2d_finalize_for_dask(acc, dates=None, *, stats=None,
+                               cells=0, k=0, axes=(), label='', degree=1):
+    """One date block of accumulators -> its coefficients.
+
+    Columns are the k gradients, the constant, why the date failed if it
+    did (0 solved, 1 no pixels or a checkerboard half with none, 2 the trend walked out of `range`, 3 the
+    covariate is degenerate on this date, 4 the iteration did not converge,
+    5 a different trend beats the answer on the global lattice, 6 the
+    coherence is not above the noise level). Every
+    unresolved date has NaN in the gradients, the constant, the errors, the
+    coherence, the coherence at ZERO trend and the gain: NaN means no data,
+    a coherence is proved only by a trend that stands. The coherence at the
+    solution, the coherence at ZERO trend (their difference is what the trend
+    bought), the sample count, the k
+    reaches -- the half-power width of each variable's own sampling -- the
+    k errors and the k centroids of the date's pixels.
+    At degree 0 the gradients are zero, the reaches NaN, and the first error
+    column is the constant's one-sigma in radians.
+    """
+    import numpy as np
+    from . import utils_detrend
+    stats = np.asarray(stats, np.float64).ravel()
+    acc = np.asarray(acc)
+    g, c, coh, coh0, det, why, lim, err = utils_detrend.trend2d_fit(
+        acc, cells, k, axes=axes, degree=degree)
+    span = np.maximum(stats[k:2 * k], 1e-30)[None, :]
+    # the transform answers in turns across the extent; the plane wants a rate
+    g = g * (2 * np.pi) / span
+    if not det.all():
+        # NAME THEM. A date that comes back NaN takes every pixel of the stack
+        # with it downstream, so the message has to say which date and what
+        # stopped it rather than how many fell out of one block.
+        _reason = {1: 'no pixels, or a checkerboard half with none',
+                   2: 'the trend walked out of `range` -- widen it',
+                   3: 'degenerate covariate on this date',
+                   4: 'did not converge -- an unconverged number is a '
+                      'plausible wrong value, so it is not returned',
+                   5: 'a different trend beats it on the global lattice -- coherence NaN',
+                   6: 'coherence not above the noise level -- not proved'}
+        _d = (np.asarray(dates).ravel() if dates is not None
+              else np.arange(det.size))
+        for _i in np.flatnonzero(~det):
+            _nm = (str(np.asarray(_d[_i], dtype='datetime64[D]'))
+                   if dates is not None else f'index {_d[_i]}')
+            print(f"trend2d('{label}'): {_nm} did not resolve and comes back "
+                  f"NaN -- {_reason.get(int(why[_i]), 'unknown')} "
+                  f"(coherence {coh[_i]:.3f})", flush=True)
+    L = utils_detrend.trend2d_layout(cells, k, len(tuple(axes)))
+    K, hw = L['K'], L['half']
+    # the two halves' counts and first moments add up to the total's
+    n = acc[:, 2 * K:2 * K + 1] + acc[:, hw + 2 * K:hw + 2 * K + 1]
+    # the centroid of each date's pixels in the variable's own units: the
+    # accumulator carries the first moment of the centred, scaled covariate
+    _m1 = (acc[:, 2 * K + 1:2 * K + 1 + k]
+           + acc[:, hw + 2 * K + 1:hw + 2 * K + 1 + k])
+    cen = stats[:k][None, :] + (_m1 / np.maximum(n, 1.0)) * span
+    # a gradient's error is in turns across the extent like the gradient; the
+    # constant's is already radians
+    if degree:
+        err = err * (2 * np.pi) / span
+    return np.concatenate(
+        [g, c[:, None], why[:, None].astype(np.float64), coh[:, None],
+         coh0[:, None], n, lim * (2 * np.pi) / span, err, cen], axis=1)
+
+
+def trend2d_default_range(k):
+    """The default `range` of trend2d() for k covariates: radians across each
+    variable's extent, 128 pi at one variable, 16 pi at two, 8 pi otherwise."""
+    return {1: 128, 2: 16, 3: 8}.get(k, 8) * np.pi
+
+
+def trend2d_cells(range_):
+    """The accumulator's grid size per variable for `range` radians across
+    the extent."""
+    return int(np.ceil(2 * float(range_) / np.pi))
+
+
+def trend2d_stats(stats, k):
+    """(centre, extent) per variable over the bursts of one fit: `stats` is one
+    (2k) array per burst, its maxima then its minima."""
+    _S = np.stack(stats)                                             # (bursts, 2k)
+    _hi = _S[:, :k].max(axis=0)
+    _lo = _S[:, k:].min(axis=0)
+    return np.concatenate([0.5 * (_hi + _lo),          # centre
+                           _hi - _lo])                 # extent
+
+
+def trend2d_recenter(coef, names, zero, stats, k):
+    """The model per date, float64, in scipy's terms: the constant where every
+    covariate sits at its zero, the slope per unit of each variable, and the
+    zero each variable is read at (the midpoint of its actual_range, or the
+    centre of a square). `names` ends in '²' for a square; `zero` holds the
+    stored zero of each name."""
+    _orig = [coef[:, i].astype(np.float64) for i in range(len(names))]
+    _zeros = [float(zero[i]) if _v.endswith('²') else float(stats[i])
+              for i, _v in enumerate(names)]
+    _icpt = coef[:, k].astype(np.float64)
+    _slopes = list(_orig)
+    for i, _v in enumerate(names):
+        if _v.endswith('²'):
+            _d = np.float64(_zeros[i]) - np.float64(zero[i])
+            _icpt = _icpt + _orig[i] * (_d * _d - np.float64(stats[i]))
+            _b = _v[:-1]
+            if _b in names and _d != 0.0:
+                _j = names.index(_b)
+                _slopes[_j] = _slopes[_j] + 2.0 * _orig[i] * _d
+        else:
+            _icpt = (_icpt + _orig[i]
+                     * (np.float64(_zeros[i]) - np.float64(stats[i])))
+    return _icpt, _slopes, _zeros
+
+
+def trend2d_model_arrays(coef, k, n):
+    """The fit's per-date columns as the model stores them: coherence,
+    coherence0, gain (their difference), pixels, the constant's one-sigma,
+    and per variable (n of them) the reach and the slope's one-sigma."""
+    return {'coherence': coef[:, k + 2].astype(np.float32),
+            'coherence0': coef[:, k + 3].astype(np.float32),
+            'gain': (coef[:, k + 2] - coef[:, k + 3]).astype(np.float32),
+            'pixels': coef[:, k + 4].astype(np.int64),
+            'stderr_intercept': coef[:, 2 * k + 5].astype(np.float64),
+            'resolution': [coef[:, k + 5 + i].astype(np.float64) for i in range(n)],
+            'stderr': [coef[:, 2 * k + 5 + i].astype(np.float64) for i in range(n)]}
+
+
+def _trend2d_join(*blocks):
+    """The date blocks of one model variable, joined in date order."""
+    return np.concatenate(blocks, axis=0)
+
+
+def trend2d_model_join(coef):
+    """The model's coefficients (dates, columns) in ONE chunk over the dates: one task per column
+    block joins the date chunks in date order; one date chunk is returned as it is. No rechunk layer.
+    >>> one = trend2d_model_join(coef)
+    """
+    if len(coef.chunks[0]) == 1:
+        return coef
+    import dask.array as da
+    from dask.base import tokenize
+    from dask.highlevelgraph import HighLevelGraph
+    name = 'trend2d-model-' + tokenize(coef.name)
+    n = len(coef.chunks[0])
+    dsk = {(name, 0, j): (_trend2d_join, *[(coef.name, i, j) for i in range(n)])
+           for j in range(len(coef.chunks[1]))}
+    graph = HighLevelGraph.from_collections(name, dsk, dependencies=[coef])
+    return da.Array(graph, name, ((sum(coef.chunks[0]),), coef.chunks[1]), dtype=coef.dtype,
+                    meta=np.empty((0, 0), coef.dtype))
+
+
+def trend2d_table(coef, stats, k, var_names, degree, key, nd, iref, union):
+    """Print trend2d(debug=True)'s table of one burst: each date's turn across
+    every variable (the constant alone without a covariate), its coherence,
+    pixels and reach, and the dates that did not resolve."""
+    _cf = np.asarray(coef)
+    _det = _cf[:, k + 1] == 0
+    _span = stats[k:2 * k]
+    # degree 0 has no gradient columns to show, only the constant
+    _tv = var_names if degree else []
+    _kt = len(_tv)
+    print(f"trend2d('{key}'): {nd} dates, {k} "
+          f"variables {var_names}, degree {degree}, "
+          f"referenced to date {iref}"
+          + (" [one fit for every burst]" if union else ""),
+          flush=True)
+    hdr = ("    date " + " ".join(f"{v:>12s}" for v in _tv)
+           + ("" if degree else f"{'intercept':>12s} {'stderr':>9s}"))
+    print(hdr + f"{'coh':>9s} {'pixels':>12s}  "
+          + " ".join(f"{'resolution ' + v:>13s}" for v in _tv)
+          + ("   [rad across the variable's span]" if degree
+             else "   [rad]"), flush=True)
+    _tag = {1: 'no pixels or a half with none', 2: 'walked out of `range`',
+            3: 'degenerate covariate', 4: 'did not converge',
+            5: 'beaten on the global lattice', 6: 'below the noise level'}
+    for d in range(nd):
+        _coh = _cf[d, k + 2]
+        _reach = " ".join(
+            f"{_cf[d, k + 5 + i] * _span[i]:13.4f}"
+            for i in range(_kt))
+        if not _det[d]:
+            print(f"    {d:4d} " + " ".join(f"{chr(45) * 2:>12s}"
+                  for _ in range(max(_kt, 1)))
+                  + ("" if degree else f" {chr(45) * 2:>9s}")
+                  + f" {_coh:8.5f} {int(_cf[d, k + 4]):12,d}  "
+                  f"{_reach}   {_tag[int(_cf[d, k + 1])]}",
+                  flush=True)
+            continue
+        row = (" ".join(f"{_cf[d, i] * _span[i]:12.4f}"
+                        for i in range(_kt)) if degree
+               else f"{_cf[d, k]:12.4f} {_cf[d, 2 * k + 5]:9.4f}")
+        print(f"    {d:4d} {row} {_coh:8.5f} "
+              f"{int(_cf[d, k + 4]):12,d}  {_reach}", flush=True)
+
+
+def trend2d_referenced(data, ref=None):
+    """The phase of `data` (date, y, x) relative to the reference date's
+    phasor `ref` (y, x): data times the conjugate of ref. With no reference
+    (a single date) the data times ones of the grid's shape and chunks."""
+    import dask.array as da
+    if ref is None:
+        ref = da.ones(data.shape[-2:], dtype=np.complex64,
+                      chunks=data.chunks[-2:])
+    else:
+        ref = da.conj(ref)
+    return data * ref
+
+
+def trend2d_covariate(data, square, zero, scale, index, name, who):
+    """One covariate as the trend2d() model reads it. A square (`square`) is
+    (base - zero)**2; any other covariate is the base less its zero when that
+    is not 0. With `scale` = (stats, cells, count) of the fit, the values are
+    checked against the fit's range in the task that reads them (refused
+    where a value's taps leave the grid); the values themselves are not
+    changed by the check."""
+    import dask.array as da
+    if square:
+        data = (data.astype(np.float64) - zero) ** 2
+    if scale is not None:
+        stats, cells, n = scale
+        mu, span = float(stats[index]), float(stats[n + index])
+        if isinstance(data, da.Array):
+            data = da.map_blocks(
+                trend2d_check_block, data, who=who,
+                covariate=name, mu=mu, span=span, cells=cells,
+                dtype=data.dtype, meta=np.empty((0,) * data.ndim, data.dtype))
+        else:
+            trend2d_check(np.asarray(data), name, mu, span, cells, who)
+    if not square and zero:
+        data = data.astype(np.float64) - zero
+    return data
+
+
+def phase_rotation(phi):
+    """exp(-1j * phi) in complex64 for a real phase `phi` (lazy for dask)."""
+    import dask.array as da
+    return da.exp(np.complex64(-1j) * da.asarray(phi.astype(np.complex64)))
+
+
+def phase_rotate(data, rot, keep=None, axis=0):
+    """`data * rot` (rot = exp(-1j * phi), see phase_rotation, on data's dims). Where
+    `keep` (a bool per index along `axis`, numpy or dask) is False, data is kept.
+    Lazy for dask: the keep mask follows the data's chunks along `axis`."""
+    import dask.array as da
+    prod = data * rot
+    if keep is None or keep.all():
+        return prod
+    idx = tuple(slice(None) if i == axis else None for i in range(prod.ndim))
+    if isinstance(data, da.Array):
+        m = da.from_array(keep, chunks=(data.chunks[axis],))[idx]
+    else:
+        m = keep[idx]
+    return da.where(m, prod, data)
+
+
+def centred_square(v, actual_range):
+    """`(v - c)**2` as float32 about c, the midpoint of the variable's own
+    actual_range, with the new actual_range [0, bound of |v - c|**2]. Returns
+    (q, c, new_range). A square is about its own centre, never the raw
+    square (see BatchCore._square_of)."""
+    ar = actual_range
+    c = 0.5 * (float(ar[0]) + float(ar[1]))
+    q = ((v.astype('float64') - c) ** 2).astype('float32')
+    _hi = (max(abs(float(ar[0]) - c), abs(float(ar[1]) - c))) ** 2
+    return q, c, [0.0, float(_hi)]
+
+
+def trend2d_poly_dask(phase, weight, variables, degree, is_complex, detrend,
+                      extrapolate, debug=False, label=''):
+    """Polynomial trend2d() of a dask (pair, y, x) grid: each block accumulates
+    its partial normal equations, the blocks are summed, each pair is solved,
+    and each block applies its trend.
+
+    `phase` is (p, y, x), `weight` the same shape or None, `variables` the
+    (y, x) covariates aligned to the phase's spatial chunks. Returns
+    (p, y, x), the phase's dtype when complex, float32 otherwise.
+    """
+    import dask.array as da
+    from .utils_dask import align_secondary, warn_secondary
+    # The phase is the PRIMARY input, its chunks are the output's. The weight and the covariates are SECONDARY (GMT U3, user
+    # ruling 2026-11-02): their (y, x) chunks go to the phase's with ONE WARNING for the call, other date chunks of the weight
+    # raise one line. Judged against the phase as given, before the per-pair layout below (which moves phase and weight alike).
+    moved = []
+    if weight is not None:
+        weight, changed = align_secondary(phase, weight, 'trend2d', 'weight')
+        if changed:
+            moved.append('weight')
+    aligned = []
+    for k, v in enumerate(variables, 1):
+        v, changed = align_secondary(phase, v, 'trend2d', f'covariate {k}', dims=('y', 'x'))
+        if changed:
+            moved.append(f'covariate {k}')
+        aligned.append(v)
+    variables = aligned
+    warn_secondary('trend2d', moved)
+    # Merged chunking: dim 0 is a single chunk spanning all pairs.
+    # Skip rechunk to avoid expensive P2P shuffle — the kernels
+    # (_accumulate_chunk, _solve_chunk, _apply_chunk) all handle
+    # multi-pair blocks via internal loops.
+    dim0_merged = (len(phase.chunks[0]) == 1
+                   and phase.chunks[0][0] > 1)
+
+    # Per-pair chunking: ensure pair dimension is chunked to 1
+    if not dim0_merged and any(c != 1 for c in phase.chunks[0]):
+        phase = phase.rechunk({0: 1})
+
+    # Phase 0: Compute global per-variable standardization (pair-independent),
+    # applied to every variable BEFORE the polynomial terms are built
+    feature_mean, feature_std = _compute_feature_stats(variables, degree)
+    n_poly = _n_poly_features(len(variables), degree)
+    n_feat = n_poly + 1  # +1 for bias
+    n_feat_b = 2 * n_feat if is_complex else n_feat
+    n_accum = n_feat * n_feat + n_feat_b + 1
+    n_coeff_out = 2 * n_feat if is_complex else n_feat
+
+    if debug:
+        print(f"DEBUG {label}: n_feat={n_feat}, n_accum={n_accum}, "
+              f"n_coeff_out={n_coeff_out}, chunks={phase.chunks}")
+
+    # Phase 1: Accumulate partial normal equations per (pair, tile)
+    n_vars = len(variables)
+    has_weight = weight is not None
+
+    def make_accumulate_fn(has_weight, n_vars, feature_mean,
+                           feature_std, degree, is_complex):
+        def fn(*args):
+            phase_c = args[0]
+            if has_weight:
+                weight_c = args[1]
+                var_cs = args[2:2 + n_vars]
+            else:
+                weight_c = None
+                var_cs = args[1:1 + n_vars]
+            return _accumulate_chunk(
+                phase_c, weight_c, var_cs,
+                feature_mean, feature_std, degree, is_complex)
+        return fn
+
+    accumulate_fn = make_accumulate_fn(
+        has_weight, n_vars, feature_mean, feature_std,
+        degree, is_complex)
+
+    blockwise_args = [phase, 'pyx']
+    if has_weight:
+        # the weight was aligned to the phase as given (above); here it follows the phase's own per-pair layout
+        if weight.chunks != phase.chunks:
+            weight = weight.rechunk(phase.chunks)
+        blockwise_args.extend([weight, 'pyx'])
+    for v_dask in variables:
+        blockwise_args.extend([v_dask, 'yx'])
+
+    partials = da.blockwise(
+        accumulate_fn, 'pyxf',
+        *blockwise_args,
+        adjust_chunks={'y': 1, 'x': 1},
+        new_axes={'f': n_accum},
+        dtype=np.float64,
+        meta=np.empty((0, 0, 0, 0), dtype=np.float64),
+    )
+
+    # Phase 2: Sum across spatial chunks (tree reduction)
+    summed = partials.sum(axis=(1, 2))  # (n_pairs, n_accum)
+
+    # Phase 3: Solve per pair
+    def make_solve_fn(n_feat, is_complex):
+        def fn(block):
+            return _solve_chunk(block, n_feat, is_complex)
+        return fn
+
+    solve_fn = make_solve_fn(n_feat, is_complex)
+    coeffs = da.map_blocks(
+        solve_fn, summed,
+        dtype=np.float64,
+        chunks=(summed.chunks[0], (n_coeff_out,)),
+    )  # (n_pairs, n_coeff_out)
+
+    # Phase 4: Apply trend per (pair, tile)
+    def make_apply_fn(n_vars, feature_mean, feature_std,
+                      degree, is_complex, detrend_mode, extrapolate):
+        def fn(*args):
+            phase_c = args[0]
+            coeffs_c = args[1]
+            var_cs = args[2:2 + n_vars]
+            return _apply_chunk(
+                phase_c, coeffs_c, var_cs,
+                feature_mean, feature_std,
+                degree, is_complex, detrend_mode, extrapolate)
+        return fn
+
+    apply_fn = make_apply_fn(
+        n_vars, feature_mean, feature_std,
+        degree, is_complex, detrend, extrapolate)
+
+    out_dtype = phase.dtype if is_complex else np.float32
+    blockwise_args_apply = [phase, 'pyx', coeffs, 'pf']
+    for v_dask in variables:
+        blockwise_args_apply.extend([v_dask, 'yx'])
+
+    return da.blockwise(
+        apply_fn, 'pyx',
+        *blockwise_args_apply,
+        concatenate=True,
+        dtype=out_dtype,
+        meta=np.empty((0, 0, 0), dtype=out_dtype),
+    )

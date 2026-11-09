@@ -14,7 +14,6 @@ import numpy as np
 import pandas as pd
 
 from . import utils_epochs
-from . import utils_tiles
 from .utils_files import exists
 from .utils_tropo import (_plan, _times)
 
@@ -112,7 +111,8 @@ def _index(vrt):
 
     Raises
     ------
-    ValueError: When the index cannot be read, is not an IONEX index, or an epoch has no day file.
+    ValueError: When the index cannot be read, is not an IONEX index, lists a file that is not a day file as published (an index
+    written before 2026-10-29), or an epoch has no day file.
 
     Examples
     --------
@@ -138,6 +138,9 @@ def _index(vrt):
                 raise ValueError(f'ERROR: {vrt} has a Source without SourceFilename or DestSlab: index_days() again')
             text = (name.text or '').strip()
             path = os.path.join(base, text) if name.get('relativeToVRT', '0') == '1' else text
+            if utils_epochs._DAY_FILE.fullmatch(os.path.basename(path)) is None:
+                raise ValueError(f'ERROR: {vrt} lists {os.path.basename(path)}, not an IONEX day file as published: index the folder '
+                                 f'again (IONEX().download again fetches no file that is present)')
             starts.append((int(slab.get('offset').split(',')[0]), os.path.normpath(path)))
     starts.sort()
     where = [None] * seconds.size
@@ -200,7 +203,7 @@ def _match(axis, want, path):
 
     Examples
     --------
-    >>> _match(np.array([40.0, 40.5]), np.array([40.0, 40.5]), 'IONEX/20160511.nc')
+    >>> _match(np.array([40.0, 40.5]), np.array([40.0, 40.5]), 'IONEX/codg1320.16i.Z')
     """
     d = np.abs(axis[None, :] - want[:, None])
     idx = d.argmin(axis=1)
@@ -209,19 +212,12 @@ def _match(axis, want, path):
     return idx
 
 
-def _require(f, path, names):
-    """Raise the ValueError of a day file that lacks one of the datasets names."""
-    for name in names:
-        if name not in f:
-            raise ValueError(f'ERROR: {path} has no {name} dataset: repeat the IONEX download')
-
-
 def _day_header(path, lat, lon):
     """The header of a day file: the scale, the base radius and the shell height.
 
     Parameters
     ----------
-    path : str - The day file (IONEX/<yyyymmdd>.nc).
+    path : str - The day file as published (IONEX/<name>).
     lat, lon : numpy.ndarray - The lattice latitudes and longitudes, degrees, ascending.
 
     Returns
@@ -230,36 +226,25 @@ def _day_header(path, lat, lon):
 
     Raises
     ------
-    ValueError: When the file cannot be read, lacks an attribute, or its nodes are not the lattice nodes.
+    ValueError: When the file or its header cannot be read, or its nodes are not the lattice nodes.
 
     Examples
     --------
-    >>> _day_header('dem_tiles/IONEX/20160511.nc', np.array([40.0, 40.5]), np.array([10.0, 11.0]))
+    >>> _day_header('dem_tiles/IONEX/codg1320.16i.Z', np.array([40.0, 40.5]), np.array([10.0, 11.0]))
     """
-    utils_tiles.hdf5_plugins()
-    import h5py
+    from .IONEX import IONEX
+    text = IONEX._head(path)
     try:
-        with h5py.File(path, 'r') as f:
-            _require(f, path, ('lat', 'lon', _VARIABLE))
-            var = f[_VARIABLE]
-            if 'exponent' not in var.attrs:
-                raise ValueError(f'ERROR: {path} has no exponent attribute on {_VARIABLE}')
-            scale = 10.0 ** int(var.attrs['exponent']) * 1e16
-            for key in ('BASE_RADIUS', 'HGT1_HGT2_DHGT'):
-                if key not in f.attrs:
-                    raise ValueError(f'ERROR: {path} has no {key} attribute: repeat the IONEX download')
-            radius = float(f.attrs['BASE_RADIUS'])
-            shell = float(np.asarray(f.attrs['HGT1_HGT2_DHGT'], dtype=float).ravel()[0])
-            file_lat = np.asarray(f['lat'][()], dtype=float)
-            file_lon = np.asarray(f['lon'][()], dtype=float)
-    except OSError as e:
-        raise ValueError(f'ERROR: {path} cannot be read: {type(e).__name__}, delete it, then download the IONEX maps again'
-                         ) from None
+        head = IONEX._header(text)
+    except ValueError as e:
+        raise ValueError(f'ERROR: {path}: {str(e).removeprefix("ERROR: ")}') from None
+    file_lat = np.sort(np.asarray(head['lat'], dtype=float))
+    file_lon = np.sort(np.asarray(head['lon'], dtype=float))
     if file_lat.size != lat.size or file_lon.size != lon.size:
         raise ValueError(f'ERROR: the nodes of {path} are not the nodes of the IONEX index: repeat the IONEX download')
     _match(file_lat, lat, path)
     _match(file_lon, lon, path)
-    return path, scale, radius, shell
+    return path, 10.0 ** head['exponent'] * 1e16, head['radius'], head['hgt'][0]
 
 
 def _shell(headers):
@@ -275,17 +260,17 @@ def _shell(headers):
 
     Raises
     ------
-    ValueError: When two day files differ in BASE_RADIUS or HGT1_HGT2_DHGT; the message names them.
+    ValueError: When two day files differ in BASE RADIUS or HGT1; the message names them.
 
     Examples
     --------
-    >>> _shell([('dem_tiles/IONEX/20160511.nc', 1e15, 6371.0, 450.0), ('dem_tiles/IONEX/20160512.nc', 1e15, 6371.0, 450.0)])
+    >>> _shell([('dem_tiles/IONEX/codg1320.16i.Z', 1e15, 6371.0, 450.0), ('dem_tiles/IONEX/codg1330.16i.Z', 1e15, 6371.0, 450.0)])
     """
     first = headers[0]
     for head in headers[1:]:
         if (head[2], head[3]) != (first[2], first[3]):
             raise ValueError(f'ERROR: the day files {os.path.basename(first[0])} and {os.path.basename(head[0])} differ: '
-                             f'BASE_RADIUS {first[2]} and {head[2]} km, HGT1 {first[3]} and {head[3]} km')
+                             f'BASE RADIUS {first[2]} and {head[2]} km, HGT1 {first[3]} and {head[3]} km')
     return first[2] * 1e3, first[3] * 1e3
 
 
@@ -322,9 +307,9 @@ def _day_maps(path, epochs, ks, lat, lon, scale):
 
     Parameters
     ----------
-    path : str - The day file.
+    path : str - The day file as published.
     epochs : tuple of str - The ISO datetimes of the maps.
-    ks : tuple of int - The band index of each epoch.
+    ks : tuple of int - The map index of each epoch in the file.
     lat, lon : numpy.ndarray - The lattice latitudes and longitudes, degrees.
     scale : float - The day file's scale, electrons per square metre per stored integer.
 
@@ -334,29 +319,24 @@ def _day_maps(path, epochs, ks, lat, lon, scale):
 
     Raises
     ------
-    ValueError: When the file cannot be read or its nodes are not the lattice nodes.
+    ValueError: When the file cannot be read or decoded, or its nodes are not the lattice nodes.
 
     Examples
     --------
-    >>> _day_maps('dem_tiles/IONEX/20160511.nc', ('2016-05-11T05:00:00',), (5,), np.array([40.0, 40.5]), np.array([10.0, 11.0]), 1e15)
+    >>> _day_maps('dem_tiles/IONEX/codg1320.16i.Z', ('2016-05-11T05:00:00',), (5,), np.array([40.0, 40.5]), np.array([10.0, 11.0]), 1e15)
     """
-    import h5py
+    from .IONEX import IONEX
     from .utils_atmosphere import atm_fill_nodata
-    utils_tiles.hdf5_plugins()
+    text = IONEX._read(path)
     try:
-        with h5py.File(path, 'r') as f:
-            _require(f, path, ('lat', 'lon', _VARIABLE))
-            file_lat = np.asarray(f['lat'][()], dtype=float)
-            file_lon = np.asarray(f['lon'][()], dtype=float)
-            var = f[_VARIABLE]
-            for k in ks:
-                if not 0 <= k < var.shape[0]:
-                    raise ValueError(f'ERROR: {path} has no map {k}: the index and the file disagree, repeat the download')
-            tecs = [np.asarray(var[k], dtype=float) for k in ks]
-    except OSError as e:
-        raise ValueError(f'ERROR: {path} cannot be read: {type(e).__name__}, delete it, then download the IONEX maps again'
-                         ) from None
-    rows, cols = _match(file_lat, lat, path), _match(file_lon, lon, path)
+        maps = IONEX._decode_maps(text)
+    except ValueError as e:
+        raise ValueError(f'ERROR: {path}: {str(e).removeprefix("ERROR: ")}') from None
+    for k in ks:
+        if not 0 <= k < maps['tec'].shape[0]:
+            raise ValueError(f'ERROR: {path} has no map {k}: the index and the file disagree, repeat the download')
+    tecs = [np.asarray(maps['tec'][k], dtype=float) for k in ks]
+    rows, cols = _match(maps['lat'], lat, path), _match(maps['lon'], lon, path)
     out = {}
     for epoch, tec in zip(epochs, tecs):
         nodata = tec == _NODATA

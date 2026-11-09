@@ -158,12 +158,14 @@ class UI:
         except ImportError:
             pass
 
-        # Monkey-patch PyVista trame Widget for dark theme (removes light gray border)
+        # Monkey-patch PyVista trame Widget for dark theme (removes light gray border); only an ipywidgets.HTML subclass
+        # (the trame_pyvista Widget of current releases is an AnyWidget and keeps its own __init__). The flag is read
+        # from the class itself: an HTML subclass inherits _dark_patched from HTML.
         try:
             from pyvista.trame.jupyter import Widget as PyVistaWidget
             from ipywidgets import HTML
 
-            if not getattr(PyVistaWidget, '_dark_patched', False):
+            if issubclass(PyVistaWidget, HTML) and not vars(PyVistaWidget).get('_dark_patched', False):
                 _original_pv_widget_init = PyVistaWidget.__init__
                 def _dark_pv_widget_init(self, viewer, src, width=None, height=None, iframe_attrs=None, **kwargs):
                     if iframe_attrs is None:

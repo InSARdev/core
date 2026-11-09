@@ -16,7 +16,8 @@ import time
 import warnings
 from .BatchCore import BatchCore
 from . import utils_xarray
-from .Batch import _Fit3dChain, _Fit3dSlice, _fit3d_keep
+from .utils_circular import wrap_phase
+from .utils_dask import graph_check
 
 # pixels a tile: the loops over a tile's pixels are innermost, so the compiler vectorises them
 _TILE = 64
@@ -261,6 +262,347 @@ def fit1d_pairs(data, A, weight=None, dh_prior=None, dh_col=None):
     rmse = np.empty(N)
     _fit1d_kernel(y, g, has_w, An, scale, lam_scale, hc, use_prior, th, gam, rmse)
     return th, gam, rmse
+
+
+def model_time(days, t0):
+    """
+    Years from the epoch t0 on a day count: the time axis of predict(), (days - t0) / 365.25.
+
+    Parameters
+    ----------
+    days : np.ndarray
+        Float64 days of the observations (a numpy datetime64[D] read as float).
+    t0 : float
+        The epoch in the same days: the model's `date` coordinate, or the median or master date.
+
+    Returns
+    -------
+    np.ndarray
+        Float64 years.
+
+    Examples
+    --------
+    >>> t = model_time(np.array([0.0, 365.25]), 0.0)
+    """
+    return ((days - t0) / 365.25).astype(np.float64)
+
+
+def elevation_to_phase(baseline, wavelength, fac):
+    """
+    Perpendicular baseline to the height-to-phase factor: baseline / ((4 pi / wavelength) / fac).
+
+    Parameters
+    ----------
+    baseline : np.ndarray
+        Perpendicular baseline per observation, metres.
+    wavelength : float
+        Radar wavelength, metres.
+    fac : float or np.ndarray
+        Elevation-to-phase scale of the stack, from elevation_phase_approximate().
+
+    Returns
+    -------
+    np.ndarray
+        Height-to-phase factor per observation, radians per metre of height.
+
+    Examples
+    --------
+    >>> e2p = elevation_to_phase(np.array([100.0, -50.0]), 0.0555, 1.0)
+    """
+    return baseline / ((4.0 * np.pi / wavelength) / fac)
+
+
+def _asdask(a):
+    """A dask array as it is; a numpy array as one block."""
+    import dask.array as da
+    return a if isinstance(a, da.Array) else da.asarray(a)
+
+
+def _unpack(blocks, use_hgt, use_sea):
+    """The model's blocks of one YX block: vel, then hgt and sea where they are used."""
+    vel = blocks[0]
+    i = 1
+    hgt = sea = None
+    if use_hgt:
+        hgt = blocks[i]
+        i += 1
+    if use_sea:
+        sea = blocks[i]
+    return vel, hgt, sea
+
+
+def _predict_dates_block(*blocks, t, e2p, use_hgt, use_sea):
+    """All dates of one YX block: the dates looped in numpy inside the one task."""
+    vel, hgt, sea = _unpack(blocks, use_hgt, use_sea)
+    out = np.empty((len(t),) + vel.shape, dtype=np.float32)
+    for i in range(len(t)):
+        phi = vel * float(t[i])
+        if e2p is not None:
+            # height is NaN where no baseline was available; a NaN would poison the whole date
+            phi = phi - np.nan_to_num(hgt) * float(e2p[i])
+        if sea is not None:
+            car = np.exp(2j * np.pi * float(t[i]))
+            phi = phi + (sea.real * car.real + sea.imag * car.imag)
+        out[i] = phi
+    return out
+
+
+def _predict_pairs_block(*blocks, t_ref, t_rep, e2p, use_hgt, use_sea):
+    """All pairs of one YX block: the pairs looped in numpy inside the one task."""
+    vel, hgt, sea = _unpack(blocks, use_hgt, use_sea)
+    out = np.empty((len(t_rep),) + vel.shape, dtype=np.float32)
+    for i in range(len(t_rep)):
+        # the pair convention, exactly fit1d's columns
+        phi = vel * float(t_rep[i] - t_ref[i])
+        if e2p is not None:
+            phi = phi - np.nan_to_num(hgt) * float(e2p[i])
+        dcos = float(np.cos(2 * np.pi * t_rep[i]) - np.cos(2 * np.pi * t_ref[i]))
+        dsin = float(np.sin(2 * np.pi * t_rep[i]) - np.sin(2 * np.pi * t_ref[i]))
+        phi = phi + (sea.real * dcos + sea.imag * dsin)
+        out[i] = phi
+    return out
+
+
+def _model_blockwise(kernel, n, vel, hgt, sea, use_hgt, use_sea, **kw):
+    """One kernel per YX block of the model, its chunks as they are; the n dates or pairs are one date block."""
+    import dask.array as da
+    arrays = [_asdask(vel)]
+    if use_hgt:
+        arrays.append(_asdask(hgt))
+    if use_sea:
+        arrays.append(_asdask(sea))
+    args = []
+    for a in arrays:
+        args += [a, 'yx']
+    return da.blockwise(kernel, 'zyx', *args, new_axes={'z': n}, dtype=np.float32,
+                        use_hgt=use_hgt, use_sea=use_sea, **kw)
+
+
+def predict_dates(vel, hgt, sea, t, e2p):
+    """
+    Modelled phase per DATE, one plane per date: vel*t - hgt*e2p + the annual term.
+
+    The per-date series of predict(), published as master*conj(date) so that it is the same radians
+    displacement_los() converts: an SLC phase runs opposite to a pair in velocity and seasonal, and
+    identical in height, whose per-date term +height*e2p already differences to -height*e2p per pair.
+    The annual term is Re(seasonal*conj(car)) with car = exp(2j*pi*t).
+
+    Parameters
+    ----------
+    vel : dask array or np.ndarray
+        Velocity per pixel, radians per year, (y, x).
+    hgt : dask array or np.ndarray or None
+        Height per pixel, metres, (y, x); used only with e2p.
+    sea : dask array or np.ndarray or None
+        Complex annual term per pixel, (y, x); None when the model has none.
+    t : np.ndarray
+        Years of each date from the model epoch, float64 (n,).
+    e2p : np.ndarray or None
+        Height-to-phase factor per date (n,); None leaves the height term out.
+
+    Returns
+    -------
+    dask array
+        Float32 (n, y, x) radians; the model's YX chunks, all dates in one block per YX block.
+
+    Examples
+    --------
+    >>> planes = predict_dates(vel, hgt, sea, t, e2p)
+    """
+    t = np.asarray(t, dtype=np.float64)
+    e2p = None if e2p is None else np.asarray(e2p)
+    return _model_blockwise(_predict_dates_block, len(t), vel, hgt, sea, e2p is not None, sea is not None,
+                            t=t, e2p=e2p)
+
+
+def predict_pairs(vel, hgt, sea, t_ref, t_rep, e2p):
+    """
+    Modelled phase per PAIR, one plane per pair: vel*(t_rep - t_ref) - hgt*e2p + the annual difference.
+
+    The pair convention of fit1d(): the columns of its design, so the prediction subtracts from the
+    pairs directly. The annual term is Re(seasonal)*dcos + Im(seasonal)*dsin, with the cosine and sine
+    differences of the two epochs.
+
+    Parameters
+    ----------
+    vel : dask array or np.ndarray
+        Velocity per pixel, radians per year, (y, x).
+    hgt : dask array or np.ndarray or None
+        Height per pixel, metres, (y, x); used only with e2p.
+    sea : dask array or np.ndarray
+        Complex annual term per pixel, (y, x); required (a model without it raises here).
+    t_ref : np.ndarray
+        Years of each pair's reference date from the model epoch, float64 (n,).
+    t_rep : np.ndarray
+        Years of each pair's repeat date from the model epoch, float64 (n,).
+    e2p : np.ndarray or None
+        Height-to-phase factor per pair (n,); None leaves the height term out.
+
+    Returns
+    -------
+    dask array
+        Float32 (n, y, x) radians; the model's YX chunks, all pairs in one block per YX block.
+
+    Examples
+    --------
+    >>> planes = predict_pairs(vel, hgt, sea, t_ref, t_rep, e2p)
+    """
+    t_ref = np.asarray(t_ref, dtype=np.float64)
+    t_rep = np.asarray(t_rep, dtype=np.float64)
+    e2p = None if e2p is None else np.asarray(e2p)
+    return _model_blockwise(_predict_pairs_block, len(t_rep), vel, hgt, sea, e2p is not None, sea is not None,
+                            t_ref=t_ref, t_rep=t_rep, e2p=e2p)
+
+
+def reference_plane(planes, index):
+    """
+    The series re-referenced to one of its planes: planes - planes[index] (the display choice of predict(ref=...)).
+
+    Parameters
+    ----------
+    planes : dask array or np.ndarray
+        Float32 (n, y, x) radians.
+    index : int
+        Position of the plane that reads zero.
+
+    Returns
+    -------
+    dask array or np.ndarray
+        The same shape; every difference between planes is unchanged.
+
+    Examples
+    --------
+    >>> series = reference_plane(planes, 0)
+    """
+    return planes - planes[index]
+
+
+def _pair_layout(name, x, chunks):
+    """True when x is one pair block (read whole by each block of unw), False when its pair chunks are unw's."""
+    if x.chunks[0] == chunks:
+        return False
+    if len(x.chunks[0]) == 1:
+        return True
+    raise ValueError(f"mix_pairs: {name} pair chunks {x.chunks[0]} differ from unw's {chunks} and are not one block")
+
+
+def _edges(chunks):
+    """The cumulative block edges of one dimension's chunks, from 0."""
+    edges = [0]
+    for c in chunks:
+        edges.append(edges[-1] + int(c))
+    return edges
+
+
+def _cover(edges, lo, hi):
+    """The block indices of `edges` that hold [lo, hi), and the offset of lo in the first of them."""
+    idx = [j for j in range(len(edges) - 1) if edges[j] < hi and edges[j + 1] > lo]
+    return idx, lo - edges[idx[0]]
+
+
+def _window_of(arr, whole, z, y, x, pair):
+    """The keys of the predicted blocks of arr that cover the window y, x of one unw block, and the window's place in them.
+
+    `whole`: arr is one pair block, so every pair block of unw reads it and cuts its own `pair`; otherwise its pair block is z.
+    """
+    iy, oy = _cover(_edges(arr.chunks[1]), y[0], y[1])
+    ix, ox = _cover(_edges(arr.chunks[2]), x[0], x[1])
+    keys = [[(arr.name, 0 if whole else z, jy, jx) for jx in ix] for jy in iy]
+    return keys, (pair if whole else None), (oy, oy + y[1] - y[0], ox, ox + x[1] - x[0])
+
+
+def _window_join(blocks, pair, yx):
+    """The window of one predicted array from its blocks: joined in y then x, its pairs cut to `pair`, its pixels to `yx`."""
+    arr = np.concatenate([np.concatenate(row, axis=2) for row in blocks], axis=1)
+    if pair is not None:
+        arr = arr[pair[0]:pair[1]]
+    return arr[:, yx[0]:yx[1], yx[2]:yx[3]]
+
+
+def _mix_window(unw, full, disp, spec):
+    """The mixed pairs of one unw block: disp + (unw - full) on the windows the predicted blocks cover (the arithmetic of mix_pairs)."""
+    return _window_join(disp, spec['disp_pair'], spec['disp_yx']) + (unw - _window_join(full, spec['full_pair'], spec['full_yx']))
+
+
+def mix_pairs(unw, full, disp):
+    """
+    Per-pair displacement mixed with the unwrapped residual: disp + (unw - full) (Batch.mix()).
+
+    Parameters
+    ----------
+    unw : dask array or np.ndarray
+        Unwrapped pair phase, float32 (n, y, x).
+    full : dask array or np.ndarray
+        Model prediction with the height term, float32 (n, y, x).
+    disp : dask array or np.ndarray
+        Model prediction without the height term, float32 (n, y, x).
+
+    Returns
+    -------
+    dask array or np.ndarray
+        Float32 (n, y, x) radians, no wrap. Dask: one task per block of unw, the pair and y/x chunks of unw; the task reads
+        in-task the blocks of full and disp that cover its window, so the blocks of the predictions need not match unw's.
+        full and disp take unw's pair chunks or one pair block; other pair chunks raise ValueError.
+
+    Examples
+    --------
+    >>> out = mix_pairs(unw, full, disp)
+    """
+    import dask.array as da
+    from dask.base import tokenize
+    from dask.highlevelgraph import HighLevelGraph
+    if not any(isinstance(a, da.Array) for a in (unw, full, disp)):
+        return disp + (unw - full)
+    unw, full, disp = _asdask(unw), _asdask(full), _asdask(disp)
+    chunks = unw.chunks[0]
+    whole_full = _pair_layout('full', full, chunks)
+    whole_disp = _pair_layout('disp', disp, chunks)
+    dtype = np.result_type(unw.dtype, full.dtype, disp.dtype)
+    name = 'mix-pairs-' + tokenize(unw.name, full.name, disp.name)
+    ey, ex = _edges(unw.chunks[1]), _edges(unw.chunks[2])
+    dsk = {}
+    for z, n in enumerate(chunks):
+        pair = (sum(chunks[:z]), sum(chunks[:z]) + n)
+        for iy in range(len(ey) - 1):
+            for ix in range(len(ex) - 1):
+                y, x = (ey[iy], ey[iy + 1]), (ex[ix], ex[ix + 1])
+                fk, fpair, fyx = _window_of(full, whole_full, z, y, x, pair)
+                dk, dpair, dyx = _window_of(disp, whole_disp, z, y, x, pair)
+                spec = {'full_pair': fpair, 'full_yx': fyx, 'disp_pair': dpair, 'disp_yx': dyx}
+                dsk[(name, z, iy, ix)] = (_mix_window, (unw.name, z, iy, ix), fk, dk, spec)
+    graph = HighLevelGraph.from_collections(name, dsk, dependencies=[unw, full, disp])
+    return da.Array(graph, name, chunks=unw.chunks, dtype=dtype)
+
+
+def mix_dates(data, full, disp):
+    """
+    Per-date displacement mixed with the complex residual: disp - angle(r * conj(mean_date r)), r = data*exp(1j*full).
+
+    The per-pixel constant is divided out by the mean over the dates of the residual r (BatchComplex.mix()).
+
+    Parameters
+    ----------
+    data : dask array or np.ndarray
+        Complex64 (n, y, x) stack.
+    full : dask array or np.ndarray
+        Model prediction with the height term, float32 (n, y, x), radians.
+    disp : dask array or np.ndarray
+        Model prediction without the height term, float32 (n, y, x), radians.
+
+    Returns
+    -------
+    dask array or np.ndarray
+        Float32 (n, y, x) radians, wrapped to (-pi, pi] by the residual angle.
+
+    Examples
+    --------
+    >>> out = mix_dates(data, full, disp)
+    """
+    import dask.array as da
+    lib = da if any(isinstance(a, da.Array) for a in (data, full, disp)) else np
+    resid = data * lib.exp(1j * full)
+    cmean = lib.nanmean(resid, axis=0)
+    return disp - lib.angle(resid * lib.conj(cmean)).astype(np.float32)
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -1105,7 +1447,7 @@ def _3d_rotate(Z, X):
     # a float32 argument costs three decimal digits. Folding into [-pi, pi] in
     # float64 first keeps the error at the float32 floor whatever the phase.
     x = np.asarray(X, np.float64)
-    x = (x - (2 * np.pi) * np.round(x / (2 * np.pi))).astype(np.float32)
+    x = wrap_phase(x).astype(np.float32)
     e = np.empty(x.shape, np.complex64)
     np.cos(x, out=e.real)
     np.sin(x, out=e.imag)
@@ -4196,7 +4538,7 @@ def _fit3d_scan(self, threshold, window, cell, baseline, level,
                     _Fit3dSlice(dsk[:, ya:yb, xa:xb]), _owned,
                     (boy + ya, box + xa),
                     _cell, _kw_of[key], _threads, _gate)
-                chain.push(_part[2])
+                chain.push(_part)
                 _sub = dsk[:, gy0:gy1, gx0:gx1]
                 # LEVEL 2 READS WIDER THAN IT WRITES. Its partners are
                 # level-1 nodes another chunk owns and solved; the values
@@ -4228,7 +4570,7 @@ def _fit3d_scan(self, threshold, window, cell, baseline, level,
 def _fit3d_union(self, threshold, window, cell, baseline, level,
                  max_dh, max_dv, step_dh, step_dv, max_seasonal,
                  consensus, err_dh, err_dv, iterations, debug,
-                 chain=None, tag='', ep=None):
+                 chain=None, tag='', ep=None, union=False):
     """One network over the union of the bursts, returned on the burst grid.
 
     A node's partners are whatever lies inside the window, and a burst edge
@@ -4254,6 +4596,12 @@ def _fit3d_union(self, threshold, window, cell, baseline, level,
     import dask as _dask
     import dask.array as da
     from .Batch import Batch
+    if union:
+        from .utils_dask import union_check
+        for _ds in self.values():
+            for _v in _ds.data_vars:
+                if _ds[_v].dtype.kind == 'c' and 'y' in _ds[_v].dims and 'date' in _ds[_v].dims:
+                    union_check(_ds[_v].chunksizes.get('date', ()), 'fit1d_network')
     _s = _fit3d_scan(self, threshold, window, cell, baseline, level,
                           max_dh, max_dv, step_dh, step_dv, max_seasonal,
                           consensus, err_dh, err_dv, iterations, debug,
@@ -4270,8 +4618,8 @@ def _fit3d_union(self, threshold, window, cell, baseline, level,
     # not exist in its chunk; on the merged grid it is asked about all of
     # them. The grid is the raster one pyramid level up, so the scene's
     # whole candidate set is megabytes and this is one in-memory task.
-    _net = _dask.delayed(_fit3d_level1_for_dask)(
-        [((b[5][1], b[5][2], b[5][3]), b[8]) for b in _blocks], _kw_net,
+    _net = _dask.delayed(_level1_of_scans)(
+        _fit3d_level1_for_dask, [(b[5], b[8]) for b in _blocks], _kw_net,
         _cores)
 
     # ---- PASS 2: the shared network written onto each burst's grid ----
@@ -4297,11 +4645,11 @@ def _fit3d_union(self, threshold, window, cell, baseline, level,
         # THE CALLER'S LEVEL, CAPPED AT ONE. This stage IS level 1. Capping
         # instead of hardcoding keeps `level=0` meaning what it documents: the
         # PS network alone, every other pixel NaN.
-        _o = _dask.delayed(_fit3d_attach_for_dask, nout=2)(
-            _Fit3dSlice(_sub), _part[0], _net,
+        _o = _dask.delayed(_attach_of_scan, nout=2)(
+            _fit3d_attach_for_dask, _Fit3dSlice(_sub), _part, _net,
             dict(_kwb, level=min(int(level), 1)),
             _origin, _threads2, _gate, emit_nodes=True)
-        chain.push(_o[0])
+        chain.push(_o)
         _l2tab.append(_o[1])
         _cells[(key, _i, _j)] = da.from_delayed(
             _o[0], shape=(6, _ny, _nx), dtype=np.complex64)
@@ -4310,7 +4658,7 @@ def _fit3d_union(self, threshold, window, cell, baseline, level,
     # THE LEVEL-1 REPORT, once every block of it has finished. At
     # level=1 nothing consumes the tables, so the report is hung off a
     # plane -- the only way to tell the graph to run it at all.
-    _rep1 = _dask.delayed(_fit3d_level_report)(1, _l2tab, bool(debug),
+    _rep1 = _dask.delayed(_fit3d_level_report)(1, _tables_chain(_l2tab), bool(debug),
                                                str(tag))
     _kk0 = next(iter(_cells))
     _ny0, _nx0 = _cells[_kk0].shape[1], _cells[_kk0].shape[2]
@@ -4329,71 +4677,10 @@ def _fit3d_union(self, threshold, window, cell, baseline, level,
             [da.concatenate([_cells[(key, i, j)] for j in range(_nc)],
                             axis=2) for i in range(_nr)], axis=1)
         model_result[key] = _fit3d_model(ds, da_xr, both, date_values, bp)
+    graph_check('_fit3d_union', model_result, self)
     return Batch(model_result)
 
 
-def fit1d_network(self, threshold: float = 0.5, window: tuple = (400, 4000),
-            cell: 'float | tuple' = 24,
-            baseline: str = 'BPR',
-            level: int = 1,
-            max_dh: float = 25.0, max_dv: float = 25.0,
-            step_dh: float = 8.0, step_dv: float = 2.0,
-            max_seasonal: float = 0.0,
-            consensus: int = 3,
-            err_dh: float = 4.0, err_dv: float = 1.0,
-            union: bool = False,
-            iterations: int = 8,
-            debug: bool = False) -> 'Batch':
-    """BatchComplex.fit1d_network() (its docstring says what it does): the PS network and level 1."""
-    # the baselines and the radar geometry are the Dataset's (N81)
-    BatchCore._needs_dataset(self, 'fit1d_network', ('BPR',) + BatchCore._GEOMETRY)
-    # DELEGATE BY STACK TYPE, exactly as fit1d() does: pairs take the
-    # pair branch (not implemented), dates take the PS network below.
-    if any('pair' in ds[v].dims
-           for ds in self.values() for v in ds.data_vars):
-        # `window` is the PS network's (DS, PS extent) pair in metres on
-        # the date path; on the pair path it is the side of the box the
-        # covariance is estimated over, so a scalar.
-        # the split is kept so a pair-domain fit has a home when one works
-        raise NotImplementedError(
-            'fit1d_network() does not support complex PAIRS. Use the per-DATE stack, '
-            'or unwrap and call Batch.fit1d() on the unwrapped pairs.')
-    # validated HERE, not only in the kernel: fit1d_network() returns a lazy Batch,
-    # so a bad value would otherwise surface at compute time far from where
-    # it was written
-    _3d_consensus(consensus)
-    if int(level) < 0:
-        raise ValueError(f'level must be >= 0; got {level!r}')
-    # LEVEL 2+ IS DROPPED (the user, 2026-10-24): it added about 30 % more DS of
-    # clearly lower accuracy at a high cost in time and memory
-    if int(level) >= 2:
-        print(f'WARNING: fit1d_network() level={level} is dropped; level 1 is used.')
-        level = 1
-    _kw = dict(threshold=threshold, window=window, cell=cell,
-               baseline=baseline, level=level,
-               max_dh=max_dh, max_dv=max_dv, step_dh=step_dh,
-               step_dv=step_dv, max_seasonal=max_seasonal,
-               consensus=consensus, err_dh=err_dh, err_dv=err_dv,
-               iterations=iterations, debug=debug)
-    if union or len(self) == 1:
-        return _fit3d_union(self, **_kw)
-    # union=False: EACH BURST ITS OWN SCENE, as trend2d() fits each burst
-    # on its own pixels. The same driver runs once per burst -- there is
-    # no second code path -- and the bursts share ONE chain, so the
-    # cluster never holds more heavy tasks at once than a single scene
-    # would. Where bursts overlap the two models disagree over the shared
-    # ground, exactly as two per-burst trends do; union=True is the way
-    # to ask for one answer there.
-    from .Batch import Batch
-    chain = _Fit3dChain()
-    # ONCE FOR THE CALL, not once per burst: a missing ref_height warns
-    # once, naming every burst. Each burst's value is its own either way.
-    ep = Batch._elevation_phase_approximate(self)
-    out = {}
-    for k in self.keys():
-        out.update(_fit3d_union(type(self)({k: self[k]}), 
-            chain=chain, tag=f' [{k}]', ep=ep, **_kw).items())
-    return Batch(out)
 
 
 def _warmup_numba_cache():
@@ -4410,3 +4697,631 @@ def _warmup_numba_cache():
 
 
 _warmup_numba_cache()
+
+
+def _tables_chain(tables):
+    """The table list of a level's report as a CHAIN of appends, one Delayed per table.
+
+    A list of Delayed handed to one delayed() call makes dask copy the whole upstream closure of every element into
+    the graph, so the graph grows with the square of the blocks. The chain holds each table once; the report receives
+    the same tables in the same order."""
+    import dask as _dask
+    acc = []
+    for t in tables:
+        acc = _dask.delayed(_append_table)(acc, t)
+    return acc
+
+
+def _append_table(acc, table):
+    return list(acc) + [table]
+
+
+def _attach_of_scan(attach, block, scan, *args, **kwargs):
+    """A block's attach, handed the WHOLE scan result: element 0 (the raster) is taken inside the task. A getitem of the
+    scan per block would copy the scan's closure into the graph."""
+    return attach(block, scan[0], *args, **kwargs)
+
+
+def _level1_of_scans(level1, scans, kw, threads):
+    """The PS test's input from the WHOLE scan results: each block's winner grid and its three index arrays (elements
+    1 to 3) are taken inside the task."""
+    return level1([((p[1], p[2], p[3]), c) for p, c in scans], kw, threads)
+
+
+class _Fit3dChain:
+    """ONE HEAVY TASK PER WORKER, across every pass and every burst.
+
+    A gate is a task's dependency on the output `width` tasks before it,
+    which keeps that many in flight whatever cluster the caller brought.
+    Measured on the scene driver: eight tasks with two threads each beat
+    sixteen with one by 15% on the bandwidth-bound scans, at the same
+    memory, and the thread budget it fixes keeps the product bit-identical
+    between runs. The chain runs THROUGH the passes -- the first attach
+    gates on the last scans -- and through the bursts of a per-burst call,
+    so a multi-burst stack under union=False never holds more tasks at once
+    than a single scene does. Sized by the first setup that sees it.
+    A task without a dependency goes to an idle worker, and a task with one
+    gate dependency follows its predecessor's worker: so the first task of
+    each class takes no gate (one shared seed would pin them to one worker).
+    The `width` classes balance the cost: a task takes the class with the
+    least summed cost (ties: the lowest index, so equal costs give the round
+    robin); optimize2 passes its windows' culled graph sizes (GOM U6).
+    """
+    __slots__ = ('width', 'last', 'cost', 'cls')
+
+    def __init__(self, width=None):
+        self.width = None if width is None else int(width)
+        self.last = []      # per class: its last output (None until its first task)
+        self.cost = []      # per class: the summed cost of its tasks
+        self.cls = None     # the class of the last gate()
+
+    def gate(self, cost=None):
+        """The dependency the next task takes: the last output of the class
+        with the least summed cost, or None for a class's first task; no
+        width, no gate. The class takes `cost` (None counts 1)."""
+        if not self.width:
+            self.cls = None
+            return None
+        if len(self.last) < self.width:
+            self.last += [None] * (self.width - len(self.last))
+            self.cost += [0] * (self.width - len(self.cost))
+        self.cls = min(range(self.width), key=self.cost.__getitem__)
+        self.cost[self.cls] += 1 if cost is None else cost
+        return self.last[self.cls]
+
+    def push(self, out):
+        """The output of the task the last gate() made: its class's last."""
+        if self.cls is not None:
+            self.last[self.cls] = out
+
+
+class _Fit3dSlice:
+    """A window of the stack, read by the fit task a date slab at a time.
+
+    Handing `delayed` a dask array makes the window a task of its own: the scheduler computes it wherever a worker is free and
+    holds it until the fit runs, so idle workers fill with windows they will never fit. Carried like this it is an ordinary
+    argument, read on the worker that is about to fit it. Measured on arcs(), the same change took a wide cluster from 81 GB to
+    8.4 GB at the same wall time.
+
+    COMPUTED AS IT IS CHUNKED, WITHOUT A RECHUNK. Asking dask for the window as ONE chunk makes it build a merge layer per read,
+    so the window is computed with the chunking it already has, and dask fuses the reads and concatenates them itself.
+
+    THE READ ASKS THE CLUSTER PER SLAB. The window's upstream (the detrend's model, the atmosphere phase planes) runs as ordinary
+    per-date tasks, bounded to the windows in flight: one local compute inside the task held every date's phase planes at once
+    (GOM C1-C2: 8.0 GB per optimize2 task on the Gastein pipeline, KilledWorker at 16 x 32). See read_together.
+    """
+    __slots__ = ('arr', 'cost')
+
+    def __init__(self, arr):
+        # THE CALLER'S CHUNKING IS KEPT. Nothing about the window needs a
+        # different one, and re-chunking it here would put back the merge
+        # layer this class exists without.
+        #
+        # ITS OWN GRAPH ONLY. The window is a view of the stack's array, and
+        # that array's graph holds every read of every block of the stack; the
+        # slice held all of it until its chain ended, on every worker that got
+        # one (90% of a worker's memory on arcs() at 512 blocks). Culled to the
+        # window's own keys it keeps the same tasks under the same keys, so the
+        # values do not change.
+        #
+        # ITS OWN COST ONLY. `dict()` of the stack's graph read every entry of
+        # the whole input for every window (the driver spent 1051-1891 s on the
+        # user's pipeline before the first task). The layers are culled one by
+        # one from the outputs down, keeping names and dependencies: dask's
+        # HighLevelGraph.cull() renames the layers and drops every dependency
+        # (a fit task then fails with "Missing dependency"). Only the layers
+        # and entries the window reaches are read. Inline, not a helper: the
+        # independence checks delete every private name of this module.
+        from dask.array import Array
+        from dask.highlevelgraph import HighLevelGraph
+        keys, todo = [], [arr.__dask_keys__()]
+        while todo:
+            key = todo.pop()
+            if isinstance(key, list):
+                todo.extend(key)
+            else:
+                keys.append(key)
+        from dask._task_spec import GraphNode
+        from dask.blockwise import Blockwise
+        from dask.core import keys_in_tasks
+        from dask.highlevelgraph import Layer, MaterializedLayer
+        missing = object()
+
+        class KeysIn:
+            # Membership of the input's keys, answered by the layers: a legacy-task layer asks whether a
+            # reference is a key of the graph. The keys are never enumerated (get_all_external_keys() asks
+            # every layer for its output keys, the whole input again for every window). A Blockwise layer
+            # holds only keys of its own output name. A layer that keeps dask's base cull is a mapping of
+            # tasks, read through `take`: ONE read per (layer, key), remembered, so the membership test and
+            # the walk below never read an entry twice (a Mapping's `in` is a read); it is asked first for the
+            # layer of the key's name, then for the others. Any other layer is asked directly.
+            def __init__(self, layers):
+                self.blockwise, self.base, self.routes, self.others, self.taken = {}, [], {}, [], {}
+                for name, layer in layers.items():
+                    if isinstance(layer, Blockwise):
+                        self.blockwise.setdefault(layer.output, []).append(layer)
+                    elif type(layer).cull is Layer.cull and type(layer).get_dependencies is Layer.get_dependencies:
+                        self.base.append(layer)
+                        self.routes[name] = layer
+                    else:
+                        self.others.append(layer)
+
+            def take(self, layer, key):
+                if (id(layer), key) not in self.taken:
+                    try:
+                        self.taken[id(layer), key] = layer[key]
+                    except KeyError:
+                        self.taken[id(layer), key] = missing
+                return self.taken[id(layer), key]
+
+            def __contains__(self, key):
+                name = key[0] if type(key) is tuple and key else key
+                if any(key in layer for layer in self.blockwise.get(name, ())):
+                    return True
+                routed = self.routes.get(name)
+                if routed is not None and self.take(routed, key) is not missing:
+                    return True
+                return any(self.take(layer, key) is not missing for layer in self.base) or any(key in layer for layer in self.others)
+
+        # ITS COST: the tasks of the culled graph, counted in the walk below (no second walk); the chain balances by it (GOM U6).
+        cost = 0
+        hlg = arr.__dask_graph__()
+        keys_set = set(keys)
+        all_ext_keys = KeysIn(hlg.layers)
+        layers, deps = {}, {}
+        for name in reversed(hlg._toposort_layers()):
+            layer = hlg.layers[name]
+            if any(layer is base for base in all_ext_keys.base):
+                # Every layer class that keeps dask's base cull (MaterializedLayer, ArrayOverlapLayer of every map_overlap, ...):
+                # the base cull copies the whole layer (`dict(self)`) on every call, once per window. Here the
+                # walk reads only the entries the window reaches, with the base cull's dependencies: a GraphNode's
+                # dependencies, a legacy task's dependencies among the input's keys. The task is read ONCE: the
+                # base cull's get_dependencies(k) is keys_in_tasks(all_keys, [self[k]]), which reads it again.
+                culled, culled_deps, seen = {}, {}, set()
+                work = list(keys_set)
+                while work:
+                    k = work.pop()
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    task = all_ext_keys.take(layer, k)
+                    if task is missing:
+                        continue
+                    culled[k] = task
+                    culled_deps[k] = set(task.dependencies) if isinstance(task, GraphNode) else set(keys_in_tasks(all_ext_keys, [task]))
+                    work.extend(d for d in culled_deps[k] if d not in seen)
+                culled = MaterializedLayer(culled, annotations=layer.annotations) if culled else None
+            else:
+                culled, culled_deps = layer.cull(keys_set, all_ext_keys)
+            if not culled_deps:
+                continue
+            cost += len(culled_deps)
+            for k, d in culled_deps.items():
+                keys_set |= d
+                keys_set.discard(k)
+            layers[name] = culled
+            deps[name] = hlg.dependencies[name]
+        graph = HighLevelGraph(layers, {n: deps[n] & layers.keys() for n in layers})
+        self.arr = Array(graph, arr.name, arr.chunks, dtype=arr.dtype, meta=arr._meta)
+        self.cost = cost
+
+    def read(self, threads=1):
+        """The window as a numpy block: read_together([self], threads)[0]."""
+        return _Fit3dSlice.read_together([self], threads)[0]
+
+    @staticmethod
+    def read_together(slices, threads=1, out=None):
+        """The windows of ONE task as numpy blocks, read a date slab at a time.
+
+        Each slab is culled from the windows' own graphs (`threads` date blocks of every window, VV and VH together), so the read
+        never holds the graph of all dates. The keys more than one date block needs (geometry, model tables, a reference phase)
+        are computed once and held. In a worker they are asked from the worker's client, and so are the slabs: the per-date
+        upstream (the atmosphere phase planes) runs as ordinary cluster tasks, bounded to the windows in flight. One local compute
+        inside the task held every date's phase planes at once (GOM C1-C2: 8.0 GB per optimize2 task, KilledWorker at 16 x 32).
+        Outside a worker the slabs run on `threads` threads. `out` (one array per window, of the window's shape) receives the
+        blocks in place (np.copyto), so a strided view, such as the interior of a padded buffer, is filled without a temporary of
+        the window's size. The values are those of one compute of the window (bitwise).
+        """
+        import contextlib
+        import numpy as np
+        from dask._task_spec import GraphNode
+        from dask.core import keys_in_tasks
+        from dask.threaded import get as threaded_get
+        from distributed import Future, get_worker, worker_client
+        threads = max(1, int(threads))
+        arrs = [sl.arr for sl in slices]
+        hlgs = [a.__dask_graph__() for a in arrs]
+        keys = [a.__dask_keys__() for a in arrs]
+        nb = len(keys[0])
+        if any(len(k) != nb for k in keys):
+            raise ValueError('the windows of one read differ in their date blocks')
+        offs = [[np.r_[0, np.cumsum(c)] for c in a.chunks] for a in arrs]
+        nw = len(arrs)
+
+        def flat(nested):
+            todo, found = [nested], []
+            while todo:
+                x = todo.pop()
+                if isinstance(x, list):
+                    todo.extend(x)
+                else:
+                    found.append(x)
+            return found
+
+        def cut(roots_w):
+            # each window's tasks reachable from its roots, read from its own layers
+            sub = {}
+            for h, roots in zip(hlgs, roots_w):
+                if roots:
+                    sub.update(dict(h.cull(set(roots))))
+            return sub
+
+        def deps(sub, k):
+            task = sub[k]
+            if isinstance(task, GraphNode):
+                return set(task.dependencies)
+            if isinstance(task, Future):
+                return set()
+            return set(keys_in_tasks(sub, [task]))
+
+        def closure(sub, roots, stop=()):
+            seen, todo = set(), list(roots)
+            while todo:
+                k = todo.pop()
+                if k in seen or k in stop:
+                    continue
+                seen.add(k)
+                todo.extend(d for d in deps(sub, k) if d not in seen)
+            return seen
+
+        # the date-shared frontier: the keys more than one date block needs. One block's closure is held at a time; `once` holds
+        # the keys of the blocks seen so far (keys, not tasks), so the keys are what grows with the dates
+        out_keys = {k for w in range(nw) for b in range(nb) for k in flat(keys[w][b])}
+        once, shared = set(), set()
+        for b in range(nb):
+            roots_w = [flat(keys[w][b]) for w in range(nw)]
+            seen = closure(cut(roots_w), [k for r in roots_w for k in r])
+            shared |= seen & once
+            once |= seen
+        frontier = [k for k in shared if k not in out_keys]
+        once = shared = None
+        frontier_set = set(frontier)
+        fsub = {}
+        if frontier:
+            for h in hlgs:
+                fsub.update(dict(h.cull(frontier_set)))
+        if out is None:
+            bufs = [np.empty(a.shape, dtype=a.dtype) for a in arrs]
+        else:
+            bufs = list(out)
+            if len(bufs) != nw or any(b_.shape != a.shape for b_, a in zip(bufs, arrs)):
+                raise ValueError('out must hold one array of each window shape')
+        try:
+            get_worker()
+            in_worker = True
+        except ValueError:
+            in_worker = False
+        with (worker_client() if in_worker else contextlib.nullcontext()) as client:
+            fval = {}
+            if frontier:
+                if client is None:
+                    fval = dict(zip(frontier, threaded_get(fsub, frontier, num_workers=threads)))
+                else:
+                    fval = dict(zip(frontier, client.get(fsub, frontier, sync=False)))
+            fsub = None
+            for s0 in range(0, nb, threads):
+                blocks = list(range(s0, min(nb, s0 + threads)))
+                roots_w = [[k for b in blocks for k in flat(keys[w][b])] for w in range(nw)]
+                sub = cut(roots_w)
+                want = [[keys[w][b] for b in blocks] for w in range(nw)]
+                if client is None:
+                    need = closure(sub, [k for r in roots_w for k in r], stop=frontier_set)
+                    run = {k: sub[k] for k in need}
+                    for k in need:
+                        for d in deps(sub, k):
+                            if d in fval:
+                                run[d] = fval[d]
+                    res = threaded_get(run, want, num_workers=threads)
+                else:
+                    run = {k: sub[k] for k in closure(sub, [k for r in roots_w for k in r])}
+                    res = client.get(run, want, sync=True)
+                sub = run = None
+                for w in range(nw):
+                    for bi, b in enumerate(blocks):
+                        d0, d1 = int(offs[w][0][b]), int(offs[w][0][b + 1])
+                        for yi, row in enumerate(res[w][bi]):
+                            y0, y1 = int(offs[w][1][yi]), int(offs[w][1][yi + 1])
+                            for xi, blk in enumerate(row):
+                                x0, x1 = int(offs[w][2][xi]), int(offs[w][2][xi + 1])
+                                np.copyto(bufs[w][d0:d1, y0:y1, x0:x1], blk)
+                res = None
+        return bufs
+
+
+def _fit3d_keep(value, *deps):
+    """Return `value`, having waited for `deps`. The graph has no other way
+    to say "run this too" without making it a real input of something."""
+    return value
+
+
+# fit1d's per-block screen: the share of a block's pixels, ranked by raw
+# resultant, whose fit residuals define the block's common phase per date
+# (never fewer than one). A per-date constant is a mild correction that only
+# has to be LOCAL; it is not an elevation slope, so a dask block is a fine
+# unit for it and no window in metres is needed.
+_FIT1D_SCREEN_TOP = 0.01
+
+
+# ---------------------------------------------------------------------------
+# fit1d family: the algorithm of Batch.fit1d, BatchComplex.fit1d and
+# BatchComplex.fit1d_network on plain arrays (the methods keep the batch part)
+# ---------------------------------------------------------------------------
+
+def pair_time_origin(ref_days, rep_days):
+    """Median acquisition day of a pair set, and the pair epochs in years from it.
+
+    ref_days, rep_days: float64[n] acquisition days of each pair's reference and
+    repeat. Returns (t0_day, t_ref, t_rep). The master is not recoverable from
+    differences, so the median acquisition is the origin (days, as elsewhere).
+    """
+    t0_day = float(np.median(np.unique(np.concatenate([ref_days, rep_days]))))
+    t_ref = (ref_days - t0_day) / 365.25
+    t_rep = (rep_days - t0_day) / 365.25
+    return t0_day, t_ref, t_rep
+
+
+def ele2phase(bp, lam, fac):
+    """Height-to-phase factor per pair or date: bp / ((4 pi / lam) / fac).
+
+    bp: perpendicular baseline; lam: radar wavelength; fac: R sin(incidence)
+    from elevation_phase(), i.e. elevation_phase() = 4 pi / (lambda R sin(inc)).
+    """
+    return bp / ((4.0 * np.pi / lam) / fac)
+
+
+def fit1d_pair_design(e2p, t_ref, t_rep, seasonal):
+    """Design matrix of the pair model, float64[n, k].
+
+    Columns: the rate (t_rep - t_ref), the height (-e2p) when e2p is not None,
+    and the annual cos/sin differences when `seasonal` is true.
+    """
+    dt = t_rep - t_ref
+    cols = [dt]
+    has_h = e2p is not None
+    if has_h:
+        cols.append(-e2p)
+    if seasonal:
+        cols.append(np.cos(2 * np.pi * t_rep) - np.cos(2 * np.pi * t_ref))
+        cols.append(np.sin(2 * np.pi * t_rep) - np.sin(2 * np.pi * t_ref))
+    return np.stack(cols, axis=1).astype(np.float64)
+
+
+def fit1d_precision(A, has_h, fit_seasonal, meter2rad):
+    """How well the design A determines each parameter, decided once for all pixels.
+
+    Returns (s_v, s_h, vif): sigma of the velocity in mm/yr and of the height in m
+    per radian of residual (NaN without a height), and the factor by which the
+    annual inflates the rate's error (1 without an annual). This is not the
+    residual: Var(theta) = sigma^2 (A'A)^-1.
+    """
+    k = A.shape[1]
+    try:
+        Cinv = np.linalg.inv(A.T @ A)
+        sig = np.sqrt(np.clip(np.diag(Cinv), 0, None))
+    except np.linalg.LinAlgError:
+        sig = np.full(k, np.inf)
+    s_v = float(sig[0]) / (meter2rad * 1e-3)
+    s_h = (float(sig[1]) / meter2rad) if has_h else float('nan')
+    # what the annual costs the rate: the same design without it
+    vif = 1.0
+    if fit_seasonal and k > (2 if has_h else 1):
+        kk_ = 2 if has_h else 1
+        A0 = A[:, :kk_]
+        try:
+            vif = float(np.sqrt(np.linalg.inv(A0.T @ A0)[0, 0])
+                        / max(float(sig[0]), 1e-30))
+            vif = 1.0 / max(vif, 1e-30)
+        except np.linalg.LinAlgError:
+            vif = float('inf')
+    return s_v, s_h, vif
+
+
+def fit1d_pairs_planes(b, A, wb, has_h, fit_seasonal, max_dh, max_seasonal, meter2rad):
+    """One block of unwrapped pairs fitted per pixel: float32 planes stacked as complex64.
+
+    b: (pair, y, x) phase; A: the design; wb: per-pair weight or None. Returns
+    (5, y, x) complex64: velocity, height, seasonal, coherence, rmse.
+
+    max_dh GATES THE PRIOR, NOT THE ANSWER: it sets the shrinkage prior on the
+    DEM-error column (sigma_dh = max_dh/3), and a height solving beyond it is NaN.
+    max_seasonal=0 leaves the annual out of the design. A pixel refused by a bound
+    keeps its coherence and rmse; only velocity, height and seasonal are NaN.
+    """
+    _mh = float(max_dh)
+    _ms = float(max_seasonal)
+    _dh_prior = meter2rad * _mh / 3.0 if has_h else None
+    shp = b.shape[1:]
+    th, gam, rms = fit1d_pairs(b, A, weight=wb, dh_prior=_dh_prior,
+                               dh_col=(1 if has_h else None))
+    nanp = np.full(shp, np.nan, np.float32)
+    vel = th[0].reshape(shp).astype(np.float32)
+    hgt = th[1].reshape(shp).astype(np.float32) if has_h else nanp
+    if fit_seasonal:
+        j = 2 if has_h else 1
+        sea = (th[j].reshape(shp)
+               + 1j * th[j + 1].reshape(shp)).astype(np.complex64)
+    else:
+        # zero, not NaN: the model holds no annual, and that is a
+        # value rather than an absence -- the same convention fit1d_network
+        # uses at max_seasonal=0
+        sea = np.zeros(shp, np.complex64)
+    gam = gam.reshape(shp).astype(np.float32)
+    rms = rms.reshape(shp).astype(np.float32)
+    # THE BOUNDS ARE THE GUARANTEE, not a hint: outside them the
+    # pixel is NaN, never clipped to the edge and reported as if it
+    # had solved there. coherence and rmse are kept -- they say how
+    # the refused fit behaved, which is what a caller needs to see.
+    bad = ~np.isfinite(vel)
+    if has_h:
+        bad |= np.abs(hgt) > _mh * meter2rad
+    if fit_seasonal:
+        bad |= np.abs(sea) > _ms * meter2rad * 1e-3
+    vel = np.where(bad, np.nan, vel).astype(np.float32)
+    hgt = np.where(bad, np.nan, hgt).astype(np.float32)
+    sea = np.where(bad, np.nan + 0j, sea).astype(np.complex64)
+    return np.stack([vel.astype(np.complex64),
+                     hgt.astype(np.complex64),
+                     sea,
+                     gam.astype(np.complex64),
+                     rms.astype(np.complex64)], axis=0)
+
+
+def date_baseline(values, n_dates):
+    """Per-date perpendicular baseline as float64; a multi-dimensional value is
+    reduced by nanmean over its non-date axes."""
+    bp = np.asarray(values, dtype=float)
+    if bp.ndim > 1:
+        bp = np.nanmean(bp.reshape(n_dates, -1), axis=1)
+    return bp
+
+
+def master_time_origin(dates_days, bp):
+    """Time origin at the master date: smallest |B_perp| (else the first date).
+
+    dates_days: float64[n] acquisition days; bp: per-date baseline or None.
+    Returns (tyr, master_index): the epochs in years from the master, and its index.
+    """
+    _b = bp if (bp is not None and bp.shape == dates_days.shape) \
+        else np.zeros_like(dates_days)
+    _master = int(np.argmin(np.abs(_b)))
+    tyr = (dates_days - dates_days[_master]) / 365.25
+    return tyr, _master
+
+
+def normalised_phasors(Z, cols, rot=None):
+    """The normalised phasors of the pixels cols of Z (date, pixel), rotated by rot per date.
+
+    A NaN on any date refuses the pixel, a zero date drops out of every sum and
+    of n, and an all-zero series is NaN.
+    """
+    Zc = Z[:, cols]
+    A = np.abs(Zc)
+    ok = np.isfinite(A) & (A > 0)
+    U = np.where(ok, Zc / np.where(ok, A, 1.0), 0)
+    if rot is not None:
+        U = (U * rot).astype(np.complex64)
+    # an index set of pixels (Z[:, cols]) comes out F-contiguous;
+    # _3d_arc_fit gets the C-contiguous array it always got
+    return np.ascontiguousarray(U), A, ok
+
+
+def fit1d_dates_block(block, ele2phase, tyr, meter2rad, max_dh, max_dv,
+                      step_dh, step_dv, threshold, adaptive):
+    """One spatial block of a complex (date, y, x) stack: per-pixel {velocity, height, coherence, rmse}.
+
+    Returns (4, y, x) complex64. The input gate, the optional block screen
+    (`adaptive`) and the fit are as in BatchComplex.fit1d(); pixels below
+    `threshold` or beyond the bounds are NaN.
+    """
+    _h, _t, _m = ele2phase, tyr, meter2rad
+    _mh, _mv, _sh, _sv = float(max_dh), float(max_dv), float(step_dh), float(step_dv)
+    _thr, _adaptive = float(threshold), bool(adaptive)
+    from .utils_dask import get_dask_chunk_size_mb
+    S = np.asarray(block)
+    nd = S.shape[0]
+    shape = S.shape[1:]
+    Z = np.ascontiguousarray(S.reshape(nd, -1))
+    npix = Z.shape[1]
+    if npix == 0:
+        e = np.empty(0, np.complex64).reshape(shape)
+        return np.stack([e, e, e, e], axis=0)
+    _budget = get_dask_chunk_size_mb()
+    # the pixels go in batches of a quarter of the chunk size (8 bytes
+    # per date and pixel, complex64), each value as from the whole
+    # block (pixels are independent): the task holds its input and
+    # arrays of a batch, none of the block's size
+    _step = max(1, int(_budget * 2**20 // 4 // (nd * 8)))
+    _batches = [slice(j, min(j + _step, npix))
+                for j in range(0, npix, _step)]
+
+    # input gate: resultant length of the normalised phasors, which
+    # a constant scatterer phase leaves unchanged
+    _finite = np.empty(npix, dtype=bool)
+    _nok = np.empty(npix, dtype=np.int64)
+    g0 = np.empty(npix)
+    for _b in _batches:
+        _U, _A, _ok = normalised_phasors(Z, _b)
+        _finite[_b] = np.isfinite(_A).all(axis=0)
+        _nok[_b] = np.maximum(_ok.sum(axis=0), 1)
+        g0[_b] = np.abs(_U.sum(axis=0)) / _nok[_b]
+        del _U, _A, _ok
+    _rot = None
+    # block screen: fit the top share of the finite pixels by raw
+    # resultant (so their own rate and DEM error stay out), average
+    # their residual phasors per date, rotate every series by that
+    # angle and recompute the gate
+    _k = max(int(round(_FIT1D_SCREEN_TOP * npix)), 1) if _adaptive else 0
+    _ref = np.argsort(np.where(_finite, -g0, np.inf),
+                      kind='stable')[:_k]
+    _ref = _ref[_finite[_ref]]
+    if len(_ref):
+        _Ur = normalised_phasors(Z, _ref)[0]
+        _, _hr, _vr = _3d_arc_fit(
+            _Ur, _h, _t, _m, max_dh=_mh, max_dv=_mv, step_dh=_sh,
+            step_dv=_sv, budget=_budget, max_seasonal=0.0)[:3]
+        _fok = np.isfinite(_vr)
+        if not _fok.any():
+            _finite[:] = False
+        else:
+            _ph = np.outer(_t, _vr[_fok])
+            if _h is not None:
+                _ph = _ph + np.outer(_h, _hr[_fok])
+            _R = _Ur[:, _fok] * np.exp(-1j * _ph)
+            _S = _R.sum(axis=0)
+            _R = _R * np.conj(_S / np.maximum(np.abs(_S), 1e-30))
+            # a date no reference holds gets angle 0, so it is not
+            # rotated
+            _c = np.angle(_R.mean(axis=1))
+            _rot = np.exp(-1j * _c)[:, None]
+            for _b in _batches:
+                g0[_b] = np.abs(normalised_phasors(Z, _b, _rot)[0].sum(axis=0)) / _nok[_b]
+    sel = np.nonzero(_finite & (g0 >= _thr))[0]
+    # only pixels at or above the gate are fitted for output
+    vel = np.full(npix, np.nan, np.float64)
+    hgt = np.full(npix, np.nan, np.float64)
+    gam = np.full(npix, np.nan, np.float32)
+    for _a in range(0, len(sel), _step):
+        _cols = sel[_a:_a + _step]
+        Us = normalised_phasors(Z, _cols, _rot)[0]
+        # NaN beyond either bound or with no non-zero date; the
+        # batching budget is the dask chunk size
+        g_, h_, v_ = _3d_arc_fit(
+            Us, _h, _t, _m, max_dh=_mh, max_dv=_mv, step_dh=_sh,
+            step_dv=_sv, budget=_budget, max_seasonal=0.0)[:3]
+        if _h is None:
+            # no baseline: the height is 0 by model, not unassessed
+            h_ = np.where(np.isfinite(v_), 0.0, np.nan)
+        vel[_cols] = v_
+        hgt[_cols] = h_
+        gam[_cols] = g_
+        del Us
+    # publish the pair sign that displacement_los() converts: a
+    # per-date series runs opposite to a pair, so the rate is
+    # negated. The height keeps its sign; its per-date +h*e2p_d
+    # differences to -h*e2p_p.
+    vel = -vel
+    # rmse = sqrt(-2 ln gamma * n/(n-p)): n non-zero dates, p
+    # parameters spent
+    nok = np.concatenate([np.maximum((np.abs(Z[:, _b]) > 0).sum(axis=0), 1)
+                          for _b in _batches])
+    npar = 2 + (0 if _h is None else 1)
+    infl = nok / np.maximum(nok - npar, 1)
+    Rres = np.clip(gam.astype(np.float64), 1e-9, 1.0)
+    rms = np.sqrt(np.maximum(-2.0 * np.log(Rres), 0.0) * infl)
+    rms = np.where(np.isfinite(gam), rms, np.nan)
+    # one complex64 array carries every plane
+    return np.stack([vel.reshape(shape).astype(np.complex64),
+                     hgt.reshape(shape).astype(np.complex64),
+                     gam.reshape(shape).astype(np.complex64),
+                     rms.reshape(shape).astype(np.complex64)],
+                    axis=0)

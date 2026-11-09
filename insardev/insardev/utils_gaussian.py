@@ -732,3 +732,20 @@ def gaussian_dask(data, weight, sigma, pixel_sizes, threshold=0.5, truncate=4.0)
                         dict(ncells=tuple(int(v) for v in n_in), scale=s, has_w=has_w,
                              lim=np.float32(1e-10 if has_w else threshold), dtype=dtype))
     return out if three else out[0]
+
+def sigma_of_wavelength(wavelength: float, dy: float, dx: float, cutoff: float, truncate: float = 4.0):
+    """
+    The Gaussian sigma in pixels of a wavelength in metres, per axis (y, x): wavelength / (pixel size * cutoff), and the
+    reach of the filter in pixels, ceil(sigma * truncate). Returns ((sig_y, sig_x), (depth_y, depth_x)) (BatchCore.gaussian).
+    """
+    sig_y = wavelength / (dy * cutoff)
+    sig_x = wavelength / (dx * cutoff)
+    sigmas = (sig_y, sig_x)
+    depths = (int(np.ceil(sigmas[0] * truncate)), int(np.ceil(sigmas[1] * truncate)))
+    return sigmas, depths
+
+def phase_of_sincos(sin_filtered, cos_filtered):
+    """
+    The wrapped phase of the Gaussian-filtered sin and cos (BatchWrap.gaussian): arctan2 of the two, as float32.
+    """
+    return np.arctan2(sin_filtered, cos_filtered).astype('float32')

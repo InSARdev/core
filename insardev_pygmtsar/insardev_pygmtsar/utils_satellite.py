@@ -3600,6 +3600,10 @@ class _CellScatter:
             del ele_sum
 
 
+class NoOutputGridError(ValueError):
+    """The bbox meets the burst footprint but not its output grid: compute_transform_inverse() raises it, S1.transform() skips the burst."""
+
+
 def compute_transform_inverse(prm, dem, dem_path,
                               scale_factor=2.0,
                               epsg=None,
@@ -3757,7 +3761,7 @@ def compute_transform_inverse(prm, dem, dem_path,
     if n_y == 0 or n_x == 0:
         # S1.transform() skips the bursts whose footprint misses the bbox, so this one's footprint meets the bbox
         # while its output grid (the geocoded first and last lines and the margin) does not
-        raise ValueError(f'ERROR: bbox {bbox} does not overlap the output grid of the burst, '
+        raise NoOutputGridError(f'ERROR: bbox {bbox} does not overlap the output grid of the burst, '
                          f'y=[{y_min:.0f}, {y_max:.0f}] x=[{x_min:.0f}, {x_max:.0f}] in EPSG:{epsg}.')
 
     if debug:
@@ -3843,7 +3847,7 @@ def compute_transform_inverse(prm, dem, dem_path,
     inv_rng = np.full((n_y, n_x), np.nan, dtype=np.float32)
     inv_ele = np.full((n_y, n_x), np.nan, dtype=np.float32)
     # NOTE: no look_E/N/U arrays: Batch.incidence() rebuilds the incidence from the stack's reference numbers and the
-    # burst geometry, it reads no azi, rng or ele
+    # burst geometry, and each pixel's own ele; it reads no azi or rng
     if compute_topo:
         # the elevation of every pixel, scattered to its nearest radar cell
         scatter = _CellScatter(n_azi * n_rng)
@@ -3936,7 +3940,7 @@ def compute_transform_inverse(prm, dem, dem_path,
         R_local = N * np.sqrt(cos_lat**2 + (1 - e2)**2 * sin_lat**2)
         del N, sin_lat, cos_lat
         # NOTE: the look vector (GMTSAR-compatible look_E/N/U) is not computed: Batch.incidence() rebuilds the
-        # incidence from the stack's reference numbers and the burst geometry, it reads no azi, rng or ele
+        # incidence from the stack's reference numbers and the burst geometry, and each pixel's own ele; it reads no azi or rng
 
         # Step 8: scatter to the output grids (the block's rows, in the row-major order of its mask)
         inv_azi[r0:r1][blk_solve] = azi_b
@@ -4010,7 +4014,7 @@ def compute_transform_inverse(prm, dem, dem_path,
 
     # Build dataset
     # NOTE: no look_E/N/U: Batch.incidence() rebuilds the incidence from the stack's reference numbers and the burst
-    # geometry, it reads no azi, rng or ele
+    # geometry, and each pixel's own ele; it reads no azi or rng
     trans = xr.Dataset({
         'rng': xr.DataArray(inv_rng, coords={'y': out_y, 'x': out_x}, dims=['y', 'x']),
         'azi': xr.DataArray(inv_azi, coords={'y': out_y, 'x': out_x}, dims=['y', 'x']),

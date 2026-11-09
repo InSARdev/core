@@ -20,6 +20,9 @@ import pandas as pd
 from numba import njit
 
 _EPS = 1e-9
+# the IONEX control mesh: nodes at the multiples of CONTROL_M metres in the output CRS, from zero (see _control);
+# CONTROL_M chosen by measurement (GMH U4)
+CONTROL_M = 800.0
 
 
 def atm_fill_nodata(grid):
@@ -125,101 +128,6 @@ def _inverse(px, py, ax, ay, bx, by, cx, cy, dx, dy):
     return False, 0.0, 0.0
 
 
-@njit(nogil=True, cache=True)
-def _locate_all(px, py, X, Y, nxn, meta, imeta, start, items, ncol, cell, uu, vv):
-    """The cell of the node lattice that holds each pixel, -1 where no cell does (of the holding cells, the smallest).
-
-    Parameters
-    ----------
-    px, py : numpy.ndarray - The pixel coordinates; output CRS (ERA5, VMF3) or longitude and latitude (IONEX).
-    X, Y : numpy.ndarray - The node coordinates, flattened in rows of nxn; output CRS (ERA5, VMF3) or longitude and latitude (IONEX).
-    meta, imeta, start, items : numpy.ndarray - The bucket index of the cells.
-    nxn, ncol : int - The row length of the node arrays and the number of cell columns.
-    cell, uu, vv : numpy.ndarray - Output: the cell of each pixel and its bilinear coordinates in that cell.
-
-    Returns
-    -------
-    int - The count of pixels that no cell holds.
-    """
-    x0 = meta[0]
-    y0 = meta[1]
-    xmax = meta[2]
-    ymax = meta[3]
-    bdx = meta[4]
-    bdy = meta[5]
-    nbx = imeta[0]
-    nby = imeta[1]
-    missing = 0
-    for k in range(px.shape[0]):
-        cell[k] = -1
-        x = px[k]
-        y = py[k]
-        if not (x >= x0 and x <= xmax and y >= y0 and y <= ymax):
-            missing += 1
-            continue
-        bx = min(int((x - x0) / bdx), nbx - 1)
-        by = min(int((y - y0) / bdy), nby - 1)
-        b = by * nbx + bx
-        best = 0.0
-        for q in range(start[b], start[b + 1]):
-            c = items[q]
-            j = c // ncol
-            i = c - j * ncol
-            a = j * nxn + i
-            found, u, v = _inverse(x, y, X[a], Y[a], X[a + 1], Y[a + 1], X[a + nxn + 1], Y[a + nxn + 1], X[a + nxn], Y[a + nxn])
-            if found:
-                # the smallest holding quad: a cell stretched across the projection cut holds the pixel too
-                ex = X[a + 1] - X[a]
-                ey = Y[a + 1] - Y[a]
-                fx = X[a + nxn + 1] - X[a]
-                fy = Y[a + nxn + 1] - Y[a]
-                gx = X[a + nxn] - X[a]
-                gy = Y[a + nxn] - Y[a]
-                s = abs(ex * fy - ey * fx) + abs(fx * gy - fy * gx)
-                if cell[k] < 0 or s < best:
-                    cell[k] = c
-                    uu[k] = u
-                    vv[k] = v
-                    best = s
-        if cell[k] < 0:
-            missing += 1
-    return missing
-
-
-@njit(nogil=True, cache=True, error_model='numpy')
-def _height_slot(h, h0, step, count):
-    """The table entry index and weight of an ellipsoidal height, by linear interpolation between entries.
-
-    Parameters
-    ----------
-    h : float - The ellipsoidal height, metres; NaN gives a NaN weight.
-    h0 : float - The height of the first entry, metres.
-    step : float - The entry spacing, metres.
-    count : int - The number of entries, at least 2.
-
-    Returns
-    -------
-    tuple - (i, w): the entry i and the weight w of entries i and i + 1.
-
-    Raises
-    ------
-    ValueError: When h is outside the first and the last entries.
-
-    Examples
-    --------
-    >>> from insardev_toolkit.utils_atmosphere import _height_slot
-    >>> _height_slot(2.5, 0.0, 5.0, 2)
-    (0, 0.5)
-    """
-    f = (h - h0) / step
-    if f != f:
-        return 0, np.nan
-    if not (f >= 0.0 and f <= count - 1):
-        raise ValueError('ERROR: a pixel height is outside the height range of the atmosphere model tables')
-    i = min(int(f), count - 2)
-    return i, f - i
-
-
 @njit(nogil=True, cache=True, error_model='numpy')
 def _form(a, b, c, s):
     """The dimensionless mapping factor of the coefficients a, b, c at s = cos of the incidence.
@@ -291,7 +199,7 @@ def _mapping_coefs(mapping):
     return np.concatenate([mapping, ((q + b + a * q) / (q + b))[..., None]], axis=-1)
 
 
-@njit(nogil=True, cache=True, error_model='numpy')
+@njit(nogil=True, cache=True, error_model='numpy', inline='always')
 def _node_phase(hyd, wet, mapping, t, r, c, i, w, s, hterm):
     """The phase in radians of one node at one time for one pixel: the zenith delay tables times their mapping, plus the
     height term.
@@ -324,7 +232,7 @@ def _node_phase(hyd, wet, mapping, t, r, c, i, w, s, hterm):
     return zh * mh + zw * mw
 
 
-@njit(nogil=True, cache=True, error_model='numpy')
+@njit(nogil=True, cache=True, error_model='numpy', inline='always')
 def _shell_phase(hyd, wet, t, r, c, m, inv):
     """The phase in radians of one node at one time for one pixel of a shell model: the table entry times the shell mapping.
 
@@ -349,7 +257,7 @@ def _shell_phase(hyd, wet, t, r, c, m, inv):
     return hyd[t, r, c, 0] * m + wet[t, r, c, 0] * inv
 
 
-@njit(nogil=True, cache=True, error_model='numpy')
+@njit(nogil=True, cache=True, error_model='numpy', inline='always')
 def _table_gap(hyd, wet, t, r, c, i, count):
     """True when a node at one time has a gap at a slot: a NaN entry at the slot or the next one, with a finite top entry.
 
@@ -376,98 +284,354 @@ def _table_gap(hyd, wet, t, r, c, i, count):
     return top and a != a
 
 
-@njit(nogil=True, cache=True, error_model='numpy')
-def _pixel_kernel(hyd, wet, mapping, loc, lr, lc, uu, vv, h, z, h0, step, count, niell, k, gaps, out):
-    """Phase of a pixel chunk on one tile: out[p, q] is the phase (radians, float32) of pixel q at the time loc[p].
-
-    Each pixel is bilinear over the 4 nodes of its cell; a pixel with a NaN height or incidence is NaN for every model,
-    with no raise and no warning.
+@njit(nogil=True, cache=True, inline='always')
+def _locate_one(x, y, X, Y, nxn, meta, imeta, start, items, ncol):
+    """The cell of one point among the reprojected nodes: the search of the kernel (the former _locate_all, removed by GAZ A2).
 
     Parameters
     ----------
-    hyd, wet : numpy.ndarray - The zenith tables of the tile, (time, y, x, height), in phase units.
-    mapping : numpy.ndarray - The (a, b, c, K) coefficients of the tile, (time, y, x, component, 4).
-    loc : numpy.ndarray - The index into the tables of each time.
-    lr, lc : numpy.ndarray - The local lower-left node of each pixel's cell.
-    uu, vv : numpy.ndarray - The bilinear weights of each pixel in its cell.
-    h : numpy.ndarray - The ellipsoidal height of each pixel, metres.
-    z : numpy.ndarray - The incidence of each pixel, radians.
+    x, y : float - The point, in the CRS of the nodes.
+    X, Y : numpy.ndarray - The node coordinates, flat (row-major, nxn nodes per row).
+    nxn : int - The number of nodes per row.
+    meta, imeta, start, items : numpy.ndarray - The cell index (see _cell_table): the box origin and sizes, the boxes and
+        the cells of each box.
+    ncol : int - The number of cells per row.
+
+    Returns
+    -------
+    tuple - (cell, u, v): the cell, -1 when no cell holds the point, and the bilinear weights of the point in the cell.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from insardev_toolkit.utils_atmosphere import _locate_one
+    >>> X = np.array([0.0, 1.0, 0.0, 1.0]); Y = np.array([0.0, 0.0, 1.0, 1.0])
+    >>> _ = _locate_one(0.25, 0.5, X, Y, 2, np.array([0.0, 0.0, 1.0, 1.0, 1.0, 1.0]), np.array([1, 1]),
+    ...                 np.array([0, 1]), np.array([0]), 1)
+    """
+    x0 = meta[0]
+    y0 = meta[1]
+    xmax = meta[2]
+    ymax = meta[3]
+    bdx = meta[4]
+    bdy = meta[5]
+    nbx = imeta[0]
+    nby = imeta[1]
+    if not (x >= x0 and x <= xmax and y >= y0 and y <= ymax):
+        return -1, 0.0, 0.0
+    bx = min(int((x - x0) / bdx), nbx - 1)
+    by = min(int((y - y0) / bdy), nby - 1)
+    b = by * nbx + bx
+    cell = -1
+    cu = 0.0
+    cv = 0.0
+    best = 0.0
+    for q in range(start[b], start[b + 1]):
+        c = items[q]
+        j = c // ncol
+        i = c - j * ncol
+        a = j * nxn + i
+        found, u, v = _inverse(x, y, X[a], Y[a], X[a + 1], Y[a + 1], X[a + nxn + 1], Y[a + nxn + 1], X[a + nxn], Y[a + nxn])
+        if found:
+            ex = X[a + 1] - X[a]
+            ey = Y[a + 1] - Y[a]
+            fx = X[a + nxn + 1] - X[a]
+            fy = Y[a + nxn + 1] - Y[a]
+            gx = X[a + nxn] - X[a]
+            gy = Y[a + nxn] - Y[a]
+            s = abs(ex * fy - ey * fx) + abs(fx * gy - fy * gx)
+            if cell < 0 or s < best:
+                cell = c
+                cu = u
+                cv = v
+                best = s
+    return cell, cu, cv
+
+
+@njit(nogil=True, cache=True, error_model='numpy', inline='always')
+def _pierce_one(qy, qx, h, z, look, shell, geocentric, ctrl, ky, kx, S0, S1, lat_c, lon_c):
+    """The IONEX pierce point of one pixel and its effective incidence: the arithmetic of the sine law (TN-200 step 2).
+
+    Parameters
+    ----------
+    qy, qx : float - The pixel latitude and longitude, degrees; with ctrl, the pixel's coordinates in the output CRS.
+    h : float - The ellipsoidal height, metres.
+    z : float - The incidence, radians.
+    look : float - The look azimuth, degrees clockwise from north (satellite to target).
+    shell : float - R + H, metres.
+    geocentric : bool - True: the mapping at the geocentric zenith of the exact ray; False: at the ellipsoid-normal zenith.
+    ctrl : bool - True: the pierce point's start is the control mesh (bilinear in the cell, the longitude unwrapped per cell).
+    ky, kx, S0, S1 : int, int, float, float - The first node row and column of the mesh and its spacings (metres).
+    lat_c, lon_c : numpy.ndarray - The control mesh latitudes and longitudes, degrees, (nodes y, nodes x).
+
+    Returns
+    -------
+    tuple of float - (pierce latitude, pierce longitude, effective incidence), degrees, degrees and radians.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from insardev_toolkit.utils_atmosphere import _pierce_one
+    >>> _ = _pierce_one(47.0, 13.0, 0.0, 0.6, 77.0, 6821e3, True, False, 0, 0, 1.0, 1.0, np.zeros((1, 1)), np.zeros((1, 1)))
+    """
+    rad = math.pi / 180.0
+    deg = 180.0 / math.pi
+    c1 = 1.0 - _E2_WGS
+    bb = _A_WGS * math.sqrt(1.0 - _E2_WGS)
+    k3 = _E2_WGS / (1.0 - _E2_WGS) * bb
+    k4 = _E2_WGS * _A_WGS
+    if ctrl:
+        ty_ = qy / S0
+        jy = math.floor(ty_)
+        iy = np.int64(jy - ky)
+        wy = ty_ - jy
+        tx_ = qx / S1
+        jx = math.floor(tx_)
+        ix = np.int64(jx - kx)
+        wx = tx_ - jx
+        la = lat_c[iy, ix] * (1.0 - wx) + lat_c[iy, ix + 1] * wx
+        lb = lat_c[iy + 1, ix] * (1.0 - wx) + lat_c[iy + 1, ix + 1] * wx
+        lat = la * (1.0 - wy) + lb * wy
+        cc = lon_c[iy, ix]
+        top = ((lon_c[iy, ix + 1] - cc + 180.0) % 360.0 - 180.0) * wx
+        bot = ((lon_c[iy + 1, ix] - cc + 180.0) % 360.0 - 180.0) * (1.0 - wx)
+        bot += ((lon_c[iy + 1, ix + 1] - cc + 180.0) % 360.0 - 180.0) * wx
+        top = top * (1.0 - wy) + bot * wy
+        lon = (cc + top + 180.0) % 360.0 - 180.0
+    else:
+        lat = qy
+        lon = qx
+    phi = lat * rad
+    sp = math.sin(phi)
+    cp = math.cos(phi + 0.0)   # + 0.0: an operand apart from sin's, so LLVM does not fuse them into sincos (1 ulp apart)
+    big_n = _A_WGS / math.sqrt(1.0 - _E2_WGS * (sp * sp))
+    pt = (big_n + h) * cp
+    zt = (big_n * c1 + h) * sp
+    R = math.hypot(pt, zt)
+    sd = (sp * pt - cp * zt) / R
+    cd = (cp * pt + sp * zt) / R
+    a = (look + 180.0) * rad
+    sz = math.sin(z)
+    ue = sz * math.sin(a)
+    un = sz * math.cos(a + 0.0)
+    uu = math.cos(z + 0.0)
+    uh = cd * un + sd * uu
+    zc = math.atan2(math.hypot(ue, uh), -sd * un + cd * uu)
+    az = math.atan2(ue, uh)
+    zray = math.asin(R * math.sin(zc) / shell)
+    beta = zc - zray
+    zeff = zray if geocentric else math.asin(R * math.sin(z) / shell)
+    sf = zt / R
+    cf = pt / R
+    s2 = sf * math.cos(beta + 0.0) + cf * math.sin(beta) * math.cos(az + 0.0)
+    dl = math.atan2(math.sin(az) * math.sin(beta) * cf, math.cos(beta + 0.0) - sf * s2)
+    p = shell * math.sqrt(1.0 - s2 * s2)
+    zz = shell * s2
+    th = math.atan2(zz * _A_WGS, p * bb)
+    lat_g = math.atan2(zz + k3 * math.pow(math.sin(th), 3.0), p - k4 * math.pow(math.cos(th + 0.0), 3.0))
+    lon = lon + dl * deg
+    if lon < -180.0 or lon > 180.0:
+        lon = (lon + 180.0) % 360.0 - 180.0
+    return lat_g * deg, lon, zeff
+
+
+@njit(nogil=True, cache=True, error_model='numpy', inline='always')
+def _pixel_phase(hyd, wet, mapping, r0, c0, u, v, h, z, h0, step, count, niell, k, out):
+    """The phase of one pixel at every date of a block (option (a)): its 4 nodes, each evaluated at the pixel's height
+    (linear in the table entries) and at the pixel's incidence (the mapping), bilinear with the pixel's weights. Written to
+    out, float32 radians; a pixel with a NaN height or incidence is NaN for every date, with no error and no warning.
+
+    Parameters
+    ----------
+    hyd, wet : numpy.ndarray - The zenith tables of one tile slot, (date, row, col, height), in phase units.
+    mapping : numpy.ndarray - The (a, b, c, K) coefficients of the slot, (date, row, col, component, 4).
+    r0, c0 : int - The local lower-left node of the pixel's cell in the tables.
+    u, v : float - The bilinear weights of the pixel in its cell.
+    h : float - The ellipsoidal height of the pixel, metres.
+    z : float - The incidence of the pixel, radians (IONEX: the effective incidence at the pierce point).
     h0, step : float - The first table height and the entry spacing, metres.
     count : int - The number of table entries.
-    niell : tuple of float - The height term (v, a, b, c); v is 0 for IONEX.
+    niell : numpy.ndarray - The height term (v, a, b, c); v is 0 for IONEX.
     k : float - The shell factor (IONEX); 1 for the mapping forms.
-    gaps : numpy.ndarray - Output: gaps[0] counts the pixel-dates whose phase is NaN from a table gap.
-    out : numpy.ndarray - Output: float32 phases, radians, shape (times, pixels).
+    out : numpy.ndarray - Output: the phase of each date, float32, 1-D.
 
-    Raises
-    ------
-    ValueError: For an incidence outside [0, 90) degrees or a height outside the tables.
+    Returns
+    -------
+    tuple of int - (code, gaps): code 0 when the pixel is evaluated, 1 for an incidence outside [0, 90) degrees, 2 for a
+    height outside the tables (out is NaN then); gaps counts the dates whose phase is NaN from a table gap.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from insardev_toolkit.utils_atmosphere import _pixel_phase
+    >>> hyd = np.ones((1, 2, 2, 2)); wet = np.zeros((1, 2, 2, 2)); mp = np.zeros((1, 2, 2, 2, 4)); mp[..., 3] = 1.0
+    >>> out = np.zeros(1, np.float32)
+    >>> _pixel_phase(hyd, wet, mp, 0, 0, 0.5, 0.5, 1.0, 0.0, 0.0, 1.0, 2, np.zeros(4), 1.0, out)
+    (0, 0)
+    >>> round(float(out[0]), 6)
+    1.0
     """
-    npos = loc.size
-    for q in range(h.size):
-        if h[q] != h[q] or z[q] != z[q]:
-            for p in range(npos):
-                out[p, q] = np.float32(np.nan)
-            continue
-        zd = z[q] * (180.0 / np.pi)
-        if not (zd >= 0.0 and zd < 90.0):
-            raise ValueError('ERROR: the incidence of the burst is outside [0, 90) degrees')
-        cz = np.cos(z[q])
-        sz = np.sin(z[q])
-        s = np.sqrt(cz * cz + (1.0 - k * k) * sz * sz)
-        inv = 1.0 / s
-        r0 = lr[q]
-        c0 = lc[q]
-        u = uu[q]
-        v = vv[q]
-        w00 = (1.0 - u) * (1.0 - v)
-        w10 = u * (1.0 - v)
-        w11 = u * v
-        w01 = (1.0 - u) * v
-        if count == 1:
-            m = inv
-            for p in range(npos):
-                t = loc[p]
-                acc = 0.0
-                if w00 != 0.0:
-                    acc += w00 * _shell_phase(hyd, wet, t, r0, c0, m, inv)
-                if w10 != 0.0:
-                    acc += w10 * _shell_phase(hyd, wet, t, r0, c0 + 1, m, inv)
-                if w11 != 0.0:
-                    acc += w11 * _shell_phase(hyd, wet, t, r0 + 1, c0 + 1, m, inv)
-                if w01 != 0.0:
-                    acc += w01 * _shell_phase(hyd, wet, t, r0 + 1, c0, m, inv)
-                out[p, q] = np.float32(acc)
-        else:
-            hterm = 0.0
-            if niell[0] != 0.0:
-                hterm = niell[0] * h[q] * (1.0 / cz - _form(niell[1], niell[2], niell[3], s))
-            i, wh = _height_slot(h[q], h0, step, count)
-            for p in range(npos):
-                t = loc[p]
-                acc = 0.0
-                if w00 != 0.0:
-                    acc += w00 * _node_phase(hyd, wet, mapping, t, r0, c0, i, wh, s, hterm)
-                if w10 != 0.0:
-                    acc += w10 * _node_phase(hyd, wet, mapping, t, r0, c0 + 1, i, wh, s, hterm)
-                if w11 != 0.0:
-                    acc += w11 * _node_phase(hyd, wet, mapping, t, r0 + 1, c0 + 1, i, wh, s, hterm)
-                if w01 != 0.0:
-                    acc += w01 * _node_phase(hyd, wet, mapping, t, r0 + 1, c0, i, wh, s, hterm)
-                out[p, q] = np.float32(acc)
-                if acc != acc and h[q] == h[q]:
-                    gap = False
-                    if w00 != 0.0:
-                        gap = gap or _table_gap(hyd, wet, t, r0, c0, i, count)
-                    if w10 != 0.0:
-                        gap = gap or _table_gap(hyd, wet, t, r0, c0 + 1, i, count)
-                    if w11 != 0.0:
-                        gap = gap or _table_gap(hyd, wet, t, r0 + 1, c0 + 1, i, count)
-                    if w01 != 0.0:
-                        gap = gap or _table_gap(hyd, wet, t, r0 + 1, c0, i, count)
-                    if gap:
-                        gaps[0] += 1
-    return out
+    ntime = out.shape[0]
+    if h != h or z != z:
+        for p in range(ntime):
+            out[p] = np.float32(np.nan)
+        return 0, 0
+    zd = z * (180.0 / math.pi)
+    if not (zd >= 0.0 and zd < 90.0):
+        for p in range(ntime):
+            out[p] = np.float32(np.nan)
+        return 1, 0
+    cz = np.cos(z)
+    sz = np.sin(z)
+    s = np.sqrt(cz * cz + (1.0 - k * k) * sz * sz)
+    inv = 1.0 / s
+    w00 = (1.0 - u) * (1.0 - v)
+    w10 = u * (1.0 - v)
+    w11 = u * v
+    w01 = (1.0 - u) * v
+    if count == 1:
+        for p in range(ntime):
+            acc = 0.0
+            if w00 != 0.0:
+                acc += w00 * _shell_phase(hyd, wet, p, r0, c0, inv, inv)
+            if w10 != 0.0:
+                acc += w10 * _shell_phase(hyd, wet, p, r0, c0 + 1, inv, inv)
+            if w11 != 0.0:
+                acc += w11 * _shell_phase(hyd, wet, p, r0 + 1, c0 + 1, inv, inv)
+            if w01 != 0.0:
+                acc += w01 * _shell_phase(hyd, wet, p, r0 + 1, c0, inv, inv)
+            out[p] = np.float32(acc)
+        return 0, 0
+    hterm = 0.0
+    if niell[0] != 0.0:
+        hterm = niell[0] * h * (1.0 / cz - _form(niell[1], niell[2], niell[3], s))
+    f = (h - h0) / step
+    if not (f >= 0.0 and f <= count - 1):
+        for p in range(ntime):
+            out[p] = np.float32(np.nan)
+        return 2, 0
+    i = min(int(f), count - 2)
+    wh = f - i
+    gaps = 0
+    for p in range(ntime):
+        acc = 0.0
+        if w00 != 0.0:
+            acc += w00 * _node_phase(hyd, wet, mapping, p, r0, c0, i, wh, s, hterm)
+        if w10 != 0.0:
+            acc += w10 * _node_phase(hyd, wet, mapping, p, r0, c0 + 1, i, wh, s, hterm)
+        if w11 != 0.0:
+            acc += w11 * _node_phase(hyd, wet, mapping, p, r0 + 1, c0 + 1, i, wh, s, hterm)
+        if w01 != 0.0:
+            acc += w01 * _node_phase(hyd, wet, mapping, p, r0 + 1, c0, i, wh, s, hterm)
+        out[p] = np.float32(acc)
+        if acc != acc:
+            gap = False
+            if w00 != 0.0:
+                gap = gap or _table_gap(hyd, wet, p, r0, c0, i, count)
+            if w10 != 0.0:
+                gap = gap or _table_gap(hyd, wet, p, r0, c0 + 1, i, count)
+            if w11 != 0.0:
+                gap = gap or _table_gap(hyd, wet, p, r0 + 1, c0 + 1, i, count)
+            if w01 != 0.0:
+                gap = gap or _table_gap(hyd, wet, p, r0 + 1, c0, i, count)
+            if gap:
+                gaps += 1
+    return 0, gaps
+
+
+@njit(nogil=True, cache=True, error_model='numpy')
+def _block_kernel(axes1d, y1, x1, y2, x2, ele, inc, look, X, Y, nxn, meta, imeta, start, items, ncol, owner, slot_of, oy, ox,
+                  HYD, WET, MAPC, h0, step, count, niell, k, pierce, shell, geocentric, ctrl, ky, kx, S0, S1, lat_c, lon_c,
+                  flags, out):
+    """The phase of one output block in one serial pass over its pixels: per pixel the pierce point (IONEX), the cell among
+    the nodes, the tile slot, and _pixel_phase, written to out[:, r, c]. Errors are counted in flags (see _phase_block).
+
+    Parameters
+    ----------
+    axes1d : bool - True: y1, x1 are the block's 1-D axes; False: y2, x2 are the 2-D coordinates.
+    y1, x1, y2, x2, ele, inc, look : numpy.ndarray - The pixel coordinates, heights, incidences and looks of the block.
+    X, Y, nxn, meta, imeta, start, items, ncol, owner : the node coordinates and the cell index (see _locate_one, _cell_table).
+    slot_of, oy, ox : numpy.ndarray - The tile slot of each tile index, and the first node of each slot (the last entry is
+        the slot of no tile, whose NaN tables give NaN).
+    HYD, WET, MAPC : numpy.ndarray - The block tables (slot, date, row, col, ...) of _block_tables.
+    h0, step, count, niell, k : the table constants of the model (see _pixel_phase).
+    pierce, shell, geocentric, ctrl : bool, float, bool, bool - The IONEX pierce point switches, the shell R + H, the zenith
+        flag, and whether the control mesh is used.
+    ky, kx, S0, S1, lat_c, lon_c : the control mesh; each pixel finds its cell and the longitude offsets from its first node.
+    flags : numpy.ndarray - Output: the error counts (missing, table gaps, incidence before the pierce point, first kernel error).
+    out : numpy.ndarray - Output: the phases, float32, (date, row, col).
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from insardev_toolkit.utils_atmosphere import _block_kernel
+    >>> X = np.array([0.0, 1.0, 0.0, 1.0]); Y = np.array([0.0, 0.0, 1.0, 1.0])
+    >>> meta = np.array([0.0, 0.0, 1.0, 1.0, 1.0, 1.0]); imeta = np.array([1, 1]); start = np.array([0, 1]); items = np.array([0])
+    >>> HYD = np.ones((2, 1, 2, 2, 1)); WET = np.zeros((2, 1, 2, 2, 1)); MAPC = np.zeros((2, 1, 2, 2, 2, 4))
+    >>> HYD[1] = np.nan; WET[1] = np.nan; MAPC[1] = np.nan
+    >>> out = np.zeros((1, 1, 1), np.float32); flags = np.zeros(4, np.int64); z2 = np.zeros((1, 1))
+    >>> _block_kernel(True, np.array([0.5]), np.array([0.5]), z2, z2, np.zeros((1, 1)), np.full((1, 1), 0.5), z2, X, Y, 2, meta,
+    ...               imeta, start, items, 1, np.array([0]), np.array([0, -1]), np.zeros(2, np.int64), np.zeros(2, np.int64),
+    ...               HYD, WET, MAPC, 0.0, 1.0, 1, np.zeros(4), 1.0, False, 0.0, True, False, 0, 0, 1.0, 1.0,
+    ...               z2, z2, flags, out)
+    >>> round(float(out[0, 0, 0]), 4)
+    1.1395
+    """
+    ny, nx = ele.shape
+    nslot = HYD.shape[0] - 1
+    pout = out.shape[0]
+    nan32 = np.float32(np.nan)
+    for r in range(ny):
+        for c in range(nx):
+            hq = np.float64(ele[r, c])
+            zq = np.float64(inc[r, c])
+            if axes1d:
+                qy = y1[r]
+                qx = x1[c]
+            else:
+                qy = y2[r, c]
+                qx = x2[r, c]
+            if pierce:
+                zd0 = zq * (180.0 / math.pi)
+                if zd0 == zd0 and not (zd0 >= 0.0 and zd0 < 90.0):
+                    flags[_INC_PRE] = 1
+                plat, plon, zeff = _pierce_one(qy, qx, hq, zq, np.float64(look[r, c]), shell, geocentric, ctrl,
+                                               ky, kx, S0, S1, lat_c, lon_c)
+                if not (math.isfinite(plon) and math.isfinite(plat)):
+                    for p in range(pout):
+                        out[p, r, c] = nan32
+                    continue
+                px = plon
+                py = plat
+                zq = zeff
+            else:
+                px = qx
+                py = qy
+            cell, u, v = _locate_one(px, py, X, Y, nxn, meta, imeta, start, items, ncol)
+            if cell < 0:
+                flags[_MISSING] += 1
+                for p in range(pout):
+                    out[p, r, c] = nan32
+                continue
+            # the slot of the cell's tile; the last slot (NaN tables) for a cell of no tile
+            s_ = nslot
+            own = owner[cell]
+            if own >= 0 and own < slot_of.size and slot_of[own] >= 0:
+                s_ = slot_of[own]
+            r0 = 0
+            c0 = 0
+            if s_ < nslot:
+                j = cell // ncol
+                i = cell - j * ncol
+                r0 = j - oy[s_]
+                c0 = i - ox[s_]
+            code, gaps = _pixel_phase(HYD[s_], WET[s_], MAPC[s_], r0, c0, u, v, hq, zq, h0, step, count, niell, k,
+                                      out[:, r, c])
+            if code == 1 and flags[_KERR] == 0:
+                flags[_KERR] = 1
+            if code == 2 and flags[_KERR] == 0:
+                flags[_KERR] = 2
+            flags[_GAPS] += gaps
 
 
 def _nodes_xy(lon, lat, crs):
@@ -521,12 +685,14 @@ def _cell_table(X, Y, owner):
 
     Returns
     -------
-    tuple - (meta, imeta, start, items, ncol, owner): the bucket index of the cells and the tile of each cell.
+    tuple - (meta, imeta, start, items, ncol, owner, boxes, box_owner): the bucket index of the cells, the tile of each cell,
+    the box (x0, x1, y0, y1) of each finite cell and the tile of each box.
     """
     ny, nx = X.shape
     ncol = nx - 1
     empty = (np.array([0.0, 0.0, -1.0, -1.0, 1.0, 1.0]), np.array([1, 1], dtype=np.int64),
-             np.zeros(2, dtype=np.int64), np.zeros(0, dtype=np.int64), max(ncol, 1), owner)
+             np.zeros(2, dtype=np.int64), np.zeros(0, dtype=np.int64), max(ncol, 1), owner,
+             np.zeros((0, 4)), np.zeros(0, dtype=np.int32))
     if ny < 2 or nx < 2:
         return empty
     CX = np.stack([X[:-1, :-1], X[:-1, 1:], X[1:, 1:], X[1:, :-1]])
@@ -562,27 +728,33 @@ def _cell_table(X, Y, owner):
     items = np.array([c for b in buckets for c in b], dtype=np.int64)
     meta = np.array([x0, y0, xmax, ymax, bdx, bdy], dtype=np.float64)
     imeta = np.array([nbx, nby], dtype=np.int64)
-    return meta, imeta, start, items, ncol, owner
+    boxes = np.stack([cx0, cx1, cy0, cy1], axis=1)
+    return meta, imeta, start, items, ncol, owner, boxes, owner[ids]
 
 
 _A_WGS = 6378137.0                                                # m, WGS84 semi-major axis
 _E2_WGS = (1.0 / 298.257223563) * (2.0 - 1.0 / 298.257223563)      # WGS84 first eccentricity squared
 
+# flags of _block_kernel: missing pixels, table gaps, incidence of the burst before the pierce point (IONEX), first kernel error
+_MISSING, _GAPS, _INC_PRE, _KERR = 0, 1, 2, 3
 
-def _control(y, x, crs, k=9):
-    """The control mesh of a projected CRS for the pierce point: the latitude and longitude of up to k x k pixels of the
-    whole grid (one pyproj call on them); None for no CRS or a geographic CRS.
+
+
+def _control(y, x, crs):
+    """The control mesh of a projected CRS for the pierce point: the latitude and longitude at the nodes of the absolute
+    lattice of CONTROL_M metres in the output CRS (the multiples of CONTROL_M from zero) that the axes need; None for no
+    CRS or a geographic CRS. A pixel's mesh values depend on its own coordinates only, never on the grid.
 
     Parameters
     ----------
     y, x : numpy.ndarray - The pixel axes in the output CRS, 1-D or 2-D of one shape.
     crs : int, str, rasterio CRS or None - The output CRS.
-    k : int - The most control points along an axis.
 
     Returns
     -------
-    tuple or None - (ri, ci, lat, lon): the control rows and columns (indices) and the latitudes and longitudes in degrees
-    (the longitudes unwrapped across +/-180), shape (len(ri), len(ci)).
+    tuple or None - (ky, kx, S, lat, lon): the first lattice indices of the node rows and columns, the spacings S =
+    (Sy, Sx) in metres and the latitudes and longitudes in degrees as the transform returns them (in [-180, 180]; the
+    +/-180 seam is crossed by the control offsets of _phase_block, cell by cell), shape (nodes y, nodes x).
 
     Examples
     --------
@@ -593,181 +765,99 @@ def _control(y, x, crs, k=9):
     from pyproj import CRS, Transformer
     if crs is None or CRS.from_user_input(crs).is_geographic:
         return None
-    ny, nx = (y.size, x.size) if y.ndim == 1 else y.shape
-    ri, ci = (np.unique(np.linspace(0, n - 1, min(n, k)).round().astype(np.int64)) for n in (ny, nx))
-    cy, cx = (y[ri][:, None], x[ci][None, :]) if y.ndim == 1 else (y[np.ix_(ri, ci)], x[np.ix_(ri, ci)])
-    cy, cx = np.broadcast_arrays(np.asarray(cy, dtype=np.float64), np.asarray(cx, dtype=np.float64))
-    lon, lat = Transformer.from_crs(crs, 'EPSG:4326', always_xy=True).transform(cx, cy)
-    # unwrap across the +/-180 seam (period 360) about the circular mean of the mesh, cell by cell: a NaN stays local
-    # (np.unwrap would spread it over the rows after it) and a mesh inside one turn is unchanged bitwise
+    y = np.asarray(y, dtype=np.float64)
+    x = np.asarray(x, dtype=np.float64)
+    S = CONTROL_M
+
+    def nodes(a):
+        k0 = int(np.floor(a.min() / S))
+        return k0, int(np.floor(a.max() / S)) - k0 + 2
+    ky, ny = nodes(y)
+    kx, nx = nodes(x)
+    Y, X = np.meshgrid((ky + np.arange(ny)) * S, (kx + np.arange(nx)) * S, indexing='ij')
+    # one transform of the mesh
+    lon, lat = Transformer.from_crs(crs, 'EPSG:4326', always_xy=True).transform(X.ravel(), Y.ravel())
+    lat = np.asarray(lat, dtype=np.float64)
     lon = np.asarray(lon, dtype=np.float64)
-    ok = np.isfinite(lon)
-    if ok.any():
-        rad = np.radians(lon[ok])
-        ref = np.degrees(np.arctan2(np.sin(rad).mean(), np.cos(rad).mean()))
-        lon = lon - 360.0 * np.round((lon - ref) / 360.0)
-    return ri, ci, np.asarray(lat, dtype=np.float64), lon
+    return ky, kx, (S, S), lat.reshape(X.shape), lon.reshape(X.shape)
 
 
-def _lerp(vals, ri, ci, rows, cols):
-    """Bilinear interpolation in index space of control values on the control rows ri and columns ci to the pixels rows
-    x cols (global indices)."""
-    def weights(idx, pos):
-        if idx.size == 1:
-            return np.zeros(pos.size, dtype=np.int64), np.zeros(pos.size, dtype=np.int64), np.zeros(pos.size)
-        j = np.clip(np.searchsorted(idx, pos, side='right') - 1, 0, idx.size - 2)
-        return j, j + 1, (pos - idx[j]) / (idx[j + 1] - idx[j])
-    j0, j1, t = weights(ci, np.asarray(cols, dtype=np.float64))
-    part = vals[:, j0] * (1.0 - t) + vals[:, j1] * t
-    i0, i1, s = weights(ri, np.asarray(rows, dtype=np.float64))
-    return part[i0] * (1.0 - s)[:, None] + part[i1] * s[:, None]
-
-
-def _pierce_offset(yy, xx, ele, inc, look, shell, control, geocentric, rows, cols):
-    """The IONEX pierce point of each pixel by the sine law, and the effective incidence of its shell mapping.
-
-    With R = |target ECEF|, S = R + H = shell and zc the geocentric zenith of the ray at the target: beta = zc -
-    arcsin(R sin zc / S), d = R beta. The pierce point lies at d along the geodesic of the look azimuth + 180 degrees
-    (the great circle of the geocentric frame, geodetic latitude) in latitude and longitude, whatever the output CRS.
-    A projected CRS takes the pixel latitude and longitude interpolated from the control mesh _control, so chunking does
-    not matter. The pierce point is the same for both conventions (TN-200 step 2); only the mapping zenith differs.
+def _extent(y, x):
+    """The extent of the pixels of a block: reductions of the 1-D axes or of the 2-D arrays (no copy).
 
     Parameters
     ----------
-    yy, xx : numpy.ndarray - The pixel coordinates, shape (ny, nx): latitude and longitude for a geographic CRS; the output
-        CRS for a projected one (then control gives the latitude and longitude).
-    ele, inc, look : numpy.ndarray - The ellipsoidal heights (metres), incidences (radians) and look azimuths
-        (degrees clockwise from north, satellite to target) of the pixels.
-    shell : float - R + H, metres.
-    control : tuple or None - The control mesh of _control; None for a geographic CRS.
-    geocentric : bool - True: the mapping at the geocentric zenith of the exact ray (ETAD ATBD 2.7 Eq. 45-46, the default);
-        False: TN-200 Eq. 22 at the ellipsoid-normal zenith z (FRM4SAR TN-200), for verifications against TN-200.
-    rows, cols : numpy.ndarray - The indices of the pixel rows and columns in the whole grid.
+    y, x : numpy.ndarray - The pixel axes in the output CRS: 1-D or 2-D of one shape.
 
     Returns
     -------
-    tuple of numpy.ndarray - (lat, lon, zeff): the pierce point in degrees (the longitude in [-180, 180]) and the effective
-    incidence z' in radians, shape (ny, nx).
-
-    Raises
-    ------
-    ValueError: For an incidence outside [0, 90) degrees.
+    tuple of float - (ymin, ymax, xmin, xmax).
 
     Examples
     --------
     >>> import numpy as np
-    >>> from insardev_toolkit.utils_atmosphere import _pierce_offset
-    >>> _ = _pierce_offset(np.full((2, 2), 47.0), np.full((2, 2), 13.0), np.zeros((2, 2)),
-    ...                    np.full((2, 2), 0.6), np.full((2, 2), 77.0), 6821e3, None, True, np.arange(2), np.arange(2))
+    >>> from insardev_toolkit.utils_atmosphere import _extent
+    >>> _extent(np.array([1.0, 3.0]), np.array([-2.0, 5.0]))
+    (1.0, 3.0, -2.0, 5.0)
     """
-    z = np.asarray(inc, dtype=np.float64)
-    zd = np.degrees(z)
-    if (~np.isnan(zd) & ~((zd >= 0.0) & (zd < 90.0))).any():
-        raise ValueError('ERROR: the incidence of the burst is outside [0, 90) degrees')
-    yy, xx = np.asarray(yy, dtype=np.float64), np.asarray(xx, dtype=np.float64)
-    if control is None:
-        lat, lon = yy, xx
-    else:
-        ri, ci, lat_c, lon_c = control
-        lat, lon = _lerp(lat_c, ri, ci, rows, cols), _lerp(lon_c, ri, ci, rows, cols)
-    phi = np.radians(lat)
-    big_n = _A_WGS / np.sqrt(1.0 - _E2_WGS * np.sin(phi) ** 2)
-    h = np.asarray(ele, dtype=np.float64)
-    pt = (big_n + h) * np.cos(phi)                                    # T = (pt cos lon, pt sin lon, zt), ECEF
-    zt = (big_n * (1.0 - _E2_WGS) + h) * np.sin(phi)
-    R = np.hypot(pt, zt)
-    # geocentric frame: the radial is the normal tilted by d = phi - phi_c; the LOS in ENU, azimuth look + 180
-    sd, cd = (np.sin(phi) * pt - np.cos(phi) * zt) / R, (np.cos(phi) * pt + np.sin(phi) * zt) / R
-    a = np.radians(np.asarray(look, dtype=np.float64) + 180.0)
-    ue, un, uu = np.sin(z) * np.sin(a), np.sin(z) * np.cos(a), np.cos(z)
-    uh = cd * un + sd * uu                                        # LOS north component, geocentric
-    zc = np.arctan2(np.hypot(ue, uh), -sd * un + cd * uu)         # angle at T between the radial and the LOS
-    az = np.arctan2(ue, uh)                                       # azimuth of the LOS, geocentric
-    zray = np.arcsin(R * np.sin(zc) / shell)                      # the zenith at the pierce point (sine law)
-    beta = zc - zray                                              # the ray: sine law at the geocentric angle zc
-    zeff = zray if geocentric else np.arcsin(R * np.sin(z) / shell)   # the mapping: ETAD, or TN-200 Eq. 22 at the normal z
-    sf, cf = zt / R, pt / R
-    s2 = sf * np.cos(beta) + cf * np.sin(beta) * np.cos(az)           # sin of the pierce latitude, geocentric
-    dl = np.arctan2(np.sin(az) * np.sin(beta) * cf, np.cos(beta) - sf * s2)
-    p, zz = shell * np.sqrt(1.0 - s2 * s2), shell * s2                # the pierce point in ECEF
-    # geodetic latitude of the pierce point: TN-200 Eq. 36 (Bowring)
-    b = _A_WGS * np.sqrt(1.0 - _E2_WGS)
-    th = np.arctan2(zz * _A_WGS, p * b)
-    lat_g = np.arctan2(zz + _E2_WGS / (1.0 - _E2_WGS) * b * np.sin(th) ** 3, p - _E2_WGS * _A_WGS * np.cos(th) ** 3)
-    lon = lon + np.degrees(dl)
-    # the seam: the IONEX node lattice runs from -180 to +180, so the longitude is wrapped into [-180, 180] (in-range values kept)
-    lon = np.where((lon < -180.0) | (lon > 180.0), np.mod(lon + 180.0, 360.0) - 180.0, lon)
-    return np.degrees(lat_g), lon, zeff
+    return float(np.min(y)), float(np.max(y)), float(np.min(x)), float(np.max(x))
 
 
-def _chunk_cells(y, x, ny, nx, yoff, xoff, chunk, nodes, index, pier=None):
-    """The cell of each pixel of one output chunk with its bilinear coordinates; with pier, the cell of its IONEX pierce point
-    (in the latitude and longitude nodes).
+def _plan(index, ymin, ymax, xmin, xmax):
+    """The tiles that a block needs: those holding the cells whose box meets the block's extent. A superset of the tiles of
+    the block's own cells; exact for the kernel, where each pixel still finds its own cell.
 
     Parameters
     ----------
-    y, x : numpy.ndarray - The pixel axes, 1-D or 2-D of one shape, in the output CRS.
-    ny, nx : int - The chunk size in pixels.
-    yoff, xoff : sequence of int - The chunk offsets of the axes.
-    chunk : tuple of int - The chunk index (bi, bj).
-    nodes, index : tuple - The lattice nodes and the cell index.
-    pier : None or tuple - None, or (ele, inc, look, shell, control, geocentric) of the chunk, see _pierce_offset.
+    index : tuple - The cell index (see _cell_table): the cell boxes and the tile of each box.
+    ymin, ymax, xmin, xmax : float - The extent of the block's pixels in the output CRS.
 
     Returns
     -------
-    tuple - Flat arrays of the pixels: the cell (-1 where none holds the pixel), u, v, the count of pixels no cell
-    holds, and with pier the effective incidence (NaN where the pierce point is NaN; else None).
-    """
-    bi, bj = chunk
-    if y.ndim == 1:
-        yy, xx = np.meshgrid(y[yoff[bi]:yoff[bi] + ny], x[xoff[bj]:xoff[bj] + nx], indexing='ij')
-    else:
-        yy = y[yoff[bi]:yoff[bi] + ny, xoff[bj]:xoff[bj] + nx]
-        xx = x[yoff[bi]:yoff[bi] + ny, xoff[bj]:xoff[bj] + nx]
-    py, px, zeff = yy, xx, None
-    if pier is not None:
-        py, px, zeff = _pierce_offset(yy, xx, *pier, yoff[bi] + np.arange(ny), xoff[bj] + np.arange(nx))
-    X, Y = nodes
-    meta, imeta, start, items, ncol = index[:5]
-    qx = np.ascontiguousarray(px, dtype=np.float64).ravel()
-    qy = np.ascontiguousarray(py, dtype=np.float64).ravel()
-    good = np.isfinite(qx) & np.isfinite(qy)
-    cell = np.zeros(qx.size, dtype=np.int64)
-    uu = np.zeros(qx.size, dtype=np.float64)
-    vv = np.zeros(qx.size, dtype=np.float64)
-    missing = 0
-    if pier is None:
-        # ERA5 and VMF3: a pixel outside the node mesh is missing (phase() has checked that the coordinates are finite)
-        missing = _locate_all(qx, qy, np.ascontiguousarray(X).ravel(), np.ascontiguousarray(Y).ravel(), X.shape[1],
-                              meta, imeta, start, items, ncol, cell, uu, vv)
-    elif good.any():
-        # IONEX: a NaN pierce point (from a NaN height, incidence or look) takes a valid location; the pixel stays NaN
-        fill = np.flatnonzero(good)[0]
-        missing = _locate_all(np.where(good, qx, qx[fill]), np.where(good, qy, qy[fill]), np.ascontiguousarray(X).ravel(),
-                              np.ascontiguousarray(Y).ravel(), X.shape[1], meta, imeta, start, items, ncol, cell, uu, vv)
-    if zeff is not None:
-        zeff = np.where(good, np.ascontiguousarray(zeff, dtype=np.float64).ravel(), np.nan)
-    return cell, uu, vv, missing, zeff
-
-
-def _plan(cell, owner):
-    """The tiles that an output chunk needs: those holding the cells its pixels fall in.
-
-    Parameters
-    ----------
-    cell : numpy.ndarray - The cell of each pixel; -1 for none.
-    owner : numpy.ndarray - The tile index of each cell.
-
-    Returns
-    -------
-    numpy.ndarray - The sorted unique tile indices.
+    list of int - The sorted unique tile indices.
 
     Examples
     --------
-    >>> _plan(np.array([0, 5, -1]), np.array([0, 0, 1, 1, 1, 1]))
+    >>> import numpy as np
+    >>> from insardev_toolkit.utils_atmosphere import _cell_table, _plan
+    >>> index = _cell_table(np.array([[0.0, 1.0], [0.0, 1.0]]), np.array([[0.0, 0.0], [1.0, 1.0]]),
+    ...                     np.array([0], dtype=np.int32))
+    >>> _plan(index, 0.2, 0.4, 0.2, 0.4)
+    [0]
     """
-    valid = cell[cell >= 0]
-    return [int(k) for k in np.unique(owner[valid]) if k >= 0]
+    boxes, box_owner = index[6], index[7]
+    meet = (boxes[:, 0] <= xmax) & (boxes[:, 1] >= xmin) & (boxes[:, 2] <= ymax) & (boxes[:, 3] >= ymin)
+    return [int(k) for k in np.unique(box_owner[meet]) if k >= 0]
+
+
+def _missing(y, x):
+    """The number of pixels with a coordinate that is not finite: O(ny + nx) for 1-D axes (the rows and columns of NaN), and
+    reductions for 2-D arrays (the count itself only when a coordinate is not finite).
+
+    Parameters
+    ----------
+    y, x : numpy.ndarray - The pixel axes in the output CRS: 1-D (the axes of a grid) or 2-D of one shape.
+
+    Returns
+    -------
+    int - The number of pixels with a coordinate that is not finite.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from insardev_toolkit.utils_atmosphere import _missing
+    >>> _missing(np.array([np.nan, 1.0]), np.array([0.0, 1.0, 2.0]))
+    3
+    """
+    if y.size == 0 or x.size == 0:
+        return 0
+    if y.ndim == 1 and x.ndim == 1:
+        by = int(np.count_nonzero(~np.isfinite(y)))
+        bx = int(np.count_nonzero(~np.isfinite(x)))
+        return by * x.size + y.size * bx - by * bx
+    if all(math.isfinite(float(v)) for v in (np.min(y), np.max(y), np.min(x), np.max(x))):
+        return 0
+    return int(np.count_nonzero(~np.isfinite(y) | ~np.isfinite(x)))
 
 
 def _time_groups(idx, tedges):
@@ -792,97 +882,223 @@ def _time_groups(idx, tedges):
     return groups, used
 
 
-def _evaluate_tile(out, pix, tabs, groups, lr, lc, uu, vv, h, z, consts):
-    """Write the phases of the pixels of one chunk that lie on one tile's tables into out. A pixel whose height reads a
-    table gap is NaN, with one warning per call.
+class _Lattice:
+    """The cell index of a model's lattice as one graph value: the phase tasks of a stack share it (dask sends it once per worker)."""
+
+    def __init__(self, index):
+        self.index = index
+
+
+def _overlap(edges, lo, hi):
+    """The blocks of one axis that hold the pixels [lo, hi), each with the slice of its pixels inside the block.
 
     Parameters
     ----------
-    out : numpy.ndarray - Output phases, (times, pixels), float32, radians.
-    pix : numpy.ndarray - The flat indices of the pixels.
-    tabs : list - The hydrostatic, wet and mapping tables of the tile, one array per time group.
-    groups : list of tuple - The times of each time group.
-    lr, lc, uu, vv : numpy.ndarray - The pixels' local cells and weights.
-    h, z : numpy.ndarray - The pixels' heights, metres, and incidences, radians.
-    consts : tuple - (h0, step, count, niell, k) of the model.
+    edges : numpy.ndarray - The first pixel of each block and the pixel count at the end (see _edges).
+    lo, hi : int - The pixels of the output block, [lo, hi).
 
     Returns
     -------
-    None - out is updated in place.
+    list of tuple - (block index, slice) of each block that holds some of the pixels.
     """
-    h0, step, count, niell, k = consts
-    for g, (pos, loc) in enumerate(groups):
-        hyd, wet, mapping = (np.ascontiguousarray(tabs[a][g][:, 0]) for a in range(3))
-        mapping = _mapping_coefs(mapping)
-        sub = np.empty((loc.size, pix.size), dtype=np.float32)
-        gaps = np.zeros(1, dtype=np.int64)
-        _pixel_kernel(hyd, wet, mapping, loc, lr, lc, uu, vv, h, z, h0, step, count, niell, k, gaps, sub)
-        out[np.ix_(pos, pix)] = sub
-        if gaps[0]:
-            warnings.warn(f'{int(gaps[0])} pixel-dates lie deeper below the model surface than the atmosphere tables reach '
-                          f'(the law below the surface ends there): their phase is NaN')
+    out = []
+    for k in range(len(edges) - 1):
+        a, b = max(lo, int(edges[k])), min(hi, int(edges[k + 1]))
+        if a < b:
+            out.append((k, slice(a - int(edges[k]), b - int(edges[k]))))
+    return out
 
 
-def _phase_block(ele, inc, look, tabs, *, y, x, yoff, xoff, chunk, groups, nodes, index, name, tiles, origins, consts, pier=None):
-    """One output chunk (time, y, x) of an opened model, float32 radians.
+def _output_chunks(chunks, ndate, shape):
+    """The chunks (date, y, x) of a lazy phase as tuples of int, checked to cover the dates and the pixel axes.
+
+    Parameters
+    ----------
+    chunks : tuple of three sequences of int - The chunk sizes of the dates, y and x.
+    ndate : int - The number of dates of the burst.
+    shape : tuple of int - The pixel shape (y, x).
+
+    Returns
+    -------
+    tuple - (date, y, x) chunk sizes.
+    """
+    out = tuple(tuple(int(n) for n in c) for c in chunks)
+    if len(out) != 3:
+        raise ValueError('ERROR: phase(): chunks is (date, y, x) chunk sizes')
+    for got, want, what in zip(out, (ndate,) + tuple(shape), ('date', 'y', 'x')):
+        if not got or min(got) < 1 or sum(got) != want:
+            raise ValueError(f'ERROR: phase(): the {what} chunks {got} do not cover the {want} {what} of the phase')
+    return out
+
+
+def _block_tables(tabs, groups, ntime, count):
+    """The tables of the block's tiles, per tile slot and date of the block (only the block's dates), and one more slot of
+    NaN tables for the pixels of no tile.
+
+    Parameters
+    ----------
+    tabs : list - The hydrostatic, wet and mapping tables of each tile (see OpenedModel.phase).
+    groups : list of tuple - The dates of the block by model time chunk: (positions, local indices).
+    ntime : int - The number of dates of the block.
+    count : int - The number of table entries.
+
+    Returns
+    -------
+    tuple of numpy.ndarray - (HYD, WET, MAPC): (slot, date, row, col, height), (slot, date, row, col, height) and
+    (slot, date, row, col, component, 4) with the constant K.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from insardev_toolkit.utils_atmosphere import _block_tables
+    >>> HYD, WET, MAPC = _block_tables([], ((np.arange(1), np.arange(1)),), 1, 1)
+    >>> HYD.shape
+    (1, 1, 2, 2, 1)
+    """
+    nslot = len(tabs)
+    if nslot:
+        t0 = tabs[0][0][0]
+        ty, tx = t0.shape[2], t0.shape[3]
+    else:
+        ty = tx = 2
+    HYD = np.full((nslot + 1, ntime, ty, tx, count), np.nan)
+    WET = np.full((nslot + 1, ntime, ty, tx, count), np.nan)
+    MAPC = np.full((nslot + 1, ntime, ty, tx, 2, 4), np.nan)
+    for s, tab in enumerate(tabs):
+        for g, (pos, loc) in enumerate(groups):
+            HYD[s, pos] = np.asarray(tab[0][g], np.float64)[loc, 0]
+            WET[s, pos] = np.asarray(tab[1][g], np.float64)[loc, 0]
+            MAPC[s, pos] = _mapping_coefs(np.asarray(tab[2][g], np.float64)[loc, 0])
+    return HYD, WET, MAPC
+
+
+def _phase_task(lattice, ele, inc, look, tabs, *, cut, block, **kw):
+    """One output block of the lazy phase: the block called on the VIEWS of the input blocks it overlaps, each writing its
+    part of one output allocated once (out=); no copy of the inputs. A block that returns another array than its out is
+    copied into the view.
+
+    Parameters
+    ----------
+    lattice : _Lattice - The cell index of the model.
+    ele, inc, look : list of list of numpy.ndarray or None - The overlapping blocks of the heights, incidences and looks.
+    tabs : list - The model tables of the block's tiles (see OpenedModel.phase).
+    cut : tuple of two lists of slice - The rows and the columns of the block in each overlapping input block.
+    block : callable - _phase_block, bound when the graph is built (as before the chunked lazy phase).
+    kw : dict - The other arguments of _phase_block (y and x: the block's 1-D axes).
+
+    Returns
+    -------
+    numpy.ndarray - float32 phases, (time, y, x).
+    """
+    rsl, csl = cut
+    y, x = kw.pop('y'), kw.pop('x')
+    hs = [s.stop - s.start for s in rsl]
+    ws = [s.stop - s.start for s in csl]
+    ntime = sum(pos.size for pos, _ in kw['groups'])
+    out = np.empty((ntime, sum(hs), sum(ws)), dtype=np.float32)
+    r0 = 0
+    for i, rs in enumerate(rsl):
+        c0 = 0
+        for j, cs in enumerate(csl):
+            part = out[:, r0:r0 + hs[i], c0:c0 + ws[j]]
+            res = block(ele[i][j][rs, cs], inc[i][j][rs, cs], None if look is None else look[i][j][rs, cs], tabs,
+                        y=y[r0:r0 + hs[i]], x=x[c0:c0 + ws[j]], index=lattice.index, out=part, **kw)
+            if res is not part:
+                part[...] = res
+            c0 += ws[j]
+        r0 += hs[i]
+    return out
+
+
+def _phase_block(ele, inc, look, tabs, *, y, x, groups, nodes, index, name, tiles, origins, consts, pier=None, out=None):
+    """One output block (time, y, x) of an opened model, float32 radians, in one numba pass per pixel.
 
     Each pixel is evaluated on the 4 nodes of its cell (of its pierce point with pier), which lie in one tile; a pixel
     whose cell has no tile, or whose height or incidence is NaN, is NaN.
 
     Parameters
     ----------
-    ele : numpy.ndarray - The ellipsoidal heights of the chunk, metres.
-    inc : numpy.ndarray - The incidences of the chunk, radians.
-    look : numpy.ndarray or None - The look azimuths of the chunk, degrees (with pier).
-    tabs : list - The tables of the chunk's tiles.
-    y, x : numpy.ndarray - The pixel axes in the output CRS.
-    yoff, xoff : sequence of int - The chunk offsets of the axes.
-    chunk : tuple of int - The chunk index.
-    groups : list of tuple - The times of each time group.
+    ele : numpy.ndarray - The ellipsoidal heights of the block, metres.
+    inc : numpy.ndarray - The incidences of the block, radians.
+    look : numpy.ndarray or None - The look azimuths of the block, degrees (with pier).
+    tabs : list - The tables of the block's tiles.
+    y, x : numpy.ndarray - The pixel axes of the block in the output CRS: 1-D, or 2-D of the shape of ele.
+    groups : list of tuple - The dates of the block, by model time chunk: (positions, local indices).
     nodes, index : tuple - The lattice nodes and the cell index.
     name : str - The model name, for the messages.
-    tiles : numpy.ndarray - The tiles of the chunk.
+    tiles : numpy.ndarray - The tiles of the block.
     origins : list of tuple - The first node (y0, x0) of each tile.
     consts : tuple - (h0, step, count, niell, k) of the model.
     pier : None or tuple - None, or (shell, control, geocentric): the IONEX pierce point with the shell R + H (metres), the
-    control mesh of the output CRS (_control, None for a geographic CRS) and the zenith flag (_pierce_offset).
+    control mesh of the output CRS (_control, None for a geographic CRS) and the zenith flag (_pierce_one).
+    out : numpy.ndarray or None - The output, (time, y, x) float32, to fill (a view of a larger output); None allocates it.
 
     Returns
     -------
-    numpy.ndarray - float32 phases, (time, y, x).
+    numpy.ndarray - float32 phases, (time, y, x): out.
 
     Raises
     ------
     ValueError: For a pixel outside the node mesh, an incidence outside [0, 90) degrees, or a height outside the tables.
     """
-    ny, nx = np.shape(ele)
-    pierce = None if pier is None else (ele, inc, look, pier[0], pier[1], pier[2])
-    cell, uu, vv, missing, zeff = _chunk_cells(y, x, ny, nx, yoff, xoff, chunk, nodes, index, pierce)
-    if missing:
-        raise ValueError(f'ERROR: {name} phase(): {missing} pixel(s) of the chunk lie outside the model nodes '
-                         f'(ERA5 and VMF3 reprojected to the output crs, IONEX in latitude and longitude)')
-    ncol = index[4]
-    h = np.ascontiguousarray(np.asarray(ele, dtype=np.float64)).ravel()
-    z = np.ascontiguousarray(np.asarray(inc, dtype=np.float64) if zeff is None else zeff).ravel()
-    lj = cell // ncol
-    li = cell - lj * ncol
-    own = index[5][cell]
+    ele = np.asarray(ele)
+    inc = np.asarray(inc)
+    ny, nx = ele.shape
     ntime = sum(pos.size for pos, _ in groups)
-    out = np.empty((ntime, ny * nx), dtype=np.float32)
-    for k, tile in enumerate(tiles):
-        pix = np.flatnonzero(own == tile)
-        if pix.size:
-            _evaluate_tile(out, pix, tabs[k], groups, np.ascontiguousarray(lj[pix] - origins[k][0]),
-                           np.ascontiguousarray(li[pix] - origins[k][1]), uu[pix], vv[pix], h[pix], z[pix], consts)
-    pix = np.flatnonzero(own < 0)
-    if pix.size:
-        count = consts[2]
-        nan = [[np.full((ntime, 1, 2, 2, count), np.nan)], [np.full((ntime, 1, 2, 2, count), np.nan)],
-               [np.full((ntime, 1, 2, 2, 2, 3), np.nan)]]
-        zero = np.zeros(pix.size, dtype=np.int64)
-        _evaluate_tile(out, pix, nan, ((np.arange(ntime), np.arange(ntime)),), zero, zero, uu[pix], vv[pix], h[pix], z[pix],
-                       consts)
-    return out.reshape(ntime, ny, nx)
+    h0, step, count, niell, k = consts
+    X, Y = nodes
+    meta, imeta, start, items, ncol, owner = index[:6]
+    tiles = [int(t) for t in tiles]
+    slot_of = np.full(max([int(owner.max()) if owner.size else -1] + tiles) + 2, -1, np.int64)
+    for s, t in enumerate(tiles):
+        slot_of[t] = s
+    oy = np.array([o[0] for o in origins] + [0], np.int64)
+    ox = np.array([o[1] for o in origins] + [0], np.int64)
+    HYD, WET, MAPC = _block_tables(tabs, groups, ntime, count)
+    y = np.asarray(y, np.float64)
+    x = np.asarray(x, np.float64)
+    axes1d = y.ndim == 1
+    y1, x1 = (y, x) if axes1d else (np.zeros(1), np.zeros(1))
+    y2, x2 = (np.zeros((1, 1)), np.zeros((1, 1))) if axes1d else (y, x)
+    z2 = np.zeros((1, 1))
+    pierce = pier is not None
+    shell, geocentric, ctrl = 0.0, True, False
+    ky = kx = 0
+    S0 = S1 = 1.0
+    lat_c = lon_c = z2
+    if pierce:
+        shell, control, geocentric = float(pier[0]), pier[1], bool(pier[2])
+        if look is None:
+            raise ValueError('ERROR: IONEX phase() needs the look azimuth (look=): the pierce point lies along it')
+        look = np.asarray(look)
+        if control is not None:
+            ctrl = True
+            ky, kx, (S0, S1), lat_c, lon_c = control
+            lat_c = np.ascontiguousarray(lat_c, np.float64)
+            lon_c = np.ascontiguousarray(lon_c, np.float64)
+
+    else:
+        look = z2
+    flags = np.zeros(4, np.int64)
+    if out is None:
+        out = np.empty((ntime, ny, nx), dtype=np.float32)
+    _block_kernel(axes1d, y1, x1, y2, x2, ele, inc, look, np.ascontiguousarray(X, np.float64).ravel(),
+                  np.ascontiguousarray(Y, np.float64).ravel(), X.shape[1], meta, imeta, start, items, ncol, owner, slot_of,
+                  oy, ox, HYD, WET, MAPC, float(h0), float(step), int(count), np.asarray(niell, np.float64), float(k), pierce,
+                  shell, geocentric, ctrl, int(ky), int(kx), float(S0), float(S1), lat_c, lon_c, flags, out)
+    if flags[_INC_PRE]:
+        raise ValueError('ERROR: the incidence of the burst is outside [0, 90) degrees')
+    if flags[_MISSING]:
+        raise ValueError(f'ERROR: {name} phase(): {int(flags[_MISSING])} pixel(s) of the chunk lie outside the model nodes '
+                         f'(ERA5 and VMF3 reprojected to the output crs, IONEX in latitude and longitude)')
+    if flags[_KERR] == 1:
+        raise ValueError('ERROR: the incidence of the burst is outside [0, 90) degrees')
+    if flags[_KERR] == 2:
+        raise ValueError('ERROR: a pixel height is outside the height range of the atmosphere model tables')
+    if flags[_GAPS]:
+        warnings.warn(f'{int(flags[_GAPS])} pixel-dates lie deeper below the model surface than the atmosphere tables reach '
+                      f'(the law below the surface ends there): their phase is NaN')
+    return out
 
 
 def _tile_chunks(a):
@@ -950,11 +1166,12 @@ def _node_grid(terms):
     -------
     tuple - (lat, lon, y0, x0): float64 degrees and int64 node indices.
     """
-    lat = np.asarray(terms['lat'].values, dtype=np.float64)
-    lon = np.asarray(terms['lon'].values, dtype=np.float64)
-    y0 = np.asarray(terms['tile y0'].values, dtype=np.int64)
-    x0 = np.asarray(terms['tile x0'].values, dtype=np.int64)
-    return lat, lon, y0, x0
+    import dask
+    # the terms may be lazy: computed on the synchronous scheduler (no Client, no thread pool)
+    lat, lon, y0, x0 = dask.compute(terms['lat'].data, terms['lon'].data, terms['tile y0'].data, terms['tile x0'].data,
+                                    scheduler='synchronous')
+    return (np.asarray(lat, dtype=np.float64), np.asarray(lon, dtype=np.float64),
+            np.asarray(y0, dtype=np.int64), np.asarray(x0, dtype=np.int64))
 
 
 def _consts(terms):
@@ -1041,13 +1258,15 @@ class OpenedModel:
                 self._tiles_done[k] = [[np.asarray(values[3 * q + j], dtype=np.float64)] for j in range(3)]
         return [self._tiles_done[k] for k in tiles]
 
-    def phase(self, times, y, x, ele, inc, look=None, geocentric=True):
+    def phase(self, times, y, x, ele, inc, look=None, geocentric=True, chunks=None):
         """The phase in radians (float32, shape (time, y, x)) of the burst times on one output chunk or a whole grid.
 
-        A dask ele, inc or look gives a lazy result with the chunks of ele; each pixel is bilinear over the 4
-        reprojected nodes around it (IONEX: over the 4 latitude-longitude nodes around its pierce point).
-        IONEX evaluates each pixel at its geodesic pierce point along the look azimuth (TN-200 steps 2 and 4; exact in a
-        projected CRS) and needs look; ERA5 and VMF3 ignore it.
+        A dask ele, inc or look gives a lazy result: each output block is one task that evaluates only its own dates and
+        pixels, reads only the model tables of its dates, and takes the ele, inc and look blocks it overlaps (cut in numpy
+        inside the task). inc and look in other chunks than ele are rechunked to ele's (one WARNING per call). Each pixel is bilinear over the 4
+        reprojected nodes around it (IONEX: over the 4 latitude-longitude nodes around its pierce point). IONEX evaluates
+        each pixel at its geodesic pierce point along the look azimuth (TN-200 steps 2 and 4; exact in a projected CRS) and
+        needs look; ERA5 and VMF3 ignore it.
 
         Parameters
         ----------
@@ -1060,6 +1279,8 @@ class OpenedModel:
         geocentric : bool - IONEX only. True (default): the mapping at the geocentric zenith of the exact ray at the pierce
         point (ETAD ATBD 2.7 Eq. 45-46). False: the mapping at the ellipsoid-normal zenith of the pixel (FRM4SAR TN-200
         Eq. 22), for verifications against TN-200. ERA5 and VMF3 ignore it.
+        chunks : None or tuple of three sequences of int - The chunks (date, y, x) of a lazy result, e.g. the stack data's
+        (Stack._data_chunks). None: one chunk of all dates and the chunks of ele. Lazy inputs only.
 
         Returns
         -------
@@ -1069,8 +1290,8 @@ class OpenedModel:
         Raises
         ------
         ValueError: For a pixel with a NaN coordinate or outside the node mesh, outside the height range of the
-        tables, or at an
-        incidence outside [0, 90) degrees; for IONEX without look.
+        tables, or at an incidence outside [0, 90) degrees; for IONEX without look; for chunks that do not cover the dates and
+        the pixels.
         """
         import dask.array as da
         import functools
@@ -1099,14 +1320,12 @@ class OpenedModel:
         else:
             raise ValueError(f'ERROR: {self.name} phase(): y and x are a grid of 1-D axes or two arrays of one shape')
         # a NaN coordinate is missing on every model, before the control mesh (_control) could spread it to finite pixels
-        yy, xx = np.broadcast_arrays(y[:, None] if y.ndim == 1 else y, x[None, :] if x.ndim == 1 else x)
-        missing = int(np.count_nonzero(~np.isfinite(yy) | ~np.isfinite(xx)))
+        missing = _missing(y, x)
         if missing:
             raise ValueError(f'ERROR: {self.name} phase(): {missing} pixel(s) of the chunk lie outside the model nodes '
                              f'(ERA5 and VMF3 reprojected to the output crs, IONEX in latitude and longitude)')
         nodes = (self.x, self.y)
         pier = (float(shell), _control(y, x, self.crs), bool(geocentric)) if pierce else None
-        zero = np.zeros(1, dtype=np.int64)
         if isinstance(ele, da.Array) or isinstance(inc, da.Array) or isinstance(look, da.Array):
             if y.ndim != 1:
                 raise ValueError(f'ERROR: {self.name} phase(): the lazy phase takes the 1-D axes y and x')
@@ -1114,55 +1333,76 @@ class OpenedModel:
             inc = da.asarray(inc)
             if ele.shape != shape or inc.shape != shape:
                 raise ValueError(f'ERROR: {self.name} phase(): ele and inc must have the shape of the pixels')
-            chunks = ele.chunks
-            inc = inc.rechunk(chunks)
+            # the secondaries inc and look take the ele (y, x) chunks, the primary's: rechunked with one WARNING per call
+            moved = []
+            if inc.chunks != ele.chunks:
+                inc = inc.rechunk(ele.chunks)
+                moved.append('inc')
             if look is not None:
                 look = da.asarray(look)
                 if look.shape != shape:
                     raise ValueError(f'ERROR: {self.name} phase(): look must have the shape of the pixels')
-                look = look.rechunk(chunks)
-            yoff = np.concatenate(([0], np.cumsum(chunks[0])[:-1])).astype(np.int64)
-            xoff = np.concatenate(([0], np.cumsum(chunks[1])[:-1])).astype(np.int64)
-            name = 'phase-' + tokenize(self.name, ele, inc, look, idx, y, x, bool(geocentric),
-                                       *[a.name for a in self._arrays])
+                if look.chunks != ele.chunks:
+                    look = look.rechunk(ele.chunks)
+                    moved.append('look')
+            if moved:
+                print(f"WARNING: {self.name} phase(): {', '.join(moved)} rechunked to the ele (y, x) chunks.", flush=True)
+            out = ((len(idx),),) + ele.chunks if chunks is None else _output_chunks(chunks, len(idx), shape)
+            dedges, yedges, xedges = _edges(out[0]), _edges(out[1]), _edges(out[2])
+            eedges = (_edges(ele.chunks[0]), _edges(ele.chunks[1]))
             ekeys = ele.__dask_keys__()
             ikeys = inc.__dask_keys__()
             lkeys = None if look is None else look.__dask_keys__()
-            groups, used = _time_groups(idx, self._tedges)
-            layer = {}
-            for bi in range(len(chunks[0])):
-                for bj in range(len(chunks[1])):
+            name = 'phase-' + tokenize(self.name, ele, inc, look, idx, y, x, bool(geocentric), out,
+                                       *[a.name for a in self._arrays])
+            lattice = (name, 'lattice')
+            layer = {lattice: _Lattice(self._index)}
+            dgroups = [_time_groups(idx[dedges[c]:dedges[c + 1]], self._tedges) for c in range(len(out[0]))]
+            for bi in range(len(out[1])):
+                r0, r1 = int(yedges[bi]), int(yedges[bi + 1])
+                ye = _overlap(eedges[0], r0, r1)
+                y_blk = y[r0:r1]
+                for bj in range(len(out[2])):
+                    c0, c1 = int(xedges[bj]), int(xedges[bj + 1])
+                    xe = _overlap(eedges[1], c0, c1)
+                    x_blk = x[c0:c1]
                     if pierce:
                         tiles = list(range(self._arrays[0].shape[1]))     # IONEX is one tile of the whole lattice
                     else:
-                        cell = _chunk_cells(y, x, chunks[0][bi], chunks[1][bj], yoff, xoff, (bi, bj), nodes, self._index)[0]
-                        tiles = _plan(cell, self._index[5])
-                    keys = [[[_first_key(self._keys[a][tc][k]) for tc in used] for a in range(3)] for k in tiles]
-                    layer[(name, 0, bi, bj)] = (
-                        functools.partial(_phase_block, y=y, x=x, yoff=yoff, xoff=xoff, chunk=(bi, bj), groups=groups,
-                                          nodes=nodes, index=self._index, name=self.name, tiles=tiles,
-                                          origins=self._origins(tiles), consts=consts, pier=pier),
-                        ekeys[bi][bj], ikeys[bi][bj], None if lkeys is None else lkeys[bi][bj], keys)
+                        tiles = _plan(self._index, *_extent(y_blk, x_blk))
+                    cut = ([s for _, s in ye], [s for _, s in xe])
+                    eb = [[ekeys[i][j] for j, _ in xe] for i, _ in ye]
+                    ib = [[ikeys[i][j] for j, _ in xe] for i, _ in ye]
+                    lb = None if lkeys is None else [[lkeys[i][j] for j, _ in xe] for i, _ in ye]
+                    for dc in range(len(out[0])):
+                        groups, used = dgroups[dc]
+                        keys = [[[_first_key(self._keys[a][tc][k]) for tc in used] for a in range(3)] for k in tiles]
+                        layer[(name, dc, bi, bj)] = (
+                            functools.partial(_phase_task, cut=cut, block=_phase_block, y=y_blk, x=x_blk,
+                                              groups=groups,
+                                              nodes=nodes, name=self.name, tiles=tiles, origins=self._origins(tiles),
+                                              consts=consts, pier=pier),
+                            lattice, eb, ib, lb, keys)
             deps = [ele, inc] + ([] if look is None else [look]) + self._arrays
             graph = HighLevelGraph.from_collections(name, layer, dependencies=deps)
-            return da.Array(graph, name, chunks=((len(idx),),) + chunks, dtype=np.float32,
-                            meta=np.empty((0, 0, 0), dtype=np.float32))
-        ele = np.asarray(ele, dtype=np.float64)
-        inc = np.asarray(inc, dtype=np.float64)
+            return da.Array(graph, name, chunks=out, dtype=np.float32, meta=np.empty((0, 0, 0), dtype=np.float32))
+        if chunks is not None:
+            raise ValueError(f'ERROR: {self.name} phase(): chunks= needs a dask ele, inc or look (the lazy phase)')
+        ele = np.asarray(ele)                  # the kernel reads each pixel as float64: the inputs are not copied
+        inc = np.asarray(inc)
         if ele.shape != shape or inc.shape != shape:
             raise ValueError(f'ERROR: {self.name} phase(): ele and inc must have the shape of the pixels')
         if look is not None:
-            look = np.asarray(look, dtype=np.float64)
+            look = np.asarray(look)
             if look.shape != shape:
                 raise ValueError(f'ERROR: {self.name} phase(): look must have the shape of the pixels')
         if pierce:
             tiles = list(range(self._arrays[0].shape[1]))
         else:
-            cell = _chunk_cells(y, x, shape[0], shape[1], zero, zero, (0, 0), nodes, self._index)[0]
-            tiles = _plan(cell, self._index[5])
+            tiles = _plan(self._index, *_extent(y, x))
         tabs = self._tiles(tiles)
         groups = ((np.arange(idx.size), idx),)
-        return _phase_block(ele, inc, look, tabs, y=y, x=x, yoff=zero, xoff=zero, chunk=(0, 0), groups=groups, nodes=nodes,
+        return _phase_block(ele, inc, look, tabs, y=y, x=x, groups=groups, nodes=nodes,
                             index=self._index, name=self.name, tiles=tiles, origins=self._origins(tiles), consts=consts,
                             pier=pier)
 
@@ -1170,7 +1410,7 @@ class OpenedModel:
 class AtmosphereModel:
     """Mixin of the atmosphere model classes ERA5, VMF3 and IONEX; open() opens a model folder once per stack."""
 
-    def open(self, folder, times, crs, wavelength, factor=1.0):
+    def open(self, folder, times, crs, wavelength, factor=1.0, heights=None):
         """Open the model of a folder once for a stack: lazy terms over the time union of the bursts, and the nodes (in the
         output CRS; IONEX in latitude and longitude).
 
@@ -1181,15 +1421,18 @@ class AtmosphereModel:
         crs : int, str, rasterio CRS or None - The output CRS of the stack; None for lon and lat.
         wavelength : float - The radar wavelength, metres.
         factor : float - The ionospheric factor (IONEX only), dimensionless.
+        heights : tuple of float or None - (lo, hi), the ellipsoidal heights (metres) of the caller's pixels: the zenith tables
+            cover that range (ERA5, VMF3; IONEX ignores it). None: the envelope at the model's table step (for callers without a
+            known range). Heights outside -500..9000 m raise one ERROR line.
 
         Returns
         -------
         OpenedModel
         """
-        terms = self._phase(folder, times, wavelength, factor)
+        terms = self._phase(folder, times, wavelength, factor, heights)
         return OpenedModel(type(self).__name__, terms, crs)
 
-    def _phase(self, folder, times, wavelength, factor):
+    def _phase(self, folder, times, wavelength, factor, heights=None):
         """The terms of the model on its native nodes, in phase units.
 
         Parameters
@@ -1198,6 +1441,7 @@ class AtmosphereModel:
         times : list of str or pandas.Timestamp - The acquisition times, UTC.
         wavelength : float - The radar wavelength, metres.
         factor : float - The ionospheric factor (IONEX only), dimensionless.
+        heights : tuple or None - (lo, hi) ellipsoidal metres of the caller's pixels, or None (the envelope); see open.
         """
         raise NotImplementedError('ERROR: the model class names its terms in _phase')
 

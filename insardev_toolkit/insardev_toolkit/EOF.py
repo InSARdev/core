@@ -48,10 +48,12 @@ class EOF(progressbar_joblib):
         basedir : str
             The directory where the downloaded orbit files will be saved.
         scenes : list or pandas.DataFrame
-            List of scene identifiers or a DataFrame containing scenes for which the orbits are to be downloaded.
+            List of scene identifiers, a DataFrame containing scenes, or the table of ASF.search (platform, startTime)
+            for which the orbits are to be downloaded.
         n_jobs : int, optional
             The number of concurrent download jobs, at most two per CPU this process may use (a larger number is
-            capped, with a note). Default is 8.
+            capped, with a note). Negative values follow joblib: -1 all CPUs, -2 all but one, and so on; 0 raises
+            ValueError. Default is 8.
         joblib_backend : str, optional
             The backend for parallel processing. Default is 'loky'.
         skip_exist : bool, optional
@@ -140,6 +142,28 @@ class EOF(progressbar_joblib):
         if not isinstance(scenes, pd.DataFrame) and isinstance(getattr(scenes, 'df', None), pd.DataFrame):
             scenes = scenes.df
 
+        # the ASF search table (ASF.search): the mission from its platform (SENTINEL-1A is S1A), the start time in UTC; its orbit column is
+        # the absolute orbit number, not an orbit file, so with skip_exist each scene takes the held orbit file that covers it
+        if isinstance(scenes, pd.DataFrame) and 'mission' not in scenes.columns and {'platform', 'startTime'} <= set(scenes.columns):
+            platform = scenes['platform'].astype(str).str.upper()
+            if not platform.str.match(r'^SENTINEL-1[A-D]$').all():
+                raise ValueError(f'ERROR: not a Sentinel-1 platform: {sorted(set(platform[~platform.str.match(r"^SENTINEL-1[A-D]$")]))}')
+            times = pd.to_datetime(scenes['startTime'], utc=True).dt.tz_localize(None)
+            scenes = pd.DataFrame({'mission': ('S1' + platform.str[-1]).values, 'startTime': times.values})
+            if skip_exist:
+                found = utils_eof.parse_files(glob.glob('*.EOF', root_dir=basedir))
+                scenes['orbit'] = [utils_eof.select(found, mission, when) for mission, when in zip(scenes['mission'], scenes['startTime'])]
+
+        # a list of scene names is the records of its scenes; with skip_exist each takes the orbit file of basedir that
+        # covers it (the scan of the data directory, utils_eof.select), as the orbit column of a DataFrame does
+        if isinstance(scenes, list):
+            scenes = pd.DataFrame([(scene.split('_')[0], datetime.strptime(scene.split('_')[5], '%Y%m%dT%H%M%S'))
+                                   for scene in scenes], columns=['mission', 'startTime'])
+            if skip_exist:
+                found = utils_eof.parse_files(glob.glob('*.EOF', root_dir=basedir))
+                scenes['orbit'] = [utils_eof.select(found, mission, when)
+                                   for mission, when in zip(scenes['mission'], scenes['startTime'])]
+
         if isinstance(scenes, pd.DataFrame):
             if skip_exist:
                 # scenes without orbits, and scenes with a restituted orbit, which a precise orbit replaces
@@ -151,9 +175,6 @@ class EOF(progressbar_joblib):
             else:
                 # process all the scenes
                 df_data = scenes[['mission', 'startTime']].assign(precise=False).values
-        elif isinstance(scenes, list):
-            df_data = [(scene.split('_')[0], datetime.strptime(scene.split('_')[5],'%Y%m%dT%H%M%S'), False)
-                       for scene in scenes]
         else:
             raise ValueError(f'Expected secenes argument is list or Pandas DataFrame')
         # nothing to do

@@ -683,31 +683,57 @@ def _write_vrt(vrt, source, files):
     write_file(vrt, _index_xml(vrt, source, files))
 
 
-def store(basedir, source, items, fetch, n_jobs=8, joblib_backend='loky'):
+def _tile_file(folder, source, epoch, lon0, lat0):
     """
-    Stores the (epoch, tile) items of a source: each item without a tile file is fetched and written as one NetCDF4
-    file; existing tile files are kept, and the VRT basedir/<source>.vrt is rebuilt from the files present. Fetches run
-    in joblib workers, while this process writes the files and the VRT in item order, so the result equals that of
-    n_jobs=1. An unreadable or missing listed tile file raises one ERROR: line before any fetch that needs it.
+    The tile file of an item, folder/<tile>_<epoch>.nc.
 
-    Parameters: basedir (str, tiles go to basedir/<source>/, the index to basedir/<source>.vrt); source (str, 'ERA5',
-    'VMF3', 'VMF3_OP', 'VMF3_EI' or 'VMF3_FC'); items (DataFrame with columns epoch, lon, lat; whole-degree corners for
-    ERA5, whole plus 0.5 for VMF3, another corner raises one ERROR: line); fetch (callable fetch(epoch, lon, lat)
-    returning {variable: {level: 2-D array}} on the tile_nodes; called for new items only, and picklable when n_jobs is
-    not 1); n_jobs (int or None, at most two fetches per CPU; None or 1 fetches here; default 8); joblib_backend (str,
-    default 'loky'). Returns: DataFrame with columns epoch, tile, path, status ('new' or 'existing'), one row per unique
-    item; path is absolute.
+    Parameters: folder (str, basedir/<source>); source (str); epoch (pandas.Timestamp, UTC); lon0, lat0 (the corner of the tile).
+    Returns: str.
 
     Examples
     --------
-    >>> store('dem_tiles', 'ERA5', scene_items(scenes, 'ERA5'), fetch)
-    >>> store('dem_tiles', 'ERA5', scene_items(scenes, 'ERA5'), fetch, n_jobs=4)
+    >>> _tile_file('dem_tiles/ERA5', 'ERA5', pd.Timestamp('2016-05-11 08:00:00'), 10, 40)
+    """
+    return os.path.join(folder, f'{tile_name(lon0, lat0, _source(source)["offset"])}_{epoch.strftime(EPOCH_FORMAT)}.nc')
+
+
+def _lists_all(vrt, paths):
+    """
+    True when the VRT exists and lists every path, read from the VRT alone (no tile file is read). A VRT that cannot be
+    read lists nothing.
+
+    Parameters: vrt (str, basedir/<source>.vrt); paths (list of str, the files of a call). Returns: bool.
+
+    Examples
+    --------
+    >>> _lists_all('dem_tiles/ERA5.vrt', ['dem_tiles/ERA5/N40E010_20160511T080000.nc'])
+    False
+    """
+    if not os.path.isfile(vrt):
+        return False
+    try:
+        listed = set(_listed(vrt))
+    except ValueError:
+        return False
+    return all(os.path.abspath(p) in listed for p in paths)
+
+
+def _items(basedir, source, items):
+    """
+    The (epoch, lon0, lat0) items of a store call, validated and without repeats, with their tile files.
+
+    Parameters: basedir (str); source (str); items (DataFrame with columns epoch, lon, lat, see store). Returns: (base,
+    folder, vrt, wanted, paths): base the absolute basedir, wanted the items, paths the tile file of each item.
+    Raises: ValueError, one ERROR: line, for items that are not a DataFrame with epoch, lon and lat, an epoch off the grid,
+    another corner, or no items.
+
+    Examples
+    --------
+    >>> _items('dem_tiles', 'ERA5', scene_items(scenes, 'ERA5'))
     """
     cfg = _source(source)
     if not isinstance(items, pd.DataFrame) or not {'epoch', 'lon', 'lat'} <= set(items.columns):
         raise ValueError('ERROR: items must be a DataFrame with epoch, lon and lat columns')
-    if not callable(fetch):
-        raise ValueError('ERROR: fetch must be a function fetch(epoch, lon, lat)')
     base = os.path.abspath(basedir)
     folder = os.path.join(base, source)
     vrt = os.path.join(base, f'{source}.vrt')
@@ -724,56 +750,162 @@ def store(basedir, source, items, fetch, n_jobs=8, joblib_backend='loky'):
             wanted.append(key)
     if not wanted:
         raise ValueError('ERROR: no items to store')
-    os.makedirs(folder, exist_ok=True)
-    present = _scan(folder, tolerant=True, offset=cfg['offset'])
-    bad = [f for f in present if f['structure'] is None]
-    if bad:
-        more = f' (and {len(bad) - 1} more unreadable tile files)' if len(bad) > 1 else ''
-        raise ValueError(bad[0]['error'] + more)
-    structure = present[0]['structure'] if present else None
-    for f in present:
-        if f['structure'] != structure:
-            raise ValueError(f'ERROR: {os.path.relpath(f["path"], base)} has variables {_summary(f["structure"])}, '
-                             f'the other tiles have {_summary(structure)}')
-    def file_of(epoch, lon0, lat0):
+    return base, folder, vrt, wanted, [_tile_file(folder, source, *key) for key in wanted]
+
+
+def _complete(basedir, source, items):
+    """
+    True when the VRT of the items exists and lists every tile file of them: all done, decided from the VRT alone.
+
+    Parameters: basedir (str); source (str); items (DataFrame, as for store). Returns: bool.
+
+    Examples
+    --------
+    >>> _complete('dem_tiles', 'ERA5', scene_items(scenes, 'ERA5'))
+    """
+    _, _, vrt, _, paths = _items(basedir, source, items)
+    return _lists_all(vrt, paths)
+
+
+class TileWriter:
+    """
+    The tile files of one store call, written as their values arrive: the folder is made when the call opens, write
+    stores one tile file atomically (existing tile files are kept), and close writes the VRT over the files present once
+    every item of the call is written. done is True when the VRT already lists every item: nothing is written then, and
+    close returns None.
+
+    Parameters: basedir (str); source (str, as store); items (DataFrame, as store). Attributes: new (list of (epoch, lon0,
+    lat0), the items without a tile file, in the order of the items); done (bool); rows (list of (epoch, tile, path) written).
+
+    Examples
+    --------
+    >>> writer = TileWriter('dem_tiles', 'ERA5', scene_items(scenes, 'ERA5'))
+    >>> writer.write(epoch, 10, 40, served)
+    >>> writer.close()
+    """
+
+    def __init__(self, basedir, source, items):
+        self.source = source
+        self.offset = _source(source)['offset']
+        self.base, self.folder, self.vrt, self.wanted, self.paths = _items(basedir, source, items)
+        self.done = _lists_all(self.vrt, self.paths)
+        self.new, self.rows, self.structure = [], [], None
+        if self.done:
+            return
+        os.makedirs(self.folder, exist_ok=True)
+        present = _scan(self.folder, tolerant=True, offset=self.offset)
+        bad = [f for f in present if f['structure'] is None]
+        if bad:
+            more = f' (and {len(bad) - 1} more unreadable tile files)' if len(bad) > 1 else ''
+            raise ValueError(bad[0]['error'] + more)
+        self.structure = present[0]['structure'] if present else None
+        for f in present:
+            if f['structure'] != self.structure:
+                raise ValueError(f'ERROR: {os.path.relpath(f["path"], self.base)} has variables {_summary(f["structure"])}, '
+                                 f'the other tiles have {_summary(self.structure)}')
+        requested = set(self.paths)
+        if os.path.isfile(self.vrt):
+            for path in _listed(self.vrt):
+                if not os.path.isfile(path) and path not in requested:
+                    raise ValueError(f'ERROR: {os.path.basename(self.vrt)} lists the tile file '
+                                     f'{os.path.relpath(path, self.base)}, which is missing: request its epoch and tile '
+                                     f'again to fetch it')
+        self.new = [key for key, path in zip(self.wanted, self.paths) if not exists(path)]
+
+    def write(self, epoch, lon0, lat0, served):
         """
-        The tile file of an item, basedir/<source>/<tile>_<epoch>.nc.
+        Writes the tile file of one item, atomically, from its served values as the fetch of store returns them.
+
+        Parameters: epoch (pandas.Timestamp); lon0, lat0 (int, the corner); served (dict {variable: {level: 2-D array}}).
+        Returns: None.
 
         Examples
         --------
-        >>> file_of(pd.Timestamp('2016-05-11 08:00:00'), 10, 40)
+        >>> writer.write(pd.Timestamp('2016-05-11 08:00:00'), 10, 40, served)
         """
-        return os.path.join(folder, f'{tile_name(lon0, lat0, cfg["offset"])}_{epoch.strftime(EPOCH_FORMAT)}.nc')
+        served, structure = _normalise(served, self.source)
+        if self.structure is None:
+            self.structure = structure
+        elif structure != self.structure:
+            raise ValueError(f'ERROR: {tile_name(lon0, lat0, self.offset)} at {epoch} has variables {_summary(structure)}, '
+                             f'the tiles have {_summary(self.structure)}')
+        path = _tile_file(self.folder, self.source, epoch, lon0, lat0)
+        _write_tile(path, self.source, lon0, lat0, served, self.structure, epoch)
+        self.rows.append((epoch, tile_name(lon0, lat0, self.offset), os.path.abspath(path)))
+
+    def close(self):
+        """
+        Writes the VRT over the tile files present, after every item of the call is written; returns the rows of the call
+        as store does: DataFrame with columns epoch, tile, path, or None when no file was written.
+
+        Examples
+        --------
+        >>> writer.close()
+        """
+        if self.done:
+            return None
+        files = _scan(self.folder, offset=self.offset)
+        if files:
+            _write_vrt(self.vrt, self.source, files)
+        if not self.rows:
+            return None
+        return pd.DataFrame(self.rows, columns=['epoch', 'tile', 'path'])
+
+
+def store(basedir, source, items, fetch, n_jobs=8, joblib_backend='loky', progress=True):
+    """
+    Stores the (epoch, tile) items of a source: a VRT basedir/<source>.vrt that lists every item means all done, and None
+    is returned at once (no tile file read, no fetch, no bar, no folder). Otherwise each item without a tile file is
+    fetched and written as one NetCDF4 file (existing tile files are kept) as its fetch completes. A failed fetch does not
+    stop the others: every item is attempted, the completed files are kept, and the call raises the first failure in the
+    order of the items (one ERROR: line) with no VRT written, so the rerun fetches only the missing items. The VRT is
+    rebuilt over the files present after every fetch succeeded. Fetches run in joblib workers, while this process writes
+    the files and the VRT in item order, so the result equals that of n_jobs=1. An unreadable or missing
+    listed tile file raises one ERROR: line before any fetch that needs it. A bar 'Downloading <source>' counts the files
+    fetched; none is shown when nothing is fetched.
+
+    Parameters: basedir (str, tiles go to basedir/<source>/, the index to basedir/<source>.vrt); source (str, 'ERA5',
+    'VMF3', 'VMF3_OP', 'VMF3_EI' or 'VMF3_FC'); items (DataFrame with columns epoch, lon, lat; whole-degree corners for
+    ERA5, whole plus 0.5 for VMF3, another corner raises one ERROR: line); fetch (callable fetch(epoch, lon, lat)
+    returning {variable: {level: 2-D array}} on the tile_nodes; called for new items only, and picklable when n_jobs is
+    not 1); n_jobs (int or None, at most two fetches per CPU; negative values follow joblib: -1 all CPUs, -2 all but one, and so on;
+    0 raises ValueError; None or 1 fetches here; default 8); joblib_backend (str,
+    default 'loky'); progress (bool, default True: the bar of the files fetched; False for a caller with its own bar).
+    Returns: DataFrame with columns epoch, tile, path, one row per file fetched by this call, path absolute; None when
+    nothing is fetched.
+
+    Examples
+    --------
+    >>> store('dem_tiles', 'ERA5', scene_items(scenes, 'ERA5'), fetch)
+    >>> store('dem_tiles', 'ERA5', scene_items(scenes, 'ERA5'), fetch, n_jobs=4)
+    """
+    if not callable(fetch):
+        raise ValueError('ERROR: fetch must be a function fetch(epoch, lon, lat)')
+    writer = TileWriter(basedir, source, items)
+    if writer.done:
+        return None
+    offset = _source(source)['offset']
+    new = writer.new
 
     def fetched(epoch, lon0, lat0):
         """
-        The fetch of one item; an exception it raises becomes one ERROR: line that names the item.
+        The fetch of one item: (True, values), or (False, one ERROR: line that names the item) for an exception it raises.
 
         Examples
         --------
         >>> fetched(pd.Timestamp('2016-05-11 08:00:00'), 10, 40)
         """
         try:
-            return fetch(epoch, lon0, lat0)
+            return True, fetch(epoch, lon0, lat0)
         except Exception as e:
             text = ' '.join(str(e).split())
             if isinstance(e, ValueError) and text.startswith('ERROR: '):
                 text = text[len('ERROR: '):]
             else:
                 text = f'{type(e).__name__}: {text}'
-            raise ValueError(f'ERROR: fetch of {tile_name(lon0, lat0, cfg["offset"])} at {epoch.isoformat()} failed: '
-                             f'{text}') from e
+            return False, (f'ERROR: fetch of {tile_name(lon0, lat0, offset)} at {epoch.isoformat()} failed: {text}')
 
-    requested = {file_of(epoch, lon0, lat0) for epoch, lon0, lat0 in wanted}
-    if os.path.isfile(vrt):
-        for path in _listed(vrt):
-            if not os.path.isfile(path) and path not in requested:
-                raise ValueError(f'ERROR: {os.path.basename(vrt)} lists the tile file '
-                                 f'{os.path.relpath(path, base)}, which is missing: request its epoch and tile '
-                                 f'again to fetch it')
     # the items without a tile file, in the order of the items: only these are fetched
-    new = [key for key in wanted if not exists(file_of(*key))]
-    new_set = set(new)
     parallel = bool(new) and n_jobs is not None and n_jobs != 1
     if parallel:
         import joblib
@@ -785,32 +917,45 @@ def store(basedir, source, items, fetch, n_jobs=8, joblib_backend='loky'):
             joblib.delayed(fetched)(epoch, lon0, lat0) for epoch, lon0, lat0 in new)
     else:
         results = (fetched(epoch, lon0, lat0) for epoch, lon0, lat0 in new)
-    rows = []
+    # a failed fetch is a value, not an exception: no fetch is cancelled, and the failures are raised after all are written
+    failures = []
+    # the bar of the files fetched: none when nothing is fetched, or when the caller shows its own bar
+    from contextlib import nullcontext
+    from .progressbar_joblib import progressbar_joblib
+    bar = None
+    if new and progress:
+        from tqdm.auto import tqdm
+        bar = tqdm(desc=f'Downloading {source}'.ljust(25), total=len(new))
+    # the parallel path counts its fetches by the joblib batches; the serial path counts the files it writes
+    joblib_bar = progressbar_joblib.progressbar_joblib(bar) if parallel and bar is not None else nullcontext()
     try:
-        for epoch, lon0, lat0 in wanted:
-            name = tile_name(lon0, lat0, cfg['offset'])
-            path = file_of(epoch, lon0, lat0)
-            if (epoch, lon0, lat0) not in new_set:
-                status = 'existing'
-            else:
-                served, new_structure = _normalise(next(results), source)
-                if structure is None:
-                    structure = new_structure
-                elif new_structure != structure:
-                    raise ValueError(f'ERROR: {name} at {epoch} has variables {_summary(new_structure)}, the tiles '
-                                     f'have {_summary(structure)}')
-                _write_tile(path, source, lon0, lat0, served, structure, epoch)
-                status = 'new'
-            rows.append((epoch, name, os.path.abspath(path), status))
+        with joblib_bar:
+            try:
+                for epoch, lon0, lat0 in new:
+                    ok, value = next(results)
+                    if not ok:
+                        failures.append(ValueError(value))
+                        continue
+                    try:
+                        writer.write(epoch, lon0, lat0, value)
+                    except Exception as e:
+                        failures.append(e)
+                        continue
+                    if bar is not None and not parallel:
+                        bar.update(1)
+            finally:
+                # an unfinished parallel call is aborted here, before its workers are stopped
+                results.close()
+                if parallel:
+                    release_workers()
     finally:
-        # an unfinished parallel call is aborted here, before its workers are stopped
-        results.close()
-        if parallel:
-            release_workers()
-        files = _scan(folder, offset=cfg['offset'])
-        if files:
-            _write_vrt(vrt, source, files)
-    return pd.DataFrame(rows, columns=['epoch', 'tile', 'path', 'status'])
+        if bar is not None:
+            bar.close()
+    # the files of the completed items are kept; the call raises its first failure in the order of the items, and no VRT is written
+    if failures:
+        raise failures[0]
+    # the index over the files present, written only after every fetch of the call succeeded
+    return writer.close()
 
 
 def _warn_filled(vrt_path, count):
@@ -1098,10 +1243,34 @@ def sources(folder):
     return [name for name in _INDEXES if os.path.isfile(os.path.join(base, f'{name}.vrt'))]
 
 
-# the IONEX day files (IONEX.download writes basedir/IONEX/<yyyymmdd>.nc): the maps of 00:00 to 24:00, one hour apart
-_DAY_FILE = re.compile(r'(\d{8})\.nc')
+# the IONEX day files as published (IONEX.download stores basedir/IONEX/<name>): the long CODE name from 2022-11-27, the
+# short one before; the maps of 00:00 to 24:00, one hour apart
+_DAY_FILE = re.compile(r'COD0OPSFIN_(\d{4})(\d{3})0000_01D_01H_GIM\.INX\.gz|codg(\d{3})0\.(\d{2})i\.Z')
 _IONEX_MAPS = 25
 _IONEX_UNITS = 'seconds since 1970-01-01 00:00:00'
+
+
+def _file_day(m):
+    """
+    The UTC day of an IONEX day file name: the year and day of year of the long name, or the day of year and two-digit year
+    of the short one (the CODE maps begin in 1995).
+
+    Parameters: m (re.Match of _DAY_FILE). Returns: pandas.Timestamp, or None for a day of year the year does not have.
+
+    Examples
+    --------
+    >>> _file_day(_DAY_FILE.fullmatch('codg1320.16i.Z'))
+    Timestamp('2016-05-11 00:00:00')
+    """
+    if m.group(1):
+        year, doy = int(m.group(1)), int(m.group(2))
+    else:
+        year, doy = int(m.group(4)), int(m.group(3))
+        year += 1900 if year >= 90 else 2000
+    first = pd.Timestamp(year, 1, 1)
+    if not 1 <= doy <= (366 if first.is_leap_year else 365):
+        return None
+    return first + pd.Timedelta(days=doy - 1)
 
 
 def _axis(values, name, path):
@@ -1113,7 +1282,7 @@ def _axis(values, name, path):
 
     Examples
     --------
-    >>> _axis(np.array([-87.5, -85.0, -82.5]), 'lat', 'IONEX/20160511.nc')
+    >>> _axis(np.array([-87.5, -85.0, -82.5]), 'lat', 'IONEX/codg1320.16i.Z')
     """
     steps = np.diff(values)
     if len(values) < 2 or not steps[0] > 0 or not np.allclose(steps, steps[0], rtol=0, atol=1e-6):
@@ -1123,55 +1292,49 @@ def _axis(values, name, path):
 
 def _read_day(path, day):
     """
-    The map epochs and grid of one IONEX day file, read without its values; the rms maps are not read.
+    The map epochs and grid of one IONEX day file as published, from its header alone (the maps are not read).
 
-    Parameters: path (str, basedir/IONEX/<yyyymmdd>.nc); day (pandas.Timestamp, the UTC day of the file name). Returns:
-    dict with epochs (DatetimeIndex) and grid (first node, step and count of lon and lat). Raises: ValueError, one
-    ERROR: line, for an unreadable file, a missing variable, not 25 maps, or no regular ascending grid.
+    Parameters: path (str, basedir/IONEX/<name>); day (pandas.Timestamp, the UTC day of the file name). Returns: dict with
+    epochs (DatetimeIndex) and grid (first node, step and count of lon and lat, ascending). Raises: ValueError, one ERROR:
+    line, for an unreadable file or header, not 25 maps one hour apart, a first map not at the day, or no regular grid.
 
     Examples
     --------
-    >>> _read_day('IONEX/20160511.nc', pd.Timestamp('2016-05-11'))
+    >>> _read_day('IONEX/codg1320.16i.Z', pd.Timestamp('2016-05-11'))
     """
-    utils_tiles.hdf5_plugins()
-    import h5py
+    from .IONEX import IONEX
+    text = IONEX._head(path)
     try:
-        with h5py.File(path, 'r') as f:
-            if not all(k in f for k in ('time', 'lat', 'lon', 'tec')):
-                raise ValueError(f'ERROR: {path} has no time, lat, lon and tec variables')
-            units = f['time'].attrs.get('units')
-            units = units.decode() if isinstance(units, bytes) else units
-            if units != _IONEX_UNITS:
-                raise ValueError(f'ERROR: {path} time units are {units!r}, expected {_IONEX_UNITS!r}')
-            seconds = np.asarray(f['time'][()], dtype=np.int64)
-            lat = np.asarray(f['lat'][()], dtype=np.float64)
-            lon = np.asarray(f['lon'][()], dtype=np.float64)
-            shape, dtype = f['tec'].shape, f['tec'].dtype
-    except OSError as e:
-        raise ValueError(f'ERROR: {path} cannot be read: {type(e).__name__}, delete it, then index again') from None
-    if len(seconds) != _IONEX_MAPS:
-        raise ValueError(f'ERROR: {path} has {len(seconds)} maps, {_IONEX_MAPS} expected')
-    if shape != (len(seconds), len(lat), len(lon)) or dtype != np.int32:
-        raise ValueError(f'ERROR: {path} tec is {dtype} {shape}, expected int32 (time, lat, lon)')
-    epochs = pd.to_datetime(seconds, unit='s')
+        head = IONEX._header(text)
+    except ValueError as e:
+        raise ValueError(f'ERROR: {path}: {str(e).removeprefix("ERROR: ")}') from None
+    if head['maps'] != _IONEX_MAPS:
+        raise ValueError(f'ERROR: {path} has {head["maps"]} maps, {_IONEX_MAPS} expected')
+    if head['interval'] != 3600:
+        raise ValueError(f'ERROR: {path} has INTERVAL {head["interval"]} s, 3600 expected')
+    if head['first'] is None or head['last'] is None:
+        raise ValueError(f'ERROR: {path} has no EPOCH OF FIRST MAP or EPOCH OF LAST MAP')
+    epochs = pd.Timestamp(*head['first']) + pd.to_timedelta(3600 * np.arange(_IONEX_MAPS), unit='s')
+    if epochs[-1] != pd.Timestamp(*head['last']):
+        raise ValueError(f'ERROR: {path} has its last map at {pd.Timestamp(*head["last"])}, not at {epochs[-1]}')
     if epochs[0] != day:
         raise ValueError(f'ERROR: {path} starts at {epochs[0]}, not at its day {day:%Y-%m-%d} 00:00')
-    lon0, dlon = _axis(lon, 'lon', path)
-    lat0, dlat = _axis(lat, 'lat', path)
-    grid = {'lon0': lon0, 'dlon': dlon, 'nlon': len(lon), 'lat0': lat0, 'dlat': dlat, 'nlat': len(lat)}
-    return {'epochs': epochs, 'grid': grid}
+    lon0, dlon = _axis(np.sort(np.asarray(head['lon'], dtype=np.float64)), 'lon', path)
+    lat0, dlat = _axis(np.sort(np.asarray(head['lat'], dtype=np.float64)), 'lat', path)
+    grid = {'lon0': lon0, 'dlon': dlon, 'nlon': len(head['lon']), 'lat0': lat0, 'dlat': dlat, 'nlat': len(head['lat'])}
+    return {'epochs': pd.DatetimeIndex(epochs), 'grid': grid}
 
 
 def index_days(basedir, source='IONEX'):
     """
-    Writes the multidimensional VRT index basedir/IONEX.vrt over the IONEX day files, atomically: dimensions epoch (seconds
-    since 1970, the maps of the day files in order), lat and lon (the node latitudes and longitudes of the day files, as
-    ascending values); one array tec (Int32, as published) with one source per day file, placed at its first epoch. The
-    rms maps are not indexed. The day files are only read; the index is rebuilt on each call.
+    Writes the multidimensional VRT index basedir/IONEX.vrt over the IONEX day files as published, atomically: dimensions
+    epoch (seconds since 1970, the maps of the day files in day order), lat and lon (the node latitudes and longitudes of the
+    day files, as ascending values); one array tec (Int32, as published) with one source per day file, placed at its first
+    epoch. The rms maps are not indexed. Only the headers of the day files are read; the index is rebuilt on each call.
 
     Parameters: basedir (str, the download folder with the IONEX subfolder); source (str, 'IONEX'). Returns: None.
-    Raises: ValueError, one ERROR: line, when the source is not IONEX, there is no day file, a day file is unreadable or
-    lacks its 25 maps, or the grids differ.
+    Raises: ValueError, one ERROR: line, when the source is not IONEX, there is no day file, two files hold one day, a day
+    file is unreadable or lacks its 25 maps, or the grids differ.
 
     Examples
     --------
@@ -1181,19 +1344,18 @@ def index_days(basedir, source='IONEX'):
         raise ValueError(f"ERROR: index_days indexes the IONEX day files, source must be 'IONEX', not {source!r}")
     base = os.path.abspath(basedir)
     folder = os.path.join(base, source)
-    days = []
+    found = {}
     for name in (sorted(os.listdir(folder)) if os.path.isdir(folder) else []):
         m = _DAY_FILE.fullmatch(name)
-        if m is None:
+        day = _file_day(m) if m else None
+        if day is None:
             continue
-        try:
-            day = pd.to_datetime(m.group(1), format='%Y%m%d')
-        except ValueError:
-            continue
-        path = os.path.join(folder, name)
-        days.append((path, _read_day(path, day)))
-    if not days:
-        raise ValueError(f'ERROR: no IONEX day file <yyyymmdd>.nc in {folder}')
+        if day in found:
+            raise ValueError(f'ERROR: two IONEX day files of {day:%Y-%m-%d} in {folder}: {os.path.basename(found[day])} and {name}')
+        found[day] = os.path.join(folder, name)
+    if not found:
+        raise ValueError(f'ERROR: no IONEX day file (COD0OPSFIN_<yyyy><ddd>0000_01D_01H_GIM.INX.gz or codg<ddd>0.<yy>i.Z) in {folder}')
+    days = [(found[day], _read_day(found[day], day)) for day in sorted(found)]
     first_path, first = days[0][0], days[0][1]['grid']
     for path, info in days[1:]:
         if info['grid'] != first:

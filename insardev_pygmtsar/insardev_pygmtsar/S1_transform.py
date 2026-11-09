@@ -132,7 +132,7 @@ def _process_date_worker(args):
             }
 
         # Transform and save
-        _transform_slc_int16(
+        has_valid = _transform_slc_int16(
             outdir=outdir, transform=transform, topo=topo,
             prm_rep=prm, prm_ref=prm_ref, slc_data=slc,
             burst_name=burst_name, record_dict=record_dict,
@@ -141,7 +141,7 @@ def _process_date_worker(args):
             reference_height=reference_height,
             debug=debug
         )
-        return burst_name
+        return burst_name, has_valid
 
 
 def _compute_reramp_phase(azi_rep, rng_rep, reramp_params):
@@ -467,6 +467,8 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
     data_proj = datagrid.spatial_ref(data_proj, epsg)
     data_proj.attrs['spatial_ref'] = data_proj.spatial_ref.attrs['spatial_ref']
     data_proj = data_proj.drop_vars('spatial_ref')
+    # a date with no valid output cell (every sample the fill value) is empty: transform() skips a burst whose dates are all empty
+    has_valid = bool((data_proj.re.values != fill_value).any() or (data_proj.im.values != fill_value).any())
     data_proj = data_proj.drop_vars(['x', 'y'])
 
     _t0 = time.perf_counter()
@@ -486,6 +488,7 @@ def _transform_slc_int16(outdir, transform, topo, prm_rep, prm_ref, slc_data,
     )
     _timings['to_zarr'] = time.perf_counter() - _t0
     del data_proj
+    return has_valid
 
 
 class S1_transform(S1_align):
@@ -542,7 +545,8 @@ class S1_transform(S1_align):
         bbox : list or tuple, optional
             The output area [lon_min, lat_min, lon_max, lat_max] in WGS84. Only the bursts whose footprint overlaps
             it are processed (the others are skipped, with a note), and each burst's output is cropped to it.
-            Raises ValueError if it overlaps no burst.
+            A burst with no valid output cell in the bbox (its output grid does not meet it, or its radar data is NaN there) is
+            skipped with a NOTE. Raises ValueError if it overlaps no burst, or if no burst is left with a valid output cell.
         overwrite : bool, optional
             Overwrite existing results and process all bursts. Default True (it was False before): a completed
             target is removed and processed again, with a NOTE; overwrite=False keeps the completed target.
@@ -631,7 +635,8 @@ class S1_transform(S1_align):
                     if len(skipped) == len(refrep_dict):
                         raise ValueError(f'ERROR: bbox {bbox} does not overlap any of the {len(refrep_dict)} bursts.')
                     if skipped:
-                        print(f'NOTE: bbox does not overlap {len(skipped)} of {len(refrep_dict)} bursts, skipped: {", ".join(skipped)}.')
+                        if debug:
+                            print(f'NOTE: bbox does not overlap {len(skipped)} of {len(refrep_dict)} bursts, skipped: {", ".join(skipped)}.')
                         refrep_dict = {key: value for key, value in refrep_dict.items() if key not in skipped}
                 refreps = [v for v in refrep_dict.values()]
 
@@ -679,7 +684,7 @@ class S1_transform(S1_align):
                     if os.path.exists(outdir):
                         assert os.path.isdir(outdir), f'ERROR: {fullBurstId} exists but is not a directory'
                         if exists(metafile, again='run the processing'):
-                            return  # Already done
+                            return True  # Already done
                         else:
                             print(f'NOTE: {fullBurstId} directory exists but metadata file is missing. Removing...')
                             shutil.rmtree(outdir)
@@ -694,13 +699,18 @@ class S1_transform(S1_align):
                     prm_ref_main = prm_cache[ref_burst_name]
 
                     # Load DEM and compute transform
-                    from .utils_satellite import compute_transform_inverse, get_dem_wgs84ellipsoid, save_transform, get_utm_epsg
+                    from .utils_satellite import compute_transform_inverse, get_dem_wgs84ellipsoid, save_transform, get_utm_epsg, NoOutputGridError
                     record = self.get_record(ref_burst_name)
                     # epsg=None: this burst's own UTM zone, from the centroid of its reference record
                     _centroid = record.geometry.iloc[0].centroid
                     burst_epsg = epsg if epsg is not None else get_utm_epsg(_centroid.y, _centroid.x)
                     dem = get_dem_wgs84ellipsoid(self.DEM, record.geometry.iloc[0], geoid_correction=False)
-                    topo, transform = compute_transform_inverse(prm_ref_main, dem, self.DEM, scale_factor=1/dem_vertical_accuracy, epsg=burst_epsg, resolution=resolution, bbox=bbox, compute_topo=remove_topo_phase, n_jobs=n_jobs_inner, debug=debug, datum=self.dem_datum())
+                    try:
+                        topo, transform = compute_transform_inverse(prm_ref_main, dem, self.DEM, scale_factor=1/dem_vertical_accuracy, epsg=burst_epsg, resolution=resolution, bbox=bbox, compute_topo=remove_topo_phase, n_jobs=n_jobs_inner, debug=debug, datum=self.dem_datum())
+                    except NoOutputGridError:
+                        # the bbox meets the footprint but not the output grid: nothing is written for this burst
+                        print(f'NOTE: {fullBurstId} skipped: the bbox meets its footprint but not its output grid (no valid output cell).')
+                        return False
                     del dem
 
                     # Save transform to zarr
@@ -733,6 +743,7 @@ class S1_transform(S1_align):
 
                     # Phase 2: Process dates sequentially (efficient - reuses cached data)
                     all_dates = burst_reps + burst_refs
+                    valid_dates = []
                     for burst_item in all_dates:
                         is_reference = burst_item in burst_refs
                         burst_ref = [b for b in burst_refs if b[:2] == burst_item[:2]][0]
@@ -763,17 +774,23 @@ class S1_transform(S1_align):
                                 'B_offset_end': baseline_result.get('B_offset_end')
                             }
 
-                        self.transform_slc_int16(outdir, transform, topo, prm, prm_ref, slc, epsg=burst_epsg,
+                        valid_dates.append(self.transform_slc_int16(outdir, transform, topo, prm, prm_ref, slc, epsg=burst_epsg,
                                                 baseline_params=baseline_params,
                                                 sc_height_params=sc_height_cache[burst_ref_name],
                                                 reramp_params=reramp_params,
                                                 remove_tidal_phase=remove_tidal_phase,
-                                                reference_height=ref_height)
+                                                reference_height=ref_height))
                         del slc
 
+                    # no valid output cell in any date (the radar data is NaN in the bbox): the burst is skipped, nothing is kept
+                    if not any(valid_dates):
+                        print(f'NOTE: {fullBurstId} skipped: no valid output cell in the bbox (its radar data is NaN there).')
+                        shutil.rmtree(outdir)
+                        return False
                     # Cleanup and consolidate
                     del topo, transform, prm_cache
                     self.consolidate_metadata(target, record_id=all_dates[-1][-1])
+                    return True
 
                 def process_burst_dates_parallel(bursts, target, n_jobs_inner, scheduler_inner=None, debug=False):
                     """Process a single burst with dates parallelized across n_jobs_inner workers."""
@@ -790,7 +807,7 @@ class S1_transform(S1_align):
                     if os.path.exists(outdir):
                         assert os.path.isdir(outdir), f'ERROR: {fullBurstId} exists but is not a directory'
                         if exists(metafile, again='run the processing'):
-                            return  # Already done
+                            return True  # Already done
                         else:
                             print(f'NOTE: {fullBurstId} directory exists but metadata file is missing. Removing...')
                             shutil.rmtree(outdir)
@@ -804,13 +821,18 @@ class S1_transform(S1_align):
                     ref_burst_name = burst_refs[0][-1]
                     prm_ref_main = prm_cache[ref_burst_name]
 
-                    from .utils_satellite import compute_transform_inverse, get_dem_wgs84ellipsoid, save_transform, get_utm_epsg
+                    from .utils_satellite import compute_transform_inverse, get_dem_wgs84ellipsoid, save_transform, get_utm_epsg, NoOutputGridError
                     record = self.get_record(ref_burst_name)
                     # epsg=None: this burst's own UTM zone, from the centroid of its reference record
                     _centroid = record.geometry.iloc[0].centroid
                     burst_epsg = epsg if epsg is not None else get_utm_epsg(_centroid.y, _centroid.x)
                     dem = get_dem_wgs84ellipsoid(self.DEM, record.geometry.iloc[0], geoid_correction=False)
-                    topo, transform = compute_transform_inverse(prm_ref_main, dem, self.DEM, scale_factor=1/dem_vertical_accuracy, epsg=burst_epsg, resolution=resolution, bbox=bbox, compute_topo=remove_topo_phase, n_jobs=n_jobs_inner, debug=debug, datum=self.dem_datum())
+                    try:
+                        topo, transform = compute_transform_inverse(prm_ref_main, dem, self.DEM, scale_factor=1/dem_vertical_accuracy, epsg=burst_epsg, resolution=resolution, bbox=bbox, compute_topo=remove_topo_phase, n_jobs=n_jobs_inner, debug=debug, datum=self.dem_datum())
+                    except NoOutputGridError:
+                        # the bbox meets the footprint but not the output grid: nothing is written for this burst
+                        print(f'NOTE: {fullBurstId} skipped: the bbox meets its footprint but not its output grid (no valid output cell).')
+                        return False
                     del dem
 
                     save_transform(transform, outdir, scale_factor=1/dem_vertical_accuracy)
@@ -875,13 +897,18 @@ class S1_transform(S1_align):
                             ref_height, n_jobs_date, debug
                         ))
 
-                    joblib.Parallel(n_jobs=n_jobs_inner, backend=scheduler_inner)(
+                    valid_dates = joblib.Parallel(n_jobs=n_jobs_inner, backend=scheduler_inner)(
                         joblib.delayed(_process_date_worker)(args) for args in worker_args
                     )
+                    if not any(has_valid for _, has_valid in valid_dates):
+                        print(f'NOTE: {fullBurstId} skipped: no valid output cell in the bbox (its radar data is NaN there).')
+                        shutil.rmtree(outdir)
+                        return False
 
                     # Cleanup and consolidate
                     del topo, transform, prm_cache
                     self.consolidate_metadata(target, record_id=all_dates[-1][-1])
+                    return True
 
                 # Default n_jobs to cpu_count(), -1 too (joblib convention), before any min(n_jobs, ...)
                 if n_jobs is None or n_jobs == -1:
@@ -890,8 +917,9 @@ class S1_transform(S1_align):
                 # Auto-select sequential scheduler for single-worker mode (most memory-efficient)
                 if n_jobs == 1 and scheduler is None:
                     scheduler = 'sequential'
-                    print(f'NOTE: n_jobs=1, auto-selecting scheduler="sequential" for lowest memory usage.')
-                    print(f'      Use scheduler="loky" or "threading" to override if needed.')
+                    if debug:
+                        print(f'NOTE: n_jobs=1, auto-selecting scheduler="sequential" for lowest memory usage.')
+                        print(f'      Use scheduler="loky" or "threading" to override if needed.')
 
                 n_bursts = len(refreps)
                 # n_dates is total dates, n_rep_dates is repeat dates only (excluding reference)
@@ -909,18 +937,26 @@ class S1_transform(S1_align):
                     n_procs = min(n_jobs, n_bursts)
                     # each of the concurrent burst workers takes its share of n_jobs for its satellite_llt2rat workers
                     n_jobs_burst = n_jobs if scheduler == 'sequential' else max(1, n_jobs // n_procs)
-                    print(f'NOTE: Using {n_procs} workers for {n_bursts} bursts, {n_dates} dates each (burst-parallel, scheduler={scheduler}).')
+                    if debug:
+                        print(f'NOTE: Using {n_procs} workers for {n_bursts} bursts, {n_dates} dates each (burst-parallel, scheduler={scheduler}).')
                     with self.progressbar_joblib(tqdm(desc='Transforming SLC...'.ljust(25), total=len(refreps))) as progress_bar:
-                        joblib.Parallel(n_jobs=n_procs, backend=scheduler)(
+                        valid_bursts = joblib.Parallel(n_jobs=n_procs, backend=scheduler)(
                             joblib.delayed(process_burst_sequential)(bursts, target, n_jobs_burst, debug) for bursts in refreps
                         )
                 else:
                     # More repeat dates than bursts: parallelize dates within each burst
                     # e.g., 1 burst × 100 dates → date-parallel
-                    print(f'NOTE: Processing {n_bursts} bursts sequentially, {n_dates} dates each with {n_jobs} workers (date-parallel, scheduler={scheduler}).')
+                    if debug:
+                        print(f'NOTE: Processing {n_bursts} bursts sequentially, {n_dates} dates each with {n_jobs} workers (date-parallel, scheduler={scheduler}).')
+                    valid_bursts = []
                     for bursts in tqdm(refreps, desc='Transforming SLC...'.ljust(25)):
-                        process_burst_dates_parallel(bursts, target, n_jobs_inner=n_jobs, scheduler_inner=scheduler, debug=debug)
+                        valid_bursts.append(process_burst_dates_parallel(bursts, target, n_jobs_inner=n_jobs, scheduler_inner=scheduler, debug=debug))
 
+                # the bursts with no valid output cell were skipped (each with a NOTE): when none is left, the call raises
+                skipped = [self.fullBurstId(bursts[0][0][-1]) for bursts, valid in zip(refreps, valid_bursts) if not valid]
+                if refreps and len(skipped) == len(refreps):
+                    where = f'bbox {bbox}' if bbox is not None else 'the output grid'
+                    raise ValueError(f'ERROR: {where} has no valid output cell in any burst: {", ".join(skipped)}.')
                 # Consolidate zarr metadata for the target directory
                 self.consolidate_metadata(target)
                 # the idle joblib workers keep their memory: stop them, the next parallel step starts its own
@@ -975,7 +1011,7 @@ class S1_transform(S1_align):
                     value = value.wkt
                 record_dict[name] = value
 
-        _transform_slc_int16(
+        return _transform_slc_int16(
             outdir=outdir, transform=transform, topo=topo,
             prm_rep=prm_rep, prm_ref=prm_ref, slc_data=slc_data,
             burst_name=burst_name, record_dict=record_dict,

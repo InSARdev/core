@@ -180,7 +180,7 @@ def _asf_query(params, retries=30, timeout_second=3):
             time.sleep(timeout_second)
 
 
-def _asf_granule_search(granule_list):
+def _asf_granule_search(granule_list, retries=30, timeout_second=3):
     """Search ASF by granule names (burst IDs or product names).
 
     The list is split into chunks so that a single request stays within the
@@ -190,6 +190,10 @@ def _asf_granule_search(granule_list):
     ----------
     granule_list : list
         List of granule identifiers.
+    retries : int, optional
+        Attempts of each catalog request, passed to _asf_query. Default 30.
+    timeout_second : int, optional
+        Seconds between the attempts, passed to _asf_query. Default 3.
 
     Returns
     -------
@@ -208,7 +212,7 @@ def _asf_granule_search(granule_list):
     for chunk in [granule_list[idx:idx + _ASF_GRANULE_CHUNK]
                   for idx in range(0, len(granule_list), _ASF_GRANULE_CHUNK)]:
         # ASF SearchAPI accepts comma-separated granule list
-        data = _asf_query({'granule_list': ','.join(chunk), 'output': 'geojson'})
+        data = _asf_query({'granule_list': ','.join(chunk), 'output': 'geojson'}, retries, timeout_second)
         for feature in data.get('features', []):
             fileID = feature.get('properties', {}).get('fileID')
             # the catalog can report the same granule twice, keep the first entry
@@ -285,7 +289,7 @@ asf_search = _asf_search_module()
 # ============================================================================
 
 
-def _asf_burst_records(bursts, missing_note=None):
+def _asf_burst_records(bursts, missing_note=None, retries=30, timeout_second=3):
     """Find Sentinel-1 bursts in the ASF catalog by name, in one batched granule search.
 
     The catalog occasionally omits one polarization channel of an otherwise complete dual-polarization scene. The
@@ -299,6 +303,10 @@ def _asf_burst_records(bursts, missing_note=None):
     missing_note : str, optional
         The NOTE printed for each burst that neither the catalog nor a sibling gives, with '{burst}' for its name.
         None prints nothing.
+    retries : int, optional
+        Attempts of each catalog search, passed to the granule search. Default 30.
+    timeout_second : int, optional
+        Seconds between the attempts of a catalog search. Default 3.
 
     Returns
     -------
@@ -309,7 +317,7 @@ def _asf_burst_records(bursts, missing_note=None):
     from tqdm.auto import tqdm
 
     with tqdm(desc=f'Downloading ASF Catalog'.ljust(25), total=1) as pbar:
-        results = asf_search.granule_search(bursts)
+        results = asf_search.granule_search(bursts, retries=retries, timeout_second=timeout_second)
         pbar.update(1)
 
     def polarization_siblings(burst):
@@ -329,7 +337,8 @@ def _asf_burst_records(bursts, missing_note=None):
     if bursts_absent:
         # a sibling is not necessarily requested here, it can be downloaded already
         siblings = {name for burst in bursts_absent for name in polarization_siblings(burst)}
-        for result in asf_search.granule_search(sorted(siblings - set(catalog))):
+        for result in asf_search.granule_search(sorted(siblings - set(catalog)), retries=retries,
+                                                timeout_second=timeout_second):
             catalog.setdefault(result.geojson()['properties']['fileID'], result)
     for burst in bursts_absent:
         sibling = next((catalog[name] for name in polarization_siblings(burst)
@@ -641,7 +650,8 @@ class ASF(progressbar_joblib):
             Authenticated session. Created automatically if None.
         n_jobs : int or None, optional
             Parallel download jobs, at most two per CPU this process may use (a larger number is capped, with a
-            note). None uses mission-specific defaults (S1: 8, NISAR: 4).
+            note). Negative values follow joblib: -1 all CPUs, -2 all but one, and so on; 0 raises ValueError.
+            None uses mission-specific defaults (S1: 8, NISAR: 4).
         joblib_backend : str, optional
             Backend for parallel processing. Default 'loky' (multiprocessing, faster on Colab).
         skip_exist : bool, optional
@@ -800,7 +810,8 @@ class ASF(progressbar_joblib):
             Session that every burst request is sent through (send(session.get, ...)), created by download().
         n_jobs : int or None
             Parallel burst downloads (joblib), at most two per CPU this process may use (a larger number is capped,
-            with a note). None gives the Sentinel-1 default of 8.
+            with a note). Negative values follow joblib: -1 all CPUs, -2 all but one, and so on; 0 raises ValueError.
+            None gives the Sentinel-1 default of 8.
         joblib_backend : str
             Backend of the parallel burst downloads; replaced by 'sequential' when debug is True.
         skip_exist : bool
@@ -1086,7 +1097,8 @@ class ASF(progressbar_joblib):
 
         # the catalog records of the bursts, rebuilt from a sibling polarization channel the catalog omits
         results = _asf_burst_records(bursts_missed,
-                                     missing_note='NOTE: burst {burst} is missing in the ASF catalog and is not downloaded.')
+                                     missing_note='NOTE: burst {burst} is missing in the ASF catalog and is not downloaded.',
+                                     retries=retries, timeout_second=timeout_second)
 
         # Check for conflicting bursts from different paths with same burstNum_subswath pattern
         # Such data cannot be stored in the same basedir without conflicts
@@ -1576,7 +1588,7 @@ class ASF(progressbar_joblib):
             Kept for the signature shared with the Sentinel-1 download.
         n_jobs : int or None
             Without a username (the cache-proxy path) the number of parallel joblib workers for the blocks and small
-            chunks, at most two per CPU (HTTP.download_jobs); 1 or debug downloads them sequentially. With a username
+            chunks, at most two per CPU (HTTP.download_jobs; negative values follow joblib: -1 all CPUs); 1 or debug downloads them sequentially. With a username
             the granules are downloaded one after another whatever the value. None is set to the NISAR default of 4
             first.
         joblib_backend : str
@@ -1634,7 +1646,7 @@ class ASF(progressbar_joblib):
         # Show connecting status first, then search status
         granule_ids = [g.replace('.h5', '') for g in granules]
         print(f"Connecting to ASF...", end='\r', flush=True)
-        search_results = asf_search.granule_search(granule_ids)
+        search_results = asf_search.granule_search(granule_ids, retries=retries, timeout_second=timeout_second)
         print(f"Searching ASF for {len(granules)} granule(s)... done ({len(search_results)} found)")
 
         # Build URL lookup: granule_id -> url
@@ -2091,6 +2103,8 @@ class ASF(progressbar_joblib):
 
         Parameters
         ----------
+        basedir : str
+            Directory of the per-polarization NISAR files, checked by skip_exist.
         granules : list
             List of NISAR granule IDs.
         polarizations : list or None
@@ -2102,7 +2116,24 @@ class ASF(progressbar_joblib):
             Bounding box (west, south, east, north) in WGS84.
             If provided, only download blocks covering this area.
         n_jobs : int
-            Number of parallel granule downloads (uses loky backend).
+            Number of parallel granule downloads (uses loky backend), at most two per CPU this process may use (a larger
+            number is capped, with a note). Negative values follow joblib: -1 all CPUs, -2 all but one, and so on; 0 raises
+            ValueError.
+        skip_exist : bool
+            Skip the polarizations whose files already exist in basedir.
+        retries : int
+            Attempts of each cache request, the first one included: 0 makes one attempt. A failure that
+            a retry cannot change (such as HTTP 404) is raised at once.
+        timeout_second : float
+            Seconds to wait before the next attempt of a failed request: a pause between
+            retries, not a request timeout.
+        min_rate : str or float
+            Minimum transfer rate in bytes per second, a size string such as '100KB' or a
+            number. A transfer slower than it is cut and retried.
+        min_rate_window : float
+            Seconds over which min_rate is measured.
+        debug : bool
+            Print the progress and each failed attempt; the download then uses the sequential backend.
         """
         # NISAR-specific default: 4 parallel jobs (optimal for Colab with decompression)
         if n_jobs is None:
@@ -3077,10 +3108,24 @@ class ASF(progressbar_joblib):
             Chunk metadata from get_chunk_info() for frequencyA.
         metadata : dict
             ALL metadata from _read_nisar_metadata_direct().
+        pol : str
+            The polarization written: 'HH', 'HV', 'VH' or 'VV'.
+        out_path : str
+            The HDF5 file written; it is written at its temporary name and renamed at the end.
+        track : int
+            Track number of the granule (from _nisar_parse_granule_id); not read by this function.
+        frame : int
+            Frame number of the granule (from _nisar_parse_granule_id); not read by this function.
+        datetime_str : str
+            Datetime of the granule (from _nisar_parse_granule_id); not read by this function.
+        debug : bool
+            Print the number of chunks to write and the size of the written file.
         downloaded_data_b : bytes, dict, or None
             Raw bytes or dict for frequencyB (ionospheric correction / quick look).
         chunk_info_b : dict, optional
             Chunk metadata for frequencyB.
+        crop_info : dict, optional
+            Bbox crop: the output is cropped to chunk-aligned bounds. None writes the full extent.
         data_offset_a : int, optional
             Override min_offset for bytes mode (for bbox-filtered downloads).
         data_offset_b : int, optional

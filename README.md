@@ -51,6 +51,14 @@ You can easily share your results publicly or with selected users, allowing othe
 
 <img src="assets/NisarLB.jpg" />
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1v_XQmHI2ox2LHRDLY3kxFK97IKQUKWZI?usp=sharing) **Anak Krakatau Eruption, Indonesia (2026).** Animated NISAR L-band frequency B HH/HV RGB composite (R = HH, G = HV, B = HH/HV) of the Krakatau archipelago, seen through the ash plume and clouds of the 4–8 September eruption: nine ascending acquisitions from 26 June to 12 October 2026, with a multi-temporal speckle filter and daily frames interpolated in time (PCHIP). Only a 22 × 22 km crop of each frame is downloaded (0.65 GB for the whole series).
+
+[<img src="assets/Krakatau_Eruption_2026.webp" />](assets/Krakatau_Eruption_2026.mp4)
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1iIvllZPzzZQFdLoTw3PI51nYjTS83LxZ?usp=sharing) **Gastein Valley, Austria (2023–2026).** Persistent and distributed scatterer (PS/DS) line-of-sight velocity around Bad Gastein from 91 Sentinel-1A VV dates (descending path 95, one IW2 burst), geocoded at full resolution on an 8 × 2 m grid. A PS network is solved and DS are attached to it, and the results are exported to GeoPackage. The image shows the LOS velocities of 3 reference areas over a satellite basemap.
+
+<img src="assets/Gastein_Valley_PSDS_Velocity.jpg" />
+
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1WEutnqPzsYno4qC9EDP_8rohqugZrGji?usp=sharing) **Iran–Iraq Earthquake (2017)**. The results compared to outputs from GMTSAR, SNAP, and GAMMA software. Illustrates bursts search by area, date, and attributes.
 
 <img src="assets/Iran–Iraq_Earthquake_2017.jpg" />
@@ -79,6 +87,10 @@ InSAR.dev Premium modules extend the packages above with the precise ECEF prepro
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1JMY9ocwgyajLVTXfd_5YsfEk-OEgrShf?usp=sharing) **Gastein Valley, Austria (2023–2026).** Persistent and distributed scatterer (PS/DS) line-of-sight velocity from 91 dual-polarization Sentinel-1 dates with PolSAR phase optimization: 7,950 PS and 178,418 DS, down to the power line pylons hidden in vegetation.
 
 <img src="assets/InSARdevPremium_GasteinValley.jpg" />
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/12TNEvOq4SpVR1fsCtLsfpx26wGWx4fOf?usp=sharing) **Surat Basin, Queensland: Corner Reflectors of FRM4SAR TN-200 (2016).** Reproduces FRM4SAR TN-200 Issue 1.4, Appendix 2 with the precise ECEF preprocessor: 40 trihedral corner reflectors of the Geoscience Australia survey on a Sentinel-1A IW SLC scene, geocoded with and without the ERA5 troposphere and CODE ionosphere, and the residual between each reflector peak and its expected position, with CR11 compared to TN-200 Table 17.
+
+<img src="assets/InSARdevPremium_TN200CR.jpg" />
 
 ## Contact
 

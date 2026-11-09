@@ -247,7 +247,7 @@ def snapshot(*args, store: str | None = None, storage_options: dict[str, str] | 
 
 def save(*args, store, storage_options: dict[str, str] | None = None,
             caption: str | None = 'Saving...', debug=False,
-            wrapper: type | None = None):
+            class_names: list[str] | None = None, wrapper: type | None = None):
     """
     Save Batch/BatchComplex dicts into one Zarr store, each burst under its own subgroup.
 
@@ -262,6 +262,10 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
         Storage options for cloud stores.
     debug : bool, optional
         If True, print debug information. Default is False.
+
+    class_names : list[str], optional
+        The classes recorded in the store, one per arg (a Stack saves its per-burst Datasets as 'Stack').
+        Default: the type names of the args.
 
     Notes
     -----
@@ -316,7 +320,7 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
     if not is_store_object and os.path.exists(store):
         shutil.rmtree(store, ignore_errors=True)
     root = zarr.group(store=store, zarr_format=3, overwrite=True)
-    root.attrs['__class__'] = [
+    root.attrs['__class__'] = list(class_names) if class_names is not None else [
         type(arg).__name__ for arg in args
     ]
     if wrapper is not None:
@@ -595,7 +599,10 @@ def open(store: str, storage_options: dict[str, str] | None = None,
     except (ValueError, KeyError, FileNotFoundError) as e:
         raise ValueError(f'open {store!r}: no readable consolidated metadata (zarr.json); the store is incomplete '
                          f'or not zarr, save it again') from e
-    from .Batch import Batch, BatchComplex, BatchUnit, BatchWrap
+    from .Batch import Batch
+    from .BatchComplex import BatchComplex
+    from .BatchUnit import BatchUnit
+    from .BatchWrap import BatchWrap
     from .Stack import Stack
     _class_map = {
         'Batch': Batch, 'BatchComplex': BatchComplex,
@@ -727,7 +734,7 @@ def open(store: str, storage_options: dict[str, str] | None = None,
 
     if interleave:
         # unpack interleaved datasets and return as Batches for chaining
-        from .Batch import Batches
+        from .Batches import Batches
         batches = []
         for idx, cls in enumerate(classes):
             prefix = f'i{idx}_'
@@ -737,7 +744,7 @@ def open(store: str, storage_options: dict[str, str] | None = None,
     result = _build(classes[0], dss)
     wrapper_name = dt.attrs.get('__wrapper__')
     if wrapper_name is not None:
-        from .Batch import Batches
+        from .Batches import Batches
         _wrapper_map = {'Batches': Batches}
         wrapper_cls = _wrapper_map.get(wrapper_name.rsplit('.', 1)[-1])
         if wrapper_cls is not None:

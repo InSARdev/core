@@ -8,12 +8,13 @@
 # See the LICENSE file in the insardev directory for license terms.
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
-"""THE RADAR GEOMETRY OF A GEOCODED BURST WITHOUT ANY TRANSFORM RASTER: elevation(), elevation_phase() and
-incidence() read the phase, its x and y, and per-burst numbers only -- never azi, rng or ele.
+"""THE RADAR GEOMETRY OF A GEOCODED BURST FROM PER-BURST NUMBERS: elevation() and elevation_phase() read the phase,
+its x and y, and per-burst numbers only -- never azi, rng or ele; incidence() reads the transform's ele as each pixel's own height.
 
 PER-BURST NUMBERS (one date's: the stack's REFERENCE date): near_range, rng_samp_rate, earth_radius,
 SC_height_start/end, num_lines, num_rng_bins, radar_wavelength, PRF, lookdir, ref_height, the exact radar-extent polygon
-`geometry` (of the crop, N116), the CRS, and the midpoint of the `ele` actual_range ATTRIBUTE (h_attr).
+`geometry` (of the crop, N116), the CRS, and the `ele` actual_range ATTRIBUTE: its midpoint h_attr, and its ends, the heights of
+incidence()'s nodes.
 
 MAPPING x, y -> radar, a satellite track rebuilt on WGS84 from those numbers and the polygon only:
   corners T_k (k = 0 near-early, 1 far-early, 2 far-late, 3 near-late) are the polygon's vertices, computed on the
@@ -27,7 +28,7 @@ MAPPING x, y -> radar, a satellite track rebuilt on WGS84 from those numbers and
   a ground point G = WGS84(lat, lon, h): a_i = G.n_i - c_i (i = 0, 3), w = a0 / (a0 - a3), line = w (L - 1),
       s = slerp(s0, s3, w),
       rho = |G - (earth_radius + SC_height(line)) s|.
-  (lat, lon) from x, y by pyproj at nodes every STEP pixels; everything per pair is bilinear between the nodes and
+  (lat, lon) from x, y by pyproj at the absolute lattice nodes (multiples of STEP_M in map units, _lattice_step); everything per pair is bilinear between the nodes and
   applied in ONE numba pass.
 
 KERNEL (k4 = 4 pi / lambda, f = line / (L - 1), Rs(f) = earth_radius + hs + (he - hs) f):
@@ -43,6 +44,8 @@ KERNEL (k4 = 4 pi / lambda, f = line / (L - 1), Rs(f) = earth_radius + hs + (he 
 """
 import numpy as np
 import numba as _numba
+import threading
+from .utils_circular import wrap_phase
 
 C_LIGHT = 299792458.0
 A_WGS = 6378137.0
@@ -50,9 +53,11 @@ F_WGS = 1.0 / 298.257223563
 E2_WGS = F_WGS * (2.0 - F_WGS)
 # the WGS84 gravitational parameter: the orbital speed sqrt(GM / Rs) of the satellite track
 GM_WGS = 3.986004418e14
-# node spacing (pixels): the geometry and the per-pair divisor at nodes, bilinear in between (node error measured
-# <= 9.3e-6 relative at 128 px)
-STEP = 128
+# node spacing in metres (degrees of a geographic CRS: _lattice_step): the nodes are the absolute multiples of it from
+# zero, so a pixel's nodes never depend on the grid it is in; the geometry and the per-pair divisor at nodes, bilinear
+# in between (STEP_M chosen by measurement, GMH U4)
+STEP_M = 225.0
+METRES_PER_DEGREE = 111320.0
 # the linearized joint solve: its slope by a central difference of +-250 m, three fixed-point steps
 JOINT_DELTA = 250.0
 JOINT_NITER = 3
@@ -151,7 +156,7 @@ def _track(P, lat, lon):
         A_, B_ = np.dot(t, s), np.dot(e2, s)
         R_ = np.hypot(A_, B_)
         ph = [np.arctan2(B_, A_) - np.arccos(kp / R_), np.arctan2(B_, A_) + np.arccos(kp / R_)]
-        ph = min(ph, key=lambda p: abs(np.angle(np.exp(1j * p))))
+        ph = min(ph, key=lambda p: abs(wrap_phase(p)))
         out['n' + tag] = np.cos(ph) * t + np.sin(ph) * e2
         out['c' + tag] = np.dot(out['n' + tag], T[iN])
     out['Om'] = float(np.arccos(np.dot(out['s0'], out['s3'])))
@@ -279,67 +284,49 @@ def _secant(px, h, anchor, bi, bj):
 
 
 # ------------------------------------------------------------------------------------------------ nodes
-def _nodes(n, step):
-    i = np.arange(0, n, step)
-    if i[-1] != n - 1:
-        i = np.append(i, n - 1)
-    return i
+def _lattice_step(crs):
+    """The node spacing of a CRS in its own units: STEP_M metres, or the same length in degrees for a geographic CRS.
+    Absolute: the nodes are its multiples from zero, so no grid, crop or pixel spacing enters."""
+    from pyproj import CRS
+    return STEP_M / METRES_PER_DEGREE if CRS.from_user_input(crs).is_geographic else STEP_M
 
 
-def _interp_w(nodes, n):
-    """Index of the left node and the weight of the right one, per output position 0 .. n - 1."""
-    q = np.arange(n)
-    j = np.clip(np.searchsorted(nodes, q, side='right') - 1, 0, nodes.size - 2)
-    w = (q - nodes[j]) / (nodes[j + 1] - nodes[j])
-    return j, w
+def _lattice(v, S):
+    """The absolute lattice of spacing S (map units): per map coordinate v the node j = floor(v / S) (at the position j S)
+    and the weight w = v / S - j of the node j + 1. A pixel's weights depend on its own coordinate only."""
+    t = np.asarray(v, np.float64) / S
+    j = np.floor(t)
+    return j.astype(np.int64), t - j
 
 
 def _node_latlon(P, gy, gx, ycoord, xcoord):
-    """The nodes of a block of global pixel indices gy, gx (consecutive) of the grid whose whole axes are ycoord, xcoord.
-
-    The nodes are the GLOBAL multiples of STEP and the grid's last pixel, so a block's nodes do not depend on its
-    chunking. The block takes the nodes that bracket it (the last at or before its first pixel, the first after its
-    last one, and at least two): their local positions (global index minus the block's first) are returned, so a
-    local position may be negative or past the block. Returns (local y positions, local x positions, lat, lon)."""
+    """The geometry nodes of a block of global pixel indices gy, gx of the grid whose axes are ycoord, xcoord (map units):
+    the multiples of _lattice_step from zero (_lattice), the block's own nodes and the next one of each axis. Returns (jy,
+    wy, jx, wx, lat, lon): per block row and column the node index from the block's first node and the weight of the next
+    node; the node latitudes and longitudes (radians, shape (nodes y, nodes x)). The nodes of a pixel do not depend on the
+    grid or the crop it is in."""
+    S = _lattice_step(P['crs'])
     spans = []
-    for k, g0, g1 in ((_nodes(np.size(ycoord), STEP), gy[0], gy[-1]), (_nodes(np.size(xcoord), STEP), gx[0], gx[-1])):
-        if k.size > 1:
-            # the last node at or before g0 (at least the second to last: the last pixel needs a segment), up to the first after g1
-            lo = min(int(np.searchsorted(k, g0, side='right')) - 1, k.size - 2)
-            hi = min(int(np.searchsorted(k, g1, side='right')), k.size - 1)
-            k = k[lo:hi + 1]
-        spans.append(k)
-    ky, kx = spans
-    Yn, Xn = np.meshgrid(np.asarray(ycoord, np.float64)[ky], np.asarray(xcoord, np.float64)[kx], indexing='ij')
-    lat, lon = _latlon(P['crs'], Xn, Yn)
-    return ky - gy[0], kx - gx[0], lat, lon
+    for axis, g in ((ycoord, gy), (xcoord, gx)):
+        j, w = _lattice(np.asarray(axis, np.float64)[g], S)
+        k0 = int(j.min())
+        spans.append((j - k0, w, k0, int(j.max()) - k0 + 2))
+    (jy, wy, ky, ny), (jx, wx, kx, nx) = spans
+    Y, X = np.meshgrid((ky + np.arange(ny)) * S, (kx + np.arange(nx)) * S, indexing='ij')
+    lat, lon = _latlon(P['crs'], X, Y)
+    return jy, wy, jx, wx, lat, lon
 
 
-def _upsample_x(Kc, ix, nx):
-    """(..., ny_nodes, nx_nodes) -> (..., ny_nodes, nx), linear in x."""
-    if ix.size == 1:
-        return np.repeat(Kc[..., :, :1], nx, axis=-1)
-    jx, wx = _interp_w(ix, nx)
+def _upsample_x(Kc, jx, wx):
+    """(..., ny_nodes, nx_nodes) -> (..., ny_nodes, nx), linear in x at the lattice positions jx (left node), wx."""
     return Kc[..., :, jx] * (1 - wx) + Kc[..., :, jx + 1] * wx
 
 
-def _rows(iy, ny, Kx):
-    """The row interpolation the numba pass applies: (row index, weight) per output row, and the x-upsampled
-    node rows with a single node row doubled."""
-    if iy.size == 1:
-        return np.zeros(ny, np.int64), np.zeros(ny), np.concatenate([Kx, Kx], axis=-2)
-    jy, wy = _interp_w(iy, ny)
-    return jy.astype(np.int64), wy, Kx
-
-
-def _bilinear(Kc, iy, ix, ny, nx):
-    """Bilinear upsampling of Kc (ny_nodes, nx_nodes) at node indices iy, ix to (ny, nx), float32."""
-    Kx = _upsample_x(Kc, ix, nx).astype(np.float32)
-    if iy.size == 1:
-        return np.repeat(Kx[:1, :], ny, axis=0)
-    jy, wy = _interp_w(iy, ny)
-    wy = wy.astype(np.float32)[:, None]
-    return Kx[jy, :] * (1 - wy) + Kx[jy + 1, :] * wy
+def _bilinear(Kc, jy, wy, jx, wx):
+    """Bilinear upsampling of Kc (ny_nodes, nx_nodes) at the lattice positions (jy, wy), (jx, wx) to (ny, nx), float32."""
+    Kx = _upsample_x(Kc, jx, wx).astype(np.float32)
+    w = np.asarray(wy, np.float32)[:, None]
+    return Kx[jy, :] * (1 - w) + Kx[jy + 1, :] * w
 
 
 @_numba.njit(nogil=True, cache=True)
@@ -396,8 +383,8 @@ _warmup_numba_cache()
 # ------------------------------------------------------------------------------------------------ blocks
 def elevation_block(ph, pidx, gy, gx, *, geos, pairs, joint, ycoord, xcoord):
     """One phase block (npair, ny, nx) -> elevation, from the phase and the block's GLOBAL pixel indices gy, gx (its
-    place in the whole grid, whose axes are ycoord, xcoord): the nodes are the global ones, so the result does not
-    depend on the block.
+    place in the whole grid, whose axes are ycoord, xcoord): the lattice is the absolute one (_node_latlon), so the result
+    does not depend on the block or on the crop.
 
     geos: the per-burst models (burst_geometry()); pairs: per pair of the variable (geometry index, b_i, b_j),
     b = (b_h nodes, b_v nodes), the dates' own triples (joint) or 0 and the pair difference (one division).
@@ -405,9 +392,8 @@ def elevation_block(ph, pidx, gy, gx, *, geos, pairs, joint, ycoord, xcoord):
     residual; flat mode: anchor the reference height, h_a the midpoint), False one division (DEM mode: position and
     tangent at h_attr; flat mode: position at h_attr, tangent at (h_attr + h_ref) / 2)."""
     sel = [pairs[int(p)] for p in np.asarray(pidx).ravel()]
-    ny, nx = ph.shape[-2:]
     P0 = geos[sel[0][0]]
-    iy, ix, lat, lon = _node_latlon(P0, gy, gx, ycoord, xcoord)
+    jy, wy, jx, wx, lat, lon = _node_latlon(P0, gy, gx, ycoord, xcoord)
     cache = {}
 
     def pix(g, h):
@@ -426,8 +412,8 @@ def elevation_block(ph, pidx, gy, gx, *, geos, pairs, joint, ycoord, xcoord):
             S = [_secant(pix(g, h), h, anchor, bi, bj) for h in (ha, ha + JOINT_DELTA, ha - JOINT_DELTA)]
             S0.append(S[0])
             S1.append((S[1] - S[2]) / (2.0 * JOINT_DELTA))
-        jy, wy, S0x = _rows(iy, ny, _upsample_x(np.stack(S0), ix, nx))
-        _, _, S1x = _rows(iy, ny, _upsample_x(np.stack(S1), ix, nx))
+        S0x = _upsample_x(np.stack(S0), jx, wx)
+        S1x = _upsample_x(np.stack(S1), jx, wx)
         # one burst model per variable on the joint path (the stack's): its anchor and offset
         P = geos[sel[0][0]]
         ha = P['h_attr']
@@ -442,34 +428,216 @@ def elevation_block(ph, pidx, gy, gx, *, geos, pairs, joint, ycoord, xcoord):
         hs = ha if P['dem_mode'] else 0.5 * (ha + P['h_ref'])
         K.append(_tangent_K(pix(g, ha), hs, bi, bj))
         A0.append(0.0 if P['dem_mode'] else P['h_ref'])
-    jy, wy, Kx = _rows(iy, ny, _upsample_x(np.stack(K), ix, nx))
+    Kx = _upsample_x(np.stack(K), jx, wx)
     return _apply_division(phc, np.ascontiguousarray(Kx, np.float32), jy, np.ascontiguousarray(wy, np.float32),
                            np.asarray(A0, np.float32), out)
 
 
-def incidence_block(gy, gx, *, geo, ycoord, xcoord):
-    """The incidence (radians) of a (y, x) block at the terrain height h_attr, from its global pixel indices gy, gx
-    and the whole axes ycoord, xcoord."""
-    ny, nx = np.size(gy), np.size(gx)
-    iy, ix, lat, lon = _node_latlon(geo, gy, gx, ycoord, xcoord)
-    return _bilinear(_Pix(geo, lat, lon, geo['h_attr']).inc, iy, ix, ny, nx)
+def _own_height(nodes, ele, heights):
+    """The block at each pixel's own height ele (y, x) from its nodes: (a, m, b) at lo, (lo + hi) / 2 and hi, heights =
+    (lo, hi), the parabola through them in float64; (a,) when lo == hi; a NaN ele gives NaN.
+
+    >>> _own_height((a, m, b), ele, (lo, hi))"""
+    lo, hi = (float(h) for h in heights)
+    e = np.asarray(ele, np.float64)
+    if hi == lo:
+        return np.where(np.isfinite(e), nodes[0], np.nan)
+    a, m, b = (np.asarray(n, np.float64) for n in nodes)
+    t = (e - lo) / (hi - lo)
+    # the parabola through (0, a), (1/2, m), (1, b) at t: a + t ((b - a) + 2 (t - 1) (a + b - 2 m))
+    q = (a + b) - 2.0 * m
+    q *= 2.0 * (t - 1.0)
+    q += b - a
+    q *= t
+    q += a
+    return q
 
 
-def look_block(gy, gx, *, geo, ycoord, xcoord):
-    """The look azimuth (degrees, in [0, 360)) of a (y, x) block at the terrain height h_attr, from its global pixel indices gy, gx
-    and the whole axes ycoord, xcoord: the azimuth on the nodes, bilinear in its sine and cosine (no wrap at 0 and 360)."""
-    ny, nx = np.size(gy), np.size(gx)
-    iy, ix, lat, lon = _node_latlon(geo, gy, gx, ycoord, xcoord)
-    a = np.radians(look_azimuth(geo, lat, lon, geo['h_attr']))
-    s = _bilinear(np.sin(a), iy, ix, ny, nx)
-    c = _bilinear(np.cos(a), iy, ix, ny, nx)
-    return np.mod(np.degrees(np.arctan2(s, c)), 360.0)
+def incidence_block(gy, gx, ele=None, *, geo, ycoord, xcoord, heights=None):
+    """The incidence (radians, float32) of a (y, x) block from its global pixel indices gy, gx and the whole axes ycoord, xcoord
+    (map units; the lattice is absolute, see _node_latlon). Without ele: at the terrain height h_attr. With the block's ele and
+    heights = (lo, hi), the ends of the ele actual_range: at each pixel's own height (_own_height, nodes at lo, the midpoint, hi).
+
+    >>> incidence_block(gy, gx, geo=geo, ycoord=y, xcoord=x)
+    >>> incidence_block(gy, gx, ele, geo=geo, ycoord=y, xcoord=x, heights=(lo, hi))"""
+    jy, wy, jx, wx, lat, lon = _node_latlon(geo, gy, gx, ycoord, xcoord)
+    if ele is None:
+        return _bilinear(_Pix(geo, lat, lon, geo['h_attr']).inc, jy, wy, jx, wx)
+    lo, hi = (float(h) for h in heights)
+    hs = (lo,) if hi == lo else (lo, 0.5 * (lo + hi), hi)
+    nodes = [_bilinear(_Pix(geo, lat, lon, h).inc, jy, wy, jx, wx) for h in hs]
+    return _own_height(nodes, ele, (lo, hi)).astype(np.float32)
+
+
+def look_block(gy, gx, ele=None, *, geo, ycoord, xcoord, heights=None):
+    """The look azimuth (degrees, in [0, 360), float32) of a (y, x) block from its global pixel indices gy, gx and the whole axes
+    ycoord, xcoord: the azimuth on the nodes, bilinear in its sine and cosine (no wrap at 0 and 360). Without ele: at the terrain
+    height h_attr. With the block's ele and heights = (lo, hi), the ends of the ele actual_range: at each pixel's own height
+    (_own_height of the sine and cosine, as incidence_block).
+
+    >>> look_block(gy, gx, geo=geo, ycoord=y, xcoord=x)
+    >>> look_block(gy, gx, ele, geo=geo, ycoord=y, xcoord=x, heights=(lo, hi))"""
+    jy, wy, jx, wx, lat, lon = _node_latlon(geo, gy, gx, ycoord, xcoord)
+
+    def sc(h):
+        a = np.radians(look_azimuth(geo, lat, lon, h))
+        return np.stack([_bilinear(np.sin(a), jy, wy, jx, wx), _bilinear(np.cos(a), jy, wy, jx, wx)])
+    if ele is None:
+        s, c = sc(geo['h_attr'])
+    else:
+        lo, hi = (float(h) for h in heights)
+        hs = (lo,) if hi == lo else (lo, 0.5 * (lo + hi), hi)
+        s, c = _own_height([sc(h) for h in hs], ele, (lo, hi))
+    return np.mod(np.degrees(np.arctan2(s, c)), 360.0).astype(np.float32)
 
 
 def elevation_phase_block(gy, gx, *, geo, ycoord, xcoord):
     """k4 kN / (rho sin th) of a (y, x) block at the terrain height h_attr: radians of phase per metre of height
     per metre of perpendicular baseline, the one-division sensitivity elevation() divides by. The block is given by
     its global pixel indices gy, gx and the whole axes ycoord, xcoord."""
-    ny, nx = np.size(gy), np.size(gx)
-    iy, ix, lat, lon = _node_latlon(geo, gy, gx, ycoord, xcoord)
-    return _bilinear(_Pix(geo, lat, lon, geo['h_attr']).tan_fac(geo['h_attr'])[0], iy, ix, ny, nx)
+    jy, wy, jx, wx, lat, lon = _node_latlon(geo, gy, gx, ycoord, xcoord)
+    return _bilinear(_Pix(geo, lat, lon, geo['h_attr']).tan_fac(geo['h_attr'])[0], jy, wy, jx, wx)
+
+
+def _ref_mode(values) -> tuple:
+    """(reference height, DEM mode) from a burst's ref_height values, the rule of _ref_height_stored(): NaN on
+    every date is DEM mode (height 0.0), else the finite value of largest magnitude is the flat-earth height."""
+    v = np.asarray(values, dtype=np.float64).ravel()
+    v = v[np.isfinite(v)]
+    return (float(v[np.argmax(np.abs(v))]), False) if v.size else (0.0, True)
+
+
+def _horn_gradient_2d_for_dask(block, dy=1.0, dx=1.0):
+    """Horn (1981) 3 x 3 terrain gradient of a DEM block, for map_overlap.
+
+    Module level so dask ships it by name. The block arrives WITH its halo and
+    leaves the same shape, so dask trims the depth back off.
+
+    The two derivatives are packed into ONE complex array -- gx + 1j*gy, per
+    metre of easting and northing -- because they come from the same nine
+    reads. Slope and aspect are then elementwise on the result and cost no
+    second pass over the raster.
+
+    `dy`/`dx` are SIGNED coordinate steps per index, so northing running either
+    way down the array gives the same gradient.
+    """
+    import numpy as np
+    z = np.asarray(block, dtype=np.float64)
+    flat = z.ndim == 3
+    if flat:
+        z = z[0]
+    out = np.full(z.shape, np.nan, dtype=np.complex64)
+    if z.shape[0] >= 3 and z.shape[1] >= 3:
+        a, b, c = z[:-2, :-2], z[:-2, 1:-1], z[:-2, 2:]
+        d, f = z[1:-1, :-2], z[1:-1, 2:]
+        g, h, i = z[2:, :-2], z[2:, 1:-1], z[2:, 2:]
+        # each side sums to four weights over a two-step span, hence the 8
+        gx = ((c + 2 * f + i) - (a + 2 * d + g)) / (8.0 * dx)
+        gy = ((g + 2 * h + i) - (a + 2 * b + c)) / (8.0 * dy)
+        out[1:-1, 1:-1] = (gx + 1j * gy).astype(np.complex64)
+    return out[None] if flat else out
+
+
+# ------------------------------------------------------------------------------------------------ batch-free geometry
+# The algorithm of the geometry methods of Batch, BatchCore and Stack (group GKK, unit U5): the batch classes keep the
+# per-burst dispatch, the coordinates, the attributes and the argument checks, and call these functions on arrays.
+
+def centre_geometry(px, py, xc, yc, n_lines, n_rng, near_range, rng_rate, sc_height, ref_height, earth_radius):
+    """The slant range (m) and sin(incidence) at the centre of the PROCESSED area of one burst, on the sphere of
+    earth_radius at ref_height. px, py: the four corners of the burst's radar extent (line and bin (0, 0), (0, n_rng-1),
+    (n_lines-1, n_rng-1), (n_lines-1, 0)) in the burst CRS; xc, yc: the centre of the burst's grid. The centre's range bin
+    comes from the inverse of the corner mapping and is kept only when it falls inside the burst; else the middle bin."""
+    c_light = 299792458.0
+    rng_c = n_rng / 2.0
+    a_c = np.array([0.0, 0.0, n_lines - 1, n_lines - 1])
+    r_c = np.array([0.0, n_rng - 1, n_rng - 1, 0.0])
+    M, b = [], []
+    for x_, y_, a_, r_ in zip(px, py, a_c, r_c):
+        M.append([x_, y_, 1, 0, 0, 0, -a_ * x_, -a_ * y_]); b.append(a_)
+        M.append([0, 0, 0, x_, y_, 1, -r_ * x_, -r_ * y_]); b.append(r_)
+    h = np.linalg.solve(np.asarray(M, float), np.asarray(b, float))
+    den = h[6] * xc + h[7] * yc + 1.0
+    cand = (h[3] * xc + h[4] * yc + h[5]) / den
+    if np.isfinite(cand) and 0.0 <= cand <= n_rng:
+        rng_c = float(cand)
+
+    slant_range = near_range + rng_c * (c_light / (2.0 * rng_rate))
+    ground_dist = earth_radius + ref_height
+    sat_dist = earth_radius + sc_height
+    cos_earth = np.clip(
+        (ground_dist ** 2 + sat_dist ** 2 - slant_range ** 2)
+        / (2.0 * ground_dist * sat_dist), -1.0, 1.0)
+    sin_inc = np.clip(
+        sat_dist * np.sin(np.arccos(cos_earth)) / slant_range, -1.0, 1.0)
+    return slant_range, sin_inc
+
+
+def elevation_phase_factor(wavelength, slant_range, sin_inc):
+    """Elevation phase per metre of height per metre of baseline (radians): (4 pi / wavelength) / (slant range sin(incidence))."""
+    return (4.0 * np.pi / wavelength) / (slant_range * sin_inc)
+
+
+def incidence_from_sine(sin_inc):
+    """The incidence angle (radians) from its sine: arcsin(sin_inc)."""
+    return float(np.arcsin(sin_inc))
+
+
+def phase_to_los(phase, wavelength):
+    """Line-of-sight displacement (metres, float32) of unwrapped phase (radians). The constant is negative to make
+    LOS = -1 * range change."""
+    # scale factor from phase in radians to displacement in meters
+    # constant is negative to make LOS = -1 * range change
+    scale = -float(wavelength) / (4 * np.pi)
+    return (phase * scale).astype('float32')
+
+
+def los_component(los, incidence, func):
+    """LOS displacement divided by a function of the incidence (func = cos for vertical, sin for east-west), float32.
+    incidence: a scalar (the burst-centre value, one per burst) or an array on the data's own grid."""
+    if np.ndim(incidence) == 0:
+        return (los / float(func(incidence))).astype('float32')
+    return (los / func(incidence)).astype('float32')
+
+
+def elevation_approx(phase, factor, baseline):
+    """Height (metres) of a scalar or array phase from the burst-centre factor (radians per metre of height per metre
+    of baseline): -phase / (factor * baseline), rounded to 3 decimals. A scalar gives a float, an array an array. A scalar
+    phase has no pixel and no reference surface: it is a phase DIFFERENCE and maps to a signed height DIFFERENCE."""
+    phase_arr = np.asarray(phase)
+    is_scalar = phase_arr.ndim == 0
+    # phi = -fac * B_perp * dh  ->  dh = -phi / (fac * B_perp), the same relation as the grids
+    elev = -phase_arr / (factor * baseline) + 0.0  # + 0.0 turns -0.0 into 0.0
+    if is_scalar:
+        return round(float(elev), 3)
+    return np.round(elev, 3)
+
+
+# rasterio rasterizes in memory inside warnings.catch_warnings, which is process-wide: dask threads entering it together leak its
+# NotGeoreferencedWarning to the display (rasterio 1.4.3, GDAL 3.9.3); one rasterization at a time per process keeps the values
+_GEOMETRY_MASK_LOCK = threading.Lock()
+
+
+def geometry_mask(shape, x0, y0, dx, dy, geoms):
+    """The polygon test of one block of a burst: True where the pixel centre lies inside the geometries, rasterized as
+    rio.clip does (rasterio geometry_mask, all_touched=False). shape: (rows, columns) of the block; x0, y0: the coordinates
+    of its first pixel centre; dx, dy: the resolution of the burst's x and y axes."""
+    from rasterio import features
+    from rasterio.transform import Affine
+    transform = Affine(dx, 0.0, x0 - dx / 2, 0.0, dy, y0 - dy / 2)
+    with _GEOMETRY_MASK_LOCK:
+        return features.geometry_mask(geoms, out_shape=tuple(shape), transform=transform,
+                                      all_touched=False, invert=True)
+
+
+def reproject_bbox(bounds, src_crs, dst_crs, n_edge):
+    """The bounding box (minx, miny, maxx, maxy) in dst_crs of a box given in src_crs: the four EDGES sampled at n_edge
+    points each, not its four corners. A lon/lat rectangle is not a rectangle in the batch CRS, and its extreme x/y can
+    lie inside a curved edge."""
+    from pyproj import CRS, Transformer
+    minx, miny, maxx, maxy = bounds
+    t = np.linspace(0.0, 1.0, n_edge)
+    xs = np.r_[minx + (maxx - minx) * t, np.full(t.size, maxx), maxx - (maxx - minx) * t, np.full(t.size, minx)]
+    ys = np.r_[np.full(t.size, miny), miny + (maxy - miny) * t, np.full(t.size, maxy), maxy - (maxy - miny) * t]
+    xs, ys = Transformer.from_crs(CRS.from_user_input(src_crs), CRS.from_user_input(dst_crs),
+                                  always_xy=True).transform(xs, ys)
+    return np.min(xs), np.min(ys), np.max(xs), np.max(ys)

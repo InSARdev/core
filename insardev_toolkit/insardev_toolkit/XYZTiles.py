@@ -277,7 +277,8 @@ class XYZTiles(datagrid, progressbar_joblib):
             Default is Google Satellite Hybrid 'https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}'.
         n_jobs : int, optional
             The number of concurrent download jobs, at most two per CPU this process may use (a larger number is
-            capped, with a note). Default is 8.
+            capped, with a note). Negative values follow joblib: -1 all CPUs, -2 all but one, and so on; 0 raises
+            ValueError. Default is 8.
         skip_exist : bool, optional
             If True, keeps the tiles already downloaded. Default is True.
         fill_value : int, optional

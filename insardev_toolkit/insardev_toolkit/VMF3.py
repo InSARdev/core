@@ -29,7 +29,7 @@ class VMF3(datagrid, progressbar_joblib, AtmosphereModel):
     # bytes of the answers to the GET requests of the last download
     bytes_requested = 0
 
-    def _phase(self, folder, times, wavelength, factor):
+    def _phase(self, folder, times, wavelength, factor, heights=None):
         """The terms of the tropospheric model of a folder per tile, in phase units, lazy.
 
         Parameters
@@ -38,9 +38,10 @@ class VMF3(datagrid, progressbar_joblib, AtmosphereModel):
         times : list of str or pandas.Timestamp - The acquisition times, UTC.
         wavelength : float - The radar wavelength, metres.
         factor : float - Not used by VMF3.
+        heights : tuple or None - (lo, hi) ellipsoidal metres of the caller's pixels, or None (the envelope); see AtmosphereModel.open.
         """
         from . import utils_tropo
-        return utils_tropo.zenith_tiles(folder, times, wavelength)
+        return utils_tropo.zenith_tiles(folder, times, wavelength, heights)
 
     @classmethod
     def _epoch_url(cls, product, epoch):
@@ -331,7 +332,7 @@ class VMF3(datagrid, progressbar_joblib, AtmosphereModel):
                  timeout_second=3, min_rate='100KB', min_rate_window=60):
         """Download the VMF3 grids that the scenes need, cut to their 1-degree tiles, and index them in basedir/VMF3_<product>.vrt.
 
-        Each scene takes its two bracketing 6-hour epochs, and a tile file that exists is kept.
+        Each scene takes its two bracketing 6-hour epochs, and a tile file that exists is kept. A VRT that lists every item means all done: None at once.
 
         Parameters
         ----------
@@ -339,7 +340,7 @@ class VMF3(datagrid, progressbar_joblib, AtmosphereModel):
         scenes : pandas.DataFrame or object or list of str - A DataFrame with startTime and geometry columns, an object with such a DataFrame as .df, or Sentinel-1 scene names (the start time is taken from the name; geometry is then required).
         product : str, optional - 'OP', 'EI' or 'FC'. Default 'OP'.
         geometry : shapely geometry, optional - The area of the scenes when scenes is a list of names.
-        n_jobs : int, optional - The number of concurrent download jobs, at most two per CPU. Default is 8.
+        n_jobs : int, optional - The number of concurrent download jobs, at most two per CPU. Negative values follow joblib: -1 all CPUs, -2 all but one, and so on; 0 raises ValueError. Default is 8.
         joblib_backend : str, optional - The joblib backend. Default is 'loky'.
         retries : int, optional - The attempts of each request. Default is 30.
         timeout_second : float, optional - Seconds between the attempts. Default is 3.
@@ -348,7 +349,7 @@ class VMF3(datagrid, progressbar_joblib, AtmosphereModel):
 
         Returns
         -------
-        pandas.DataFrame - Columns epoch, tile, path, status; status is 'new' or 'existing'.
+        pandas.DataFrame or None - The tile files downloaded by this call: columns epoch, tile, path; None when nothing is downloaded.
 
         Examples
         --------

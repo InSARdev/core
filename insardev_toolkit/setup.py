@@ -48,6 +48,7 @@ setup(
                       'numpy',
                       'numba',
                       'llvmlite',
+                      'ncompress',
                       'pandas>=2.2',
                       'geopandas',
                       'distributed>=2024.1.0',

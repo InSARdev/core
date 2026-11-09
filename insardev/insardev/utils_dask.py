@@ -28,41 +28,30 @@ from dask._task_spec import Task as _Task
 import weakref as _weakref
 
 
-def get_dask_chunk_size_mb() -> int:
+def get_dask_chunk_size_mb() -> float:
     """
-    Get Dask chunk size from configuration in megabytes.
+    Get the Dask chunk size in MiB from the 'array.chunk-size' configuration.
 
-    Reads from dask.config 'array.chunk-size' (e.g., '128MiB', '256MB').
-    Returns 128 MB as default if not configured.
+    A string is read with its unit ('128MiB', '256MB', '0.5MiB', '4 KiB'; MB and GB are read as MiB and GiB);
+    a number or a string of digits is bytes. A value that cannot be read raises ValueError.
 
     Returns
     -------
-    int
-        Dask chunk size in megabytes.
+    float
+        Dask chunk size in MiB.
+
+    >>> get_dask_chunk_size_mb()
+    128.0
     """
-    chunk_size_str = dask.config.get('array.chunk-size', '128MiB')
-
-    # Parse string like '128MiB', '256MB', '1GiB'
-    chunk_size_str = chunk_size_str.strip().upper()
-
-    if chunk_size_str.endswith('GIB') or chunk_size_str.endswith('GB'):
-        suffix = 'GIB' if 'GIB' in chunk_size_str else 'GB'
-        value = float(chunk_size_str.replace(suffix, '').strip())
-        return int(value * 1024)
-    elif chunk_size_str.endswith('MIB') or chunk_size_str.endswith('MB'):
-        suffix = 'MIB' if 'MIB' in chunk_size_str else 'MB'
-        value = float(chunk_size_str.replace(suffix, '').strip())
-        return int(value)
-    elif chunk_size_str.endswith('KIB') or chunk_size_str.endswith('KB'):
-        suffix = 'KIB' if 'KIB' in chunk_size_str else 'KB'
-        value = float(chunk_size_str.replace(suffix, '').strip())
-        return max(1, int(value / 1024))
-    else:
-        # Assume bytes
-        try:
-            return max(1, int(float(chunk_size_str) / (1024 * 1024)))
-        except ValueError:
-            return 128  # Default fallback
+    import re
+    value = dask.config.get('array.chunk-size', '128MiB')
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value) / 2 ** 20
+    m = re.match(r'^(\d+(?:\.\d*)?|\.\d+)\s*(GIB|GB|MIB|MB|KIB|KB|B)?$', str(value).strip().upper())
+    if m is None:
+        raise ValueError(f"Cannot read dask's array.chunk-size {value!r}. Use e.g. '128MiB', '256MB', '1GiB' or a number of bytes.")
+    units = {'GIB': 1024.0, 'GB': 1024.0, 'MIB': 1.0, 'MB': 1.0, 'KIB': 1 / 1024, 'KB': 1 / 1024, 'B': 1 / 2 ** 20}
+    return float(m.group(1)) * units[m.group(2) or 'B']
 
 
 def cluster_cores():
@@ -104,485 +93,6 @@ def cluster_cores():
                 "them in the Dask cluster: Client(..., resources={'cpu': N}).")
         _cores = max(1, _os.process_cpu_count() or 1)
     return _slots, _cores
-
-
-def get_aligned_chunk_size(original_chunk: int, target_bytes: int, element_bytes: int,
-                           other_dims_size: int = 1, min_chunk: int = 256) -> int:
-    """
-    Calculate aligned chunk size that divides evenly into original chunk.
-
-    Uses power-of-2 divisions (//2, //4, //8, ...) to ensure new chunks align
-    perfectly with original chunk boundaries, avoiding inefficient overlapping
-    chunks that degrade dask performance.
-
-    Parameters
-    ----------
-    original_chunk : int
-        Original chunk size in pixels for this dimension.
-    target_bytes : int
-        Target memory per chunk in bytes.
-    element_bytes : int
-        Bytes per element (e.g., 8 for complex64, 4 for float32).
-    other_dims_size : int
-        Product of sizes of other dimensions in the chunk (e.g., n_dates * other_spatial).
-    min_chunk : int
-        Minimum chunk size (default 256).
-
-    Returns
-    -------
-    int
-        Aligned chunk size that divides evenly into original_chunk.
-
-    Examples
-    --------
-    >>> # Original 4096 chunk, need smaller for memory
-    >>> get_aligned_chunk_size(4096, 256*1024*1024, 8, other_dims_size=5*4096)
-    2048  # Returns 2048 (4096//2) if it fits, else 1024 (4096//4), etc.
-    """
-    # Calculate maximum chunk size that fits in target memory
-    # chunk_y * other_dims_size * element_bytes <= target_bytes
-    max_chunk = target_bytes // (other_dims_size * element_bytes)
-    max_chunk = max(min_chunk, max_chunk)
-
-    # If original chunk already fits, use it
-    if original_chunk <= max_chunk:
-        return original_chunk
-
-    # Find largest power-of-2 division that fits
-    # Try //2, //4, //8, //16, ... until it fits or hits min_chunk
-    divisor = 2
-    while True:
-        candidate = original_chunk // divisor
-        if candidate <= max_chunk:
-            return max(min_chunk, candidate)
-        if candidate <= min_chunk:
-            return min_chunk
-        divisor *= 2
-
-
-def subdivide_chunk(chunk_size: int, n_parts: int) -> tuple:
-    """
-    Subdivide a single chunk into n roughly equal parts.
-
-    Parameters
-    ----------
-    chunk_size : int
-        Original chunk size.
-    n_parts : int
-        Number of parts to split into.
-
-    Returns
-    -------
-    tuple
-        Tuple of part sizes that sum to chunk_size.
-
-    Examples
-    --------
-    >>> subdivide_chunk(101, 2)
-    (50, 51)
-    >>> subdivide_chunk(301, 3)
-    (100, 100, 101)
-    >>> subdivide_chunk(100, 4)
-    (25, 25, 25, 25)
-    """
-    if n_parts <= 1:
-        return (chunk_size,)
-
-    base_size = chunk_size // n_parts
-    remainder = chunk_size % n_parts
-
-    # Distribute remainder across parts: first 'remainder' parts get +1
-    parts = []
-    for i in range(n_parts):
-        if i < remainder:
-            parts.append(base_size + 1)
-        else:
-            parts.append(base_size)
-
-    return tuple(parts)
-
-
-def subdivide_chunks_dim(chunks: tuple, n_parts: int) -> tuple:
-    """
-    Subdivide all chunks in one dimension into n parts each.
-
-    Parameters
-    ----------
-    chunks : tuple
-        Original chunk sizes for one dimension, e.g., (5001, 4003, 5001).
-    n_parts : int
-        Number of parts to split each chunk into.
-
-    Returns
-    -------
-    tuple
-        New chunk sizes, e.g., (2500, 2501, 2001, 2002, 2500, 2501).
-
-    Examples
-    --------
-    >>> subdivide_chunks_dim((100, 80), 2)
-    (50, 50, 40, 40)
-    >>> subdivide_chunks_dim((101, 99), 2)
-    (51, 50, 50, 49)
-    """
-    result = []
-    for chunk in chunks:
-        result.extend(subdivide_chunk(chunk, n_parts))
-    return tuple(result)
-
-
-def compute_subdivided_chunks(
-    original_chunks: tuple,
-    target_bytes: int,
-    element_bytes: int,
-    min_chunk: int = 64,
-) -> tuple:
-    """
-    Compute subdivided chunks that fit memory budget without crossing original boundaries.
-
-    Each original chunk is split into roughly equal parts. The subdivision factor
-    is chosen to make chunks fit within target_bytes while keeping chunks above min_chunk.
-
-    Parameters
-    ----------
-    original_chunks : tuple
-        Original chunk sizes, e.g., ((5001, 4003), (1921, 1921)) for 2D.
-    target_bytes : int
-        Target memory per chunk in bytes.
-    element_bytes : int
-        Bytes per element.
-    min_chunk : int
-        Minimum chunk size per dimension.
-
-    Returns
-    -------
-    tuple
-        New chunk sizes for each dimension.
-
-    Examples
-    --------
-    >>> # Original chunks 5001×1921, target 16MB for float32
-    >>> compute_subdivided_chunks(((5001,), (1921,)), 16*1024*1024, 4)
-    ((2500, 2501), (960, 961))  # approximately
-    """
-    ndim = len(original_chunks)
-    pixel_budget = target_bytes // element_bytes
-
-    # Get max chunk size per dimension
-    max_y = max(original_chunks[0]) if original_chunks[0] else 1
-    max_x = max(original_chunks[1]) if ndim > 1 and original_chunks[1] else 1
-
-    # If already fits, no subdivision needed
-    if max_y * max_x <= pixel_budget:
-        return original_chunks
-
-    # Find subdivision factor that fits budget
-    # Try subdividing both dimensions equally first
-    for n in range(1, 32):  # Up to 32x subdivision
-        new_y = (max_y + n - 1) // n  # Ceiling division
-        new_x = (max_x + n - 1) // n
-
-        if new_y * new_x <= pixel_budget and new_y >= min_chunk and new_x >= min_chunk:
-            # Found good subdivision, apply to all chunks
-            new_chunks_y = subdivide_chunks_dim(original_chunks[0], n)
-            new_chunks_x = subdivide_chunks_dim(original_chunks[1], n) if ndim > 1 else ()
-            if ndim == 2:
-                return (new_chunks_y, new_chunks_x)
-            elif ndim == 3:
-                return (original_chunks[0], new_chunks_y, new_chunks_x)
-
-    # If equal subdivision doesn't work, try asymmetric
-    for n_y in range(1, 32):
-        for n_x in range(1, 32):
-            new_y = (max_y + n_y - 1) // n_y
-            new_x = (max_x + n_x - 1) // n_x
-
-            if new_y * new_x <= pixel_budget and new_y >= min_chunk and new_x >= min_chunk:
-                new_chunks_y = subdivide_chunks_dim(original_chunks[0], n_y)
-                new_chunks_x = subdivide_chunks_dim(original_chunks[1], n_x) if ndim > 1 else ()
-                if ndim == 2:
-                    return (new_chunks_y, new_chunks_x)
-                elif ndim == 3:
-                    return (original_chunks[0], new_chunks_y, new_chunks_x)
-
-    # Fallback: just return original (shouldn't happen with reasonable inputs)
-    return original_chunks
-
-
-def compute_aligned_chunks_2d(shape: tuple, original_chunks: tuple, target_bytes: int,
-                               element_bytes: int, min_chunk: int = 64) -> tuple:
-    """
-    Compute aligned chunk sizes for 2D spatial data.
-
-    Subdivides each original chunk into roughly equal parts that fit within
-    the memory budget. Never crosses original chunk boundaries.
-
-    Parameters
-    ----------
-    shape : tuple
-        Array shape (y, x).
-    original_chunks : tuple
-        Original chunk sizes ((y_chunks...), (x_chunks...)).
-    target_bytes : int
-        Target memory per chunk in bytes.
-    element_bytes : int
-        Bytes per element.
-    min_chunk : int
-        Minimum chunk size.
-
-    Returns
-    -------
-    tuple
-        New chunk sizes as tuples for each dimension.
-    """
-    return compute_subdivided_chunks(original_chunks, target_bytes, element_bytes, min_chunk)
-
-
-
-
-def compute_aligned_chunks_3d(shape: tuple, original_chunks: tuple, target_bytes: int,
-                               element_bytes: int, min_chunk: int = 64,
-                               keep_first_dim: bool = True) -> tuple:
-    """
-    Compute aligned chunk sizes for 3D data (e.g., date/pair, y, x).
-
-    Subdivides each original spatial chunk into roughly equal parts that fit within
-    the memory budget. Never crosses original chunk boundaries.
-
-    Parameters
-    ----------
-    shape : tuple
-        Array shape (n, y, x) where n is dates or pairs.
-    original_chunks : tuple
-        Original chunk sizes ((n_chunks...), (y_chunks...), (x_chunks...)).
-    target_bytes : int
-        Target memory per chunk in bytes.
-    element_bytes : int
-        Bytes per element.
-    min_chunk : int
-        Minimum spatial chunk size.
-    keep_first_dim : bool
-        If True, keep first dimension as single chunk (all dates/pairs together).
-        If False, also chunk first dimension.
-
-    Returns
-    -------
-    tuple
-        New chunk sizes as tuples for each dimension.
-    """
-    n_dim = shape[0]
-
-    if keep_first_dim:
-        n_chunks = (n_dim,)
-        # Adjust target for all dates in one chunk
-        spatial_target_bytes = target_bytes // n_dim
-    else:
-        n_chunks = original_chunks[0]
-        # Use first n_chunk as representative
-        n_chunk = n_chunks[0] if n_chunks else n_dim
-        spatial_target_bytes = target_bytes // n_chunk
-
-    # Subdivide spatial dimensions
-    spatial_chunks = (original_chunks[1], original_chunks[2])
-    new_spatial = compute_subdivided_chunks(spatial_chunks, spatial_target_bytes, element_bytes, min_chunk)
-
-    return (n_chunks, new_spatial[0], new_spatial[1])
-
-
-def validate_chunks_aligned(original_chunks: tuple, new_chunks: tuple) -> bool:
-    """
-    Validate that new chunks don't cross original chunk boundaries.
-
-    Parameters
-    ----------
-    original_chunks : tuple
-        Original chunk sizes per dimension.
-    new_chunks : tuple
-        New chunk sizes per dimension.
-
-    Returns
-    -------
-    bool
-        True if aligned, False if any new chunk crosses original boundary.
-
-    Raises
-    ------
-    ValueError
-        If new chunks cross original boundaries.
-    """
-    for dim, (orig_dim, new_dim) in enumerate(zip(original_chunks, new_chunks)):
-        # Build boundary positions for original chunks
-        orig_boundaries = set()
-        pos = 0
-        for chunk in orig_dim:
-            pos += chunk
-            orig_boundaries.add(pos)
-
-        # Check that all new chunk boundaries align with original
-        pos = 0
-        for chunk in new_dim:
-            pos += chunk
-            # Every new boundary must be at an original boundary
-            # Exception: intermediate boundaries within an original chunk are fine
-            # What we need to check: the cumulative sum of new chunks must hit
-            # every original boundary exactly
-
-        # Alternative check: sum of new chunks between original boundaries
-        # must equal original chunk size
-        orig_pos = 0
-        new_idx = 0
-        new_pos = 0
-
-        for orig_chunk in orig_dim:
-            orig_end = orig_pos + orig_chunk
-            # Sum new chunks until we reach orig_end
-            sum_new = 0
-            while new_idx < len(new_dim) and new_pos < orig_end:
-                sum_new += new_dim[new_idx]
-                new_pos += new_dim[new_idx]
-                new_idx += 1
-
-            if new_pos != orig_end:
-                raise ValueError(
-                    f"New chunks cross original boundary in dimension {dim}: "
-                    f"original chunk ends at {orig_end}, but new chunks end at {new_pos}. "
-                    f"Original: {orig_dim}, New: {new_dim}"
-                )
-            orig_pos = orig_end
-
-    return True
-
-
-def rechunk3d(data, target_mb: int = None, min_chunk: int = 64,
-              keep_first_dim: bool = True, debug: bool = False):
-    """
-    Rechunk dask array to fit within Dask chunk size without crossing original boundaries.
-
-    Subdivides each original chunk into roughly equal parts. The new chunks never
-    cross original chunk boundaries, ensuring efficient dask operations.
-
-    If original chunks already fit within target, returns data unchanged to allow
-    users to apply custom rechunking via .chunk() if needed.
-
-    Parameters
-    ----------
-    data : dask.array.Array or xarray.DataArray
-        Input data to rechunk.
-    target_mb : int, optional
-        Target memory per chunk in megabytes. If None (default), uses Dask config
-        'array.chunk-size' setting (typically 128MB).
-    min_chunk : int
-        Minimum spatial chunk size (default 64).
-    keep_first_dim : bool
-        For 3D data, keep first dimension (dates/pairs) as single chunk.
-    debug : bool
-        Print debug information.
-
-    Returns
-    -------
-    same type as input
-        Rechunked data with subdivided chunk boundaries, or original data if
-        no rechunking needed.
-
-    Raises
-    ------
-    ValueError
-        If computed new chunks would cross original chunk boundaries (indicates bug).
-
-    Examples
-    --------
-    >>> # Rechunk using Dask config chunk size
-    >>> slc_rechunked = rechunk3d(slc_data, keep_first_dim=True)
-
-    >>> # Original: ((5001, 4003), (1921, 1921))
-    >>> # New:      ((2500, 2501, 2001, 2002), (960, 961, 960, 961))
-
-    >>> # If chunks already fit, returns unchanged (allows custom rechunking)
-    >>> small_data = rechunk3d(data, target_mb=256)  # returns as-is if fits
-    >>> custom = small_data.chunk({'y': 1000, 'x': 1000})  # user can customize
-    """
-    import dask.array as da
-    import xarray as xr
-
-    # Handle xarray DataArray
-    is_xarray = isinstance(data, xr.DataArray)
-    if is_xarray:
-        dask_data = data.data
-        if not isinstance(dask_data, da.Array):
-            return data
-    else:
-        dask_data = data
-
-    if not isinstance(dask_data, da.Array):
-        return data
-
-    # Get Dask chunk size from config if not specified
-    if target_mb is None:
-        target_mb = get_dask_chunk_size_mb()
-
-    target_bytes = target_mb * 1024 * 1024
-    element_bytes = dask_data.dtype.itemsize
-    shape = dask_data.shape
-    original_chunks = dask_data.chunks
-    ndim = dask_data.ndim
-
-    # Check if rechunking is actually needed
-    current_chunk_bytes = 1
-    for i, dim_chunks in enumerate(original_chunks):
-        if ndim == 3 and keep_first_dim and i == 0:
-            current_chunk_bytes *= shape[0]
-        else:
-            current_chunk_bytes *= max(dim_chunks) if dim_chunks else 1
-    current_chunk_bytes *= element_bytes
-
-    if current_chunk_bytes <= target_bytes:
-        if debug:
-            print(f"rechunk3d: effective chunks ({current_chunk_bytes/1e6:.1f} MB) "
-                  f"already fit target ({target_mb} MB), returning unchanged")
-        # Return data as-is to allow user custom rechunking
-        # Only exception: for 3D with keep_first_dim, ensure first dim is merged
-        if ndim == 3 and keep_first_dim and original_chunks[0] != (shape[0],):
-            new_chunks = {0: shape[0]}
-            if is_xarray:
-                return data.chunk(new_chunks)
-            else:
-                return dask_data.rechunk(new_chunks)
-        return data
-
-    # Compute new chunks
-    if ndim == 2:
-        new_chunk_sizes = compute_aligned_chunks_2d(
-            shape, original_chunks, target_bytes, element_bytes, min_chunk
-        )
-    elif ndim == 3:
-        new_chunk_sizes = compute_aligned_chunks_3d(
-            shape, original_chunks, target_bytes, element_bytes, min_chunk, keep_first_dim
-        )
-    else:
-        if debug:
-            print(f"rechunk3d: unsupported ndim={ndim}, returning unchanged")
-        return data
-
-    # Validate that new chunks don't cross original boundaries
-    validate_chunks_aligned(original_chunks, new_chunk_sizes)
-
-    if debug:
-        print(f"rechunk3d: {shape}, dtype={dask_data.dtype}")
-        print(f"  original chunks: {original_chunks}")
-        print(f"  original chunk size: {current_chunk_bytes/1e6:.1f} MB")
-        print(f"  target: {target_mb} MB")
-        print(f"  new chunks: {new_chunk_sizes}")
-        max_new_chunk = 1
-        for dim_chunks in new_chunk_sizes:
-            max_new_chunk *= max(dim_chunks) if dim_chunks else 1
-        print(f"  max new chunk size: {max_new_chunk * element_bytes / 1e6:.1f} MB")
-
-    if is_xarray:
-        dims = data.dims
-        chunk_dict = {dims[i]: new_chunk_sizes[i] for i in range(len(new_chunk_sizes))}
-        return data.chunk(chunk_dict)
-    else:
-        return dask_data.rechunk(new_chunk_sizes)
 
 
 def _compute_chunk_score(
@@ -675,6 +185,7 @@ def rechunk2d(
     min_chunk: int = 64,
     max_chunk: int = 16384,
     merge: bool = False,
+    floors: list = None,
 ) -> dict:
     """
     Compute optimal chunk sizes aligned to input chunk boundaries.
@@ -696,8 +207,8 @@ def rechunk2d(
         Bytes per element (e.g., 8 for complex64, 4 for float32).
     input_chunks : tuple of tuples, optional
         Input chunk sizes per spatial dim: ((cy0, cy1, ...), (cx0, cx1, ...)).
-    target_mb : int, optional
-        Target memory per chunk in MB. If None, uses dask config.
+    target_mb : float, optional
+        Target memory per chunk in MiB. If None, uses dask config ('array.chunk-size').
     min_chunk : int
         Minimum chunk size (default 64).
     max_chunk : int
@@ -707,6 +218,10 @@ def rechunk2d(
         output tiles.  If False (default), each input chunk is kept
         whole or split — never merged with neighbors.  False avoids
         cross-chunk rechunk graphs that explode in layered pipelines.
+    floors : list, optional
+        The fixed smallest tile is appended when no tile of min_chunk x min_chunk px fits 1.2 times the budget
+        (26.67 KiB per date at 8 B per pixel): the largest tile (cy, cx) is appended. The caller prints the
+        WARNING (warn_floor); rechunk2d prints nothing.
 
     Returns
     -------
@@ -787,14 +302,18 @@ def rechunk2d(
             candidates.append((yg, xg))
 
         # Strategy C: balanced split/merge
+        c_floor = []
         target_c = _find_optimal_chunk_pair(
-            y_size, x_size, pixel_budget, element_bytes, min_chunk, max_chunk)
+            y_size, x_size, pixel_budget, element_bytes, min_chunk, max_chunk, floors=c_floor)
         yg = split_dim(y_in, target_c['y'])
         xg = split_dim(x_in, target_c['x'])
         candidates.append((yg, xg))
+        c_tiles = (yg, xg)
 
         # Pick strategy with fewest output tiles
         best_yg, best_xg = min(candidates, key=lambda c: len(c[0]) * len(c[1]))
+        if floors is not None and c_floor and (best_yg, best_xg) == c_tiles:
+            floors.append((max(best_yg), max(best_xg)))
 
         result = {'y': best_yg, 'x': best_xg}
         if is_3d:
@@ -810,18 +329,30 @@ def rechunk2d(
         return result
 
     result = _find_optimal_chunk_pair(
-        y_size, x_size, pixel_budget, element_bytes, min_chunk, max_chunk)
+        y_size, x_size, pixel_budget, element_bytes, min_chunk, max_chunk, floors=floors)
     if is_3d:
         result[0] = 1
     return result
+
+
+def warn_floor(who: str, floors) -> None:
+    """
+    One WARNING line per call when rechunk2d made its fixed smallest tile (the budget per date is too small for a 64 x 64 px
+    tile: 1.2 x the budget is below 4096 px): the largest tile of floors is named. warn_floor('chunk2d', [(35, 62)])
+    """
+    if floors:
+        cy, cx = max(floors, key=lambda p: p[0] * p[1])
+        print(f"WARNING: {who}(): the budget per date is too small for a 64 x 64 px tile (1.2 x the budget is below 4096 px): "
+              f"the largest floor tile made is {cy} x {cx} px", flush=True)
 
 
 def _find_optimal_chunk_pair(
     y_size: int, x_size: int,
     pixel_budget: int, element_bytes: int,
     min_chunk: int = 64, max_chunk: int = 16384,
+    floors: list = None,
 ) -> dict:
-    """Find optimal (cy, cx) chunk pair for a given array shape and budget."""
+    """Find optimal (cy, cx) chunk pair for a given array shape and budget; the fallback tile is appended to floors."""
     max_pixels = int(1.2 * pixel_budget)
 
     def get_candidates(dim_size):
@@ -870,6 +401,8 @@ def _find_optimal_chunk_pair(
         while cy * cx > max_pixels and cx > min_chunk:
             cx //= 2
         best_result = {'y': cy, 'x': cx}
+        if floors is not None:
+            floors.append((cy, cx))
 
     return best_result
 
@@ -1301,3 +834,216 @@ def install_safe_restart():
 
     restart.__insardev_safe_restart__ = True
     Client.restart = restart
+
+
+def overlap_check(result, source, name, window, halo):
+    """The map_overlap `result` of `source` keeps the input's chunks, or raises one line. A halo larger than a chunk makes
+    dask rechunk the input (ensure_minimum_chunksize), and the output then has other chunks than the input the user gave:
+    the ValueError names the function, the smallest input chunk, the window and the halo it needs.
+
+    Examples
+    --------
+    >>> filtered = overlap_check(filtered, dsk, 'median', (11, 11), (5, 5))
+    """
+    if result.chunks == source.chunks:
+        return result
+    smallest = min(min(c) for c in source.chunks[-2:])
+    raise ValueError(
+        f'{name}(): window {tuple(int(v) for v in window)} px needs a halo of {tuple(int(v) for v in halo)} px, '
+        f'larger than the smallest input chunk of {smallest} px: give the input blocks of at least {max(int(v) for v in halo)} px')
+
+
+def union_check(chunks, who):
+    """Rule (3) of the union drivers: a union=True function runs one task per input date chunk, so a date axis that is
+    ONE chunk of more than one date would make one task join every date of every burst: that case raises one line.
+    One date is one chunk in every layout, so it never raises. `chunks` is the date chunk sizes of the input, `who` the
+    public name of the function.
+
+    Examples
+    --------
+    >>> union_check((10, 10), 'trend2d')  # two date chunks: no raise
+    >>> union_check((1,), 'unwrap2d')  # one date: no raise
+    """
+    if len(chunks) == 1 and chunks[0] > 1:
+        raise ValueError(f"{who}(union=True): the date axis is one chunk, so one task would join all {chunks[0]} "
+                         f"dates of every burst -- chunk the stack by date, one or more dates per chunk.")
+
+
+def coarsen_chunks(blocks, window):
+    """Block sizes of one dimension for coarsen() by `window`: the block boundaries moved up to whole windows
+    (the first block starts at the window grid), or None when no boundary is left inside the dimension."""
+    import numpy as np
+    n, w = int(sum(blocks)), int(window)
+    inner = sorted({-(-int(b) // w) * w for b in np.cumsum(blocks)[:-1]} - {0})
+    inner = [b for b in inner if b < n]
+    if inner:
+        return tuple(int(s) for s in np.diff([0] + inner + [n]))
+    return None
+
+
+# the graph rule (the user, 2026-11-01): one WARNING line when a call makes more than GRAPH_CHUNK_LIMIT output chunks of one
+# variable of one burst, when it adds more than GRAPH_TASK_LIMIT lazy tasks, or when its input already carries more than
+# GRAPH_TASK_LIMIT (about 2000 chunks x 20 tasks per chunk: the user expects 10 to 20 tasks per chunk)
+GRAPH_CHUNK_LIMIT = 2000
+GRAPH_TASK_LIMIT = 40000
+
+
+def _lazy_arrays(obj):
+    """The dask arrays of a dask array, an xarray object, a list or a dict of them (other objects have none)."""
+    import dask.array as da
+    import xarray as xr
+    if isinstance(obj, (list, tuple)):
+        return [a for o in obj for a in _lazy_arrays(o)]
+    if isinstance(obj, dict):
+        return [a for o in obj.values() for a in _lazy_arrays(o)]
+    if isinstance(obj, xr.Dataset):
+        return [v.data for v in obj.data_vars.values() if isinstance(v.data, da.Array)]
+    if isinstance(obj, xr.DataArray):
+        obj = obj.data
+    return [obj] if isinstance(obj, da.Array) else []
+
+
+def _graph_layers(arrays):
+    """{layer name: layer} of the lazy graphs of the arrays; a plain (materialised) graph counts as one layer."""
+    from dask.highlevelgraph import HighLevelGraph
+    layers = {}
+    for arr in arrays:
+        graph = arr.__dask_graph__()
+        if isinstance(graph, HighLevelGraph):
+            layers.update(graph.layers)
+        else:
+            layers.setdefault(arr.name, graph)
+    return layers
+
+
+def graph_check(name, result, source):
+    """
+    Warn when a call makes too many lazy graph objects: the graph rule (GRAPH_CHUNK_LIMIT, GRAPH_TASK_LIMIT).
+
+    Counts the lazy graph only (the layers by length, nothing is optimised). Prints one WARNING line per rule that fires:
+    more than GRAPH_CHUNK_LIMIT output chunks of one variable of one burst (the largest is named), more than GRAPH_TASK_LIMIT
+    lazy tasks added to the input's graph by the call, and more than GRAPH_TASK_LIMIT lazy tasks that the input already
+    carries (the line suggests a snapshot). Otherwise nothing.
+    The count line names chunk2d() when the input already has as many chunks.
+
+    Parameters
+    ----------
+    name : str
+        Function name for the message.
+    result : dask.array.Array, xarray.DataArray, xarray.Dataset, list or dict of them
+        Output of the function.
+    source : dask.array.Array, xarray.DataArray, xarray.Dataset, list or dict of them
+        Input of the function.
+
+    Returns
+    -------
+    dict or None
+        added, output_chunks, added_per_chunk, input_per_chunk, input_tasks, max_chunks; None when the result has no dask array.
+
+    Examples
+    --------
+    >>> graph_check('lee', result, source)
+    """
+    import math
+
+    def named(obj, burst=None, var=None):
+        """(label, dask array) of each lazy array of obj: a variable of a dataset, named by its burst (a dict key)."""
+        import dask.array as da
+        import xarray as xr
+        if isinstance(obj, (list, tuple)):
+            return [p for o in obj for p in named(o, burst, var)]
+        if isinstance(obj, dict):
+            return [p for k, o in obj.items() for p in named(o, str(k), var)]
+        if isinstance(obj, xr.Dataset):
+            return [p for k, v in obj.data_vars.items() for p in named(v.data, burst, str(k))]
+        if isinstance(obj, xr.DataArray):
+            return named(obj.data, burst, var or (None if obj.name is None else str(obj.name)))
+        if isinstance(obj, da.Array):
+            return [(' in '.join(p for p in (var, burst) if p) or 'array', obj)]
+        return []
+
+    res_arrays = _lazy_arrays(result)
+    if not res_arrays:
+        return None
+    src_arrays = _lazy_arrays(source)
+    src_layers = _graph_layers(src_arrays)
+    res_layers = _graph_layers(res_arrays)
+    added = sum(len(layer) for key, layer in res_layers.items() if key not in src_layers)
+    out_chunks = sum(math.prod(a.numblocks) for a in res_arrays)
+    in_total = sum(len(layer) for layer in src_layers.values())
+    in_chunks = sum(math.prod(a.numblocks) for a in src_arrays) or 1
+    counts = [(math.prod(a.numblocks), label) for label, a in named(result)]
+    over = sorted((n, label) for n, label in counts if n > GRAPH_CHUNK_LIMIT)
+    info = {'added': added, 'output_chunks': out_chunks,
+            'added_per_chunk': added / max(out_chunks, 1), 'input_per_chunk': in_total / in_chunks,
+            'input_tasks': in_total, 'max_chunks': max((n for n, _ in counts), default=0)}
+    if over:
+        n, label = over[-1]
+        more = f' ({len(over) - 1} more arrays over the limit)' if len(over) > 1 else ''
+        kept = n <= max((math.prod(a.numblocks) for a in src_arrays), default=0)
+        advice = (': the input has as many: re-chunk it with a larger chunk2d() budget' if kept
+                  else ': use a larger budget or keep the stored chunks')
+        print(f"WARNING: {name}(): {n} output chunks of {label} (more than {GRAPH_CHUNK_LIMIT}){advice}{more}", flush=True)
+    if added > GRAPH_TASK_LIMIT:
+        print(f"WARNING: {name}(): {added} lazy tasks added ({info['added_per_chunk']:.0f} per output chunk, {out_chunks} "
+              f"output chunks), more than {GRAPH_TASK_LIMIT}: the graph grows with the dates and pairs of the call", flush=True)
+    if in_total > GRAPH_TASK_LIMIT:
+        print(f"WARNING: {name}(): the input carries {in_total} lazy tasks, more than {GRAPH_TASK_LIMIT}: take a snapshot of "
+              f"the input first (Stack.snapshot()), so the call does not carry its graph", flush=True)
+    return info
+
+
+# ----------------------------------------------------------------------------
+# Inputs of a multi-input function (GMT U2, user ruling 2026-11-02). The PRIMARY inputs (the data: every polarisation)
+# set the output's chunks and are never rechunked. A SECONDARY input (a weight, a phase to remove, a covariate) takes the
+# primary's (y, x) chunks, rechunked with one WARNING per call; other date chunks of a secondary raise one line.
+
+def _sizes(chunks) -> str:
+    """The chunk sizes as text: _sizes((32, 32)) is '(32, 32)'; more than 8 blocks give their count."""
+    return str(tuple(chunks)) if len(chunks) <= 8 else f'{len(chunks)} blocks'
+
+
+def check_primary_chunks(arrays: dict, who: str) -> None:
+    """Raises one line when the primary inputs (name: dask array of the same dims) are chunked differently:
+    check_primary_chunks({'VV': vv, 'VH': vh}, 'detrend')."""
+    names = list(arrays)
+    for n in names[1:]:
+        if arrays[n].chunks != arrays[names[0]].chunks:
+            raise ValueError(f"ERROR: {who}(): the primary inputs '{names[0]}' and '{n}' are chunked differently; "
+                             f"all polarisations are chunked the same")
+
+
+def align_secondary(primary, secondary, who: str, name: str, check_dates: bool = True, dims=None):
+    """A secondary input on the primary's chunks: returns (array, changed). Each of its dims takes the primary's chunks
+    of that dim ('date' first, 'y' and 'x' last), so a 1-D covariate over 'x' gets the x chunks only. Its (y, x) chunks
+    go to the primary's (changed=True: the caller warns once per call with warn_secondary); other date chunks raise
+    one line, unless check_dates is False (the caller rebuilt the dates, so the secondary keeps its own date chunks).
+    dims: the secondary's dims (default ('date', 'y', 'x') for 3-D and ('y', 'x') for 2-D; a 1-D one must name its dim).
+    data, changed = align_secondary(primary, phase, 'detrend', 'phase')."""
+    dims = tuple(dims) if dims is not None else {3: ('date', 'y', 'x'), 2: ('y', 'x')}.get(secondary.ndim)
+    if dims is None or len(dims) != secondary.ndim:
+        raise ValueError(f"align_secondary(): name the dims of the {secondary.ndim}-D secondary '{name}' (dims=...)")
+    axis = {'date': 0, 'y': -2, 'x': -1}
+    pc = primary.chunks
+    target = []
+    for d, c in zip(dims, secondary.chunks):
+        if d == 'date':
+            if check_dates and c != pc[0]:
+                raise ValueError(f"ERROR: {who}(): the date chunks of the {name} {_sizes(c)} differ from the data's "
+                                 f"{_sizes(pc[0])}: a secondary input takes the data's date chunks")
+            target.append(pc[0] if check_dates else c)
+        else:
+            target.append(pc[axis[d]])
+    target = tuple(target)
+    if secondary.chunks == target:
+        return secondary, False
+    return secondary.rechunk(target), True
+
+
+def warn_secondary(who: str, names) -> None:
+    """ONE WARNING line per call for the secondary inputs rechunked in it (names: 'phase', "covariate 'ele'", ...):
+    warn_secondary('detrend', ['phase'])."""
+    names = list(dict.fromkeys(names))
+    if names:
+        print(f"WARNING: {who}(): {', '.join(names)} rechunked to the data's (y, x) chunks; the data's chunks are the output's.",
+              flush=True)

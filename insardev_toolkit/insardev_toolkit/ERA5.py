@@ -7,6 +7,8 @@
 #
 # See the LICENSE file in the insardev_toolkit directory for license terms.
 # ----------------------------------------------------------------------------
+import threading
+
 from .datagrid import datagrid
 from .progressbar_joblib import progressbar_joblib
 from .utils_atmosphere import AtmosphereModel
@@ -32,8 +34,10 @@ class ERA5(datagrid, progressbar_joblib, AtmosphereModel):
     workers = 16
     # bytes of the answers to the GET requests of the last download
     bytes_requested = 0
+    # the counter is updated by the threads of the parallel hours
+    _count_lock = threading.Lock()
 
-    def _phase(self, folder, times, wavelength, factor):
+    def _phase(self, folder, times, wavelength, factor, heights=None):
         """The terms of the tropospheric model of a folder per tile, in phase units, lazy.
 
         Parameters
@@ -42,9 +46,10 @@ class ERA5(datagrid, progressbar_joblib, AtmosphereModel):
         times : list of str or pandas.Timestamp - The acquisition times, UTC.
         wavelength : float - The radar wavelength, metres.
         factor : float - Not used by ERA5.
+        heights : tuple or None - (lo, hi) ellipsoidal metres of the caller's pixels, or None (the envelope); see AtmosphereModel.open.
         """
         from . import utils_tropo
-        return utils_tropo.zenith_tiles(folder, times, wavelength)
+        return utils_tropo.zenith_tiles(folder, times, wavelength, heights)
 
     @staticmethod
     def _block_ranges(offsets, cbytes, blocks):
@@ -142,7 +147,7 @@ class ERA5(datagrid, progressbar_joblib, AtmosphereModel):
             meta['arrays'][name] = zarray
         return meta
 
-    def _hour_index(self, meta, hour, net):
+    def _hour_index(self, meta, hour, net, chunks=None):
         """The index of an hour (UTC) in the time array of a store, checked against the store's validity and its time value.
 
         Parameters
@@ -150,6 +155,7 @@ class ERA5(datagrid, progressbar_joblib, AtmosphereModel):
         meta : dict - The metadata of the store.
         hour : datetime.datetime - The hour, naive UTC, on the hour.
         net : dict - The retry and timeout arguments.
+        chunks : dict, optional - The time chunks read so far, by chunk index; a chunk is read once.
 
         Returns
         -------
@@ -178,12 +184,16 @@ class ERA5(datagrid, progressbar_joblib, AtmosphereModel):
         time = meta['arrays']['time']
         index = int((hour - datetime(1900, 1, 1)).total_seconds()) // 3600
         chunk, pos = divmod(index, time['chunks'][0])
-        try:
-            body = fetch(meta['store'] + f'time/{chunk}', **net)
-        except NotFound:
-            raise ValueError(f'ERROR: the time chunk {chunk} of {meta["store"]} is not in the store') from None
-        self.bytes_requested += len(body)
-        values = np.frombuffer(numcodecs.blosc.decompress(body), dtype=time['dtype'])
+        if chunks is None:
+            chunks = {}
+        if chunk not in chunks:
+            try:
+                body = fetch(meta['store'] + f'time/{chunk}', **net)
+            except NotFound:
+                raise ValueError(f'ERROR: the time chunk {chunk} of {meta["store"]} is not in the store') from None
+            self.bytes_requested += len(body)
+            chunks[chunk] = np.frombuffer(numcodecs.blosc.decompress(body), dtype=time['dtype'])
+        values = chunks[chunk]
         if index >= time['shape'][0] or int(values[pos]) != index:
             held = int(values[pos]) if pos < values.size else None
             raise ValueError(f'ERROR: the time index {index} of {meta["store"]} holds {held}, expected {index}')
@@ -225,28 +235,32 @@ class ERA5(datagrid, progressbar_joblib, AtmosphereModel):
             raise ValueError(f'ERROR: the level array of {meta["store"]} is not {self.levels} ascending integers (hPa)')
         return values.astype(np.int32)
 
-    def _read_hour(self, meta, index, tiles, invariant, net, pool):
+    def _read_hour(self, meta, index, tiles, invariant, net, pool, models=True):
         """The values of the tiles at one hour: the model variables on the pressure levels and the surface fields.
 
-        Blocks are read by byte range; a chunk whose block route fails is read whole, with a warning.
+        Blocks are read by byte range; a chunk whose block route fails is read whole, with a warning. Hours may be read
+        side by side in threads: the surface geopotential of the tiles not in invariant is read here and must be read
+        before, by the call with models False.
 
         Parameters
         ----------
         meta : dict - The metadata of the store.
         index : int - The index of the hour in the store.
         tiles : list of tuple - (lon0, lat0) of the tiles, the lower-left corners in whole degrees.
-        invariant : dict - {(lon0, lat0): (5, 5) float32 surface geopotential}, filled for the tiles read now.
+        invariant : dict - {(lon0, lat0): (5, 5) float32 surface geopotential}, filled for the tiles not in it.
         net : dict - The retry and timeout arguments.
         pool : concurrent.futures.Executor - The pool of the range requests.
+        models : bool, optional - False reads the surface geopotential only (the catalogue step). Default is True.
 
         Returns
         -------
-        dict - {(lon0, lat0): {variable: array}}: the model variables (37, 5, 5) with the level axis first, the surface fields (5, 5); float32 as served.
+        dict - {(lon0, lat0): {variable: array}}: the model variables (37, 5, 5) with the level axis first, the surface fields (5, 5); float32 as served; {} when models is False.
 
         Examples
         --------
         >>> era5 = ERA5()
         >>> era5._read_hour(meta, 1019984, [(150, -27)], {}, {'retries': 30}, pool)
+        >>> era5._read_hour(meta, 1019984, [(150, -27)], {}, {'retries': 30}, pool, models=False)
         """
         import struct
         import numcodecs
@@ -274,7 +288,8 @@ class ERA5(datagrid, progressbar_joblib, AtmosphereModel):
                 raise ValueError(f'ERROR: {url} is not in the ERA5 store') from None
             if start is not None and len(body) != stop - start:
                 raise ValueError(f'ERROR: {url}: bytes {start}-{stop - 1} came as {len(body)} bytes')
-            self.bytes_requested += len(body)
+            with self._count_lock:
+                self.bytes_requested += len(body)
             return body
 
         def header(path, dtype, items):
@@ -459,16 +474,18 @@ class ERA5(datagrid, progressbar_joblib, AtmosphereModel):
             return gather(meta, name, lead + (rows, cols)).reshape(len(corners), n, n)
 
         rows, cols = positions_of(tiles)
+        new = [t for t in tiles if t not in invariant]
+        if new:
+            for t, field in zip(new, surface('geopotential_at_surface', new)):
+                invariant[t] = field
+        if not models:
+            return {}
         out = {t: {} for t in tiles}
         levels = np.arange(self.levels, dtype=np.int64)[:, None]
         for name in self.model_variables:
             values = gather(meta, name, (np.int64(index), levels, rows[None, :], cols[None, :]))
             for k, t in enumerate(tiles):
                 out[t][name] = values[:, k * n * n:(k + 1) * n * n].reshape(self.levels, n, n)
-        new = [t for t in tiles if t not in invariant]
-        if new:
-            for t, field in zip(new, surface('geopotential_at_surface', new)):
-                invariant[t] = field
         for t in tiles:
             out[t]['geopotential_at_surface'] = invariant[t]
         surf = surface('surface_pressure', tiles)
@@ -549,10 +566,15 @@ class ERA5(datagrid, progressbar_joblib, AtmosphereModel):
         return levels
 
     def download(self, basedir, scenes, geometry=None, retries=30, timeout_second=3, min_rate='100KB',
-                 min_rate_window=60):
+                 min_rate_window=60, n_jobs=8):
         """Download the ERA5 pressure levels and surface fields that the scenes need as 1-degree tiles, and index them in basedir/ERA5.vrt.
 
-        Each scene takes its two bracketing hours; a tile file that exists is kept and listed as existing.
+        The catalogue steps (the store metadata with the levels, the hour indices, the surface fields) show the bar 'Downloading
+        ERA5 Catalog'; then the new hours are read in parallel, and the bar 'Downloading ERA5' counts them as they complete.
+        The folder is made at the start, and the tiles of each hour are written as the hour completes (atomically): an
+        interrupted or failed call keeps them, and the next call reads only the missing hours. The VRT is written after every
+        hour succeeded. Each scene takes its two bracketing hours; a tile file that exists is kept. A VRT that lists every item
+        means all done: None at once.
 
         Parameters
         ----------
@@ -563,14 +585,15 @@ class ERA5(datagrid, progressbar_joblib, AtmosphereModel):
         timeout_second : float, optional - Seconds between the attempts. Default is 3.
         min_rate : str or float, optional - Bytes per second a transfer must keep. Default '100KB'.
         min_rate_window : float, optional - Seconds over which the rate is averaged. Default is 60.
+        n_jobs : int or None, optional - Hours read at once in threads of this process, each with up to 16 range requests in flight; 1 or None reads them one after another. Negative values follow joblib: -1 all CPUs, -2 all but one, and so on; 0 raises ValueError. Default is 8.
 
         Returns
         -------
-        pandas.DataFrame - Columns epoch, tile, path, status; status is 'new' or 'existing'.
+        pandas.DataFrame or None - The tile files downloaded by this call: columns epoch, tile, path; None when nothing is downloaded.
 
         Raises
         ------
-        ValueError: When the scenes argument is invalid, a tile file holds another number of levels or cannot be read, or an hour is outside the store; no file is written then.
+        ValueError: When the scenes argument is invalid, a tile file holds another number of levels or cannot be read, or an hour is outside the store or cannot be read; the tiles of the hours completed before are kept, and no VRT is written then.
 
         Examples
         --------
@@ -579,54 +602,115 @@ class ERA5(datagrid, progressbar_joblib, AtmosphereModel):
         """
         import os
         import numpy as np
-        from concurrent.futures import ThreadPoolExecutor
-        from .utils_epochs import scene_items, store, tile_name
-        from .utils_files import exists
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from tqdm.auto import tqdm
+        from .utils_epochs import scene_items, TileWriter, tile_name, _complete
 
         net = {'retries': retries, 'timeout_second': timeout_second, 'min_rate': min_rate,
                'min_rate_window': min_rate_window}
         items = scene_items(scenes, 'ERA5', geometry=geometry)
         base = os.path.abspath(basedir)
         folder = os.path.join(base, 'ERA5')
+        # a VRT that lists every item means all done: no tile file is read and no request is made
+        if _complete(base, 'ERA5', items):
+            return None
         levels = self._tile_levels(folder)
-        rows = []
-        for epoch, lon0, lat0 in items.itertuples(index=False):
-            lon0, lat0 = int(lon0), int(lat0)
-            path = os.path.join(folder, f'{tile_name(lon0, lat0)}_{epoch:%Y%m%dT%H%M%S}.nc')
-            rows.append((epoch, lon0, lat0, 'existing' if exists(path) else 'new'))
+        # the folder is made here; the tile files of the items without one are written as their hours complete
+        writer = TileWriter(base, 'ERA5', items)
+        new = writer.new
         self.bytes_requested = 0
-        new = [r for r in rows if r[3] == 'new']
-        meta, index, values, invariant = None, {}, {}, {}
+        invariant = {}
+
+        def served(out):
+            """The values of one tile at one hour as the writer takes them: {variable: {level: 2-D array}}; the surface fields are labelled 'surface'."""
+            values = {var: {str(int(p)): out[var][k] for k, p in enumerate(levels, 0)} for var in self.model_variables}
+            values.update({var: {'surface': out[var]} for var in self.surface_variables})
+            return values
+
         if new:
-            meta = self._store_meta(self.url + self.store, ('level',) + self.model_variables + self.surface_variables, net)
-            store_levels = self._levels(meta, net)
-            if levels is not None and not np.array_equal(levels, store_levels):
-                raise ValueError(f'ERROR: the store levels differ from the levels of the tile files in {folder}')
-            levels = store_levels
-            # the index of every new hour before the first write: an hour outside the store raises with no file written
-            index = {h: self._hour_index(meta, h.to_pydatetime(), net) for h in sorted({r[0] for r in new})}
-
-        def fetch(epoch, lon0, lat0):
-            """The values of one tile at one hour, as {variable: {level: 2-D array}}; the surface fields are labelled 'surface'.
-
-            Parameters
-            ----------
-            epoch : pandas.Timestamp - The hour of the values, UTC.
-            lon0, lat0 : int - The lower-left corner of the tile in whole degrees.
-
-            Examples
-            --------
-            >>> fetch(pd.Timestamp('2016-05-11 08:00:00'), 150, -27)
-            """
-            if epoch not in values:
-                values.clear()
-                corners = [(r[1], r[2]) for r in new if r[0] == epoch]
-                values[epoch] = self._read_hour(meta, index[epoch], corners, invariant, net, pool)
-            out = values[epoch][(lon0, lat0)]
-            served = {var: {str(int(p)): out[var][k] for k, p in enumerate(levels, 0)} for var in self.model_variables}
-            served.update({var: {'surface': out[var]} for var in self.surface_variables})
-            return served
-
-        with ThreadPoolExecutor(max_workers=self.workers) as pool:
-            # the fetches run in this process: the hour reads share this pool and the invariant fields
-            return store(base, 'ERA5', items, fetch, n_jobs=None)
+            # the hours of the new tiles, their corners, and the first hour of each tile (the hour that reads its surface geopotential)
+            hours = list(dict.fromkeys(r[0] for r in new))
+            corners = {h: list(dict.fromkeys((r[1], r[2]) for r in new if r[0] == h)) for h in hours}
+            first = {}
+            for h in hours:
+                for t in corners[h]:
+                    first.setdefault(t, h)
+            groups = {h: [t for t in corners[h] if first[t] == h] for h in hours}
+            from .HTTP import joblib_jobs
+            n_jobs = joblib_jobs(n_jobs)
+            workers = min(1 if n_jobs is None else n_jobs, len(hours))
+            # the catalogue bar: the store metadata with the levels, the index of each new hour, the surface geopotential of each group
+            cat = tqdm(desc='Downloading ERA5 Catalog'.ljust(25), total=1 + len(hours) + sum(1 for g in groups.values() if g))
+            # the request pool of all hours: self.workers requests in flight for each parallel hour
+            with ThreadPoolExecutor(max_workers=self.workers * max(1, n_jobs or 1)) as pool:
+                try:
+                    meta = self._store_meta(self.url + self.store, ('level',) + self.model_variables + self.surface_variables, net)
+                    store_levels = self._levels(meta, net)
+                    cat.update(1)
+                    cat.refresh()
+                    if levels is not None and not np.array_equal(levels, store_levels):
+                        raise ValueError(f'ERROR: the store levels differ from the levels of the tile files in {folder}')
+                    levels = store_levels
+                    # the index of every new hour before the first write (each time chunk read once), then the surface geopotential
+                    # of each group at its first hour (as the serial reads did); an hour outside the store raises with no file written
+                    chunks, index = {}, {}
+                    for h in hours:
+                        index[h] = self._hour_index(meta, h.to_pydatetime(), net, chunks)
+                        cat.update(1)
+                        cat.refresh()
+                    for h in hours:
+                        if groups[h]:
+                            self._read_hour(meta, index[h], groups[h], invariant, net, pool, models=False)
+                            cat.update(1)
+                            cat.refresh()
+                finally:
+                    cat.close()
+                # the hours in parallel, each with its block requests in flight on the pool; each hour's tiles are written when it completes
+                with ThreadPoolExecutor(max_workers=workers) as hour_pool:
+                    futures = {hour_pool.submit(self._read_hour, meta, index[h], corners[h], invariant, net, pool): h
+                               for h in hours}
+                    # the bar counts the hours as they complete, whatever their order
+                    bar = tqdm(desc='Downloading ERA5'.ljust(25), total=len(hours))
+                    errors, written = {}, set()
+                    try:
+                        for f in as_completed(futures):
+                            if f.cancelled():
+                                continue
+                            h = futures[f]
+                            if f.exception() is None:
+                                values = f.result()
+                                for lon0, lat0 in corners[h]:
+                                    writer.write(h, lon0, lat0, served(values[(lon0, lat0)]))
+                                written.add(f)
+                            else:
+                                # the pending hours are cancelled; the running ones are awaited, and the earliest failing hour has started
+                                errors[h] = f.exception()
+                                for g in futures:
+                                    g.cancel()
+                            bar.update(1)
+                            bar.refresh()
+                    except KeyboardInterrupt:
+                        # an interrupt cancels the queued hours, awaits the reads in flight and writes the hours they completed
+                        for g in futures:
+                            g.cancel()
+                        hour_pool.shutdown(wait=True)
+                        for g, h in futures.items():
+                            if g not in written and not g.cancelled() and g.exception() is None:
+                                values = g.result()
+                                for lon0, lat0 in corners[h]:
+                                    writer.write(h, lon0, lat0, served(values[(lon0, lat0)]))
+                        raise
+                    finally:
+                        bar.close()
+                if errors:
+                    # the error of the earliest failing hour in hour order, named by its first tile (the error line of store's fetch)
+                    h = next(h for h in hours if h in errors)
+                    e = errors[h]
+                    text = ' '.join(str(e).split())
+                    if isinstance(e, ValueError) and text.startswith('ERROR: '):
+                        text = text[len('ERROR: '):]
+                    else:
+                        text = f'{type(e).__name__}: {text}'
+                    lon0, lat0 = corners[h][0]
+                    raise ValueError(f'ERROR: fetch of {tile_name(lon0, lat0)} at {h.isoformat()} failed: {text}') from e
+        return writer.close()
