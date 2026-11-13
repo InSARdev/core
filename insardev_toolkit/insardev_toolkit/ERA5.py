@@ -45,7 +45,7 @@ class ERA5(datagrid, progressbar_joblib, AtmosphereModel):
         folder : str - The folder of the downloaded model fields.
         times : list of str or pandas.Timestamp - The acquisition times, UTC.
         wavelength : float - The radar wavelength, metres.
-        factor : float - Not used by ERA5.
+        factor : float - Unused by ERA5; the common argument of the model interface.
         heights : tuple or None - (lo, hi) ellipsoidal metres of the caller's pixels, or None (the envelope); see AtmosphereModel.open.
         """
         from . import utils_tropo
@@ -493,45 +493,15 @@ class ERA5(datagrid, progressbar_joblib, AtmosphereModel):
             out[t]['surface_pressure'] = surf[k]
         return out
 
-    def _tile_files(self, folder):
-        """The tile files of a folder, as (epoch, lon0, lat0, path) sorted by epoch and tile.
-
-        Parameters
-        ----------
-        folder : str - The tile folder, basedir/ERA5.
-
-        Returns
-        -------
-        list of tuple - (pandas.Timestamp, int, int, str) per tile file; empty when the folder is missing.
-
-        Examples
-        --------
-        >>> era5 = ERA5()
-        >>> era5._tile_files('era5_tiles/ERA5')
-        """
-        import os
-        import re
-        import pandas as pd
-
-        if not os.path.isdir(folder):
-            return []
-        pattern = re.compile(r'([NS])(\d{2})([EW])(\d{3})_(\d{8}T\d{6})\.nc')
-        files = []
-        for fname in sorted(os.listdir(folder)):
-            m = pattern.fullmatch(fname)
-            if m is None:
-                continue
-            lat0 = int(m.group(2)) * (1 if m.group(1) == 'N' else -1)
-            lon0 = int(m.group(4)) * (1 if m.group(3) == 'E' else -1)
-            files.append((pd.to_datetime(m.group(5), format='%Y%m%dT%H%M%S'), lon0, lat0, os.path.join(folder, fname)))
-        return sorted(files, key=lambda f: (f[0], f[2], f[1]))
-
-    def _tile_levels(self, folder):
+    def _tile_levels(self, folder, files=None):
         """The pressure levels (hPa) that the tile files of a folder hold.
 
         Parameters
         ----------
         folder : str - The tile folder, basedir/ERA5.
+        files : list of dict, optional - The entries of the folder with their structure (utils_epochs._scan, or TileWriter.files
+        of the download); no tile file is opened for them. None reads the folder: the tile files the basedir/ERA5.vrt lists are
+        not opened, the others are opened once.
 
         Returns
         -------
@@ -546,13 +516,19 @@ class ERA5(datagrid, progressbar_joblib, AtmosphereModel):
         >>> era5 = ERA5()
         >>> era5._tile_levels('era5_tiles/ERA5')
         """
+        import os
         import numpy as np
-        from .utils_epochs import _read_structure
+        from .utils_epochs import _scan, _vrt_tiles
 
+        if files is None:
+            vrt = os.path.join(os.path.dirname(os.path.abspath(folder)), 'ERA5.vrt')
+            listed, structure = _vrt_tiles(vrt) if os.path.isfile(vrt) else ([], None)
+            files = _scan(folder, listed={p: structure for p in listed} if structure is not None else None)
         levels = None
-        for _, _, _, path in self._tile_files(folder):
-            # the labels of the pressure variables in the variables attribute (utils_epochs), in hPa
-            pressure = [labels for _, _, labels in _read_structure(path) if labels != ['surface']]
+        for entry in files:
+            path = entry['path']
+            # the labels of the pressure variables in the structure of the tile (utils_epochs), in hPa
+            pressure = [labels for _, _, labels in entry['structure'] if labels != ['surface']]
             held = np.array([int(p) for p in pressure[0]], dtype=np.int32) if pressure else np.zeros(0, dtype=np.int32)
             if held.size != self.levels:
                 raise ValueError(f'ERROR: {path} holds {held.size} levels, not the {self.levels} pressure levels of the '
@@ -614,9 +590,11 @@ class ERA5(datagrid, progressbar_joblib, AtmosphereModel):
         # a VRT that lists every item means all done: no tile file is read and no request is made
         if _complete(base, 'ERA5', items):
             return None
-        levels = self._tile_levels(folder)
-        # the folder is made here; the tile files of the items without one are written as their hours complete
+        # the folder is made here; the tile files of the items without one are written as their hours complete. The writer
+        # scans the folder once: the levels are taken from its entries, so each present tile file is opened once and a listed
+        # one not at all
         writer = TileWriter(base, 'ERA5', items)
+        levels = self._tile_levels(folder, writer.files)
         new = writer.new
         self.bytes_requested = 0
         invariant = {}

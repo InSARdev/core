@@ -194,7 +194,10 @@ def progressbar(futures, **kwargs):
     Raises
     ------
     RuntimeError
-        The graph needs data the cluster no longer holds.
+        The graph needs data the cluster no longer holds, or a task was cancelled.
+    Exception
+        The exception of the first failed task, raised with its traceback. The bar returns
+        before every task is done, so the failure is looked for after it.
     """
     import time
     from distributed.client import futures_of
@@ -217,3 +220,16 @@ def progressbar(futures, **kwargs):
             time.sleep(delay)
             delay = min(2 * delay, 1.0)
     TqdmDaskProgress(futures, **kwargs)
+    # The bar's listener stops at the first finished or errored status it sees, so an error can
+    # be unseen here: iterate the futures in completion order and raise the first failure.
+    if futures:
+        from distributed import as_completed
+        for f in as_completed(futures):
+            if f.status == 'error':
+                exc, tb = f.exception(), f.traceback()
+                _drop_refused(client, futures)
+                raise exc.with_traceback(tb)
+            if f.status == 'cancelled':
+                reason = _refusal_reason(f)
+                _drop_refused(client, futures)
+                raise RuntimeError(f'The computation was cancelled ({reason}).')

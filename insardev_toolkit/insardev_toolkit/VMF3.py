@@ -37,7 +37,7 @@ class VMF3(datagrid, progressbar_joblib, AtmosphereModel):
         folder : str - The folder of the downloaded model fields.
         times : list of str or pandas.Timestamp - The acquisition times, UTC.
         wavelength : float - The radar wavelength, metres.
-        factor : float - Not used by VMF3.
+        factor : float - Unused by VMF3; the common argument of the model interface.
         heights : tuple or None - (lo, hi) ellipsoidal metres of the caller's pixels, or None (the envelope); see AtmosphereModel.open.
         """
         from . import utils_tropo

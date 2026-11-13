@@ -3521,7 +3521,6 @@ class BatchCore(dict):
             result[k] = ds
         chunked = type(self)(result)
         warn_floor('chunk', floors)
-        graph_check('chunk', chunked, self)
         return chunked
 
     def chunk2d(self, budget=None, chunks=1):
@@ -3605,7 +3604,6 @@ class BatchCore(dict):
                     ds = ds.assign(rechunked_vars)
                 result[k] = ds
         warn_floor('chunk2d', floors)
-        graph_check('chunk2d', result, self)
         return type(self)(result)
 
     def chunk1d(self, budget=None, chunks=-1):
@@ -3685,7 +3683,6 @@ class BatchCore(dict):
                     ds = ds.assign(rechunked_vars)
                 result[k] = ds
         warn_floor('chunk1d', floors)
-        graph_check('chunk1d', result, self)
         return type(self)(result)
 
     def pipe(self, func, *args, **kwargs):
@@ -5552,10 +5549,12 @@ class BatchCore(dict):
                 result_dask = gaussian_dask(dask_data, weight_dask, sigmas, (dy, dx), threshold=threshold,
                                             truncate=truncate)
 
+                # the variable's own attrs go with its values (the smoothed trend keeps its ele range for polynomial())
                 new_vars[var] = xr.DataArray(
                     result_dask,
                     dims=data_arr.dims,
-                    coords=data_arr.coords
+                    coords=data_arr.coords,
+                    attrs=data_arr.attrs
                 )
 
             if isinstance(ds, xr.DataArray):

@@ -19,7 +19,6 @@ from collections import namedtuple
 import math
 import os
 import warnings
-import xml.etree.ElementTree as ET
 
 import numpy as np
 import pandas as pd
@@ -30,7 +29,6 @@ from numba.extending import intrinsic
 
 from . import utils_epochs
 from . import utils_geoid
-from .utils_files import exists
 
 _NAME_ERA5 = 'ERA5'
 # VMF3 index variables (level 'surface').
@@ -851,64 +849,6 @@ def _nodes(values, flat):
     return np.asarray(values, dtype=float).reshape(-1)[flat]
 
 
-def _root(vrt):
-    """
-    The root element of a VRT index written by utils_epochs.store().
-
-    Parameters: vrt (str). Returns: xml.etree.ElementTree.Element. Raises: ValueError, one ERROR: line, when the VRT
-    cannot be read.
-
-    Examples
-    --------
-    >>> _root('dem_tiles.vrt')
-    """
-    try:
-        return ET.parse(vrt).getroot()
-    except (OSError, ET.ParseError) as e:
-        raise ValueError(f'ERROR: {vrt} cannot be read: {type(e).__name__}') from None
-
-
-def _bands(vrt):
-    """
-    The VRTRasterBand elements of a VRT index by (description, variable, level); the description is the ISO datetime of
-    the epoch.
-
-    Parameters: vrt (str). Returns: dict {(description, variable, level): element}.
-
-    Examples
-    --------
-    >>> _bands('dem_tiles.vrt')
-    """
-    out = {}
-    for band in _root(vrt).findall('VRTRasterBand'):
-        meta = {m.get('key'): m.text for m in band.findall('Metadata/MDI')}
-        out.setdefault((band.findtext('Description'), meta.get('VARIABLE'), meta.get('LEVEL')), band)
-    return out
-
-
-def _listed(band, vrt):
-    """
-    The absolute paths of the tile files that a band lists.
-
-    Parameters: band (VRTRasterBand element); vrt (str, for relative paths). Returns: list of str. Raises: ValueError,
-    one ERROR: line, when a source is not a NETCDF variable.
-
-    Examples
-    --------
-    >>> _listed(_bands('dem_tiles.vrt')[('2016-05-11T06:00:00', 'zhd', 'surface')], 'dem_tiles.vrt')
-    """
-    base = os.path.dirname(os.path.abspath(vrt))
-    out = []
-    for src in band.findall('SimpleSource'):
-        name = src.find('SourceFilename')
-        text = (name.text or '').strip()
-        if not text.startswith('NETCDF:'):
-            raise ValueError(f'ERROR: {vrt} lists a source without a NETCDF variable: {text}')
-        rel = text[len('NETCDF:'):].rsplit(':', 1)[0].strip('"')
-        out.append(os.path.join(base, rel) if name.get('relativeToVRT', '0') == '1' else rel)
-    return out
-
-
 def _levels(index):
     """
     The ERA5 pressure labels as stored, from the highest pressure down.
@@ -967,9 +907,13 @@ def model(path):
     raise ValueError(f'ERROR: {path} holds more than one tropospheric index: {", ".join(names)}')
 
 
+_VERIFIED = set()   # (index path, its mtime, the epochs) verified in this process
+
+
 def _verify(index, stamps):
     """
-    Checks that an index holds the bands that the epochs need, and that their tile files exist.
+    Checks that an index holds the bands that the epochs need, and that their tile files exist. The result is kept per
+    process for the index (its path and mtime) and the epochs, and each tile file is checked once (utils_epochs.exists_once).
 
     Parameters: index (utils_epochs.Index); stamps (list of pandas.Timestamp; each time needs the epochs around it).
     Raises: ValueError, one ERROR: line, for a missing epoch, band or tile file.
@@ -982,6 +926,9 @@ def _verify(index, stamps):
     required = _required(name, index)
     epochs = sorted({e for e0, e1, w in _plan(stamps, utils_epochs.SOURCES[name]['hours'])
                      for e in (e0, e1) if e is not None})
+    key = (index.path, os.stat(index.path).st_mtime_ns, tuple(epochs))
+    if key in _VERIFIED:
+        return
     for e in epochs:
         ei = index.epoch_of(e)
         for v, lev in required:
@@ -991,9 +938,10 @@ def _verify(index, stamps):
                 raise ValueError(f'ERROR: {name} has no {v}{where} of epoch {e:%Y-%m-%d %H:%M} in {index.path}: store() that '
                                  f'epoch first')
             for path, _, _, _ in arr['sources'][ei]:
-                if not exists(path):
+                if not utils_epochs.exists_once(path):
                     raise ValueError(f'ERROR: {path} listed in {index.path} is missing: call store() again with the same items '
                                      f'to fetch it')
+    _VERIFIED.add(key)
 
 
 def verify(path, times):
@@ -1072,12 +1020,11 @@ def vmf3_zenith_tables(ah, aw, zhd, zwd, orography, lat, lon, epochs, first, sec
                         _fold(mapping, first, second, w0, w1), np.array([1e-3, *_HT_COEF]))
 
 
-# the global envelope of the zenith tables (ellipsoidal heights, m; the domain of the ruling U18) and the table step of each
-# model (m), by measurement (gfa4 design section 2.6: the finest step whose node time stays at or below the envelope's 10 m cost)
+# the global envelope of the zenith tables (ellipsoidal heights, m; the domain of the ruling U18) and their one height step (m)
+# for both models: 10 m, by measurement (against a 1 m table: ERA5 0.0046 mm, VMF3 0.0011 mm at most, D143)
 _TABLE_H0 = -500.0
 _TABLE_TOP = 9000.0
-_ERA5_STEP = 2.0
-_VMF3_STEP = 5.0
+_TABLE_STEP = 10.0
 
 
 def _table_rows(heights, step):
@@ -1168,8 +1115,8 @@ def zenith_tiles(path, times, wavelength, heights=None):
     are in phase units (-4 pi / wavelength times the delay).
 
     Parameters: path (str, folder of the downloaded model fields); times (list of str or pandas.Timestamp, UTC; the
-    first axis of the result); wavelength (float, metres); heights ((lo, hi) ellipsoidal metres of the caller's pixels, or None: the envelope at the model's
-    table step, _table_rows). Returns: lazy xarray.Dataset: hydro and wet with dims (time,
+    first axis of the result); wavelength (float, metres); heights ((lo, hi) ellipsoidal metres of the caller's range, or None: the
+    envelope; the rows of the 10 m table step, _table_rows). Returns: lazy xarray.Dataset: hydro and wet with dims (time,
     tile, ty, tx, height); mapping with dims (time, tile, ty, tx, component, coef); coordinates time, lat and lon
     (degrees), tile y0 and x0 (lattice row and column of each tile's first node), height (m); attributes h0, step,
     count, niell, shell_k. Raises: ValueError, one ERROR: line, for a wavelength that is not positive, a folder without
@@ -1197,7 +1144,7 @@ def zenith_tiles(path, times, wavelength, heights=None):
     plan = _plan(stamps, utils_epochs.SOURCES[name]['hours'])
     ntime = len(plan)
     scale = -4.0 * np.pi / float(wavelength)
-    tstep = _ERA5_STEP if name == _NAME_ERA5 else _VMF3_STEP
+    tstep = _TABLE_STEP
     h0, count = _table_rows(heights, tstep)
     groups = _epoch_groups(plan)
     order = [k for group in groups for k in group]

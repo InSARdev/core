@@ -66,23 +66,33 @@ class _StackView(BatchComplex):
 _StackView.__name__ = 'Stack'
 
 
-# THE ATMOSPHERE OF A BURST (the user, 2026-10-20, RP/gfa_rulings.md): the toolkit opens each atmosphere model once per stack
-# (one model grid shared by all bursts) and evaluates it per output chunk (OpenedModel.phase in insardev_toolkit
-# utils_atmosphere: the ERA5 and VMF3 nodes reprojected to the output CRS as sparse points, bilinear per pixel; the IONEX nodes
-# stay in latitude and longitude, each pixel at its geodesic pierce point; each node's form at the pixel's own height and
-# incidence). This module holds no model name branch, no node and no pixel helper.
+# THE ATMOSPHERE OF A BURST (the user, 2026-10-20, RP/gfa_rulings.md; the redesign of 2026-11-08, GAM U4): the toolkit opens each
+# atmosphere model once per stack, and opened.phase() gives its tables lazily on the model's own nodes (one chunk per date and
+# tile). This module computes the phase with its own kernel (utils_atmosphere): burst_constants once per burst (the geometry and
+# the shell flags), and at the graph build the one eager step (_chunk_ranges: the ele range of each chunk, with a progress bar) and
+# block_tables once per spatial chunk (the height rows of its range, every HS_STEP of the kind, and the polynomials of the incidence or, for the
+# ionosphere, the pierce point about the absolute 10 km centres its pixels need; held as data, one key per chunk), then per data
+# block cut_block and grid_block, one numba pass per block, pixelwise. The tables of the stack's dates and tiles are computed
+# once at the phase call and held (_held_group); each data block is one task that reads the held chunks of its tiles, its ele
+# block, the chunk's tables and the burst's constants. The folder's kind comes from the tables' own variables; no model name is
+# compared here.
+DEFAULT_HEIGHTS = (-500.0, 9000.0)
+_HELD = {}
+_HELD_MAX = 8
 
 
-def _atmosphere_open(folder, times, crs, lam, factor, kind, method, heights=None):
-    """The atmosphere model of the folder, opened once for the stack: the class of the folder (toolkit model_class) and its
-    open() with the union of the bursts' times, the output crs and the wavelength. Nothing is computed here: the terms are
-    one task of the graph that every chunk of the bursts shares. heights: (lo, hi) ellipsoidal metres, the union of the bursts' ele actual_range (None: the envelope of the model's tables).
-    Raises one ERROR line when the folder holds another kind of model."""
+def _atmosphere_open(folder, times, crs, lam, factor, kind, method, heights):
+    """The atmosphere model of the folder, opened once for the stack: the toolkit's class of the folder and its open() with the
+    union of the bursts' times, the output crs, the wavelength and heights (lo, hi): the union of the bursts' ele actual_range.
+    Raises one ERROR line when the folder holds the other kind of tables (a 'tec' lattice is the ionosphere, a height axis the
+    troposphere)."""
     from insardev_toolkit.utils_atmosphere import model_class
-    cls = model_class(folder)
-    if (cls.__name__ == 'IONEX') != (kind == 'iono'):
-        raise ValueError(f"ERROR: {method}() needs the {kind} model, the folder {folder} holds {cls.__name__}")
-    return cls().open(folder, list(times), crs, lam, 1.0 if factor is None else factor, heights=heights)
+    opened = model_class(folder)().open(folder, list(times), crs, lam, 1.0 if factor is None else factor, heights=heights)
+    is_iono = 'tec' in opened.terms.data_vars
+    if is_iono != (kind == 'iono'):
+        holds = 'the ionosphere' if is_iono else 'the troposphere'
+        raise ValueError(f"ERROR: {method}() needs the {kind} model, the folder {folder} holds {holds}")
+    return opened
 
 
 def _atmosphere_reference(stack, baseline, ref, method):
@@ -122,6 +132,8 @@ def _atmosphere_reference(stack, baseline, ref, method):
     return out
 
 
+
+
 def _data_chunks(ds):
     """The chunks (date, y, x) of the burst's gridded data, its complex variables first; None when the data is not chunked.
     The atmosphere phase takes them, so the phase and the data share one chunking (GLK U2)."""
@@ -132,16 +144,149 @@ def _data_chunks(ds):
     return None
 
 
+def _held_table(arrs, chunks):
+    """The lazy tables of one model, computed once and held for the stack: arrs (dask arrays) with one rechunk spec each in
+    chunks (one chunk per date and tile, the other dims whole). They are persisted in ONE call, so the reads they share run
+    once; with a distributed client each is kept alive in every graph built from it (hold_persisted). Without one they are
+    computed in ONE call on dask's synchronous scheduler into numpy (never the threaded scheduler). Returns the held arrays
+    in order."""
+    import dask
+    import dask.array as da
+    from .utils_dask import hold_persisted
+    rechunked = [arr.rechunk(spec) for arr, spec in zip(arrs, chunks)]
+    if _held_client() is None:
+        values = dask.compute(*rechunked, scheduler='synchronous')
+        return [da.from_array(v, chunks=arr.chunks) for v, arr in zip(values, rechunked)]
+    return [hold_persisted(arr) for arr in dask.persist(*rechunked)]
+
+
+def _held_group(opened, kind):
+    """The held tables of one opened model: the model's lattice (lat, lon, degrees), the time labels, the tile first nodes, and
+    the lazy tables computed and held (_held_table): troposphere hydro, wet, mapping (one chunk per date and tile) with the
+    height rows and the height term; ionosphere tec (one chunk per date) with the shell R + H, a number."""
+    import dask
+    import pandas as pd
+    T = opened.phase()
+    lat = np.asarray(T['lat'].values, dtype=np.float64)
+    lon = np.asarray(T['lon'].values, dtype=np.float64)
+    held = {'times': pd.DatetimeIndex(opened.times), 'lat': lat, 'lon': lon}
+    if kind == 'tropo':
+        held['tiles'] = list(zip(np.asarray(T['tile y0'].values, dtype=int).tolist(),
+                                 np.asarray(T['tile x0'].values, dtype=int).tolist()))
+        held['ty'], held['tx'] = int(T.sizes['ty']), int(T.sizes['tx'])
+        held['hydro'], held['wet'], held['mapping'] = _held_table(
+            [T[v].data for v in ('hydro', 'wet', 'mapping')], [{0: 1, 1: 1}] * 3)
+        held['h_first'] = float(np.asarray(T['height'].values, dtype=np.float64)[0])
+        held['hcoef'] = np.asarray(T['height_term'].values, dtype=np.float64)
+        held['shell'] = None
+    else:
+        held['tec'], shell = _held_table([T['tec'].data, T['shell'].data], [{0: 1, 1: -1, 2: -1}, {}])
+        held['shell'] = float(dask.compute(shell, scheduler='synchronous' if _held_client() is None else None)[0])
+        held['h_first'], held['hcoef'] = 0.0, np.zeros(4)
+    return held
+
+
+def _held_client():
+    """The id of the distributed client that the default scheduler runs on, or None for any other scheduler (synchronous
+    configured, or no client): the held tables belong to the client that persisted them, and a graph computed on another
+    scheduler cannot resolve their futures."""
+    import dask.base
+    from distributed import Client
+    client = getattr(dask.base.get_scheduler(), '__self__', None)
+    return client.id if isinstance(client, Client) else None
+
+
+def _held_alive(held):
+    """True when every dask array of a held group has all its futures finished on the cluster; an array without futures
+    (the synchronous path) is alive. False after client.restart() or a lost worker: the group is rebuilt."""
+    import dask.array as da
+    from distributed import futures_of
+    for v in held.values():
+        if isinstance(v, da.Array) and any(f.status != 'finished' for f in futures_of(v)):
+            return False
+    return True
+
+
+def _held_for(folder, crs, lam, stamps, span, factor, kind, method):
+    """The held tables of a group of bursts (one folder, crs and wavelength): reused by a second call with the same times,
+    heights, factor and client while the held chunks are alive on the cluster (_HELD, the last _HELD_MAX groups); otherwise the
+    model is opened once and its tables are held. The entries of another client are dropped."""
+    client = _held_client()
+    for k in [k for k in _HELD if k[-1] != client]:
+        del _HELD[k]
+    sig = (kind, folder, crs, lam, tuple(sorted(stamps)), tuple(span), factor, client)
+    if sig in _HELD and not _held_alive(_HELD[sig]):
+        del _HELD[sig]
+    if sig not in _HELD:
+        opened = _atmosphere_open(folder, tuple(sorted(stamps)), crs, lam, factor, kind, method, span)
+        if len(_HELD) >= _HELD_MAX:
+            _HELD.pop(next(iter(_HELD)))
+        _HELD[sig] = _held_group(opened, kind)
+    return _HELD[sig]
+
+
+def _table_key(arr, i, t=None):
+    """The dask key of one held chunk: the date index i and, for a table with tiles, the tile t; the other indices are 0."""
+    idx = [i] if t is None else [i, t]
+    return (arr.name,) + tuple(idx + [0] * (arr.ndim - len(idx)))
+
+
+def _chunk_ranges(eles, method):
+    """The ele range (lo, hi) of every spatial chunk of every burst, read now: the one eager step of the atmosphere phase (the
+    tables of a chunk cover its own heights only). One WARNING names it, as align() does; the chunks are read in parallel on the
+    cluster with a progress bar, without a Client on the synchronous scheduler (never the threaded one).
+
+    Parameters
+    ----------
+    eles : dict - Per burst key: (the ele dask array, the data chunks (dates, y, x)).
+    method : str - The calling method's name, for the message.
+
+    Returns
+    -------
+    dict - Per burst key: the nested lists [iy][ix] of (lo, hi), metres.
+
+    Examples
+    --------
+    >>> ranges = _chunk_ranges({key: (ele_array, ((1,), (ny,), (nx,)))}, 'troposphere_phase')
+    """
+    import dask
+    import dask.array as da
+    from .utils_atmosphere import ele_range
+    jobs = []
+    for key, (ele, dchunks) in eles.items():
+        blocks = da.asarray(ele).rechunk((dchunks[1], dchunks[2])).blocks
+        jobs += [((key, iy, ix), dask.delayed(ele_range)(blocks[iy, ix]))
+                 for iy in range(len(dchunks[1])) for ix in range(len(dchunks[2]))]
+    print(f'WARNING: {method}() is not lazy: it reads the height range of {len(jobs)} chunk(s) now, so the tables of each chunk '
+          f'cover its own heights only.', flush=True)
+    delayed = [d for _, d in jobs]
+    if _held_client() is None:
+        values = dask.compute(*delayed, scheduler='synchronous')
+    else:
+        from .utils_dask import progress_persisted
+        persisted = dask.persist(*delayed)
+        progress_persisted(list(persisted), desc='Heights of chunks'.ljust(25))
+        values = dask.compute(*persisted)
+    out = {key: [[None] * len(dchunks[2]) for _ in dchunks[1]] for key, (_, dchunks) in eles.items()}
+    for ((key, iy, ix), _), v in zip(jobs, values):
+        out[key][iy][ix] = v
+    return out
+
+
 def _atmosphere_phase(stack, kind, factor, method, geocentric=True, baseline=None, ref=None):
-    """Batch of per burst Datasets with the variable 'phase' (date, y, x), float32 radians, one lazy dask array per
-    burst. The folder of kind ('tropo' or 'iono') comes from the burst attributes set by load(); the heights from
-    stack.transform() ('ele'), the incidence from stack.incidence() and, for the ionosphere, the look azimuth from
-    stack.look(): grids of the stack's own pixels, as arrays. The wavelength and the times come from the burst. Bursts
-    sharing a folder, crs and wavelength share ONE opened model (_atmosphere_open). geocentric is the zenith flag of
-    OpenedModel.phase (IONEX only). Nothing is computed here."""
+    """Batch of per burst Datasets with the variable 'phase' (date, y, x), float32 radians, one lazy dask array per burst,
+    on the data's chunks. The folder of kind ('tropo' or 'iono') comes from the burst attributes set by load(). The tables
+    are computed and held at this call (_held_for); each data block is one task of an explicit layer (phase_block): its ele
+    block, the held chunks of its tiles for each date and for the reference, and the burst's geometry (Batch._stack_geometry).
+    The reference is subtracted in the kernel. Bursts sharing a folder, crs and wavelength share one opened model."""
+    import uuid
     import dask.array as da
     import xarray as xr
     import pandas as pd
+    from dask._task_spec import DataNode, Task, TaskRef
+    from dask.highlevelgraph import HighLevelGraph
+    from .Batch import _ele_range, _stack_geometry, _warn_no_actual_range
+    from .utils_atmosphere import block_tables, burst_constants, cut_block, phase_block, pixel_axis
     missing = [key for key, ds in stack.items() if kind not in ds.attrs]
     if missing:
         raise ValueError(f"ERROR: {method}() needs the {kind} folder of the bursts: call Stack().load(..., {kind}=folder) first")
@@ -151,8 +296,6 @@ def _atmosphere_phase(stack, kind, factor, method, geocentric=True, baseline=Non
         missing = [n for n in ug.SCALARS + ('BPR', 'ref_height') if n not in tf[key].variables]
         if missing:
             raise KeyError(f"ERROR: {method}(): burst {key} carries no {', '.join(missing)}.")
-    inc = stack.incidence()
-    lk = stack.look() if kind == 'iono' else None
     bursts = []
     for key, ds in stack.items():
         if 'startTime' not in ds or 'radar_wavelength' not in ds:
@@ -165,50 +308,105 @@ def _atmosphere_phase(stack, kind, factor, method, geocentric=True, baseline=Non
         times = tuple(pd.Timestamp(str(t)) for t in np.asarray(ds['startTime'].values))
         bursts.append((key, ds, str(ds.attrs[kind]), float(lam[0]), times, ds.rio.crs.to_string()))
     reference = _atmosphere_reference(stack, baseline, ref, method)
-    union = {}
-    for key, ds, folder, lam, times, crs in bursts:
-        union.setdefault((folder, crs, lam), set()).update(times)
     # the heights of each opened model: the union of its bursts' ele actual_range (the transform's attribute, never the raster);
-    # a group with a burst without it is opened for the envelope (heights None), and ONE WARNING of this call names those bursts
-    from .Batch import _ele_range
+    # a burst without it counts the default range -500..9000 m, and ONE WARNING of this call names those bursts
+    union = {}
     spans = {}
     nores = []
     for key, ds, folder, lam, times, crs in bursts:
         gkey = (folder, crs, lam)
+        union.setdefault(gkey, set()).update(times)
         rng = _ele_range(tf[key])
         if rng is None:
             nores.append(str(key))
-            spans[gkey] = None
-        elif gkey not in spans:
-            spans[gkey] = rng
-        elif spans[gkey] is not None:
-            spans[gkey] = (min(spans[gkey][0], rng[0]), max(spans[gkey][1], rng[1]))
+            rng = DEFAULT_HEIGHTS
+        spans[gkey] = rng if gkey not in spans else (min(spans[gkey][0], rng[0]), max(spans[gkey][1], rng[1]))
     if nores:
         print(f"WARNING: {method}(): burst(s) {', '.join(nores)} carry no ele actual_range: the {kind} model of their folder "
-              f"is opened for the envelope of its tables (heights None).", flush=True)
-    opened = {}
+              f"is opened for the default heights -500..9000 m.", flush=True)
+    held = {}
     for gkey, stamps in union.items():
         folder, crs, lam = gkey
-        opened[gkey] = _atmosphere_open(folder, tuple(sorted(stamps)), crs, lam, factor, kind, method, spans[gkey])
+        held[gkey] = _held_for(folder, crs, lam, stamps, spans[gkey], factor, kind, method)
+    uncut = []
     out = {}
+    ranges = _chunk_ranges({key: (tf[key]['ele'].data, _data_chunks(ds) or ((ds.sizes['date'],), (ds.sizes['y'],), (ds.sizes['x'],)))
+                            for key, ds, *_ in bursts}, method)
     for key, ds, folder, lam, times, crs in bursts:
-        ele = da.asarray(tf[key]['ele'].data)
-        incidence = da.asarray(inc[key]['incidence'].data)
-        look = None if lk is None else da.asarray(lk[key]['look'].data)
-        ycoord = np.asarray(ds.y.values, dtype=np.float64)
-        xcoord = np.asarray(ds.x.values, dtype=np.float64)
-        res = opened[(folder, crs, lam)].phase(times, ycoord, xcoord, ele, incidence, look=look, geocentric=geocentric,
-                                               chunks=_data_chunks(ds))
-        if reference is not None:
-            # referenced to one acquisition: its phase is subtracted at each pixel, a NaN there gives NaN
-            res = res - res[reference[key]]
+        gkey = (folder, crs, lam)
+        hg = held[gkey]
+        geo = _stack_geometry(tf[key], key, method, 'Call it on the stack.', uncut)[0]
+        rng = _ele_range(tf[key]) or DEFAULT_HEIGHTS
+        dates = [int(i) for i in hg['times'].get_indexer(list(times))]
+        if min(dates) < 0:
+            raise ValueError(f"ERROR: {method}(): a date of burst {key} is not a time of its opened {kind} model")
+        ref_i = None if reference is None else dates[reference[key]]
+        dchunks = _data_chunks(ds) or ((ds.sizes['date'],), (ds.sizes['y'],), (ds.sizes['x'],))
+        ele = da.asarray(tf[key]['ele'].data).rechunk((dchunks[1], dchunks[2]))
+        uid = uuid.uuid4().hex
+        name = f'atm-{kind}-{uid}'
+        skey = (f'atm-static-{uid}', 0)
+        # the burst's constants, once per burst: the geometry, the shell flags and the longitude of the centre of its whole output grid
+        xs, ys = np.asarray(ds.x.values, dtype=np.float64), np.asarray(ds.y.values, dtype=np.float64)
+        const = burst_constants(geo, crs, rng, shell=hg['shell'], geocentric=bool(geocentric),
+                                centre=(0.5 * (xs.min() + xs.max()), 0.5 * (ys.min() + ys.max())))
+        static = dict(const=const, node_lat=hg['lat'], node_lon=hg['lon'], h_first=hg['h_first'], hcoef=hg['hcoef'])
+        layer = {skey: DataNode(skey, static)}
+        tables = [hg[v] for v in ('hydro', 'wet', 'mapping')] if kind == 'tropo' else [hg['tec']]
+        tiles = hg.get('tiles', [])
+        ty, tx = hg.get('ty', 0), hg.get('tx', 0)
+
+        def refs_of(i, sel):
+            """The held chunks of date index i for the tiles sel (troposphere: hydro, wet, mapping per tile)."""
+            if kind == 'tropo':
+                return [TaskRef(_table_key(hg[v], i, t)) for t in sel for v in ('hydro', 'wet', 'mapping')]
+            return [TaskRef(_table_key(hg['tec'], i))]
+
+        oy = np.cumsum((0,) + tuple(dchunks[1])).tolist()
+        ox = np.cumsum((0,) + tuple(dchunks[2])).tolist()
+        od = np.cumsum((0,) + tuple(dchunks[0])).tolist()
+        # the burst's pixel axes: the transform's lattice as (first, step) per axis (a step of a one-pixel axis is 0.0); each block
+        # computes its own coordinates from them (pixel_axis), so no coordinate array is held in a task or a key
+        ystep = float(ys[1] - ys[0]) if ys.size > 1 else 0.0
+        xstep = float(xs[1] - xs[0]) if xs.size > 1 else 0.0
+        axes = (float(ys[0]), ystep, float(xs[0]), xstep)
+        for jc in range(len(dchunks[0])):
+            for iy in range(len(dchunks[1])):
+                for ix in range(len(dchunks[2])):
+                    ycoord = pixel_axis(axes[0], axes[1], oy[iy], oy[iy + 1])
+                    xcoord = pixel_axis(axes[2], axes[3], ox[ix], ox[ix + 1])
+                    span = (oy[iy], oy[iy + 1], ox[ix], ox[ix + 1])
+                    sel = []
+                    if kind == 'tropo':
+                        # the box of the model's lattice only ({}: the burst's tables are not needed for it)
+                        cut = cut_block(ycoord, xcoord, const, hg['lat'], hg['lon'], tables={})
+                        sel = [t for t, (y0, x0) in enumerate(tiles)
+                               if y0 < cut.i1 and y0 + ty > cut.i0 and x0 < cut.j1 and x0 + tx > cut.j0]
+                    tiles_sel = tuple(tiles[t] for t in sel)
+                    plan, refs = [], []
+                    for dj in range(od[jc], od[jc + 1]):
+                        plan.append((tiles_sel, ref_i is not None))
+                        refs += refs_of(dates[dj], sel)
+                        if ref_i is not None:
+                            refs += refs_of(ref_i, sel)
+                    # the chunk's polynomial tables: built here, at the graph build, for the chunk's own ele range (only what the
+                    # kind needs), and held as DATA in one key per spatial chunk that the chunk's dates read; no task builds them
+                    tkey = (f'atm-tables-{uid}', iy, ix)
+                    if tkey not in layer:
+                        layer[tkey] = DataNode(tkey, block_tables(ycoord, xcoord, const, ranges[key][iy][ix]))
+                    bkey = (name, jc, iy, ix)
+                    layer[bkey] = Task(bkey, phase_block, kind, TaskRef((ele.name, iy, ix)), axes, span,
+                                       TaskRef(skey), TaskRef(tkey), plan, *refs)
+        graph = HighLevelGraph.from_collections(name, layer, dependencies=[ele] + tables)
+        res = da.Array(graph, name, chunks=dchunks, dtype=np.float32, meta=np.empty((0, 0, 0), dtype=np.float32))
         phase = xr.DataArray(res, dims=('date', 'y', 'x'), coords={'date': ds.date, 'y': ds.y, 'x': ds.x},
                              attrs={'units': 'radians'})
         result_ds = xr.Dataset({'phase': phase})
         result_ds.attrs = dict(ds.attrs)
         out[key] = result_ds.rio.write_crs(ds.rio.crs)
+    _warn_no_actual_range(method, uncut)
     result = Batch(out)
-    graph_check(method, result, [tf, inc, lk])
+    graph_check(method, result, [ds for _, ds, *_ in bursts])
     return result
 
 
@@ -1443,14 +1641,13 @@ class Stack:
         ref : None, int, str or datetime: the date whose phase is subtracted at each pixel (NaN there gives NaN); None: each burst's own smallest |baseline| date (a burst without the baseline takes its first date), so the bursts may differ; ref= names one date for all bursts (a burst without it raises one ERROR line).
 
         The folder is the tropo= of load() (a VMF3 or ERA5 folder of the atmosphere model, the model is detected from it).
-        The toolkit returns the model's terms on its own nodes, reprojected lazily to the stack's crs inside the toolkit, for
-        the two epochs that bracket each date (weighted by the time). Per burst the terms are cropped to the nodes that bracket
-        the burst (one margin node). Each pixel takes the model's delay at its own ellipsoidal height (transform().ele) and
-        incidence: the common form evaluated on the 4 nodes around the pixel, then bilinear in x and y. A pixel outside the
-        model grid, or an incidence outside [0, 90) degrees, raises one ERROR line.
+        The model's tables are computed once at this call and held for the stack (the dates and tiles of the bursts); each
+        pixel takes the model's delay at its own ellipsoidal height (transform().ele) and incidence, by the kernel of the
+        Stack (utils_atmosphere): the zenith delay bilinear at the pixel's lat/lon, the mapping at the pixel's incidence, for the
+        date minus the reference. A pixel outside the model grid is NaN, with one warning per block.
 
-        Lazy, as the Tiles reprojection: no phase is computed and no model file is read at the call (ref=None reads only the per-date baseline, 1-D per burst); each chunk is computed when the result
-        is. The chunks are the burst's, with all dates in one chunk. Returns a Batch of Datasets with the variable 'phase'
+        Lazy, as the Tiles reprojection: no phase is computed and no model file is read at the call beyond the held tables (ref=None reads only the per-date baseline, 1-D per burst); each chunk is computed when the result
+        is. The chunks are the burst's (date, y, x) chunks. Returns a Batch of Datasets with the variable 'phase'
         (date, y, x), float32.
 
         >>> stack = Stack().load('gas.zarr', tropo='dem_tiles/VMF3_OP')
@@ -1465,13 +1662,11 @@ class Stack:
 
         The folder is the iono= of load() (a folder of the CODE IONEX maps). Each pixel takes the TEC at its pierce
         point: the point of the single-layer shell (R + H, 450 km above the earth sphere of the maps) where the line of
-        sight from the satellite to the pixel crosses it (TN-200 step 2). The pierce point lies at the sine-law ground
-        distance from the pixel, toward the satellite, on the bearing stack.look() + 180 (stack.look() is the azimuth
-        from the satellite to the target, an array on the stack's grid like the incidence), in the stack's crs. The
-        toolkit reads the maps on their native grid, reprojects the nodes lazily to the crs, and gives the bilinear TEC
-        over the 4 nodes around each pierce point, times the mapping at the pixel's incidence (TN-200 Eq. 21 and 22, R =
-        the pixel's distance from the earth centre) and factor. factor is the ionospheric factor of the mapping: the
-        delay is factor times the slant TEC, so it scales the correction linearly. Proposed values: 0.78 for Sentinel-1
+        sight from the satellite to the pixel crosses it (TN-200 step 2), from the burst's geometry at its terrain height
+        (the midpoint of its ele actual_range). The TEC is bilinear over the 4 nodes around each pierce point, times the
+        mapping at the pierce point (TN-200 Eq. 21 and 22, R = the pixel's distance from the earth centre) and factor. factor
+        is the ionospheric factor of the mapping: the delay is factor times the slant TEC, so it scales the correction
+        linearly. Proposed values: 0.78 for Sentinel-1
         (MPC 2025, at solar maximum; the default used here), 0.90 for Sentinel-1 with the older products (TN-200 and
         ETAD before 2025, which changes with the Sun's state), 0.76 for ALOS-2 (published), about 0.79 for NISAR (from
         the profile model's altitude slope anchored at Sentinel-1; not measured). The L-band accuracy is well below
@@ -1485,8 +1680,8 @@ class Stack:
         baseline : str or None, default 'BPR': per-date baseline whose |value| picks the reference date; None: absolute phase.
         ref : None, int, str or datetime: the date whose phase is subtracted at each pixel (NaN there gives NaN); None: each burst's own smallest |baseline| date (a burst without the baseline takes its first date), so the bursts may differ; ref= names one date for all bursts (a burst without it raises one ERROR line).
 
-        Lazy, as troposphere_phase(): no phase is computed and no model file is read at the call (ref=None reads only the per-date baseline, 1-D per burst); the chunks are the burst's, all dates in one
-        chunk. Returns a Batch of Datasets with the variable 'phase' (date, y, x), float32.
+        Lazy, as troposphere_phase(): the held tables are computed at the call; the chunks are the burst's (date, y, x) chunks.
+        Returns a Batch of Datasets with the variable 'phase' (date, y, x), float32.
 
         >>> stack = Stack().load('gas.zarr', iono='dem_tiles')
         >>> phase = stack.ionosphere_phase(factor=0.78)

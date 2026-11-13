@@ -415,7 +415,7 @@ def _write_tile(path, source, lon0, lat0, served, structure, epoch):
     atomically.
 
     Parameters: path (str); source (str); lon0, lat0 (int); served, structure (as _normalise returns them); epoch
-    (pandas.Timestamp). Returns: None.
+    (pandas.Timestamp). Returns: bool, the latitudes are north-up (read back from the verified bytes, in the same open).
 
     Examples
     --------
@@ -454,36 +454,41 @@ def _write_tile(path, source, lon0, lat0, served, structure, epoch):
             # the VRT declares NaN as nodata for float bands: NaN is read back as stored, in the same cells
             if not np.array_equal(f[var][()], stacks[var], equal_nan=np.issubdtype(stacks[var].dtype, np.floating)):
                 raise ValueError(f'ERROR: tile verification failed for {path}')
+        lat = np.asarray(f['lat'][()])
     write_file(path, data)
+    return bool(lat.size > 1 and lat[1] < lat[0])
 
 
-def _read_structure(path):
+def _read_tile(path):
     """
-    The structure [[variable, dtype, [levels]], ...] of a tile file.
+    The structure [[variable, dtype, [levels]], ...] of a tile file and whether its latitudes are north-up, from one open.
 
-    Parameters: path (str). Returns: list.
+    Parameters: path (str). Returns: tuple (list, bool).
 
     Examples
     --------
-    >>> _read_structure('ERA5/N40E010_20160511T080000.nc')
-    [['sp', 'float32', ['surface']]]
+    >>> _read_tile('ERA5/N40E010_20160511T080000.nc')
+    ([['sp', 'float32', ['surface']]], False)
     """
     utils_tiles.hdf5_plugins()
     import h5py
     try:
         with h5py.File(path, 'r') as f:
-            return json.loads(f.attrs['variables'])
+            structure = json.loads(f.attrs['variables'])
+            lat = np.asarray(f['lat'][()])
     except (OSError, KeyError, ValueError) as e:
         raise ValueError(f'ERROR: tile file {path} cannot be read: {type(e).__name__}') from None
+    return structure, bool(lat.size > 1 and lat[1] < lat[0])
 
 
-def _scan(folder, tolerant=False, offset=None):
+def _scan(folder, tolerant=False, offset=None, listed=None):
     """
-    The tile files of a source folder, sorted by name, with their epoch, corner and structure. An unreadable file raises
-    its ERROR: line; with tolerant it is listed with structure None.
+    The tile files of a source folder, sorted by name, with their epoch, corner, structure and north-up flag. An unreadable
+    file raises its ERROR: line; with tolerant it is listed with structure None. A file in listed (dict {path: structure},
+    the files a VRT lists) is not opened: its structure is the one given and it is north-up False (checked when indexed).
 
     Parameters: folder (str, e.g. basedir/ERA5); tolerant (bool, default False); offset (0.0 or 0.5, None accepts
-    either). Returns: list of dict.
+    either); listed (dict or None, default None). Returns: list of dict.
 
     Examples
     --------
@@ -493,23 +498,74 @@ def _scan(folder, tolerant=False, offset=None):
     out = []
     if not os.path.isdir(folder):
         return out
+    # one absolute, resolved form on both sides of the match: a relative folder and an absolute one give the same files
+    listed = {os.path.realpath(p): s for p, s in (listed or {}).items()}
     for name in sorted(os.listdir(folder)):
         m = _FILE.fullmatch(name)
         if m is None:
             continue
         path = os.path.join(folder, name)
         lon0, lat0 = _parse_tile(m.group(1), offset)
-        structure, error = None, None
-        try:
-            structure = _read_structure(path)
-        except ValueError as e:
-            # one ERROR: line that names the file and says to delete it; store() raises it before any fetch
-            error = f'{e}, delete it, then store again'
-            if not tolerant:
-                raise ValueError(error) from None
+        structure, north_up, error = None, False, None
+        key = os.path.realpath(path)
+        if key in listed:
+            structure = listed[key]
+        else:
+            try:
+                structure, north_up = _read_tile(path)
+            except ValueError as e:
+                # one ERROR: line that names the file and says to delete it; store() raises it before any fetch
+                error = f'{e}, delete it, then store again'
+                if not tolerant:
+                    raise ValueError(error) from None
         out.append({'path': path, 'epoch': pd.to_datetime(m.group(2), format=EPOCH_FORMAT), 'lon0': lon0,
-                    'lat0': lat0, 'structure': structure, 'error': error})
+                    'lat0': lat0, 'structure': structure, 'north_up': north_up, 'error': error})
     return out
+
+
+def _vrt_tiles(vrt):
+    """
+    The tile files that a VRT lists, and the structure of its variables; both read from the VRT alone (no tile file is
+    opened). The structure is the inverse of _index_xml: [[variable, dtype, [levels]], ...], None when the VRT has no variable.
+
+    Parameters: vrt (str). Returns: tuple (list of the absolute paths, sorted; list or None). Raises: ValueError, one ERROR:
+    line, for a VRT that cannot be read.
+
+    Examples
+    --------
+    >>> _vrt_tiles('ERA5.vrt')
+    ([], None)
+    """
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.parse(vrt).getroot()
+    except (OSError, ET.ParseError) as e:
+        raise ValueError(f'ERROR: {vrt} cannot be read: {type(e).__name__}') from None
+    base = os.path.dirname(os.path.abspath(vrt))
+    out = set()
+    for name in root.iter('SourceFilename'):
+        text = (name.text or '').strip()
+        if text.startswith('NETCDF:'):
+            text = text[len('NETCDF:'):].rsplit(':', 1)[0].strip('"')
+        out.add(os.path.join(base, text) if name.get('relativeToVRT', '0') == '1' else text)
+    dtypes = {gdal: dtype for dtype, gdal in utils_tiles._GDAL_TYPES.items()}
+    labels, structure = None, []
+    for array in root.iter('Array'):
+        if array.get('name') == 'level':
+            for attr in array.iter('Attribute'):
+                if attr.get('name') == 'labels':
+                    labels = attr.find('Value').text.split(',')
+    for array in root.iter('Array'):
+        name = array.get('name')
+        if name in ('epoch', 'level', 'lat', 'lon'):
+            continue
+        dims = [ref.get('ref') for ref in array.iter('DimensionRef')]
+        levels = ['surface'] if 'level' not in dims else labels
+        dtype = dtypes.get((array.find('DataType').text or '').strip())
+        if dtype is None or levels is None:
+            raise ValueError(f'ERROR: {vrt} cannot be read: the variable {name} has no known type or levels')
+        structure.append([name, dtype, levels])
+    return sorted(out), (structure or None)
 
 
 def _listed(vrt):
@@ -587,7 +643,8 @@ def _index_xml(vrt, source, files):
     (pressure levels, where the model has them), lat and lon; one array per variable with one source per tile file,
     placed by its offset.
 
-    Parameters: vrt (str; tile paths are relative to its folder); source (str); files (list of dict, from _scan).
+    Parameters: vrt (str; tile paths are relative to its folder); source (str); files (list of dict, from _scan or the
+    writer, with the structure and the north-up flag of each tile; no tile file is opened here).
     Returns: str. Raises: ValueError, one ERROR: line, when the tiles differ in variables or levels, or a tile is
     north-up.
 
@@ -595,7 +652,6 @@ def _index_xml(vrt, source, files):
     --------
     >>> _index_xml('dem/ERA5.vrt', 'ERA5', _scan('dem/ERA5'))
     """
-    import h5py
     from xml.sax.saxutils import escape
     cfg = _source(source)
     step, n = cfg['step'], cfg['nodes']
@@ -615,9 +671,7 @@ def _index_xml(vrt, source, files):
             raise ValueError(f'ERROR: {var} has the levels {_summary([[var, dtype, labs]])}, the other variables have '
                              f'the levels of {labels[0]} to {labels[-1]}: one level dimension holds all of them')
     for f in files:
-        with h5py.File(f['path'], 'r') as hf:
-            lat = np.asarray(hf['lat'][()])
-        if lat.size > 1 and lat[1] < lat[0]:
+        if f['north_up']:
             raise ValueError(f'ERROR: {os.path.relpath(f["path"], base)} is north-up: delete it, then store() again')
     lon_min = float(min(f['lon0'] for f in files))
     lat_min = float(min(f['lat0'] for f in files))
@@ -789,32 +843,37 @@ class TileWriter:
         self.offset = _source(source)['offset']
         self.base, self.folder, self.vrt, self.wanted, self.paths = _items(basedir, source, items)
         self.done = _lists_all(self.vrt, self.paths)
-        self.new, self.rows, self.structure = [], [], None
+        self.new, self.rows, self.structure, self.files = [], [], None, []
         if self.done:
             return
         os.makedirs(self.folder, exist_ok=True)
-        present = _scan(self.folder, tolerant=True, offset=self.offset)
+        # the files the VRT lists keep their structure from the VRT and are not opened (checked when they were indexed);
+        # the other tile files of the folder are read once, here: this is the one scan of the call
+        listed, vrt_structure = _vrt_tiles(self.vrt) if os.path.isfile(self.vrt) else ([], None)
+        present = _scan(self.folder, tolerant=True, offset=self.offset,
+                        listed={p: vrt_structure for p in listed} if vrt_structure is not None else None)
         bad = [f for f in present if f['structure'] is None]
         if bad:
             more = f' (and {len(bad) - 1} more unreadable tile files)' if len(bad) > 1 else ''
             raise ValueError(bad[0]['error'] + more)
-        self.structure = present[0]['structure'] if present else None
+        self.structure = vrt_structure if vrt_structure is not None else (present[0]['structure'] if present else None)
         for f in present:
             if f['structure'] != self.structure:
                 raise ValueError(f'ERROR: {os.path.relpath(f["path"], self.base)} has variables {_summary(f["structure"])}, '
                                  f'the other tiles have {_summary(self.structure)}')
         requested = set(self.paths)
-        if os.path.isfile(self.vrt):
-            for path in _listed(self.vrt):
-                if not os.path.isfile(path) and path not in requested:
-                    raise ValueError(f'ERROR: {os.path.basename(self.vrt)} lists the tile file '
-                                     f'{os.path.relpath(path, self.base)}, which is missing: request its epoch and tile '
-                                     f'again to fetch it')
+        for path in listed:
+            if not os.path.isfile(path) and path not in requested:
+                raise ValueError(f'ERROR: {os.path.basename(self.vrt)} lists the tile file '
+                                 f'{os.path.relpath(path, self.base)}, which is missing: request its epoch and tile '
+                                 f'again to fetch it')
+        self.files = present
         self.new = [key for key, path in zip(self.wanted, self.paths) if not exists(path)]
 
     def write(self, epoch, lon0, lat0, served):
         """
-        Writes the tile file of one item, atomically, from its served values as the fetch of store returns them.
+        Writes the tile file of one item, atomically, from its served values as the fetch of store returns them; the file's
+        structure and latitude order come from the write itself (no reopen).
 
         Parameters: epoch (pandas.Timestamp); lon0, lat0 (int, the corner); served (dict {variable: {level: 2-D array}}).
         Returns: None.
@@ -830,13 +889,19 @@ class TileWriter:
             raise ValueError(f'ERROR: {tile_name(lon0, lat0, self.offset)} at {epoch} has variables {_summary(structure)}, '
                              f'the tiles have {_summary(self.structure)}')
         path = _tile_file(self.folder, self.source, epoch, lon0, lat0)
-        _write_tile(path, self.source, lon0, lat0, served, self.structure, epoch)
+        north_up = _write_tile(path, self.source, lon0, lat0, served, self.structure, epoch)
         self.rows.append((epoch, tile_name(lon0, lat0, self.offset), os.path.abspath(path)))
+        # the entry as _scan makes it from the file name (the corner parsed from the tile name)
+        lon_name, lat_name = _parse_tile(tile_name(lon0, lat0, self.offset), self.offset)
+        self.files.append({'path': path, 'epoch': pd.to_datetime(epoch.strftime(EPOCH_FORMAT), format=EPOCH_FORMAT),
+                           'lon0': lon_name, 'lat0': lat_name, 'structure': self.structure, 'north_up': north_up,
+                           'error': None})
 
     def close(self):
         """
-        Writes the VRT over the tile files present, after every item of the call is written; returns the rows of the call
-        as store does: DataFrame with columns epoch, tile, path, or None when no file was written.
+        Writes the VRT over the tile files present (the files of the scan and of the writes), after every item of the call is
+        written; returns the rows of the call as store does: DataFrame with columns epoch, tile, path, or None when no file
+        was written.
 
         Examples
         --------
@@ -844,9 +909,8 @@ class TileWriter:
         """
         if self.done:
             return None
-        files = _scan(self.folder, offset=self.offset)
-        if files:
-            _write_vrt(self.vrt, self.source, files)
+        if self.files:
+            _write_vrt(self.vrt, self.source, self.files)
         if not self.rows:
             return None
         return pd.DataFrame(self.rows, columns=['epoch', 'tile', 'path'])
@@ -1133,10 +1197,32 @@ def _attribute_of(arr, name):
     return ''
 
 
+_EXISTS = set()   # the files confirmed to exist in this process: each file is checked once
+
+
+def exists_once(path):
+    """
+    Whether a file exists, checked once per process: a file confirmed by an earlier call is not checked again.
+
+    Parameters: path (str). Returns: bool, as utils_files.exists (an empty file raises EmptyFileError).
+
+    Examples
+    --------
+    >>> exists_once('dem_tiles/ERA5/10_40_20160511T080000.nc')
+    """
+    if path in _EXISTS:
+        return True
+    if not exists(path):
+        return False
+    _EXISTS.add(path)
+    return True
+
+
 def _read_blocks(index, plan):
     """
     The stored blocks of a plan, each file opened once and each variable read whole; the no-data nodes (NaN) of each 2-D
-    block are filled (atm_fill_nodata), and one warning counts the filled nodes.
+    block are filled (atm_fill_nodata), and one warning counts the filled nodes. The tile files are not checked here:
+    the verify of the index does that (once per file per process).
 
     Parameters: index (Index, of the model folder); plan (dict {path: variables}). Returns: dict {(path, variable):
     array (levels, rows, columns)}. Raises: ValueError, one ERROR: line, when a listed tile file is missing or
@@ -1151,9 +1237,6 @@ def _read_blocks(index, plan):
     blocks = {}
     filled = 0
     for path, names in plan.items():
-        if not exists(path):
-            raise ValueError(f'ERROR: {path} listed in {index.path} is missing: call store() again with the same items '
-                             f'to fetch it')
         try:
             with h5py.File(path, 'r') as f:
                 for sv in sorted(names):
@@ -1168,6 +1251,9 @@ def _read_blocks(index, plan):
                         filled += count
                         levels.append(block)
                     blocks[(path, sv)] = np.stack(levels)
+        except FileNotFoundError:
+            raise ValueError(f'ERROR: {path} listed in {index.path} is missing: call store() again with the same items '
+                             f'to fetch it') from None
         except OSError as e:
             raise ValueError(f'ERROR: {path} cannot be read: {type(e).__name__}, delete it, then store() again') from None
     _warn_filled(index.path, filled)
@@ -1325,12 +1411,54 @@ def _read_day(path, day):
     return {'epochs': pd.DatetimeIndex(epochs), 'grid': grid}
 
 
+def _days_listed(vrt, base):
+    """
+    What an IONEX index lists, read from the VRT alone (no day file is opened): the day files it lists (absolute path, normalised,
+    -> the seconds since 1970 of their maps) and its lat and lon arrays. Nothing is listed, and the arrays are None, for a VRT
+    that is missing, unreadable or lacks those arrays: the index is then written over the day files present, as with no index.
+
+    Parameters: vrt (str, basedir/IONEX.vrt); base (str, the absolute basedir). Returns: tuple (dict, numpy.ndarray or None,
+    numpy.ndarray or None).
+
+    Examples
+    --------
+    >>> _days_listed('dem_tiles/IONEX.vrt', 'dem_tiles')
+    ({}, None, None)
+    """
+    import xml.etree.ElementTree as ET
+    if not os.path.isfile(vrt):
+        return {}, None, None
+    try:
+        root = ET.parse(vrt).getroot()
+    except (OSError, ET.ParseError):
+        return {}, None, None
+    arrays = {array.get('name'): array for array in root.iter('Array')}
+
+    def values(name):
+        inline = arrays[name].find('InlineValues') if name in arrays else None
+        if inline is None or not inline.text:
+            return None
+        return np.array([float(v) for v in inline.text.split(',')], dtype=np.float64)
+    lat, lon, seconds = values('lat'), values('lon'), values('epoch')
+    if lat is None or lon is None or seconds is None or 'tec' not in arrays:
+        return {}, None, None
+    listed = {}
+    for source in arrays['tec'].iter('Source'):
+        name = (source.find('SourceFilename').text or '').strip()
+        start = int(source.find('DestSlab').get('offset').split(',')[0])
+        epochs = seconds[start:start + _IONEX_MAPS]
+        if len(epochs) == _IONEX_MAPS:
+            listed[os.path.normpath(os.path.join(base, name))] = [float(s) for s in epochs]
+    return listed, lat, lon
+
+
 def index_days(basedir, source='IONEX'):
     """
     Writes the multidimensional VRT index basedir/IONEX.vrt over the IONEX day files as published, atomically: dimensions
     epoch (seconds since 1970, the maps of the day files in day order), lat and lon (the node latitudes and longitudes of the
     day files, as ascending values); one array tec (Int32, as published) with one source per day file, placed at its first
-    epoch. The rms maps are not indexed. Only the headers of the day files are read; the index is rebuilt on each call.
+    epoch. The rms maps are not indexed. The day files the index already lists are not opened: only the headers of the others
+    are read, and the index is rewritten on each call.
 
     Parameters: basedir (str, the download folder with the IONEX subfolder); source (str, 'IONEX'). Returns: None.
     Raises: ValueError, one ERROR: line, when the source is not IONEX, there is no day file, two files hold one day, a day
@@ -1355,24 +1483,37 @@ def index_days(basedir, source='IONEX'):
         found[day] = os.path.join(folder, name)
     if not found:
         raise ValueError(f'ERROR: no IONEX day file (COD0OPSFIN_<yyyy><ddd>0000_01D_01H_GIM.INX.gz or codg<ddd>0.<yy>i.Z) in {folder}')
-    days = [(found[day], _read_day(found[day], day)) for day in sorted(found)]
-    first_path, first = days[0][0], days[0][1]['grid']
-    for path, info in days[1:]:
-        if info['grid'] != first:
-            raise ValueError(f'ERROR: {path} has a grid other than {first_path}')
-    lat = first['lat0'] + first['dlat'] * np.arange(first['nlat'], dtype=np.float64)
-    lon = first['lon0'] + first['dlon'] * np.arange(first['nlon'], dtype=np.float64)
+    # the day files the index lists keep their entries as it has them (their grid was checked when they were indexed); each other
+    # day file is read here once, and its grid is checked against the lat and lon arrays of the index (or of the first new day
+    # file, when there is no index)
+    listed, lat, lon = _days_listed(os.path.join(base, f'{source}.vrt'), base)
+    first_path, days = None, []
+    for day in sorted(found):
+        path = found[day]
+        if os.path.normpath(path) in listed:
+            days.append((path, listed[os.path.normpath(path)]))
+            continue
+        info = _read_day(path, day)
+        grid = info['grid']
+        node_lat = grid['lat0'] + grid['dlat'] * np.arange(grid['nlat'], dtype=np.float64)
+        node_lon = grid['lon0'] + grid['dlon'] * np.arange(grid['nlon'], dtype=np.float64)
+        if lat is None:
+            lat, lon, first_path = node_lat, node_lon, path
+        elif not (np.array_equal(node_lat, lat) and np.array_equal(node_lon, lon)):
+            named = first_path or os.path.join(base, f'{source}.vrt')
+            raise ValueError(f'ERROR: {path} has a grid other than {named}')
+        days.append((path, [_seconds(when) for when in info['epochs']]))
     seconds, sources, offset = [], [], 0
-    for path, info in days:
-        seconds.extend(_seconds(when) for when in info['epochs'])
+    for path, epochs in days:
+        seconds.extend(epochs)
         sources.append((offset, os.path.relpath(path, base)))
-        offset += len(info['epochs'])
+        offset += len(epochs)
     e_attr = '<Attribute name="{}"><DataType>String</DataType><Value>{}</Value></Attribute>'
     out = ['<VRTDataset>\n<Group name="/">\n',
            '  ' + e_attr.format('model', source) + '\n',
            f'  <Dimension name="epoch" size="{len(seconds)}" type="TEMPORAL" indexingVariable="epoch"/>\n',
-           f'  <Dimension name="lat" size="{first["nlat"]}" type="HORIZONTAL_Y" indexingVariable="lat"/>\n',
-           f'  <Dimension name="lon" size="{first["nlon"]}" type="HORIZONTAL_X" indexingVariable="lon"/>\n',
+           f'  <Dimension name="lat" size="{len(lat)}" type="HORIZONTAL_Y" indexingVariable="lat"/>\n',
+           f'  <Dimension name="lon" size="{len(lon)}" type="HORIZONTAL_X" indexingVariable="lon"/>\n',
            f'  <Array name="epoch"><DataType>Float64</DataType><DimensionRef ref="epoch"/>'
            f'<InlineValues>{_numbers(seconds)}</InlineValues>' + e_attr.format('units', _IONEX_UNITS) + '</Array>\n',
            f'  <Array name="lat"><DataType>Float64</DataType><DimensionRef ref="lat"/>'

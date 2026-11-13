@@ -126,7 +126,8 @@ class IONEX(datagrid, progressbar_joblib, AtmosphereModel):
         self.password = password
 
     def _phase(self, folder, times, wavelength, factor, heights=None):
-        """The terms of the ionospheric model of a folder on the native nodes, in phase units, lazy.
+        """The terms of the ionospheric model of a folder on the native nodes, in phase units, lazy; the day files the times need
+        are checked to exist first (verify), and no day file is read.
 
         Parameters
         ----------
@@ -134,9 +135,10 @@ class IONEX(datagrid, progressbar_joblib, AtmosphereModel):
         times : list of str or pandas.Timestamp - The acquisition times, UTC.
         wavelength : float - The radar wavelength, metres.
         factor : float - The ionospheric factor, dimensionless.
-        heights : ignored (the ionospheric terms have one height axis with identical values along it).
+        heights : accepted and not used: the ionospheric terms have no height axis (one layer; the pierce point is the caller's).
         """
         from . import utils_iono
+        utils_iono.verify(folder, times)
         return utils_iono.zenith_tiles(folder, times, wavelength, factor)
 
     def download(self, basedir, scenes, skip_exist=True, n_jobs=8, retries=30,

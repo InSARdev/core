@@ -881,11 +881,8 @@ def coarsen_chunks(blocks, window):
     return None
 
 
-# the graph rule (the user, 2026-11-01): one WARNING line when a call makes more than GRAPH_CHUNK_LIMIT output chunks of one
-# variable of one burst, when it adds more than GRAPH_TASK_LIMIT lazy tasks, or when its input already carries more than
-# GRAPH_TASK_LIMIT (about 2000 chunks x 20 tasks per chunk: the user expects 10 to 20 tasks per chunk)
-GRAPH_CHUNK_LIMIT = 2000
-GRAPH_TASK_LIMIT = 40000
+# the graph rule: a call that splits the input's chunks prints one WARNING line. A result array with more (y, x) blocks than
+# its input's is split; blocks along other dims (dates, pairs) never count, and a chunking the user set is never judged.
 
 
 def _lazy_arrays(obj):
@@ -918,13 +915,11 @@ def _graph_layers(arrays):
 
 def graph_check(name, result, source):
     """
-    Warn when a call makes too many lazy graph objects: the graph rule (GRAPH_CHUNK_LIMIT, GRAPH_TASK_LIMIT).
+    Warn when a call splits the input's chunks: a result array has more (y, x) blocks than its input's.
 
-    Counts the lazy graph only (the layers by length, nothing is optimised). Prints one WARNING line per rule that fires:
-    more than GRAPH_CHUNK_LIMIT output chunks of one variable of one burst (the largest is named), more than GRAPH_TASK_LIMIT
-    lazy tasks added to the input's graph by the call, and more than GRAPH_TASK_LIMIT lazy tasks that the input already
-    carries (the line suggests a snapshot). Otherwise nothing.
-    The count line names chunk2d() when the input already has as many chunks.
+    The (y, x) blocks of an xarray object are the blocks of its dims y and x (none without them); a bare dask array counts its
+    last two axes (one block below two axes). Each burst is compared with its own input; the split line names the largest split.
+    Counts the lazy graph only (the layers by length, nothing is optimised). Otherwise nothing is printed.
 
     Parameters
     ----------
@@ -946,8 +941,9 @@ def graph_check(name, result, source):
     """
     import math
 
-    def named(obj, burst=None, var=None):
-        """(label, dask array) of each lazy array of obj: a variable of a dataset, named by its burst (a dict key)."""
+    def named(obj, burst=None, var=None, dims=None):
+        """(label, burst, (y, x) blocks) of each lazy array of obj: a variable of a dataset, named by its burst (a
+        dict key); the dims of an xarray object say which of its axes are y and x."""
         import dask.array as da
         import xarray as xr
         if isinstance(obj, (list, tuple)):
@@ -955,41 +951,45 @@ def graph_check(name, result, source):
         if isinstance(obj, dict):
             return [p for k, o in obj.items() for p in named(o, str(k), var)]
         if isinstance(obj, xr.Dataset):
-            return [p for k, v in obj.data_vars.items() for p in named(v.data, burst, str(k))]
+            return [p for k, v in obj.data_vars.items() for p in named(v.data, burst, str(k), v.dims)]
         if isinstance(obj, xr.DataArray):
-            return named(obj.data, burst, var or (None if obj.name is None else str(obj.name)))
+            return named(obj.data, burst, var or (None if obj.name is None else str(obj.name)), obj.dims)
         if isinstance(obj, da.Array):
-            return [(' in '.join(p for p in (var, burst) if p) or 'array', obj)]
+            nb = obj.numblocks
+            if dims is not None:
+                yx = math.prod(nb[list(dims).index(d)] for d in ('y', 'x')) if 'y' in dims and 'x' in dims else 1
+            else:
+                yx = math.prod(nb[-2:]) if len(nb) >= 2 else 1
+            label = ' in '.join(p for p in (var, burst) if p) or 'array'
+            return [(label, burst, yx)]
         return []
 
     res_arrays = _lazy_arrays(result)
     if not res_arrays:
         return None
     src_arrays = _lazy_arrays(source)
+    res, src = named(result), named(source)
     src_layers = _graph_layers(src_arrays)
     res_layers = _graph_layers(res_arrays)
     added = sum(len(layer) for key, layer in res_layers.items() if key not in src_layers)
     out_chunks = sum(math.prod(a.numblocks) for a in res_arrays)
     in_total = sum(len(layer) for layer in src_layers.values())
     in_chunks = sum(math.prod(a.numblocks) for a in src_arrays) or 1
-    counts = [(math.prod(a.numblocks), label) for label, a in named(result)]
-    over = sorted((n, label) for n, label in counts if n > GRAPH_CHUNK_LIMIT)
+    # the input's (y, x) blocks of each burst (its largest array); a burst the source does not have (a merge) counts the sum
+    per_burst = {}
+    for _, burst, yx in src:
+        per_burst[burst] = max(per_burst.get(burst, 0), yx)
+    whole = sum(per_burst.values())
+    split = sorted((yx, label, per_burst.get(burst, whole)) for label, burst, yx in res
+                   if src and yx > per_burst.get(burst, whole))
     info = {'added': added, 'output_chunks': out_chunks,
             'added_per_chunk': added / max(out_chunks, 1), 'input_per_chunk': in_total / in_chunks,
-            'input_tasks': in_total, 'max_chunks': max((n for n, _ in counts), default=0)}
-    if over:
-        n, label = over[-1]
-        more = f' ({len(over) - 1} more arrays over the limit)' if len(over) > 1 else ''
-        kept = n <= max((math.prod(a.numblocks) for a in src_arrays), default=0)
-        advice = (': the input has as many: re-chunk it with a larger chunk2d() budget' if kept
-                  else ': use a larger budget or keep the stored chunks')
-        print(f"WARNING: {name}(): {n} output chunks of {label} (more than {GRAPH_CHUNK_LIMIT}){advice}{more}", flush=True)
-    if added > GRAPH_TASK_LIMIT:
-        print(f"WARNING: {name}(): {added} lazy tasks added ({info['added_per_chunk']:.0f} per output chunk, {out_chunks} "
-              f"output chunks), more than {GRAPH_TASK_LIMIT}: the graph grows with the dates and pairs of the call", flush=True)
-    if in_total > GRAPH_TASK_LIMIT:
-        print(f"WARNING: {name}(): the input carries {in_total} lazy tasks, more than {GRAPH_TASK_LIMIT}: take a snapshot of "
-              f"the input first (Stack.snapshot()), so the call does not carry its graph", flush=True)
+            'input_tasks': in_total, 'max_chunks': max((math.prod(a.numblocks) for a in res_arrays), default=0)}
+    if split:
+        n, label, m = split[-1]
+        more = f' ({len(split) - 1} more arrays split)' if len(split) > 1 else ''
+        print(f"WARNING: {name}(): {n} (y, x) blocks of {label}, more than the input's {m}: "
+              f"the call splits the input's chunks{more}", flush=True)
     return info
 
 

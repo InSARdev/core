@@ -14,7 +14,6 @@ import numpy as np
 import pandas as pd
 
 from . import utils_epochs
-from .utils_files import exists
 from .utils_tropo import (_plan, _times)
 
 _NAME = 'IONEX'
@@ -213,7 +212,7 @@ def _match(axis, want, path):
 
 
 def _day_header(path, lat, lon):
-    """The header of a day file: the scale, the base radius and the shell height.
+    """One read of a day file: its TEC maps as published and its header values, in one IONEX._read.
 
     Parameters
     ----------
@@ -222,41 +221,41 @@ def _day_header(path, lat, lon):
 
     Returns
     -------
-    tuple - (path, scale, radius, shell): the scale in electrons per square metre per stored integer; the radius and shell in km.
+    dict - path; tec: the integer maps (epoch, lat, lon) as published, on the file's own lattice (ascending); rows, cols: the
+    lattice's index in the file's latitudes and longitudes; scale: electrons per square metre per stored integer; radius and hgt:
+    BASE RADIUS and HGT1 in km.
 
     Raises
     ------
-    ValueError: When the file or its header cannot be read, or its nodes are not the lattice nodes.
+    ValueError: When the file cannot be read or decoded (its header included), or its nodes are not the lattice nodes.
 
     Examples
     --------
     >>> _day_header('dem_tiles/IONEX/codg1320.16i.Z', np.array([40.0, 40.5]), np.array([10.0, 11.0]))
     """
     from .IONEX import IONEX
-    text = IONEX._head(path)
+    text = IONEX._read(path)
     try:
-        head = IONEX._header(text)
+        maps = IONEX._decode_maps(text)
     except ValueError as e:
         raise ValueError(f'ERROR: {path}: {str(e).removeprefix("ERROR: ")}') from None
-    file_lat = np.sort(np.asarray(head['lat'], dtype=float))
-    file_lon = np.sort(np.asarray(head['lon'], dtype=float))
-    if file_lat.size != lat.size or file_lon.size != lon.size:
+    if maps['lat'].size != lat.size or maps['lon'].size != lon.size:
         raise ValueError(f'ERROR: the nodes of {path} are not the nodes of the IONEX index: repeat the IONEX download')
-    _match(file_lat, lat, path)
-    _match(file_lon, lon, path)
-    return path, 10.0 ** head['exponent'] * 1e16, head['radius'], head['hgt'][0]
+    head = maps['header']
+    return {'path': path, 'tec': maps['tec'], 'rows': _match(maps['lat'], lat, path), 'cols': _match(maps['lon'], lon, path),
+            'scale': 10.0 ** maps['exponent'] * 1e16, 'radius': head['BASE_RADIUS'], 'hgt': head['HGT1_HGT2_DHGT'][0]}
 
 
-def _shell(headers):
-    """The base radius and shell height in metres from the day file headers; the day files must agree.
+def _shell(reads):
+    """The shell R + H in metres from the day file headers (BASE RADIUS and HGT1); the day files must agree.
 
     Parameters
     ----------
-    headers : list of tuple - The day file headers, radius and shell in km.
+    reads : list of dict - The day file reads of _day_header.
 
     Returns
     -------
-    tuple of float - (radius, shell) in metres.
+    float - R + H, metres.
 
     Raises
     ------
@@ -264,14 +263,14 @@ def _shell(headers):
 
     Examples
     --------
-    >>> _shell([('dem_tiles/IONEX/codg1320.16i.Z', 1e15, 6371.0, 450.0), ('dem_tiles/IONEX/codg1330.16i.Z', 1e15, 6371.0, 450.0)])
+    >>> _shell([{'path': 'dem_tiles/IONEX/codg1320.16i.Z', 'radius': 6371.0, 'hgt': 450.0}, {'path': 'dem_tiles/IONEX/codg1330.16i.Z', 'radius': 6371.0, 'hgt': 450.0}])
     """
-    first = headers[0]
-    for head in headers[1:]:
-        if (head[2], head[3]) != (first[2], first[3]):
-            raise ValueError(f'ERROR: the day files {os.path.basename(first[0])} and {os.path.basename(head[0])} differ: '
-                             f'BASE RADIUS {first[2]} and {head[2]} km, HGT1 {first[3]} and {head[3]} km')
-    return first[2] * 1e3, first[3] * 1e3
+    first = reads[0]
+    for read in reads[1:]:
+        if (read['radius'], read['hgt']) != (first['radius'], first['hgt']):
+            raise ValueError(f'ERROR: the day files {os.path.basename(first["path"])} and {os.path.basename(read["path"])} differ: '
+                             f'BASE RADIUS {first["radius"]} and {read["radius"]} km, HGT1 {first["hgt"]} and {read["hgt"]} km')
+    return first['radius'] * 1e3 + first['hgt'] * 1e3
 
 
 def _source(index, epoch):
@@ -302,53 +301,41 @@ def _source(index, epoch):
     return index['where'][k]
 
 
-def _day_maps(path, epochs, ks, lat, lon, scale):
-    """The TEC grids of some epochs of one day file, over the whole lattice, in electrons per square metre.
+def _day_maps(read, k, epoch):
+    """The TEC grid of one map of a read day file over the lattice, in electrons per square metre; the no-data nodes are filled.
 
     Parameters
     ----------
-    path : str - The day file as published.
-    epochs : tuple of str - The ISO datetimes of the maps.
-    ks : tuple of int - The map index of each epoch in the file.
-    lat, lon : numpy.ndarray - The lattice latitudes and longitudes, degrees.
-    scale : float - The day file's scale, electrons per square metre per stored integer.
+    read : dict - The day file read of _day_header.
+    k : int - The map index in the file.
+    epoch : str - The ISO datetime of the map, for the message.
 
     Returns
     -------
-    dict - {epoch: grid}, each grid float64 (lat, lon).
+    numpy.ndarray - float64, (lat, lon).
 
     Raises
     ------
-    ValueError: When the file cannot be read or decoded, or its nodes are not the lattice nodes.
+    ValueError: When the file has no map k: the index and the file disagree.
 
     Examples
     --------
-    >>> _day_maps('dem_tiles/IONEX/codg1320.16i.Z', ('2016-05-11T05:00:00',), (5,), np.array([40.0, 40.5]), np.array([10.0, 11.0]), 1e15)
+    >>> _day_maps({'path': 'dem_tiles/IONEX/codg1320.16i.Z', 'tec': np.zeros((1, 2, 2), dtype=np.int32), 'rows': np.array([0, 1]), 'cols': np.array([0, 1]), 'scale': 1e15}, 0, '2016-05-11T00:00:00')
     """
-    from .IONEX import IONEX
     from .utils_atmosphere import atm_fill_nodata
-    text = IONEX._read(path)
-    try:
-        maps = IONEX._decode_maps(text)
-    except ValueError as e:
-        raise ValueError(f'ERROR: {path}: {str(e).removeprefix("ERROR: ")}') from None
-    for k in ks:
-        if not 0 <= k < maps['tec'].shape[0]:
-            raise ValueError(f'ERROR: {path} has no map {k}: the index and the file disagree, repeat the download')
-    tecs = [np.asarray(maps['tec'][k], dtype=float) for k in ks]
-    rows, cols = _match(maps['lat'], lat, path), _match(maps['lon'], lon, path)
-    out = {}
-    for epoch, tec in zip(epochs, tecs):
-        nodata = tec == _NODATA
-        if nodata.any():
-            tec, filled = atm_fill_nodata(np.where(nodata, np.nan, tec))
-            print(f'WARNING: IONEX: {filled} no-data nodes ({_NODATA}) of the map {epoch} filled (linear, nearest at the border)')
-        out[epoch] = tec[np.ix_(rows, cols)] * scale
-    return out
+    path, tecs = read['path'], read['tec']
+    if not 0 <= k < tecs.shape[0]:
+        raise ValueError(f'ERROR: {path} has no map {k}: the index and the file disagree, repeat the download')
+    tec = np.asarray(tecs[k], dtype=float)
+    nodata = tec == _NODATA
+    if nodata.any():
+        tec, filled = atm_fill_nodata(np.where(nodata, np.nan, tec))
+        print(f'WARNING: IONEX: {filled} no-data nodes ({_NODATA}) of the map {epoch} filled (linear, nearest at the border)')
+    return tec[np.ix_(read['rows'], read['cols'])] * read['scale']
 
 
 def _days(index, epochs, lat, lon):
-    """The day file headers and the lazy TEC grids of some epochs.
+    """The day file reads and the lazy TEC grids of some epochs: one read task per day file, whatever the epochs it serves.
 
     Parameters
     ----------
@@ -358,31 +345,23 @@ def _days(index, epochs, lat, lon):
 
     Returns
     -------
-    tuple - (headers, maps): the headers in epoch order; maps {ISO datetime: delayed TEC grid}.
+    tuple - (reads, grids): reads {day file path: delayed _day_header}; grids {ISO datetime: delayed TEC grid}.
 
     Examples
     --------
     >>> _days(_index('dem_tiles/IONEX.vrt'), [pd.Timestamp('2016-05-11 05:00')], np.array([40.0, 40.5]), np.array([10.0, 11.0]))
     """
     import dask
-    headers, items = {}, {}
+    reads, grids = {}, {}
     for e in epochs:
-        iso = e.isoformat()
         path, k = _source(index, e)
-        if path not in headers:
-            headers[path] = _day_header(path, lat, lon)
-            items[path] = ([], [])
-        items[path][0].append(iso)
-        items[path][1].append(k)
-    maps = {}
-    for path, (isos, ks) in items.items():
-        grids = dask.delayed(_day_maps)(path, tuple(isos), tuple(ks), lat, lon, headers[path][1])
-        for iso in isos:
-            maps[iso] = grids[iso]
-    return list(headers.values()), maps
+        if path not in reads:
+            reads[path] = dask.delayed(_day_header)(path, lat, lon)
+        grids[e.isoformat()] = dask.delayed(_day_maps)(reads[path], k, e.isoformat())
+    return reads, grids
 
 
-def _value(tec0, tec1, w0, w1, scale):
+def _value(tec0, tec1, w0, w1, scale, shell):
     """The IONEX value at every node of one time, in metres of one-way vertical delay.
 
     Parameters
@@ -390,6 +369,7 @@ def _value(tec0, tec1, w0, w1, scale):
     tec0, tec1 : numpy.ndarray or None - The TEC grids (electrons per square metre) of the two bracketing epochs; None takes tec0 alone.
     w0, w1 : float - The time weights, summing to 1.
     scale : float - The metres of delay per electron per square metre.
+    shell : float - The shell R + H of the day files, metres: a dependency only, so the value is computed when the day files agree.
 
     Returns
     -------
@@ -397,7 +377,7 @@ def _value(tec0, tec1, w0, w1, scale):
 
     Examples
     --------
-    >>> _value(np.ones((2, 2)), None, 1.0, 0.0, 2.0)
+    >>> _value(np.ones((2, 2)), None, 1.0, 0.0, 2.0, 6821e3)
     """
     value = w0 * tec0
     if tec1 is not None:
@@ -430,8 +410,12 @@ def model(path):
     raise ValueError(f'ERROR: no IONEX index (IONEX.vrt) in {path}')
 
 
+_VERIFIED = set()   # (IONEX.vrt path, its mtime, the epochs) verified in this process
+
+
 def verify(path, times):
-    """Check that the maps and day files that the times need are stored in a folder; reads no map values.
+    """Check that the maps and day files that the times need are stored in a folder; reads no map values. The result is
+    kept per process for the index and the epochs, and each day file is checked once (utils_epochs.exists_once).
 
     Parameters
     ----------
@@ -451,10 +435,14 @@ def verify(path, times):
     vrt = _vrt(path)
     index = _index(vrt)
     epochs = sorted({e for e0, e1, w in _plan(stamps, _STEP_HOURS) for e in (e0, e1) if e is not None})
+    key = (vrt, os.stat(vrt).st_mtime_ns, tuple(epochs))
+    if key in _VERIFIED:
+        return
     for e in epochs:
         f, _ = _source(index, e)
-        if not exists(f):
+        if not utils_epochs.exists_once(f):
             raise ValueError(f'ERROR: {f} listed in {vrt} is missing: repeat the IONEX download of {e:%Y-%m-%d}')
+    _VERIFIED.add(key)
 
 
 def delay(path, times, wavelength, factor):
@@ -469,12 +457,13 @@ def delay(path, times, wavelength, factor):
 
     Returns
     -------
-    xarray.Dataset - Lazy; the variable value (time, y, x) in metres, the attributes shell_k (float, R / (R + H)) and
-        shell (float, R + H in metres), the coordinates time, y, x, term, epoch and weight, and the CRS EPSG:4326 (spatial_ref).
+    xarray.Dataset - Lazy; the variable value (time, y, x) in metres and shell (no dims), R + H in metres from the day file headers,
+        checked to agree (the value depends on that check); the coordinates time, term, epoch, weight, y, x, and the CRS EPSG:4326 (spatial_ref).
 
     Raises
     ------
-    ValueError: When the folder has no IONEX index, a map or day file is missing, the wavelength or factor is not valid, or the day files differ in their shell parameters.
+    ValueError: When the folder has no IONEX index, the wavelength or factor is not valid, or the day files differ in their shell
+        parameters (raised when the values are computed). A missing map or day file is named when it is read.
 
     Examples
     --------
@@ -486,32 +475,29 @@ def delay(path, times, wavelength, factor):
     import xarray as xr
     model(path)
     stamps = _times(times)
-    verify(path, stamps)
     lam = _wavelength(wavelength)
     fac = _factor(factor)
-    vrt = _vrt(path)
-    index = _index(vrt)
+    index = _index(_vrt(path))
     lat, lon = _lattice(index)
     plan = _plan(stamps, _STEP_HOURS)
     epochs = sorted({e for e0, e1, w in plan for e in (e0, e1) if e is not None})
-    headers, maps = _days(index, epochs, lat, lon)
-    radius, height = _shell(headers)
+    reads, grids = _days(index, epochs, lat, lon)
+    shell = dask.delayed(_shell)(list(reads.values()))
     scale = _K * (lam / _C) ** 2 * fac
     shape = (lat.size, lon.size)
     values, epoch, weights = [], [], []
     for e0, e1, w in plan:
         w0, w1 = (1.0, 0.0) if e1 is None else (1.0 - w, w)
         e1s = e0 if e1 is None else e1
-        node = dask.delayed(_value)(maps[e0.isoformat()], None if e1 is None else maps[e1.isoformat()], w0, w1, scale)
+        node = dask.delayed(_value)(grids[e0.isoformat()], None if e1 is None else grids[e1.isoformat()], w0, w1, scale, shell)
         values.append(da.from_delayed(node, shape=shape, dtype=float))
         epoch.append([e0.to_datetime64(), e1s.to_datetime64()])
         weights.append([w0, w1])
     ds = xr.Dataset(
-        {'value': (('time', 'y', 'x'), da.stack(values))},
+        {'value': (('time', 'y', 'x'), da.stack(values)), 'shell': ((), da.from_delayed(shell, shape=(), dtype=float))},
         coords={'time': pd.DatetimeIndex(stamps), 'term': np.arange(2), 'y': lat, 'x': lon,
                 'epoch': (('time', 'term'), np.array(epoch, dtype='datetime64[ns]')),
-                'weight': (('time', 'term'), np.array(weights, dtype=float))},
-        attrs={'shell_k': radius / (radius + height), 'shell': radius + height})
+                'weight': (('time', 'term'), np.array(weights, dtype=float))})
     return ds.rio.write_crs('EPSG:4326')
 
 
@@ -543,7 +529,7 @@ def phase(path, times, wavelength, factor):
 
 
 def zenith_tiles(path, times, wavelength, factor):
-    """The ionospheric terms as one lazy tile of the whole lattice, with one table entry per node and time and the shell mapping of every node.
+    """The ionospheric terms of a folder for the stack: the zenith TEC phase on the native lattice and the shell height, lazy.
 
     Parameters
     ----------
@@ -554,22 +540,12 @@ def zenith_tiles(path, times, wavelength, factor):
 
     Returns
     -------
-    xarray.Dataset - Lazy, one dask chunk per time: hydro (time, tile, ty, tx, height) with one height, wet and mapping zeros; the attributes shell_k (R / (R + H)) and shell (R + H, metres) from the day file of the first time.
+    xarray.Dataset - Lazy, one dask chunk per time: tec (time, lat, lon), the zenith TEC phase in radians (-4 pi / wavelength is not
+        +4 pi / wavelength times the one-way delay, the sign of the model); shell (no dims), R + H in metres from the day files,
+        checked to agree and computed with the tec tables. Coordinates time, lat and lon (the IONEX nodes).
     """
-    import dask.array as da
     import xarray as xr
     ds = phase(path, times, wavelength, factor)
-    value = da.asarray(ds['value'].data)
-    ntime, ny, nx = value.shape
-    hydro = value[:, None, :, :, None]
-    wet = da.zeros_like(hydro)
-    mapping = da.zeros((ntime, 1, ny, nx, 2, 3), chunks=(value.chunks[0], (1,), (ny,), (nx,), (2,), (3,)), dtype=float)
-    return xr.Dataset(
-        {'hydro': (('time', 'tile', 'ty', 'tx', 'height'), hydro),
-         'wet': (('time', 'tile', 'ty', 'tx', 'height'), wet),
-         'mapping': (('time', 'tile', 'ty', 'tx', 'component', 'coef'), mapping)},
-        coords={'time': ds['time'].values, 'lat': ds['y'].values, 'lon': ds['x'].values,
-                'tile y0': ('tile', np.array([0], dtype=np.int64)), 'tile x0': ('tile', np.array([0], dtype=np.int64)),
-                'height': [0.0], 'component': ['hydrostatic', 'wet'], 'coef': ['a', 'b', 'c']},
-        attrs={'h0': 0.0, 'step': 1.0, 'count': 1, 'niell': [0.0, 0.0, 0.0, 0.0], 'shell_k': float(ds.attrs['shell_k']),
-               'shell': float(ds.attrs['shell'])})
+    return xr.Dataset({'tec': (('time', 'lat', 'lon'), ds['value'].data), 'shell': ((), ds['shell'].data)},
+                      coords={'time': ds['time'].values, 'lat': ds['y'].values, 'lon': ds['x'].values})
+
