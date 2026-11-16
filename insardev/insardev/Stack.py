@@ -32,6 +32,7 @@ from . import utils_io
 from . import utils_xarray
 from . import utils_baseline
 from . import utils_align
+from . import utils_rotate
 from . import utils_median
 from typing import TYPE_CHECKING
 from .utils_dask import graph_check
@@ -1650,8 +1651,12 @@ class Stack:
         is. The chunks are the burst's (date, y, x) chunks. Returns a Batch of Datasets with the variable 'phase'
         (date, y, x), float32.
 
+        Chunking the dates of the stack (k dates per chunk) makes the phase cheaper per date: each stored block is one task for its
+        k dates, and the work that does not depend on the date is done once for them (the default, one date per chunk, repeats it
+        for every date).
+
         >>> stack = Stack().load('gas.zarr', tropo='dem_tiles/VMF3_OP')
-        >>> phase = stack.troposphere_phase()
+        >>> phase = stack.chunk({'date': 8}).troposphere_phase()
         """
         return _atmosphere_phase(self, 'tropo', None, 'troposphere_phase', baseline=baseline, ref=ref)
 
@@ -1681,10 +1686,11 @@ class Stack:
         ref : None, int, str or datetime: the date whose phase is subtracted at each pixel (NaN there gives NaN); None: each burst's own smallest |baseline| date (a burst without the baseline takes its first date), so the bursts may differ; ref= names one date for all bursts (a burst without it raises one ERROR line).
 
         Lazy, as troposphere_phase(): the held tables are computed at the call; the chunks are the burst's (date, y, x) chunks.
-        Returns a Batch of Datasets with the variable 'phase' (date, y, x), float32.
+        Returns a Batch of Datasets with the variable 'phase' (date, y, x), float32. Chunking the dates of the stack (k dates per chunk)
+        makes the phase cheaper per date, as for troposphere_phase().
 
         >>> stack = Stack().load('gas.zarr', iono='dem_tiles')
-        >>> phase = stack.ionosphere_phase(factor=0.78)
+        >>> phase = stack.chunk({'date': 8}).ionosphere_phase(factor=0.78)
         """
         return _atmosphere_phase(self, 'iono', float(factor), 'ionosphere_phase', geocentric=bool(geocentric),
                                  baseline=baseline, ref=ref)
@@ -3497,25 +3503,23 @@ class Stack:
             for line in utils_align.correction_lines(ids, corrections):
                 print(line, flush=True)
 
-        # Apply corrections: multiply SLC by exp(-i * phi) per date
-        # Use numpy broadcasting to avoid xarray coordinate alignment issues
+        # Apply corrections: multiply SLC by exp(-i * phi) per date (utils_rotate)
         result = {}
         for bid in ids:
             ds = self[bid]
             bidx = id_to_idx[bid]
             phase_corr = corrections[bidx, :]  # shape (n_dates,)
-            # Build correction array matching the date dimension position
-            corr_arr = utils_align.phase_factor(phase_corr)
+            # the correction (rad, float64) along the date dimension: utils_rotate rotates in float64 and casts the result once
+            corr_phase = xr.DataArray(phase_corr, dims=['date'])
 
             new_vars = {}
             for var in ds.data_vars:
                 da = ds[var]
                 if np.issubdtype(da.dtype, np.complexfloating) and 'date' in da.dims:
-                    # Reshape corr to broadcast: (n_dates, 1, 1, ...) matching date dim position
-                    date_axis = list(da.dims).index('date')
-                    shape = [1] * da.ndim
-                    shape[date_axis] = n_dates
-                    new_vars[var] = da * corr_arr.reshape(shape)
+                    # one numba pass per block, lazy for dask, the grid's own dtype; the join as xarray arithmetic does
+                    new_vars[var] = xr.apply_ufunc(utils_rotate.rotate_block, da, corr_phase, dask='parallelized',
+                                                   join=xr.get_options()['arithmetic_join'],
+                                                   output_dtypes=[np.result_type(da.dtype, np.complex64)])
                 else:
                     new_vars[var] = da
             result[bid] = xr.Dataset(new_vars, coords=ds.coords, attrs=ds.attrs)

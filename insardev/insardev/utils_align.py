@@ -149,11 +149,6 @@ def date_residual(rows, corr):
             float(np.average(abs_before, weights=weights)))
 
 
-def phase_factor(phase):
-    """exp(-1j * phase) as complex64: the factor that removes a phase correction."""
-    return np.exp(-1j * phase).astype(np.complex64)
-
-
 def correction_lines(ids, corrections):
     """Debug lines: the corrections (rad) of every burst that has a non-zero one."""
     lines = []

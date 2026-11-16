@@ -17,6 +17,7 @@ trend fitting.
 import numpy as np
 import numba as nb
 from .utils_circular import wrap_phase
+from . import utils_rotate
 
 
 def _warmup_numba_cache():
@@ -2299,17 +2300,36 @@ def trend2d_covariate(data, square, zero, scale, index, name, who):
 
 
 def phase_rotation(phi):
-    """exp(-1j * phi) in complex64 for a real phase `phi` (lazy for dask)."""
-    import dask.array as da
-    return da.exp(np.complex64(-1j) * da.asarray(phi.astype(np.complex64)))
+    """The real phase `phi` in float32, the phase phase_rotate takes (lazy for dask): the rotation exp(-1j * phi) is evaluated
+    per block by utils_rotate in one numba pass.
+
+    >>> import numpy as np
+    >>> phase_rotation(np.array([0.5, 1.0])).dtype.name
+    'float32'
+    """
+    return phi.astype(np.float32)
 
 
-def phase_rotate(data, rot, keep=None, axis=0):
-    """`data * rot` (rot = exp(-1j * phi), see phase_rotation, on data's dims). Where
+def phase_rotate(data, phi, keep=None, axis=0):
+    """`data * exp(-1j * phi)` by utils_rotate, one numba pass per block (phi = phase_rotation(...) on data's dims). Where
     `keep` (a bool per index along `axis`, numpy or dask) is False, data is kept.
-    Lazy for dask: the keep mask follows the data's chunks along `axis`."""
+    Lazy for dask: the keep mask follows the data's chunks along `axis`; phi has the data's chunks (the caller rechunks it).
+
+    >>> import numpy as np
+    >>> d = np.array([[1 + 0j, 0j]], np.complex64)
+    >>> phase_rotate(d, np.zeros((1, 2), np.float32)).tolist()
+    [[(1+0j), 0j]]
+    """
     import dask.array as da
-    prod = data * rot
+    if isinstance(data, da.Array) or isinstance(phi, da.Array):
+        # blockwise, not map_blocks: the operands are aligned by their trailing dimensions and their chunks, so a phase with
+        # one chunk along a dimension is not broadcast over the data's blocks
+        d_arr, p_arr = da.asarray(data), da.asarray(phi)
+        prod = da.blockwise(utils_rotate.rotate_block, tuple(range(max(d_arr.ndim, p_arr.ndim)))[::-1],
+                            d_arr, tuple(range(d_arr.ndim))[::-1], p_arr, tuple(range(p_arr.ndim))[::-1],
+                            dtype=np.result_type(d_arr.dtype, np.complex64))
+    else:
+        prod = utils_rotate.rotate_block(data, phi)
     if keep is None or keep.all():
         return prod
     idx = tuple(slice(None) if i == axis else None for i in range(prod.ndim))

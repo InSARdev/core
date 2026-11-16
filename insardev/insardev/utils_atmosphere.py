@@ -15,7 +15,8 @@ polynomials, per row, in (x - x_c, y - y_c) about the absolute 10 km centres the
 need (a 3 x 3 stencil at +-100 m) of the incidence and, with a shell, of the ionosphere's pierce latitude, pierce longitude and
 effective incidence (the look azimuth enters through them only). cut_block, per chunk: each pixel's lat/lon, bilinear on the absolute geometry lattice
 (utils_geometry._lattice_step; pyproj only at its nodes), and the box of the model's lattice the chunk reads. grid_block, one
-numba pass per block: the troposphere (at each of the four model nodes around the pixel, the zenith delays at the pixel's height
+numba pass per block for all of the block's dates (per row the date-independent part of each pixel once, then each date reads only its
+tables; chunking the dates of the stack, k dates per chunk, makes the phase cheaper per date): the troposphere (at each of the four model nodes around the pixel, the zenith delays at the pixel's height
 (linear between the 10 m rows) times the mapping at the pixel's incidence plus the height term, then the bilinear of the node
 delays; date minus reference) or the
 ionosphere (the pierce point from the polynomials, the TEC bilinear times the mapping). Each pixel's value depends on its own
@@ -495,25 +496,39 @@ def _node_delay(hyd, wet, mp, p, m, kf, wh, s, hz):
 @nb.njit(nogil=True, cache=True, error_model='numpy')
 def _grid_tropo(ele, ycoord, xcoord, jy, wy, jx, wx, LAT, LON, lat0, dla, lon0, dlo, nla, nlo, i0, j0,
                 hyd_d, wet_d, map_d, hyd_r, wet_r, map_r, hcoef, h_first, hs, hstep, cell, step, kx0, ky0, inc_t, out, flags):
-    """The troposphere phase of a block in one serial pass: the date minus the reference, per pixel (see grid_block). flags counts:
-    [0] pixels whose height is outside the held rows, [1] NaN table values, [2] pixels outside the model's lattice or its box.
+    """The troposphere phase of a block in one serial pass, every date inside the pass: the date minus the reference, per pixel (see
+    grid_block). Per row, the date-independent part of each pixel (its lat/lon cell and weights, the height rows, the incidence and
+    the reference's four node delays) is computed once into row buffers of nx values; then each date reads only its own tables.
+    The tables of the dates carry a leading date axis: hyd_d, wet_d (nd, na, nb, nh), map_d (nd, na, nb, 2, 4); the reference's do
+    not; out is (nd, ny, nx). flags counts: [0] pixels whose height is outside the held rows, [1] NaN table values (pixel-dates), [2]
+    pixels outside the model's lattice or its box.
     """
+    nd = hyd_d.shape[0]
     ny = ele.shape[0]
     nx = ele.shape[1]
-    na = hyd_d.shape[0]
-    nbb = hyd_d.shape[1]
-    nh = hyd_d.shape[2]
+    na = hyd_d.shape[1]
+    nbb = hyd_d.shape[2]
+    nh = hyd_d.shape[3]
     nhs = hs.shape[0]
     hv = hcoef[0]
     ha = hcoef[1]
     hb = hcoef[2]
     hc = hcoef[3]
+    ok = np.zeros(nx, np.bool_)
+    P = np.zeros(nx, np.int64)
+    M = np.zeros(nx, np.int64)
+    KF = np.zeros(nx, np.int64)
+    WH = np.zeros(nx, np.float64)
+    S = np.zeros(nx, np.float64)
+    HZ = np.zeros(nx, np.float64)
+    W4 = np.zeros((nx, 4), np.float64)
+    R4 = np.zeros((nx, 4), np.float64)
     for r in range(ny):
         a = jy[r]
         w1 = wy[r]
         for c in range(nx):
+            ok[c] = False
             e = ele[r, c]
-            out[r, c] = np.nan
             if e != e:
                 continue
             b = jx[c]
@@ -552,32 +567,57 @@ def _grid_tropo(ele, ycoord, xcoord, jy, wy, jx, wx, LAT, LON, lat0, dla, lon0, 
             inc = (1.0 - wq) * _poly(inc_t, ix, iy, kh, dx, dy) + wq * _poly(inc_t, ix, iy, kh + 1, dx, dy)
             s_inc = math.cos(inc)
             hz = height_term(hv, ha, hb, hc, e, inc)
-            acc = 0.0
+            ok[c] = True
+            P[c] = ia
+            M[c] = jb
+            KF[c] = kf
+            WH[c] = wh
+            S[c] = s_inc
+            HZ[c] = hz
             for q in range(4):
-                p = ia + (q >> 1)
-                m = jb + (q & 1)
-                wn = (fl if (q >> 1) else 1.0 - fl) * (fn if (q & 1) else 1.0 - fn)
-                acc += wn * (_node_delay(hyd_d, wet_d, map_d, p, m, kf, wh, s_inc, hz)
-                             - _node_delay(hyd_r, wet_r, map_r, p, m, kf, wh, s_inc, hz))
-            if acc != acc:
-                flags[1] += 1
-            out[r, c] = acc
+                W4[c, q] = (fl if (q >> 1) else 1.0 - fl) * (fn if (q & 1) else 1.0 - fn)
+                R4[c, q] = _node_delay(hyd_r, wet_r, map_r, ia + (q >> 1), jb + (q & 1), kf, wh, s_inc, hz)
+        # the dates: each reads only its own tables
+        for k in range(nd):
+            hd = hyd_d[k]
+            wd = wet_d[k]
+            md = map_d[k]
+            for c in range(nx):
+                if not ok[c]:
+                    out[k, r, c] = np.nan
+                    continue
+                acc = 0.0
+                for q in range(4):
+                    acc += W4[c, q] * (_node_delay(hd, wd, md, P[c] + (q >> 1), M[c] + (q & 1), KF[c], WH[c], S[c], HZ[c]) - R4[c, q])
+                if acc != acc:
+                    flags[1] += 1
+                out[k, r, c] = acc
 
 
 @nb.njit(nogil=True, cache=True, error_model='numpy')
 def _grid_iono(ele, ycoord, xcoord, hs, hstep, cell, step, kx0, ky0, pl_t, pn_t, zf_t, tec_d, tec_r, lat0, dla, lon0, dlo, out, flags):
-    """The ionosphere phase of a block in one serial pass: the TEC of the date minus the reference at the pierce point, times the
-    mapping of its effective incidence (see grid_block). flags counts: [0] pixels whose height is outside the held rows, [1] NaN
-    table values, [2] pixels whose pierce point is outside the lattice."""
+    """The ionosphere phase of a block in one serial pass, every date inside the pass: the TEC of the date minus the reference at the
+    pierce point, times the mapping of its effective incidence (see grid_block). Per row, the date-independent part of each pixel
+    (the pierce point, its lattice cell, the mapping and the reference's TEC) is computed once into row buffers of nx values; then
+    each date reads only its own table. tec_d is (nd, nlat, nlon), tec_r (nlat, nlon), out (nd, ny, nx). flags counts: [0] pixels
+    whose height is outside the held rows, [1] NaN table values (pixel-dates), [2] pixels whose pierce point is outside the lattice."""
+    nd = tec_d.shape[0]
     ny = ele.shape[0]
     nx = ele.shape[1]
-    nla = tec_d.shape[0]
-    nlo = tec_d.shape[1]
+    nla = tec_d.shape[1]
+    nlo = tec_d.shape[2]
     nhs = hs.shape[0]
+    ok = np.zeros(nx, np.bool_)
+    IL = np.zeros(nx, np.int64)
+    JN = np.zeros(nx, np.int64)
+    FL = np.zeros(nx, np.float64)
+    FN = np.zeros(nx, np.float64)
+    MF = np.zeros(nx, np.float64)
+    DR = np.zeros(nx, np.float64)
     for r in range(ny):
         for c in range(nx):
+            ok[c] = False
             e = ele[r, c]
-            out[r, c] = np.nan
             if e != e:
                 continue
             kh, wq = _height_row(e, hs[0], nhs, hstep)
@@ -604,36 +644,68 @@ def _grid_iono(ele, ycoord, xcoord, hs, hstep, cell, step, kx0, ky0, pl_t, pn_t,
                 jn = nlo - 2
             fl = tl - il
             fn = tn - jn
-            dd = ((1.0 - fl) * ((1.0 - fn) * tec_d[il, jn] + fn * tec_d[il, jn + 1])
-                  + fl * ((1.0 - fn) * tec_d[il + 1, jn] + fn * tec_d[il + 1, jn + 1]))
-            dr = ((1.0 - fl) * ((1.0 - fn) * tec_r[il, jn] + fn * tec_r[il, jn + 1])
-                  + fl * ((1.0 - fn) * tec_r[il + 1, jn] + fn * tec_r[il + 1, jn + 1]))
-            val = (dd - dr) * mf
-            if val != val:
-                flags[1] += 1
-            out[r, c] = val
+            ok[c] = True
+            IL[c] = il
+            JN[c] = jn
+            FL[c] = fl
+            FN[c] = fn
+            MF[c] = mf
+            DR[c] = ((1.0 - fl) * ((1.0 - fn) * tec_r[il, jn] + fn * tec_r[il, jn + 1])
+                     + fl * ((1.0 - fn) * tec_r[il + 1, jn] + fn * tec_r[il + 1, jn + 1]))
+        # the dates: each reads only its own table
+        for k in range(nd):
+            td = tec_d[k]
+            for c in range(nx):
+                if not ok[c]:
+                    out[k, r, c] = np.nan
+                    continue
+                il = IL[c]
+                jn = JN[c]
+                fl = FL[c]
+                fn = FN[c]
+                dd = ((1.0 - fl) * ((1.0 - fn) * td[il, jn] + fn * td[il, jn + 1])
+                      + fl * ((1.0 - fn) * td[il + 1, jn] + fn * td[il + 1, jn + 1]))
+                val = (dd - DR[c]) * MF[c]
+                if val != val:
+                    flags[1] += 1
+                out[k, r, c] = val
 
 
 def grid_block(ele, cut, troposphere=None, ionosphere=None):
-    """The phase of one block from its cut: the troposphere or the ionosphere (date minus reference), one of the two per call.
-    Warns once per block when pixels are NaN for a height outside the held rows, a NaN table value or a pixel outside the
-    model's lattice.
+    """The phase of one block from its cut, for every date of the call in ONE numba pass: the troposphere or the ionosphere (date minus
+    reference), one of the two per call. The date-independent work of each pixel (its lattice cell, height rows, incidence or pierce
+    point and the reference's node delays) is done once per pixel, then each date reads only its own tables: a block of k dates costs
+    far less than k blocks of one date. Chunking the dates of the stack (k dates per chunk) makes the phase cheaper per date.
+    Warns once per block when pixels are NaN for a height outside the held rows, a NaN table value or a pixel outside the model's
+    lattice.
 
     Parameters
     ----------
     ele : numpy.ndarray - The block's pixel heights (ny, nx), metres; NaN gives NaN.
     cut : Cut - The per-chunk step of the block (cut_block).
-    troposphere : tuple or None - (hyd_d, wet_d, map_d, hyd_r, wet_r, map_r, hcoef, h_first): the tables on the box of the cut
-        (na, nb, nh), the mapping (na, nb, 2, 4), the height term (v, a, b, c) and the first held height, metres.
-    ionosphere : tuple or None - (tec_d, tec_r): the TEC tables on the whole model lattice (nlat, nlon), phase units.
+    troposphere : tuple or None - (hyd_d, wet_d, map_d, hyd_r, wet_r, map_r, hcoef, h_first): the tables of the dates on the box of the
+        cut, with a leading date axis (nd, na, nb, nh), the mapping (nd, na, nb, 2, 4); the reference's tables without it (na, nb, nh),
+        (na, nb, 2, 4); the height term (v, a, b, c) and the first held height, metres.
+    ionosphere : tuple or None - (tec_d, tec_r): the TEC of the dates (nd, nlat, nlon) and of the reference (nlat, nlon) on the whole
+        model lattice, phase units.
 
     Returns
     -------
-    numpy.ndarray - The phase (ny, nx), float32, radians.
+    numpy.ndarray - The phase (nd, ny, nx), float32, radians.
 
     Examples
     --------
-    >>> phase = grid_block(ele, cut, troposphere=(hyd_d, wet_d, map_d, hyd_r, wet_r, map_r, hcoef, h_first))
+    >>> import numpy as np
+    >>> from insardev.utils_atmosphere import cut_block, grid_block
+    >>> y, x = 5220764.0 + 8.0 * np.arange(4), 358279.0 + 2.0 * np.arange(4)
+    >>> poly = np.zeros((3, 3, 5, 6))
+    >>> pl, pn, zf = poly.copy(), poly.copy(), poly.copy()
+    >>> pl[..., 0], pn[..., 0], zf[..., 0] = 47.127, 13.132, 0.3
+    >>> tables = dict(hs=1000.0 * np.arange(-1, 4), hstep=1000.0, cell=10000.0, step=100.0, kx0=35, ky0=521, pl=pl, pn=pn, zf=zf)
+    >>> cut = cut_block(y, x, {'crs': 'EPSG:32633', 'lon_c': 13.13}, 47.0 + 0.05 * np.arange(8), 13.0 + 0.05 * np.arange(8), tables)
+    >>> tec = np.ones((2, 8, 8))
+    >>> grid_block(np.full((4, 4), 900.0), cut, ionosphere=(tec, np.zeros((8, 8)))).shape
+    (2, 4, 4)
     """
     ele = np.asarray(ele, np.float64)
     ny, nx = cut.ycoord.size, cut.xcoord.size
@@ -644,7 +716,6 @@ def grid_block(ele, cut, troposphere=None, ionosphere=None):
     const = cut.const
     if 'cell' not in const:
         raise ValueError('ERROR: the cut carries no polynomial tables (cut_block with tables=None or block_tables)')
-    out = np.empty((ny, nx), np.float32)
     flags = np.zeros(3, np.int64)
     if troposphere is not None:
         if const['inc'] is None:
@@ -652,8 +723,11 @@ def grid_block(ele, cut, troposphere=None, ionosphere=None):
         hyd_d, wet_d, map_d, hyd_r, wet_r, map_r, hcoef, h_first = troposphere
         arrays = [np.ascontiguousarray(v, np.float64) for v in (hyd_d, wet_d, map_d, hyd_r, wet_r, map_r)]
         box = (cut.i1 - cut.i0, cut.j1 - cut.j0)
-        if any(a.shape[:2] != box for a in arrays):
+        if any(a.shape[1:3] != box for a in arrays[:3]) or any(a.shape[:2] != box for a in arrays[3:]):
             raise ValueError('ERROR: the troposphere tables and the cut differ in the box of the model lattice')
+        if len({a.shape[0] for a in arrays[:3]}) != 1:
+            raise ValueError('ERROR: the troposphere tables of the dates differ in the number of dates')
+        out = np.empty((arrays[0].shape[0], ny, nx), np.float32)
         _grid_tropo(ele, cut.ycoord, cut.xcoord, cut.jy, cut.wy, cut.jx, cut.wx, cut.LAT, cut.LON, cut.lat0, cut.dla,
                     cut.lon0, cut.dlo, cut.nla, cut.nlo, cut.i0, cut.j0, *arrays,
                     np.ascontiguousarray(hcoef, np.float64), float(h_first), const['hs'], const['hstep'], const['cell'], const['step'],
@@ -662,8 +736,9 @@ def grid_block(ele, cut, troposphere=None, ionosphere=None):
         if const['pl'] is None:
             raise ValueError('ERROR: the ionosphere needs the burst constants of a shell (burst_constants)')
         tec_d, tec_r = (np.ascontiguousarray(v, np.float64) for v in ionosphere)
-        if tec_d.shape != (cut.nla, cut.nlo) or tec_r.shape != tec_d.shape:
+        if tec_d.shape[1:] != (cut.nla, cut.nlo) or tec_r.shape != (cut.nla, cut.nlo):
             raise ValueError('ERROR: the ionosphere tables and the cut differ in the model lattice')
+        out = np.empty((tec_d.shape[0], ny, nx), np.float32)
         _grid_iono(ele, cut.ycoord, cut.xcoord, const['hs'], const['hstep'], const['cell'], const['step'], const['kx0'], const['ky0'],
                    const['pl'], const['pn'], const['zf'], tec_d, tec_r, cut.lat0, cut.dla, cut.lon0, cut.dlo, out, flags)
     parts = []
@@ -680,11 +755,13 @@ def grid_block(ele, cut, troposphere=None, ionosphere=None):
 
 
 def phase_block(kind, ele, axes, span, static, tables, plan, *refs):
-    """The atmosphere phase of one data block for each of its dates: the per-chunk step (cut_block, with the chunk's tables)
-    and the grid kernel (grid_block), in one task. The block's pixel coordinates are not passed: they are computed here from the
-    transform's lattice (pixel_axis). The held tables arrive as flat arguments (refs): per date of the plan, the tables of the date
-    and, when the plan says so, of the reference, each for the tiles the plan names (troposphere: hydro, wet, mapping per tile;
-    ionosphere: the tec lattice).
+    """The atmosphere phase of one data block for ALL of its dates in one task: the per-chunk step (cut_block, with the chunk's tables)
+    and ONE grid kernel call (grid_block) for every date of the plan, so the date-independent work of each pixel is done once, not
+    once per date. The block's pixel coordinates are not passed: they are computed here from the transform's lattice (pixel_axis).
+    The held tables arrive as flat arguments (refs): per date of the plan, the tables of the date and, when the plan says so, of
+    the reference, each for the tiles the plan names (troposphere: hydro, wet, mapping per tile; ionosphere: the tec lattice). The
+    dates of one block share their tiles and their reference (the Stack's plan always does). Chunking the dates of the stack (k dates
+    per chunk) makes the phase cheaper per date: one task and one kernel call per stored block for its k dates.
 
     Parameters
     ----------
@@ -696,7 +773,8 @@ def phase_block(kind, ele, axes, span, static, tables, plan, *refs):
     static : dict - The burst constants (const), the model's node_lat and node_lon (degrees), h_first (the first held height) and
         hcoef (v, a, b, c of the height term).
     tables : dict - The chunk's polynomial tables (block_tables), built once at the graph build.
-    plan : list of (tuple, bool) - Per date: the tiles (y0, x0) of the box and whether the reference is subtracted.
+    plan : list of (tuple, bool) - Per date: the tiles (y0, x0) of the box and whether the reference is subtracted; the same for
+        every date.
     refs : numpy.ndarray - The tables of the plan, in its order.
 
     Returns
@@ -705,38 +783,50 @@ def phase_block(kind, ele, axes, span, static, tables, plan, *refs):
 
     Examples
     --------
-    >>> out = phase_block('iono', ele, (y0, dy, x0, dx), (0, 4, 0, 6), static, tables, [((), False)], tec)
+    >>> import numpy as np
+    >>> from insardev.utils_atmosphere import phase_block
+    >>> poly = np.zeros((3, 3, 5, 6))
+    >>> pl, pn, zf = poly.copy(), poly.copy(), poly.copy()
+    >>> pl[..., 0], pn[..., 0], zf[..., 0] = 47.127, 13.132, 0.3
+    >>> tables = dict(hs=1000.0 * np.arange(-1, 4), hstep=1000.0, cell=10000.0, step=100.0, kx0=35, ky0=521, pl=pl, pn=pn, zf=zf)
+    >>> static = dict(const={'crs': 'EPSG:32633', 'lon_c': 13.13}, node_lat=47.0 + 0.05 * np.arange(8),
+    ...               node_lon=13.0 + 0.05 * np.arange(8), h_first=0.0, hcoef=np.zeros(4))
+    >>> tec = np.ones((1, 8, 8))
+    >>> phase_block('iono', np.full((4, 4), 900.0), (5220764.0, 8.0, 358279.0, 2.0), (0, 4, 0, 4), static, tables,
+    ...             [((), True)] * 2, 2 * tec, tec, 3 * tec, tec).shape
+    (2, 4, 4)
     """
     ele = np.asarray(ele, np.float64)
     ny, nx = ele.shape
     y_first, y_step, x_first, x_step = axes
     i0, i1, j0, j1 = span
+    if not plan:
+        return np.empty((0, ny, nx), np.float32)
+    tiles, has_ref = plan[0]
+    if any(p[0] != tiles or p[1] != has_ref for p in plan):
+        raise ValueError('ERROR: the dates of one block must share their tiles and their reference')
     ycoord = pixel_axis(y_first, y_step, i0, i1)
     xcoord = pixel_axis(x_first, x_step, j0, j1)
     cut = cut_block(ycoord, xcoord, static['const'], static['node_lat'], static['node_lon'], tables)
-    out = np.empty((len(plan), ny, nx), np.float32)
-    pos = 0
-    for k, (tiles, has_ref) in enumerate(plan):
-        n = 3 * len(tiles) if kind == 'tropo' else 1
-        d_arr = refs[pos:pos + n]
-        pos += n
-        r_arr = None
-        if has_ref:
-            r_arr = refs[pos:pos + n]
-            pos += n
-        if kind == 'tropo':
-            box = (cut.i0, cut.i1, cut.j0, cut.j1)
-            # a held chunk is (1 date, 1 tile, ...): its own tile values
-            hyd_d, wet_d, map_d = (gather(tiles, [np.asarray(a)[0, 0] for a in d_arr[q::3]], *box) for q in range(3))
-            if r_arr is None:
-                hyd_r, wet_r, map_r = np.zeros_like(hyd_d), np.zeros_like(wet_d), np.zeros_like(map_d)
-            else:
-                hyd_r, wet_r, map_r = (gather(tiles, [np.asarray(a)[0, 0] for a in r_arr[q::3]], *box) for q in range(3))
-            out[k] = grid_block(ele, cut, troposphere=(hyd_d, wet_d, map_d, hyd_r, wet_r, map_r,
-                                                       static['hcoef'], static['h_first']))
+    n = 3 * len(tiles) if kind == 'tropo' else 1
+    stride = n * (2 if has_ref else 1)
+    dates = [refs[k * stride:k * stride + n] for k in range(len(plan))]
+    ref = refs[n:2 * n] if has_ref else None
+    if has_ref:
+        for k in range(1, len(plan)):
+            r_k = refs[k * stride + n:k * stride + 2 * n]
+            if any(a is not b and not np.array_equal(a, b, equal_nan=True) for a, b in zip(r_k, ref)):
+                raise ValueError('ERROR: the dates of one block must share their reference')
+    if kind == 'tropo':
+        box = (cut.i0, cut.i1, cut.j0, cut.j1)
+        # a held chunk is (1 date, 1 tile, ...): its own tile values
+        hyd_d, wet_d, map_d = (np.stack([gather(tiles, [np.asarray(a)[0, 0] for a in d[q::3]], *box) for d in dates]) for q in range(3))
+        if ref is None:
+            hyd_r, wet_r, map_r = np.zeros_like(hyd_d[0]), np.zeros_like(wet_d[0]), np.zeros_like(map_d[0])
         else:
-            # a held chunk is (1 date, lat, lon): the whole lattice of the date
-            tec_d = np.asarray(d_arr[0])[0]
-            tec_r = np.zeros_like(tec_d) if r_arr is None else np.asarray(r_arr[0])[0]
-            out[k] = grid_block(ele, cut, ionosphere=(tec_d, tec_r))
-    return out
+            hyd_r, wet_r, map_r = (gather(tiles, [np.asarray(a)[0, 0] for a in ref[q::3]], *box) for q in range(3))
+        return grid_block(ele, cut, troposphere=(hyd_d, wet_d, map_d, hyd_r, wet_r, map_r, static['hcoef'], static['h_first']))
+    # a held chunk is (1 date, lat, lon): the whole lattice of the date
+    tec_d = np.stack([np.asarray(d[0])[0] for d in dates])
+    tec_r = np.zeros_like(tec_d[0]) if ref is None else np.asarray(ref[0])[0]
+    return grid_block(ele, cut, ionosphere=(tec_d, tec_r))

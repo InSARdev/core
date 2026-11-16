@@ -10,6 +10,7 @@
 # ----------------------------------------------------------------------------
 from __future__ import annotations
 from . import utils_io,  utils_xarray, utils_align
+from . import utils_rotate
 from .utils_circular import wrap_phase, dissolve_pol
 import operator
 from types import FunctionType
@@ -6175,16 +6176,19 @@ class BatchCore(dict):
 
         def rotate(coeffs):
             """The complex input times exp(-1j * polyval(coeffs)) on every complex grid: the phase is corrected
-            as the real-valued branches subtract it, the magnitude is unchanged."""
-            # polyval() returns DataArrays: the rotation is a DataArray per burst
-            rot = phase.polyval(coeffs).iexp(sign=-1)
+            as the real-valued branches subtract it, the magnitude is unchanged. The rotation is utils_rotate's
+            one numba pass per block, the same as detrend's; each grid keeps its own dtype."""
+            # polyval() returns DataArrays: the phase is rotated per burst, grid by grid
+            phi = phase.polyval(coeffs)
+
             out = {}
             for k, ds in self.items():
-                if k not in rot:
+                if k not in phi:
                     out[k] = ds
                     continue
-                r = rot[k].astype(ds[polarization].dtype)
-                out[k] = BatchCore._binary_vars(ds, r, operator.mul)
+                # each grid by utils_rotate.rotate_grid: lazy for dask, its own dtype, the attributes of the old v * p
+                out[k] = BatchCore._binary_vars(ds, phi[k], lambda g, p: xr.Dataset(
+                    {v: utils_rotate.rotate_grid(g[v], p) for v in g.data_vars}))
             return type(self)(out)
 
         def with_residual(batch, residual):

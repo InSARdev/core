@@ -13,6 +13,7 @@ from .BatchCore import BatchCore
 import numpy as np
 import xarray as xr
 from . import utils_complex
+from . import utils_rotate
 from . import utils_xarray
 from .Batch import Batch
 from .BatchWrap import BatchWrap
@@ -1438,8 +1439,8 @@ class BatchComplex(BatchCore):
             fused = keep is None and not is_model and isinstance(phi.data, da.Array)
 
             def rotate(d, p):
-                # the numbers of utils_detrend.phase_rotation and phase_rotate, evaluated on one block
-                return d * np.exp(np.complex64(-1j) * p.astype(np.complex64))
+                """The block d times exp(-1j * p), the numbers of utils_detrend.phase_rotate, in one numba pass (utils_rotate)."""
+                return utils_rotate.rotate_block(d, p)
 
             upd = {}
             for v, a in BatchCore._vars_of(ds).items():
