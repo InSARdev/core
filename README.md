@@ -59,6 +59,10 @@ You can easily share your results publicly or with selected users, allowing othe
 
 <img src="assets/Gastein_Valley_PSDS_Velocity.jpg" />
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1vM7nVEFRUs9XvSFsrTmAQdYOG9bnd-AZ?usp=sharing) **Lake Sarez Landslides, Tajikistan (2017).** Line-of-sight (LOS) velocity of the landslides at Lake Sarez in the Pamir Mountains from 19 Sentinel-1A VV dates (descending path 5, two IW2 bursts, May–December 2017), computed directly from the phase of every date with no interferogram pairs and no phase unwrapping: per pixel with `fit1d()` and on a network of persistent and distributed scatterers with `fit1d_network()`. The results are compared to the velocity map, time series and velocity ranges of [Nardini et al. (2024)](https://doi.org/10.1007/s10346-024-02214-y). The image shows both velocity maps in 3D over the satellite basemap draped on the DEM.
+
+<img src="assets/Lake_Sarez_Landslides_2017.jpg" />
+
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1WEutnqPzsYno4qC9EDP_8rohqugZrGji?usp=sharing) **Iran–Iraq Earthquake (2017)**. The results compared to outputs from GMTSAR, SNAP, and GAMMA software. Illustrates bursts search by area, date, and attributes.
 
 <img src="assets/Iran–Iraq_Earthquake_2017.jpg" />
@@ -66,6 +70,14 @@ You can easily share your results publicly or with selected users, allowing othe
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/17h8OdohGO9XuHUY_jkwSFu2IrD7uUsPU?usp=sharing) **Central Türkiye Earthquakes (2023).** Interferogram covering two consecutive Sentinel-1 scenes (56 bursts).
 
 <img src="assets/Türkiye_Earthquakes_2023_intf.jpg" />
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1X6xZIvtNdRYUMAOo5ESFLr3wdl1lQm0j?usp=sharing) **La Cumbre Volcano Eruption, Galápagos, Ecuador (2020).** Deformation of Fernandina Island caused by the 12–13 January 2020 fissure eruption, mapped by a single Sentinel-1 descending interferogram (2020-01-10 S1B, 2020-01-16 S1A; eight bursts). The interferogram is unwrapped, converted to line-of-sight (LOS) displacement of tens of centimetres, shown in 3D on the DEM, and compared to the map published by the Instituto Geofísico, Escuela Politécnica Nacional (IG-EPN).
+
+<img src="assets/La_Cumbre_Volcano_Eruption_2020.jpg" />
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1mJXzvMokjRPTX9bZxBgEI5YYcTqUGM-q?usp=sharing) **Pico do Fogo Volcano Eruption, Cape Verde (2014).** Deformation of Fogo Island caused by the eruption that began on 23 November 2014, mapped by one of the first Sentinel-1 TOPS interferograms of a volcanic eruption (descending pair 2014-11-08, 2014-12-02; two bursts per date). The interferogram is unwrapped, converted to line-of-sight (LOS) displacement, shown in 3D on the DEM, and compared to the interferogram published by [González et al. (2015)](https://doi.org/10.1002/2015GL066003).
+
+<img src="assets/Pico_do_Fogo_Volcano_Eruption_2014.jpg" />
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1jDdGWlNUI4upclLKDsezcVjLjIuD-rkK?usp=sharing) **Imperial Valley Subsidence, CA USA (2015).** SBAS velocity map from a Sentinel-1 time series stack. Interactive result: [Imperial_Valley_2015.html](https://insar.dev/ui/Imperial_Valley_2015_ipyleaflet.html). Uses the same bursts as the GMTSAR ['Sentinel-1 TOPS Time Series' example](http://topex.ucsd.edu/gmtsar/tar/S1A_Stack_CPGF_T173.tar.gz).
 
