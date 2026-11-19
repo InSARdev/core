@@ -146,6 +146,9 @@ class TqdmDaskProgress(ProgressBar):
 def _scheduler_knows(keys, dask_scheduler=None):
     return all(k in dask_scheduler.tasks for k in keys)
 
+async def _loop_barrier():
+    return None
+
 def _drop_refused(client, futures):
     """
     Detach the futures of a graph the scheduler refused from the client, before raising.
@@ -157,10 +160,17 @@ def _drop_refused(client, futures):
     'cancelled' and was refused falsely before the scheduler had even seen the new graph.
     The scheduler has already released the refused keys, so nothing is sent to it; the
     futures are released, so a kept traceback holds no cluster data either.
+
+    Future.release() only schedules the release on the client's event loop. The synchronous
+    round trip through the loop that follows makes the releases happen, and queues them to the
+    scheduler, before the caller raises and persists the same keys again; a persist that binds
+    its new futures first leaves the reference count above zero, the release is never sent and
+    the scheduler hands back the old error.
     """
     for f in futures:
         client.futures.pop(f.key, None)
         f.release()
+    client.sync(_loop_barrier)
 
 def _refusal_reason(future):
     """The text of a cancelled future's CancelledError, raised and dropped here so that
