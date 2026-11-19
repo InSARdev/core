@@ -105,19 +105,15 @@ class EOF(progressbar_joblib):
             If the orbit server is unreachable and a scene is still without an orbit.
         """
         import pandas as pd
-        import requests
         import os
-        import re
         import glob
         from datetime import datetime
-        import time
         import joblib
-        import zipfile
         from io import BytesIO
         import xmltodict
         from tqdm.auto import tqdm
         from . import utils_eof
-        from .HTTP import final, attempts, answer, send, read_body, ProxyStatusError
+        from .HTTP import attempts
         from .utils_S1 import _write_buffer
         from .utils_files import exists
 
@@ -188,49 +184,9 @@ class EOF(progressbar_joblib):
         df = df.groupby(['date', 'mission']).agg(times=('startTime', lambda times: sorted(set(times))),
                                                  precise=('precise', 'all')).reset_index()
 
-        def unreachable(error):
-            # the orbit server is not reached: no connection, DNS failure, a proxy that is not reached, timeout. A
-            # proxy that answers with an HTTP status is reached, as a server with an HTTP error is
-            return isinstance(error, (requests.ConnectionError, requests.Timeout)) and answer(error) is None
-
-        def named(e, text, **kwargs):
-            # the same exception type, with a plain message that names the request and its URL, which a joblib
-            # worker returns in full
-            return type(e)(f'{text}: {e}', **kwargs)
-
-        def get(url, request, read):
-            # read(body) of the request. An HTTP error status, of the orbit server or of a proxy, raises with
-            # the message it returned, or its status line (HTTP.send); a server that is not reached raises its
-            # connection error, and a body slower than min_rate is cut (HTTP.read_body) and retried.
-            # Every error keeps its exception type and names the request and the URL
-            try:
-                response = send(requests.get, url, what=f'{request} cannot be downloaded from {url}',
-                                stream=True, timeout=EOF.http_timeout)
-            except (requests.HTTPError, ProxyStatusError):
-                raise
-            except Exception as e:
-                raise named(e, f'{request} cannot be downloaded from {url}') from None
-            with response:
-                try:
-                    body = read_body(response, min_rate, min_rate_window)
-                except Exception as e:
-                    raise named(e, f'{request} cannot be downloaded from {url}') from None
-                try:
-                    return read(body)
-                except Exception as e:
-                    raise named(e, f'{request} from {url} cannot be used') from None
-
         def download_index(mission, date, times, orbit_offset_start, orbit_offset_end, precise):
-            url = EOF.orbits_url.format(mission=mission,
-                                       year=date.year,
-                                       month=date.month,
-                                       day=date.day)
-            #print ('url', url + 'index.csv')
+            url, orbits = EOF._index(mission, date, min_rate, min_rate_window)
             index = url + 'index.csv'
-            # a line that is not an orbit file name raises, as a data parse error
-            orbits = get(index, f'The orbit index for {mission} on {date}',
-                         lambda body: [utils_eof.parse(line) for line in body.decode().splitlines()
-                                       if line.strip()])
             if precise:
                 # a restituted orbit is replaced by a precise one only, and is kept while none is published
                 orbits = [orbit for orbit in orbits if orbit.product == 'POEORB']
@@ -253,33 +209,11 @@ class EOF(progressbar_joblib):
             def write(body):
                 # checked in memory, then written through a temporary file that is renamed when complete, so that
                 # a response that is not a valid orbit file, or a failed write, leaves no file for the scan to take
-                with zipfile.ZipFile(BytesIO(body), 'r') as zip_in:
-                    zip_files = zip_in.namelist()
-                    if len(zip_files) == 0:
-                        raise Exception('ERROR: Downloaded file is empty zip archive.')
-                    if len(zip_files) > 1:
-                        raise Exception('NOTE: Downloaded zip archive includes multiple files.')
-                    # extract specific file content
-                    orbit_content = zip_in.read(zip_files[0])
+                orbit_content = EOF._unzip(body)
                 # check XML validity
                 xmltodict.parse(orbit_content)
                 _write_buffer(BytesIO(orbit_content), filename)
-            get(url, request, write)
-
-        def download_with_retry(func, retries, timeout_second, *args, **kwargs):
-            # the result and None, or None and the error of the last attempt, so that every request of a stage
-            # has its outcome before the errors are judged; retries=0 makes one attempt, as retries=1 (HTTP.attempts).
-            # A failure that a retry cannot change (HTTP.final) ends the attempts of the request at once
-            n = attempts(retries)
-            for retry in range(n):
-                try:
-                    return func(*args, **kwargs), None
-                except Exception as e:
-                    stop = final(e)
-                    print(f'ERROR: download attempt {retry+1} failed{" (not retried)" if stop else ""}: {e}')
-                    if stop or retry + 1 >= n:
-                        return None, e
-                time.sleep(timeout_second)
+            EOF._get(url, request, write, min_rate, min_rate_window)
 
         def skip_unreachable(outcomes, rows, lacking, skipped):
             # an error other than an unreachable server raises, the first in date order, and names its date.
@@ -287,7 +221,7 @@ class EOF(progressbar_joblib):
             # the stage for the dates (rows) with a warning when every scene has an orbit. True when skipped
             errors = [error for _, error in outcomes if error is not None]
             for error in errors:
-                if not unreachable(error):
+                if not EOF._unreachable(error):
                     raise error
             if not errors:
                 return False
@@ -309,7 +243,7 @@ class EOF(progressbar_joblib):
         # joblib reads the class file from disk,
         # and to allow modification of orbit_offset_* on the fly, add them to the arguments
         with EOF.progressbar_joblib(tqdm(desc='Downloading Orbits List'.ljust(25), total=len(df))) as progress_bar:
-            outcomes = joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(download_with_retry)\
+            outcomes = joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(EOF._with_retry)\
                                     (download_index, retries, timeout_second,
                                     mission=scene.mission,
                                     date=scene.date,
@@ -340,7 +274,7 @@ class EOF(progressbar_joblib):
         
         # download orbits index files and detect the orbits
         with EOF.progressbar_joblib(tqdm(desc='Downloading Orbit Files'.ljust(25), total=len(orbits))) as progress_bar:
-            outcomes = joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(download_with_retry)\
+            outcomes = joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(EOF._with_retry)\
                                     (download_orbit, retries, timeout_second,
                                     basedir=basedir,
                                     url=orbit.url + orbit.orbit,
@@ -355,3 +289,463 @@ class EOF(progressbar_joblib):
             # the files downloaded
             return orbits['orbit'][[error is None for _, error in outcomes]].reset_index(drop=True)
         return orbits['orbit']
+
+    # the requests of the orbit server, shared by EOF.download and the Sentinel-1 burst downloaders
+
+    @staticmethod
+    def _unreachable(error):
+        """
+        Private helper of the Sentinel-1 downloaders: whether the orbit server was not reached.
+
+        Parameters
+        ----------
+        error : Exception
+            The error of a request.
+
+        Returns
+        -------
+        bool
+            True for no connection, a DNS failure, a proxy that is not reached or a timeout. A proxy that answers
+            with an HTTP status is reached, as a server with an HTTP error is.
+        """
+        import requests
+        from .HTTP import answer
+        return isinstance(error, (requests.ConnectionError, requests.Timeout)) and answer(error) is None
+
+    @staticmethod
+    def _named(e, text, **kwargs):
+        """
+        Private helper of the Sentinel-1 downloaders: the same exception type, with a plain message that names the
+        request and its URL, which a joblib worker returns in full.
+
+        Parameters
+        ----------
+        e : Exception
+            The error.
+        text : str
+            The text put before the error message.
+        **kwargs
+            Passed to the exception type.
+
+        Returns
+        -------
+        Exception
+            The new exception, not raised.
+        """
+        return type(e)(f'{text}: {e}', **kwargs)
+
+    @staticmethod
+    def _get(url, request, read, min_rate, min_rate_window):
+        """
+        Private helper of the Sentinel-1 downloaders: one request of the orbit server, read by a function.
+
+        An HTTP error status, of the orbit server or of a proxy, raises with the message it returned, or its status
+        line (HTTP.send); a server that is not reached raises its connection error, and a body slower than min_rate
+        is cut (HTTP.read_body). Every error keeps its exception type and names the request and the URL.
+
+        Parameters
+        ----------
+        url : str
+            The URL.
+        request : str
+            The request named in the errors.
+        read : callable
+            Takes the response body (bytes) and returns the result.
+        min_rate : str or float
+            Bytes per second the body must keep (HTTP.read_body).
+        min_rate_window : float
+            Seconds over which the rate is averaged.
+
+        Returns
+        -------
+        object
+            read(body).
+
+        Raises
+        ------
+        requests.HTTPError, HTTP.ProxyStatusError
+            For an HTTP error status.
+        Exception
+            Another error of the request or of read, of its own type, naming the request and the URL.
+        """
+        import requests
+        from .HTTP import send, read_body, ProxyStatusError
+        try:
+            response = send(requests.get, url, what=f'{request} cannot be downloaded from {url}',
+                            stream=True, timeout=EOF.http_timeout)
+        except (requests.HTTPError, ProxyStatusError):
+            raise
+        except Exception as e:
+            raise EOF._named(e, f'{request} cannot be downloaded from {url}') from None
+        with response:
+            try:
+                body = read_body(response, min_rate, min_rate_window)
+            except Exception as e:
+                raise EOF._named(e, f'{request} cannot be downloaded from {url}') from None
+            try:
+                return read(body)
+            except Exception as e:
+                raise EOF._named(e, f'{request} from {url} cannot be used') from None
+
+    @staticmethod
+    def _with_retry(func, retries, timeout_second, *args, **kwargs):
+        """
+        Private helper of the Sentinel-1 downloaders: a request with its attempts.
+
+        Every request of a stage has its outcome before the errors are judged; retries=0 makes one attempt, as
+        retries=1 (HTTP.attempts). A failure that a retry cannot change (HTTP.final) ends the attempts at once.
+
+        Parameters
+        ----------
+        func : callable
+            The request, called with args and kwargs.
+        retries : int
+            The number of attempts.
+        timeout_second : float
+            Seconds between the attempts.
+
+        Returns
+        -------
+        tuple
+            (result, None), or (None, error) with the error of the last attempt.
+        """
+        import time
+        from .HTTP import final, attempts
+        n = attempts(retries)
+        for retry in range(n):
+            try:
+                return func(*args, **kwargs), None
+            except Exception as e:
+                stop = final(e)
+                print(f'ERROR: download attempt {retry+1} failed{" (not retried)" if stop else ""}: {e}')
+                if stop or retry + 1 >= n:
+                    return None, e
+            time.sleep(timeout_second)
+
+    @staticmethod
+    def _index(mission, date, min_rate, min_rate_window):
+        """
+        Private helper of the Sentinel-1 downloaders: the orbit index of a mission and day.
+
+        Parameters
+        ----------
+        mission : str
+            The mission (S1A, ...).
+        date : datetime.date
+            The day.
+        min_rate : str or float
+            Bytes per second the index download must keep.
+        min_rate_window : float
+            Seconds over which the rate is averaged.
+
+        Returns
+        -------
+        tuple
+            (url, orbits): the day folder URL (EOF.orbits_url) and the orbit files it lists (utils_eof.Orbit).
+
+        Raises
+        ------
+        Exception
+            The errors of EOF._get; a line that is not an orbit file name raises, as a data parse error.
+        """
+        from . import utils_eof
+        url = EOF.orbits_url.format(mission=mission, year=date.year, month=date.month, day=date.day)
+        orbits = EOF._get(url + 'index.csv', f'The orbit index for {mission} on {date}',
+                          lambda body: [utils_eof.parse(line) for line in body.decode().splitlines()
+                                        if line.strip()],
+                          min_rate, min_rate_window)
+        return url, orbits
+
+    @staticmethod
+    def _unzip(body):
+        """
+        Private helper of the Sentinel-1 downloaders: the single file of a downloaded orbit zip.
+
+        Parameters
+        ----------
+        body : bytes
+            The zip archive.
+
+        Returns
+        -------
+        bytes
+            The content of its only member.
+
+        Raises
+        ------
+        Exception
+            If the archive is empty or holds several files.
+        """
+        import zipfile
+        from io import BytesIO
+        with zipfile.ZipFile(BytesIO(body), 'r') as zip_in:
+            zip_files = zip_in.namelist()
+            if len(zip_files) == 0:
+                raise Exception('ERROR: Downloaded file is empty zip archive.')
+            if len(zip_files) > 1:
+                raise Exception('NOTE: Downloaded zip archive includes multiple files.')
+            return zip_in.read(zip_files[0])
+
+    @staticmethod
+    def _orbit_names(scenes, n_jobs=8, joblib_backend='loky', retries=30, timeout_second=3, min_rate='100KB',
+                     min_rate_window=60):
+        """
+        Private helper of the Sentinel-1 burst downloaders: the orbit file URL of every burst.
+
+        The orbit index of every distinct mission and day is read once. Each burst takes the file of its mission
+        that covers its time, a precise orbit first, then the newest production (utils_eof.select). A missing
+        orbit never raises: it is printed as a WARNING and its burst gets None.
+
+        Parameters
+        ----------
+        scenes : pandas.DataFrame
+            One row per burst, with the columns burst (a name for the messages), mission (S1A, ...) and startTime
+            (naive UTC).
+        n_jobs, joblib_backend, retries, timeout_second, min_rate, min_rate_window
+            As EOF.download.
+
+        Returns
+        -------
+        list
+            Aligned with the rows: the URL of the selected orbit file (.EOF.zip), or None.
+        """
+        import joblib
+        import pandas as pd
+        from tqdm.auto import tqdm
+        from . import utils_eof
+        from .HTTP import download_jobs
+        from .utils_pool import release_workers
+
+        rows = [(burst, mission, pd.Timestamp(time))
+                for burst, mission, time in zip(scenes['burst'], scenes['mission'], scenes['startTime'])]
+        keys = list(dict.fromkeys((mission, time.date()) for _, mission, time in rows))
+        n_jobs = download_jobs(n_jobs)
+        with EOF.progressbar_joblib(tqdm(desc='Downloading Orbits List'.ljust(25), total=len(keys))) as progress_bar:
+            outcomes = joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(EOF._with_retry)\
+                                    (EOF._index, retries, timeout_second, mission, date, min_rate, min_rate_window)
+                                    for mission, date in keys)
+        # the idle joblib workers keep their memory: stop them, the next parallel step starts its own
+        release_workers()
+        indexes = dict(zip(keys, outcomes))
+        for (mission, date), (_, error) in indexes.items():
+            if error is not None:
+                names = [burst for burst, m, time in rows if (m, time.date()) == (mission, date)]
+                print(f'WARNING: the orbit index for {mission} on {date} cannot be read ({type(error).__name__}: '
+                      f'{error}): {len(names)} burst(s) get no orbit: {", ".join(map(str, names))}.')
+        urls = []
+        for burst, mission, time in rows:
+            index, _ = indexes[(mission, time.date())]
+            if index is None:
+                urls.append(None)
+                continue
+            url, orbits = index
+            name = utils_eof.select(orbits, mission, time)
+            if name is None:
+                print(f'WARNING: no orbit file in {url}index.csv covers {burst} ({mission} {time}).')
+                urls.append(None)
+            else:
+                urls.append(url + name)
+        return urls
+
+    @staticmethod
+    def _file_records(url, windows, request, min_rate, min_rate_window):
+        """
+        Private helper of the Sentinel-1 burst downloaders: the records of an orbit file inside time windows.
+
+        The zip is unpacked and cropped while it is read, so that only the crop leaves the worker.
+
+        Parameters
+        ----------
+        url : str
+            The orbit file URL (.EOF.zip).
+        windows : list of tuple
+            The (start, stop) windows, naive UTC.
+        request : str
+            The request named in the errors.
+        min_rate, min_rate_window
+            As EOF._get.
+
+        Returns
+        -------
+        list of tuple
+            utils_eof.osv_records() of the file in the windows.
+        """
+        from . import utils_eof
+        return EOF._get(url, request, lambda body: utils_eof.osv_records(EOF._unzip(body), windows),
+                        min_rate, min_rate_window)
+
+    @staticmethod
+    def _orbit_records(scenes, urls=None, n_jobs=8, joblib_backend='loky', retries=30, timeout_second=3,
+                       min_rate='100KB', min_rate_window=60):
+        """
+        Private helper of the Sentinel-1 burst downloaders: the orbit records around every burst.
+
+        Each orbit file is downloaded once, however many bursts use it, and cropped to the windows of its bursts
+        (utils_eof.ORBIT_MARGIN + 60 seconds around each start time); utils_eof.set_orbit makes the exact cut. A
+        missing orbit never raises: it is printed as a WARNING and its burst gets None.
+
+        Parameters
+        ----------
+        scenes : pandas.DataFrame
+            One row per burst, with the columns burst, mission and startTime (naive UTC), see EOF._orbit_names.
+        urls : list, optional
+            The orbit file URL of every row, or None; default EOF._orbit_names(scenes).
+        n_jobs, joblib_backend, retries, timeout_second, min_rate, min_rate_window
+            As EOF.download.
+
+        Returns
+        -------
+        list
+            Aligned with the rows: (source, records), the orbit file name (.EOF) and the crop of its file (the rows
+            of one file share one list), or None.
+        """
+        import os
+        import joblib
+        import pandas as pd
+        from datetime import timedelta
+        from tqdm.auto import tqdm
+        from . import utils_eof
+        from .HTTP import download_jobs
+        from .utils_pool import release_workers
+
+        if urls is None:
+            urls = EOF._orbit_names(scenes, n_jobs=n_jobs, joblib_backend=joblib_backend, retries=retries,
+                                    timeout_second=timeout_second, min_rate=min_rate,
+                                    min_rate_window=min_rate_window)
+        rows = [(burst, mission, pd.Timestamp(time))
+                for burst, mission, time in zip(scenes['burst'], scenes['mission'], scenes['startTime'])]
+        # the rows of each orbit file
+        groups = {}
+        for row, url in enumerate(urls):
+            if url is not None:
+                groups.setdefault(url, []).append(row)
+        margin = timedelta(seconds=utils_eof.ORBIT_MARGIN + 60)
+        files = []
+        for url, members in groups.items():
+            name = os.path.basename(url)
+            _, mission, time = rows[members[0]]
+            windows = [(rows[row][2] - margin, rows[row][2] + margin) for row in members]
+            files.append((url, name, windows, f'The orbit file {name} for {mission} on {time.date()}'))
+        n_jobs = download_jobs(n_jobs)
+        with EOF.progressbar_joblib(tqdm(desc='Downloading Orbit Files'.ljust(25), total=len(files))) as progress_bar:
+            outcomes = joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(joblib.delayed(EOF._with_retry)\
+                                    (EOF._file_records, retries, timeout_second, url, windows, request, min_rate,
+                                     min_rate_window)
+                                    for url, name, windows, request in files)
+        # the idle joblib workers keep their memory: stop them, the next parallel step starts its own
+        release_workers()
+        results = [None] * len(rows)
+        keep = timedelta(seconds=utils_eof.ORBIT_MARGIN)
+        for (url, name, _, _), (records, error) in zip(files, outcomes):
+            members = groups[url]
+            if error is not None:
+                names = [rows[row][0] for row in members]
+                print(f'WARNING: the orbit file {name} cannot be downloaded ({type(error).__name__}: {error}): '
+                      f'{len(names)} burst(s) get no orbit: {", ".join(map(str, names))}.')
+                continue
+            source = name.removesuffix('.zip')
+            for row in members:
+                burst, _, time = rows[row]
+                if utils_eof._bracket(records, time - keep, time + keep) is None:
+                    print(f'WARNING: the orbit file {name} has no records around {burst} ({time}).')
+                    continue
+                results[row] = (source, records)
+        return results
+
+    @staticmethod
+    def _update_bursts(basedir, skip_exist=True, n_jobs=8, joblib_backend='loky', retries=30, timeout_second=3,
+                       min_rate='100KB', min_rate_window=60):
+        """
+        Private helper of ASF.update and CDSE.update: rewrite the orbit stored in the stored Sentinel-1 bursts.
+
+        The bursts are the annotations basedir/*/annotation/S1_*-BURST.xml whose subswath is the one of their folder
+        (the IW2 annotation stored in an IW1 or IW3 folder is never changed). Each burst takes the orbit file of its
+        mission that covers its start, a precise orbit first, then the newest production (EOF._orbit_names). With
+        skip_exist=True only the bursts whose stored source differs from the selected file are rewritten, with
+        skip_exist=False every burst with a selected file. The new annotation is utils_eof.set_orbit() of the stored
+        bytes, written to a temporary file renamed when complete (utils_files.write_file). A burst without an orbit
+        (no published file, a failed download, or records that do not cover it) keeps its file, with a WARNING. The
+        .EOF files in basedir are neither read nor deleted; only the orbit server is asked.
+
+        Parameters
+        ----------
+        basedir : str
+            The data directory of the burst folders.
+        skip_exist : bool, optional
+            True rewrites only the bursts whose stored orbit differs from the selected one, False all. Default True.
+        n_jobs, joblib_backend, retries, timeout_second, min_rate, min_rate_window
+            As EOF.download.
+
+        Returns
+        -------
+        pandas.DataFrame or None
+            The rewritten bursts (column burst, the annotation file name without .xml) and their new orbit (column
+            orbit, the orbit file name), or None when no burst is rewritten.
+
+        Examples
+        --------
+        >>> EOF._update_bursts('data/')
+        """
+        import os
+        from glob import glob
+        import pandas as pd
+        import xml.etree.ElementTree as ET
+        from . import utils_eof
+        from .utils_files import write_file
+
+        paths = []
+        for rel in sorted(glob('*/annotation/S1_*-BURST.xml', root_dir=basedir)):
+            folder = rel.split(os.sep)[0]
+            name = os.path.basename(rel)
+            # the IW2 annotation of an IW1 or IW3 burst is auxiliary and never changed
+            if name.split('_')[2] == folder.split('_')[-1]:
+                paths.append(os.path.join(basedir, rel))
+        if not paths:
+            print(f'NOTE: no stored Sentinel-1 burst in {basedir}.')
+            return None
+
+        contents, bursts, missions, starts, stored = [], [], [], [], []
+        for path in paths:
+            with open(path, 'rb') as f:
+                content = f.read()
+            root = ET.fromstring(content)
+            contents.append(content)
+            bursts.append(os.path.basename(path).removesuffix('.xml'))
+            missions.append(root.findtext('adsHeader/missionId'))
+            starts.append(pd.Timestamp(root.findtext('swathTiming/burstList/burst/azimuthTime')))
+            orbit = utils_eof.stored_orbit(path)
+            stored.append(None if orbit is None else orbit[0])
+        scenes = pd.DataFrame({'burst': bursts, 'mission': missions, 'startTime': starts})
+        urls = EOF._orbit_names(scenes, n_jobs=n_jobs, joblib_backend=joblib_backend, retries=retries,
+                                timeout_second=timeout_second, min_rate=min_rate, min_rate_window=min_rate_window)
+        selected = [None if url is None else os.path.basename(url).removesuffix('.zip') for url in urls]
+        rewrite = [row for row, name in enumerate(selected)
+                   if name is not None and (not skip_exist or name != stored[row])]
+        # the bursts that hold the selected orbit already (skip_exist=True only)
+        held = len([name for name in selected if name is not None]) - len(rewrite)
+
+        records = []
+        if rewrite:
+            records = EOF._orbit_records(scenes.iloc[rewrite].reset_index(drop=True), [urls[row] for row in rewrite],
+                                         n_jobs=n_jobs, joblib_backend=joblib_backend, retries=retries,
+                                         timeout_second=timeout_second, min_rate=min_rate,
+                                         min_rate_window=min_rate_window)
+        rewritten, sources = [], []
+        for row, orbit in zip(rewrite, records):
+            if orbit is None:
+                continue
+            source, osvs = orbit
+            try:
+                new = utils_eof.set_orbit(contents[row], source, osvs)
+            except utils_eof.OrbitNotFound as e:
+                print(f'WARNING: {bursts[row]} keeps its orbit: {e}')
+                continue
+            write_file(paths[row], new)
+            rewritten.append(bursts[row])
+            sources.append(source)
+        kept = len(paths) - len(rewritten) - held
+        print(f'NOTE: {len(rewritten)} of {len(paths)} stored bursts get a new orbit, {held} hold the selected orbit '
+              f'already, {kept} keep theirs (no orbit could be read).')
+        if not rewritten:
+            return None
+        return pd.DataFrame({'burst': rewritten, 'orbit': sources})

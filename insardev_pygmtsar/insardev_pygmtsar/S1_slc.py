@@ -92,9 +92,14 @@ class S1_slc(Satellite):
                                    f'startTime {start_time.date()} does not match expected date {expected_date}. '
                                    f'This is likely caused by a race condition during parallel download. '
                                    f'Delete the corrupted files and re-download with n_jobs=1 or re-run the download.')
-                # the orbit file of the burst's own mission that covers the burst time, a precise orbit first,
-                # then the newest production, as EOF.download selects it; None when no file covers the burst
-                orbit = utils_eof.select(orbits, ann['missionId'], start_time)
+                # the orbit stored in the burst annotation by the download first: its source, the orbit file it was
+                # taken from; else the orbit file of the burst's own mission that covers the burst time, a precise
+                # orbit first, then the newest production, as EOF.download selects it; None when no file covers it
+                stored = utils_eof.stored_orbit(os.path.join(meta_dir, meta))
+                if stored is not None:
+                    orbit = stored[0]
+                else:
+                    orbit = utils_eof.select(orbits, ann['missionId'], start_time)
                 # Build record from parsed annotation
                 record = {
                     'fullBurstID': prefix,

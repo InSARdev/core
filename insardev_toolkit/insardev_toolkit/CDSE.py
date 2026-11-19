@@ -592,6 +592,15 @@ class CDSE(progressbar_joblib):
         The IW2 annotation of an IW1 or IW3 burst (annotation/<name with IW2>.xml, written by the ASF downloader) is
         optional here: a burst folder without it is complete, and an existing one is kept (CDSE never writes it).
 
+        The annotation of a burst holds its orbit: generalAnnotation/orbitList, with the attribute source = the name
+        of the orbit (EOF) file it comes from, holds the orbit state vectors of that file from the last one at or
+        before 120 s (utils_eof.ORBIT_MARGIN) before the burst start to the first one at or after 120 s after the burst
+        stop. The file is the one of the burst's mission whose validity covers the burst, a precise orbit (POEORB)
+        first, then the newest production. The orbits are downloaded with the bursts and kept in memory: no orbit file
+        is written. A burst whose orbit is not published is not downloaded and gets a WARNING; a burst that fails after
+        its attempts gets a WARNING; the call does not raise for them, and one WARNING line counts the bursts not stored
+        (not in the catalog, without an orbit, failed to download). The next download fetches them.
+
         Parameters
         ----------
         basedir : str
@@ -609,7 +618,8 @@ class CDSE(progressbar_joblib):
         joblib_backend : str, optional
             Joblib backend (default 'loky').
         skip_exist : bool, optional
-            Skip already downloaded (default True).
+            Skip already downloaded (default True). With skip_exist=False every requested burst is downloaded again
+            and all its files are written again, its annotation with the newest published orbit.
         retries : int, optional
             Attempts of each burst, the first one included; 0 makes one attempt, as 1 does (HTTP.attempts). A
             failure that a retry cannot change (HTTP.final, such as HTTP 404) is not retried. Default 30.
@@ -627,7 +637,7 @@ class CDSE(progressbar_joblib):
         Returns
         -------
         DataFrame or None
-            Downloaded bursts info.
+            The requested names of the bursts stored by this call (column 'burst'), or None when none is.
         """
         import os
         import zipfile
@@ -713,13 +723,46 @@ class CDSE(progressbar_joblib):
             else:
                 pattern_to_fullburstid[pattern] = full_burst_id
 
+        from datetime import datetime
+        from .HTTP import download_jobs
+        from .utils_pool import release_workers
+        n_jobs = download_jobs(n_jobs)
+        sequential = n_jobs is None or debug
+        backend = 'sequential' if sequential else joblib_backend
+
+        # the requested name of every catalog record (the record is named after the burst azimuth time)
+        def burst_key(name):
+            parts = name.split('_')
+            return int(parts[1]), parts[2], parts[3][:8], parts[4]
+        requested = {burst_key(name): name for name in bursts_missed}
+        def requested_name(result):
+            name = result.geojson()['properties']['fileID']
+            return requested.get(burst_key(name), name)
+
+        # the orbit of every burst, kept in memory and stored in its annotation; no orbit file is written. A burst
+        # whose orbit is not published is not downloaded (the WARNING is printed by EOF._orbit_records)
+        orbits = []
+        if results:
+            from .EOF import EOF
+            names = [result.geojson()['properties']['fileID'] for result in results]
+            scenes = pd.DataFrame({'burst': names,
+                                   'mission': ['S1' + result.geojson()['properties']['platform'][-1].upper()
+                                               for result in results],
+                                   'startTime': [datetime.strptime(name.split('_')[3], '%Y%m%dT%H%M%S')
+                                                 for name in names]})
+            orbits = EOF._orbit_records(scenes, n_jobs=n_jobs, joblib_backend=backend, retries=retries,
+                                        timeout_second=timeout_second, min_rate=min_rate,
+                                        min_rate_window=min_rate_window)
+        no_orbit = [requested_name(result) for result, orbit in zip(results, orbits) if orbit is None]
+        tasks = [(result, orbit) for result, orbit in zip(results, orbits) if orbit is not None]
+
         session = session or self._get_session()
         use_post = self.username is not None  # CDSE requires POST for authenticated downloads
         get_burst_url = self._get_burst_url  # Capture method for closure
         # Extract token for pickling (session headers don't survive loky serialization)
         auth_token = getattr(session, '_token', None) if use_post else None
 
-        def download_burst(result):
+        def download_burst(result, orbit):
             """Download and extract single burst with full ASF-compatible XML filtering."""
             import requests
             import xmltodict
@@ -758,8 +801,9 @@ class CDSE(progressbar_joblib):
                 os.makedirs(dirname, exist_ok=True)
 
             # Check if all files already exist and validate; every one is checked before any download, so that an
-            # empty one raises
-            all_exist = all([exists(filepath) for filepath in (tif_file, xml_file, xml_noise_file, xml_calib_file)])
+            # empty one raises. With skip_exist=False the burst is downloaded and written again.
+            all_exist = skip_exist and all([exists(filepath)
+                                            for filepath in (tif_file, xml_file, xml_noise_file, xml_calib_file)])
 
             if all_exist:
                 with open(xml_file, 'r') as f:
@@ -936,7 +980,7 @@ class CDSE(progressbar_joblib):
             # A CDSE burst product counts the lines of its XMLs from the first line of the burst, except the noise
             # azimuth vector, which keeps the lines of the whole subswath. In the subswath the vector and the
             # geolocation grid both start at line 0, so the burst starts at vector line (first vector line - first
-            # grid line).
+            # grid line). The annotation holds the orbit of the burst (utils_eof.set_orbit).
             # a file missing from the archive is final (HTTP.final), a retry delivers the same archive
             if not noise_xml:
                 raise NotFound(f'No noise XML in the CDSE archive of {burst}')
@@ -952,7 +996,7 @@ class CDSE(progressbar_joblib):
                 noise_azimuth_line = int(vector['firstAzimuthLine']) - min(int(point['line']) for point in points)
             xml_contents = dict(zip((xml_file, xml_noise_file, xml_calib_file),
                                     burst_xmls(annotation, noise, calibration, 0, PAIRS_TIFF_OFFSET,
-                                               noise_azimuth_line)))
+                                               noise_azimuth_line, orbit=orbit)))
 
             # All validations passed - write to temp files then atomic rename.
             # This guarantees no partial files on disk if interrupted mid-write.
@@ -965,14 +1009,14 @@ class CDSE(progressbar_joblib):
 
             return cache_status  # Return cache status (HIT/MISS/etc)
 
-        def download_burst_with_retry(result, retries, timeout_second):
+        def download_burst_with_retry(result, orbit, retries, timeout_second):
             # retries=0 makes one attempt (HTTP.attempts); a failure that a retry cannot change (HTTP.final) ends the
             # attempts of the burst at once
             burst_id = result.geojson()['properties']['fileID']
             n = attempts(retries)
             for retry in range(n):
                 try:
-                    return download_burst(result)  # Returns cache_status or True (for existing)
+                    return download_burst(result, orbit)  # Returns cache_status or True (for existing)
                 except EmptyFileError:
                     raise
                 except Exception as e:
@@ -980,21 +1024,20 @@ class CDSE(progressbar_joblib):
                     print(f'ERROR: download attempt {retry+1} failed{" (not retried)" if stop else ""} '
                           f'for {burst_id}: {e}')
                     if stop or retry + 1 == n:
-                        # a failed burst returns its item and last error on one line: the raise of the download names them
-                        return burst_id, ' '.join(str(e).split())
+                        # a failed burst returns its item and last error on one line
+                        error = ' '.join(str(e).split())
+                        print(f'WARNING: {burst_id} is not stored: {error}.')
+                        return burst_id, error
                 time.sleep(timeout_second)
 
-        from .HTTP import download_jobs
-        from .utils_pool import release_workers
-        n_jobs = download_jobs(n_jobs)
-        if n_jobs is None or debug:
+        if sequential:
             print('Note: sequential processing applied when n_jobs is None or debug is True.')
             # Simple loop with tqdm for sequential/debug mode
             statuses = []
             hits, misses = 0, 0
-            pbar = tqdm(results, desc='Downloading CDSE SLC'.ljust(25))
-            for result in pbar:
-                status = download_burst_with_retry(result, retries, timeout_second)
+            pbar = tqdm(tasks, desc='Downloading CDSE SLC'.ljust(25))
+            for result, orbit in pbar:
+                status = download_burst_with_retry(result, orbit, retries, timeout_second)
                 statuses.append(status)
                 # Update HIT/MISS counts
                 if status == 'HIT':
@@ -1005,21 +1048,83 @@ class CDSE(progressbar_joblib):
                     pbar.set_postfix_str(f'HIT:{hits} MISS:{misses}')
         else:
             # Parallel download with joblib
-            with self.progressbar_joblib(tqdm(desc='Downloading CDSE SLC'.ljust(25), total=len(results))) as progress_bar:
+            with self.progressbar_joblib(tqdm(desc='Downloading CDSE SLC'.ljust(25), total=len(tasks))) as progress_bar:
                 statuses = joblib.Parallel(n_jobs=n_jobs, backend=joblib_backend)(
-                    joblib.delayed(download_burst_with_retry)(result, retries, timeout_second)
-                    for result in results
+                    joblib.delayed(download_burst_with_retry)(result, orbit, retries, timeout_second)
+                    for result, orbit in tasks
                 )
 
         # the idle joblib workers keep their memory: stop them, the next parallel step starts its own
         release_workers()
-        # the raise names every failed item and its last error, one line each (the causes stay in the log too)
-        failed = [status for status in statuses if isinstance(status, tuple)]
-        if failed:
-            raise Exception('\n'.join([f'Bursts downloading failed for {len(failed)} items.'] +
-                                      [f'{item}: {error}' for item, error in failed]))
+        stored = [requested_name(result) for (result, _), status in zip(tasks, statuses) if not isinstance(status, tuple)]
+        failed = [requested_name(result) for (result, _), status in zip(tasks, statuses) if isinstance(status, tuple)]
+        found = {requested_name(result) for result in results}
+        not_in_catalog = [burst for burst in bursts_missed if burst not in found]
+        missed = set(not_in_catalog) | set(no_orbit) | set(failed)
+        if missed:
+            names = [burst for burst in bursts_missed if burst in missed]
+            print(f'WARNING: {len(names)} of {len(bursts_missed)} bursts are not stored ({len(not_in_catalog)} not in the '
+                  f'catalog, {len(no_orbit)} without an orbit, {len(failed)} failed to download): '
+                  f'{", ".join(names)}. The next download fetches them.')
+        if not stored:
+            return None
+        # the requested names of the bursts stored by this call
+        return pd.DataFrame(stored, columns=['burst'])
 
-        return pd.DataFrame(bursts_missed, columns=['burst'])
+    @staticmethod
+    def update(basedir, skip_exist=True, n_jobs=8, joblib_backend='loky', retries=30, timeout_second=3, min_rate='100KB',
+               min_rate_window=60):
+        """
+        Update the orbit stored in the Sentinel-1 bursts of a data directory.
+
+        The orbit stored in the annotation of every Sentinel-1 burst in basedir (generalAnnotation/orbitList, with the
+        attribute source = the orbit file name) is replaced by the most precise, most recent published orbit: the
+        orbit file of the burst's mission that covers the burst, a precise orbit (POEORB) first, then the newest
+        production. With skip_exist=True only the bursts whose stored orbit (source) differs from the selected file
+        are rewritten, such as a restituted orbit (RESORB) once the POEORB is published (about 20 days after the
+        acquisition), a reprocessed POEORB, or a burst downloaded before the orbit was stored in it; with
+        skip_exist=False the orbit of every stored burst is rewritten. Only the annotation files change, each written
+        to a temporary file and renamed when complete; the measurement, noise and calibration files and the IW2
+        annotation of IW1 and IW3 bursts are not changed. The orbit files are read from the orbit server: the call
+        needs internet and no account. A burst with no published orbit keeps its own, with a WARNING.
+
+        Parameters
+        ----------
+        basedir : str
+            The data directory of the burst folders.
+        skip_exist : bool, optional
+            True rewrites only the bursts whose stored orbit differs from the selected one; False rewrites the orbit
+            of every stored burst. Default True.
+        n_jobs : int, optional
+            The number of concurrent orbit downloads, as EOF.download. Default 8.
+        joblib_backend : str, optional
+            The backend for parallel processing. Default 'loky'.
+        retries : int, optional
+            The number of attempts of each orbit index and orbit file request, as EOF.download. Default 30.
+        timeout_second : float, optional
+            Seconds between the attempts. Default 3.
+        min_rate : str or float, optional
+            Bytes per second an orbit download must keep, as EOF.download. Default '100KB'.
+        min_rate_window : float, optional
+            Seconds over which the rate is averaged. Default 60.
+
+        Returns
+        -------
+        pandas.DataFrame or None
+            The rewritten bursts (column burst) and their new orbit (column orbit, the orbit file name), or None when
+            no burst is rewritten.
+
+        Examples
+        --------
+        >>> cdse = CDSE()
+        >>> cdse.update(DATADIR)
+        >>> # rewrite the orbit of every stored burst
+        >>> cdse.update(DATADIR, skip_exist=False)
+        """
+        from .EOF import EOF
+        return EOF._update_bursts(basedir, skip_exist=skip_exist, n_jobs=n_jobs, joblib_backend=joblib_backend,
+                                  retries=retries, timeout_second=timeout_second, min_rate=min_rate,
+                                  min_rate_window=min_rate_window)
 
     @staticmethod
     def _burst_exists(basedir, burst):

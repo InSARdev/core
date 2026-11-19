@@ -16,13 +16,22 @@ class S1_gmtsar(S1_slc):
 
     def _orbit_file(self, burst: str, record) -> str:
         """
-        Return the orbit file path of a burst from its record, FileNotFoundError when it has no orbit file.
+        Return the orbit file path of a burst: its annotation when the download stored the orbit in it
+        (utils_eof.stored_orbit), even when an EOF file is in the folder; else the EOF file of its record,
+        FileNotFoundError when it has none.
         """
         import os
+        from insardev_toolkit import utils_eof
+        from insardev_toolkit.utils_files import exists
+        annotation = os.path.join(self.datadir, self.fullBurstId(burst), 'annotation', f'{burst}.xml')
+        # an annotation emptied after the scan raises (utils_files.exists), as in _burst_files
+        if exists(annotation) and utils_eof.stored_orbit(annotation) is not None:
+            return annotation
         orbit_val = record['orbit'].iloc[0]
         if not isinstance(orbit_val, str):
-            raise FileNotFoundError(f'ERROR: No orbit file for burst {burst} ({record["startTime"].iloc[0].date()}). '
-                                    f'Download the orbits.')
+            raise FileNotFoundError(f'ERROR: No orbit for burst {burst} ({record["startTime"].iloc[0].date()}): its annotation '
+                                    f'holds no stored orbit and no orbit file covers it. Store the orbits in the bursts with '
+                                    f'ASF().update(datadir), or download the orbit files with EOF().download.')
         return os.path.join(self.datadir, orbit_val)
 
     def _burst_files(self, burst: str) -> tuple:

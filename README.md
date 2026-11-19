@@ -32,7 +32,7 @@ The Cache APIs at insar.dev provide fast access to Sentinel-1 data via NASA ASF 
 - **Dual-polarization support** — all polarization channels (VV+VH or HH+HV) processed separately or together for PolSAR analysis
 - **Ascending and descending on the same grid** — both orbit directions processed in common geocoded coordinates for straightforward vertical and east-west displacement decomposition
 - **Per-pixel incidence geometry** — elevation-corrected incidence from spherical Earth model, no central-point approximation
-- **Integrated data access** — download Sentinel-1 bursts and NISAR polarizations and frequencies, Sentinel-1 orbits, DEM, land mask, and map tiles
+- **Integrated data access** — download Sentinel-1 bursts with their orbits, NISAR polarizations and frequencies, DEM, land mask, and map tiles
 - **Runs anywhere** — locally on MacOS/Linux/Windows, on Google Colab, GitHub runners, Docker containers, and even Raspberry Pi 4 & 5
 
 ## Interactive Examples on Google Colab

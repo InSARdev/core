@@ -21,7 +21,7 @@ choose the same way, so the scan finds the file that the download selected.
 """
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import NamedTuple
 
 from .HTTP import NotFound
@@ -174,3 +174,178 @@ def select(orbits, mission: str, time, offset_start=None, offset_end=None):
         return None
     return max(candidates, key=lambda orbit: (orbit.product == 'POEORB', orbit.production,
                                               orbit.start, orbit.stop)).name
+
+
+# the seconds of orbit kept in a burst annotation before the burst start and after the burst stop
+ORBIT_MARGIN = 120.0
+# the time of an orbit state vector, as an orbit file (without its UTC= prefix) and a burst annotation write it
+_OSV_TIME = '%Y-%m-%dT%H:%M:%S.%f'
+
+
+def osv_records(content, windows) -> list:
+    """
+    The orbit state vectors of a Sentinel-1 orbit (EOF) file inside time windows, with their texts as the file
+    writes them.
+
+    Parameters
+    ----------
+    content : bytes
+        The orbit file.
+    windows : iterable of tuple
+        The (start, stop) windows, naive UTC datetimes; a state vector at a window end is inside it.
+
+    Returns
+    -------
+    list of tuple
+        The records (time, x, y, z, vx, vy, vz) of the state vectors inside any window, in file order: the UTC
+        time without its UTC= prefix and the texts of X, Y, Z, VX, VY and VZ, all str, never converted to numbers.
+
+    Raises
+    ------
+    ValueError
+        If the content holds no Data_Block/List_of_OSVs/OSV records.
+    """
+    import xml.etree.ElementTree as ET
+
+    osvs = ET.fromstring(content).findall('Data_Block/List_of_OSVs/OSV')
+    if not osvs:
+        raise ValueError('Not a Sentinel-1 orbit file: no List_of_OSVs records')
+    windows = list(windows)
+    records = []
+    for osv in osvs:
+        time = osv.findtext('UTC').removeprefix('UTC=')
+        when = datetime.strptime(time, _OSV_TIME)
+        if any(start <= when <= stop for start, stop in windows):
+            records.append((time,) + tuple(osv.findtext(key) for key in ('X', 'Y', 'Z', 'VX', 'VY', 'VZ')))
+    return records
+
+
+def _bracket(records, start, stop):
+    """
+    The records from the last one at or before start to the first one at or after stop, ends included.
+
+    Parameters
+    ----------
+    records : list of tuple
+        The records as osv_records() returns them, sorted by time.
+    start, stop : datetime.datetime
+        The times to bracket (UTC, naive).
+
+    Returns
+    -------
+    list of tuple or None
+        The bracketing records, None when no record is at or before start or none is at or after stop.
+    """
+    times = [datetime.strptime(record[0], _OSV_TIME) for record in records]
+    before = [index for index, time in enumerate(times) if time <= start]
+    after = [index for index, time in enumerate(times) if time >= stop]
+    if not before or not after:
+        return None
+    return list(records[before[-1]:after[0] + 1])
+
+
+def set_orbit(annotation, source, records) -> bytes:
+    """
+    Store the orbit of a burst in its annotation: the orbit list of the annotation is replaced by the records of
+    an orbit file around the burst, ORBIT_MARGIN seconds before its start and after its stop, tagged by the file.
+
+    Parameters
+    ----------
+    annotation : bytes
+        A stored burst annotation: a <product> with exactly one swathTiming/burstList/burst.
+    source : str
+        The orbit file name (.EOF, without .zip).
+    records : list of tuple
+        The records of the orbit file as osv_records() returns them, sorted by time.
+
+    Returns
+    -------
+    bytes
+        The annotation with its <orbitList> replaced by <orbitList count="N" source="SOURCE"> and one <orbit> per
+        kept record, in the layout of the file; every byte before and after the list is kept.
+
+    Raises
+    ------
+    utils_eof.OrbitNotFound
+        If the records do not cover the burst with the margins (final for HTTP.final, not retried).
+    ValueError
+        If the source is not an orbit file name, or the annotation has not exactly one orbit list.
+    """
+    import xml.etree.ElementTree as ET
+
+    parse(source)
+    root = ET.fromstring(annotation)
+    start = datetime.strptime(root.findtext('swathTiming/burstList/burst/azimuthTime'), _OSV_TIME)
+    lines_per_burst = int(root.findtext('swathTiming/linesPerBurst'))
+    interval = float(root.findtext('imageAnnotation/imageInformation/azimuthTimeInterval'))
+    # the burst stop as utils_S1.burst_xmls computes it
+    stop = start + timedelta(seconds=(lines_per_burst - 1) * interval)
+    low = start - timedelta(seconds=ORBIT_MARGIN)
+    high = stop + timedelta(seconds=ORBIT_MARGIN)
+    kept = _bracket(records, low, high)
+    if kept is None:
+        raise OrbitNotFound(f'ERROR: the orbit {source} does not cover the burst from {low} to {high}.')
+
+    matches = list(re.finditer(rb'<orbitList\b[^>]*>.*?</orbitList>', annotation, re.S))
+    if len(matches) != 1:
+        raise ValueError(f'Expected one orbitList in the annotation, found {len(matches)}')
+    match = matches[0]
+    # the indentation of the list when its tag starts a line (pretty xmltodict layout), two levels deep
+    begin = match.start()
+    while begin > 0 and annotation[begin - 1:begin] in (b' ', b'\t'):
+        begin -= 1
+    if begin > 0 and annotation[begin - 1:begin] == b'\n':
+        newline, pad = '\n', annotation[begin:match.start()].decode()
+    else:
+        newline, pad = '', ''
+    unit = pad[:len(pad) // 2]
+    one, two, three = pad + unit, pad + unit * 2, pad + unit * 3
+    parts = [f'<orbitList count="{len(kept)}" source="{source}">']
+    for time, x, y, z, vx, vy, vz in kept:
+        parts += [f'{one}<orbit>',
+                  f'{two}<time>{time}</time>',
+                  f'{two}<frame>Earth Fixed</frame>',
+                  f'{two}<position>',
+                  f'{three}<x>{x}</x>',
+                  f'{three}<y>{y}</y>',
+                  f'{three}<z>{z}</z>',
+                  f'{two}</position>',
+                  f'{two}<velocity>',
+                  f'{three}<x>{vx}</x>',
+                  f'{three}<y>{vy}</y>',
+                  f'{three}<z>{vz}</z>',
+                  f'{two}</velocity>',
+                  f'{one}</orbit>']
+    parts.append(f'{pad}</orbitList>')
+    element = newline.join(parts).encode()
+    return annotation[:match.start()] + element + annotation[match.end():]
+
+
+def stored_orbit(path):
+    """
+    The orbit stored in a burst annotation by set_orbit().
+
+    Parameters
+    ----------
+    path : str
+        The annotation file.
+
+    Returns
+    -------
+    tuple or None
+        (source, records): the orbit file name and the records (time, x, y, z, vx, vy, vz), all str, the texts
+        as stored; None for an annotation as ESA wrote it (its orbit list has no source attribute).
+
+    Raises
+    ------
+    xml.etree.ElementTree.ParseError
+        If the file is not XML.
+    """
+    import xml.etree.ElementTree as ET
+
+    orbits = ET.parse(path).getroot().find('generalAnnotation/orbitList')
+    source = orbits.get('source')
+    if source is None:
+        return None
+    keys = ('time', 'position/x', 'position/y', 'position/z', 'velocity/x', 'velocity/y', 'velocity/z')
+    return source, [tuple(orbit.findtext(key) for key in keys) for orbit in orbits.findall('orbit')]

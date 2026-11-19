@@ -7,7 +7,7 @@ Sentinel-1 SLC preprocessing library for Python.
 - **Per-burst Sentinel-1 TOPS SLC preprocessing** — independent processing of each burst, no frame stitching
 - **Geometric coregistration** — bursts aligned to a reference via radar-to-geographic transforms with differential topo phase correction between reference and repeat geometries
 - **Dual-polarization support** — all polarization channels (VV+VH or HH+HV) processed together
-- **Precise orbit integration** — automatic application of restituted and precise orbit files
+- **Precise orbit integration** — the orbit stored in each burst by the download, or, for a burst without it, the restituted and precise orbit files of the data folder
 - **DEM preparation** — geocoding and coordinate transformations to a common geographic grid
 - **User-defined coordinate system and resolution** — output in any EPSG projection at any resolution, from small large-area overviews to precise local analysis grids
 - **Solid Earth tidal phase correction** — per-date tidal displacement projected onto the radar line-of-sight using IERS 2003 solid Earth tide model and satellite look vectors, computed efficiently via 2×2 radar-grid corner interpolation

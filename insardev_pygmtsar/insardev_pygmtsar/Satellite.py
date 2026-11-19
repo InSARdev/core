@@ -97,9 +97,11 @@ class Satellite(progressbar_joblib, datagrid):
         is always the first date: any date would do, so a baseline that cannot be solved is
         reported as an error rather than worked around by choosing another origin.
 
-        Sentinel-1 reads the orbits from files downloaded after the bursts, so its baselines
-        stay undefined until the orbits are there and the data directory is scanned again.
-        Nisar carries the orbit inside the scene and has no such wait.
+        Sentinel-1 reads the orbit the download stored in each burst (ASF.download, CDSE.download,
+        ASF.update, CDSE.update), or, for a burst without it, the orbit files of the data
+        directory (EOF().download). When a date of a burst ID has neither, the baselines of all
+        the dates of that burst ID are undefined until its orbit is there and the data directory
+        is scanned again. Nisar carries the orbit inside the scene.
 
         Parameters
         ----------
@@ -133,8 +135,8 @@ class Satellite(progressbar_joblib, datagrid):
 
         BPRs = pd.Series(np.nan, index=self.df.index, name='BPR')
         if 'orbit' in self.df.columns and self.df.orbit.isnull().all():
-            print('NOTE: Orbits are not downloaded, baselines are undefined. '
-                  'Download the orbits and scan the data directory again.')
+            print('NOTE: Orbits are not found, baselines are undefined. Store the orbits in the bursts with '
+                  'ASF().update(datadir), or download the orbit files with EOF().download, and scan the data directory again.')
             return BPRs
 
         # bursts are keyed by fullBurstID and burst, scenes by sceneId and scene

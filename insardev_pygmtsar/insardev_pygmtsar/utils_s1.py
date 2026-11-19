@@ -86,14 +86,16 @@ def _orbit_for(burst: tuple, t1: float, t2: float) -> str:
 
 def satellite_orbit(xml_path: str, t1: float, t2: float, burst: tuple = None) -> pd.DataFrame:
     """
-    Extract orbit state vectors from Sentinel-1 EOF XML file.
+    Extract orbit state vectors from a Sentinel-1 EOF XML file, or from the orbit stored in a burst annotation.
 
     Replaces GMTSAR ext_orb_s1a binary.
 
     Parameters
     ----------
     xml_path : str
-        Path to orbit EOF XML file (e.g., S1A_OPER_AUX_POEORB_*.EOF)
+        Path to an orbit EOF XML file (e.g., S1A_OPER_AUX_POEORB_*.EOF), or to a burst annotation with an orbit
+        stored by the download (utils_eof.stored_orbit; any path that does not end with .EOF): the state vectors
+        of its orbit file around the burst, which give the same values as that file
     t1 : float
         Start time as an SC_clock value: year * 1000 + 0-based day + day fraction (e.g., 2015020.5 is 2015, day 20
         counted from 0, 12:00)
@@ -108,10 +110,10 @@ def satellite_orbit(xml_path: str, t1: float, t2: float, burst: tuple = None) ->
     Raises
     ------
     FileNotFoundError
-        There is no orbit file at xml_path.
+        There is no orbit file at xml_path, or the burst annotation holds no stored orbit.
     ValueError
-        The orbit file cannot be used: it has no state vectors over the time (the burst when given),
-        a gap between them, or a state vector that is not finite (utils_satellite.orbit_defect).
+        The orbit file (or stored orbit) cannot be used: it has no state vectors over the time (the burst when
+        given), a gap between them, or a state vector that is not finite (utils_satellite.orbit_defect).
 
     Returns
     -------
@@ -163,13 +165,15 @@ def satellite_orbit(xml_path: str, t1: float, t2: float, burst: tuple = None) ->
 
 def check_orbit_file(xml_path: str, bursts: list) -> None:
     """
-    Check an EOF file for every burst that uses it with one read of the file: the state vectors of each burst
-    (those satellite_orbit reads for it, over orbit_window) are checked as satellite_orbit checks them.
+    Check an EOF file, or the orbit stored in a burst annotation, for every burst that uses it with one read of
+    the file: the state vectors of each burst (those satellite_orbit reads for it, over orbit_window) are checked as
+    satellite_orbit checks them.
 
     Parameters
     ----------
     xml_path : str
-        Path to orbit EOF XML file.
+        Path to an orbit EOF XML file, or to a burst annotation with an orbit stored by the download
+        (utils_eof.stored_orbit; any path that does not end with .EOF).
     bursts : list
         (name, start, stop) of each burst, start and stop as SC_clock values (SC_clock_start, SC_clock_stop).
 
@@ -195,21 +199,27 @@ def check_orbit_file(xml_path: str, bursts: list) -> None:
 
 
 def _eof_error(xml_path: str, df: pd.DataFrame, t1: float, t2: float, burst: tuple):
-    """The error of the state vectors df of an EOF file read from t1 to t2 for the burst (name, start, stop) when
-    they cannot be used (utils_satellite.orbit_defect), None when they can."""
+    """The error of the state vectors df of an EOF file, or of the orbit stored in a burst annotation, read from t1
+    to t2 for the burst (name, start, stop) when they cannot be used (utils_satellite.orbit_defect), None when they
+    can."""
     from .utils_satellite import orbit_defect
     year0 = int(np.floor(t1 / 1000.0 + 0.5))
     span = ((burst[1] - year0 * 1000) * 86400.0, (burst[2] - year0 * 1000) * 86400.0) if burst is not None else ()
     defect = orbit_defect(df, *span)
     if defect is None:
         return None
+    if not xml_path.endswith('.EOF'):
+        return ValueError(f'ERROR: Orbit stored in {xml_path} {defect} {_orbit_for(burst, t1, t2)}. '
+                          f'Download the burst again.')
     return ValueError(f'ERROR: Orbit file {xml_path} {defect} {_orbit_for(burst, t1, t2)}. '
                       f'Delete it and download the orbits again.')
 
 
 def _eof_state_vectors(xml_path: str, t1: float, t2: float, burst: tuple = None) -> tuple:
     """
-    The state vectors of an EOF file from t1 to t2 (year.day_fraction), in file order, without a check.
+    The state vectors of an EOF file, or of the orbit stored in a burst annotation (a path that does not end with
+    .EOF, utils_eof.stored_orbit), from t1 to t2 (year.day_fraction), in file order, without a check. Both give
+    their texts to one conversion, so a stored state vector has the values of the same one read from the EOF file.
 
     Returns
     -------
@@ -221,52 +231,63 @@ def _eof_state_vectors(xml_path: str, t1: float, t2: float, burst: tuple = None)
     Raises
     ------
     FileNotFoundError
-        There is no file at xml_path; the error names the burst (name, start, stop) when given.
+        There is no file at xml_path, or the annotation holds no stored orbit; the error names the burst
+        (name, start, stop) when given.
     """
     import xml.etree.ElementTree as ET
     from insardev_toolkit.utils_files import exists
+    from insardev_toolkit import utils_eof
 
     if not exists(xml_path):
         raise FileNotFoundError(f'ERROR: Orbit file {xml_path} not found for {_orbit_for(burst, t1, t2)}. '
                                 f'Download the orbits again.')
 
-    # ONLY THE WINDOW IS PARSED. A precise-orbit file covers 26 hours at 10 s --
-    # 9,361 state vectors -- and a burst asks for about 47 minutes of it, so
-    # building the whole DOM and converting every timestamp throws away 97% of
-    # the work, once per burst. ISO-8601 timestamps sort lexicographically in
-    # chronological order, so the blocks can be selected as TEXT first and only
-    # the survivors handed to the XML parser. The string window is widened by a
-    # margin and the exact numeric test below still decides, so the result is
-    # what parsing the whole file would have given.
-    _margin = 60.0 / 86400.0
-    root = None
-    try:
-        with open(xml_path, 'r', encoding='utf-8', errors='replace') as f:
-            _text = f.read()
-        _blocks = _text.split('<OSV>')
-        if len(_blocks) > 1:
-            _lo = _ydf_to_iso(t1 - _margin)
-            _hi = _ydf_to_iso(t2 + _margin)
-            _kept = []
-            for _b in _blocks[1:]:
-                _i = _b.find('<UTC>UTC=')
-                _j = _b.find('</OSV>')
-                if _i < 0 or _j < 0:
-                    _kept = None
-                    break
-                _ts = _b[_i + 9:_i + 35]
-                if _lo <= _ts <= _hi:
-                    _kept.append('<OSV>' + _b[:_j + 6])
-            if _kept:
-                root = ET.fromstring('<List_of_OSVs>' + ''.join(_kept) + '</List_of_OSVs>')
-    except (OSError, UnicodeError, ET.ParseError):
+    if not xml_path.endswith('.EOF'):
+        # a burst annotation: the orbit the download stored in it, the texts of its orbit file's state vectors
+        stored = utils_eof.stored_orbit(xml_path)
+        if stored is None:
+            raise FileNotFoundError(f'ERROR: No orbit stored in {xml_path} for {_orbit_for(burst, t1, t2)}. '
+                                    f'Download the burst again.')
+        texts = [('UTC=' + record[0],) + tuple(record[1:]) for record in stored[1]]
+    else:
+        # ONLY THE WINDOW IS PARSED. A precise-orbit file covers 26 hours at 10 s --
+        # 9,361 state vectors -- and a burst asks for about 47 minutes of it, so
+        # building the whole DOM and converting every timestamp throws away 97% of
+        # the work, once per burst. ISO-8601 timestamps sort lexicographically in
+        # chronological order, so the blocks can be selected as TEXT first and only
+        # the survivors handed to the XML parser. The string window is widened by a
+        # margin and the exact numeric test below still decides, so the result is
+        # what parsing the whole file would have given.
+        _margin = 60.0 / 86400.0
         root = None
-    if root is None:
-        # anything unexpected about the file -- read it whole, as before
-        root = ET.parse(xml_path).getroot()
+        try:
+            with open(xml_path, 'r', encoding='utf-8', errors='replace') as f:
+                _text = f.read()
+            _blocks = _text.split('<OSV>')
+            if len(_blocks) > 1:
+                _lo = _ydf_to_iso(t1 - _margin)
+                _hi = _ydf_to_iso(t2 + _margin)
+                _kept = []
+                for _b in _blocks[1:]:
+                    _i = _b.find('<UTC>UTC=')
+                    _j = _b.find('</OSV>')
+                    if _i < 0 or _j < 0:
+                        _kept = None
+                        break
+                    _ts = _b[_i + 9:_i + 35]
+                    if _lo <= _ts <= _hi:
+                        _kept.append('<OSV>' + _b[:_j + 6])
+                if _kept:
+                    root = ET.fromstring('<List_of_OSVs>' + ''.join(_kept) + '</List_of_OSVs>')
+        except (OSError, UnicodeError, ET.ParseError):
+            root = None
+        if root is None:
+            # anything unexpected about the file -- read it whole, as before
+            root = ET.parse(xml_path).getroot()
 
-    # Find all OSV (Orbit State Vector) elements
-    osvs = root.findall('.//OSV')
+        # Find all OSV (Orbit State Vector) elements: their UTC, X, Y, Z, VX, VY and VZ texts
+        texts = ((osv.find('UTC').text,) + tuple(osv.find(key).text for key in ('X', 'Y', 'Z', 'VX', 'VY', 'VZ'))
+                 for osv in root.findall('.//OSV'))
 
     # t1/t2 count the days of the scene year (year * 1000 + day), running below day 0 or past Dec 31 when the
     # window crosses Jan 1: the vectors of the other year are put on that count too, and so is 'clock'
@@ -274,11 +295,11 @@ def _eof_state_vectors(xml_path: str, t1: float, t2: float, burst: tuple = None)
 
     records = []
     ydfs = []
-    for osv in osvs:
+    for utc_text, x_text, y_text, z_text, vx_text, vy_text, vz_text in texts:
         # Parse UTC timestamp: "UTC=2015-01-20T22:59:44.000000". Fixed width, so
         # it is sliced rather than passed to strptime, which dominated this
         # function: one call per state vector, almost all of them discarded.
-        utc_str = osv.find('UTC').text
+        utc_str = utc_text
         if utc_str.startswith('UTC='):
             utc_str = utc_str[4:]
         year = int(utc_str[0:4])
@@ -303,12 +324,12 @@ def _eof_state_vectors(xml_path: str, t1: float, t2: float, burst: tuple = None)
             continue
 
         # Extract position and velocity
-        x = float(osv.find('X').text)
-        y = float(osv.find('Y').text)
-        z = float(osv.find('Z').text)
-        vx = float(osv.find('VX').text)
-        vy = float(osv.find('VY').text)
-        vz = float(osv.find('VZ').text)
+        x = float(x_text)
+        y = float(y_text)
+        z = float(z_text)
+        vx = float(vx_text)
+        vy = float(vy_text)
+        vz = float(vz_text)
 
         records.append({
             'iy': year,

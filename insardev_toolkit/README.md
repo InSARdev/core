@@ -5,7 +5,8 @@ Utility functions and helper tools for the InSAR.dev ecosystem.
 ## Features
 
 - DEM downloading (Copernicus GLO-30/GLO-90, NASA SRTM, JAXA ALOS)
-- Sentinel-1 orbit file (EOF) downloading
+- Sentinel-1 burst downloads store each burst's orbit in its annotation, the precise orbit (POEORB) once published, else the newest restituted orbit (RESORB); no orbit file is written; `update` rewrites it when a more precise or newer orbit is published
+- Sentinel-1 orbit file (EOF) downloading with `EOF().download`, for bursts downloaded before the orbits were stored in them
 - Sentinel-1 SLC downloading from ASF (Alaska Satellite Facility)
 - Map tile downloading (XYZ, OpenStreetMap, Google Maps)
 - ERA5 pressure-level downloading: the ECMWF reanalysis on 37 pressure levels from the Google ARCO v3 copy (ERA5T for the latest hours), cut to 1-degree tiles
@@ -16,6 +17,20 @@ Utility functions and helper tools for the InSAR.dev ecosystem.
 - NetCDF and xarray data grid operations
 - 3D visualization export (VTK format)
 - HTTP utilities for downloading and extraction
+
+## Sentinel-1 orbits
+
+`ASF.download` and `CDSE.download` store the orbit of each Sentinel-1 burst in its annotation: `generalAnnotation/orbitList`
+with the attribute `source`, the name of the orbit (EOF) file it comes from. The list holds the state vectors of that file from
+the last one at or before 120 s before the burst start to the first one at or after 120 s after its stop. The file is the one of
+the burst's mission that covers the burst, a precise orbit (POEORB) first, then the newest production. No orbit file is written.
+A burst without an orbit (none published, or its orbit index or file cannot be read) is not downloaded: a WARNING names it, and
+the next download fetches it. `asf.update(DATADIR)` rewrites the stored orbit of the bursts whose `source` differs from the most
+precise, most recent published orbit, such as a restituted orbit (RESORB) once the POEORB is published, and stores it in the
+bursts downloaded without one; a burst whose orbit cannot be read keeps its own, with a WARNING; `asf.update(DATADIR,
+skip_exist=False)` rewrites the orbit of every burst. With the default `skip_exist=True`, `asf.download` changes no stored file
+and makes no network request once every burst is stored; `skip_exist=False` downloads and writes every burst again.
+`EOF().download` still downloads the orbit files; the preprocessors read them for a burst without a stored orbit.
 
 ## Atmosphere downloads
 

@@ -341,7 +341,7 @@ def _filter_azimuth_time(items, start, stop, delta):
             if low <= datetime.strptime(item['azimuthTime'], '%Y-%m-%dT%H:%M:%S.%f') <= high]
 
 
-def burst_xmls(annotation, noise, calibration, burst_index, byte_offset, noise_azimuth_line=None):
+def burst_xmls(annotation, noise, calibration, burst_index, byte_offset, noise_azimuth_line=None, orbit=None):
     """
     The annotation, noise and calibration XML files of one burst, as every source stores them: ASF.download (from
     the burst manifest), CDSE.download (from the burst product) and PyGMTSAR.safeload (from a SAFE).
@@ -361,6 +361,12 @@ def burst_xmls(annotation, noise, calibration, burst_index, byte_offset, noise_a
     noise_azimuth_line : int, optional
         The first line of the burst in the lines of the noise azimuth vector, when that vector counts its lines from
         another first line than the rest of the source XMLs (CDSE). Default: that of the rest.
+    orbit : tuple, optional
+        (source, records): the orbit file name (.EOF) and its records around the burst, as EOF._orbit_records
+        returns them for the burst. When given, the orbit list of the annotation is replaced by the records from the
+        last one at or before utils_eof.ORBIT_MARGIN seconds before the burst start to the first one at or after
+        ORBIT_MARGIN seconds after its stop, tagged by the source (utils_eof.set_orbit); the noise and calibration
+        files are not changed. Default None: the orbit list of the source annotation is kept.
 
     Returns
     -------
@@ -464,8 +470,13 @@ def burst_xmls(annotation, noise, calibration, burst_index, byte_offset, noise_a
         items = vectors(calibration['calibrationVectorList'].get('calibrationVector', []))
         calibration_out['calibrationVectorList'] = {'@count': len(items), 'calibrationVector': items}
 
-    return tuple(xmltodict.unparse({root: content}, pretty=True, indent='  ').encode('utf-8')
-                 for root, content in (('product', product), ('noise', noise_out), ('calibration', calibration_out)))
+    files = tuple(xmltodict.unparse({root: content}, pretty=True, indent='  ').encode('utf-8')
+                  for root, content in (('product', product), ('noise', noise_out), ('calibration', calibration_out)))
+    if orbit is None:
+        return files
+    from .utils_eof import set_orbit
+    source, records = orbit
+    return (set_orbit(files[0], source, records),) + files[1:]
 
 
 def iw2_annotation_xml(metadata, polarization):
