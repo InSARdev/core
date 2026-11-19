@@ -57,6 +57,7 @@ from .BatchWrap import BatchWrap
 from .BatchUnit import BatchUnit
 from .BatchComplex import BatchComplex
 from .Batches import Batches
+from .BatchFrame import BatchFrame
 from .Baseline import Baseline
 
 # Auto-load extensions if available

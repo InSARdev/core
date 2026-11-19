@@ -9,7 +9,80 @@
 # Professional use requires an active per-seat subscription at: https://patreon.com/pechnikov
 # ----------------------------------------------------------------------------
 """Export helpers of the batch classes: GeoPackage blocks, GeoJSON pixel rectangles and their precision."""
+import datetime
+import os
+import re
 import numpy as np
+
+_ISO_DATE = re.compile(r'[0-9]{4}-[0-9]{2}-[0-9]{2}')
+
+
+def _tre_name(name):
+    """
+    `d` + YYYYMMDD for a column named by an ISO date (YYYY-MM-DD, a real calendar date); any other name is kept as it is.
+
+    Examples
+    --------
+    >>> _tre_name('2018-10-17')
+    'd20181017'
+    >>> _tre_name('2018-13-45')
+    '2018-13-45'
+    >>> _tre_name('velocity')
+    'velocity'
+    """
+    if isinstance(name, str) and _ISO_DATE.fullmatch(name):
+        try:
+            datetime.date.fromisoformat(name)
+        except ValueError:
+            return name
+        return 'd' + name.replace('-', '')
+    return name
+
+
+def _table_to_geopackage(table, filename: str, crs: str | int | None = 4326, layer: str | None = None,
+                         overwrite: bool = True) -> None:
+    """
+    Write a table of points (a GeoDataFrame, or a lazy one with compute()) to a GeoPackage as ONE layer.
+
+    The columns named by an ISO date become `d` + YYYYMMDD, the TRE naming; every other column keeps its name. The points are
+    reprojected to crs (None keeps the table's own CRS). A lazy table is computed here, before the write. The `.gpkg` extension is
+    added when missing; the layer is named after the file unless layer is given. With overwrite an existing file is removed first.
+
+    Parameters
+    ----------
+    table : GeoDataFrame | dask-geopandas GeoDataFrame
+        The points, one row per point, with the date columns and the geometry.
+    filename : str
+        The output GeoPackage.
+    crs : str | int | None, optional
+        The CRS of the written points. Default 4326.
+    layer : str, optional
+        The layer name. Default: the file's stem.
+    overwrite : bool, optional
+        Replace an existing file. Default True. When False a new layer is added to the file, and an existing layer of the
+        same name gets the rows appended.
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> _table_to_geopackage(table, 'dates.gpkg', crs=4326)
+    """
+    names = {c: _tre_name(c) for c in table.columns}
+    if hasattr(table, 'compute'):
+        table = table.compute()
+    if not filename.lower().endswith('.gpkg'):
+        filename = filename + '.gpkg'
+    if layer is None:
+        layer = os.path.splitext(os.path.basename(filename))[0]
+    table = table.rename(columns=names)
+    if crs is not None:
+        table = table.to_crs(crs)
+    if overwrite and os.path.exists(filename):
+        os.remove(filename)
+    table.to_file(filename, layer=layer, driver='GPKG', mode='w' if overwrite else 'a')
 
 
 def gpkg_block(blocks, yv, xv, decimals):

@@ -204,9 +204,9 @@ class BatchComplex(BatchCore):
                     f'turn a rotation rate into a velocity')
 
             # t = 0 at the master (utils_fit1d.master_time_origin: smallest |B_perp|,
-            # else the first date); it is written to the model's `date`, which
-            # predict() reads as its origin
-            tyr, _master = utils_fit1d.master_time_origin(dday, bp)
+            # else the first date). The model records no epoch: predict() finds
+            # the same origin on the stack it predicts.
+            tyr, _ = utils_fit1d.master_time_origin(dday, bp)
 
             data_da = ds[pol]
             if data_da.dims[0] != 'date':
@@ -238,8 +238,6 @@ class BatchComplex(BatchCore):
                               ('rmse', stacked[3].real.astype(np.float32))):
                 mvars[nm_] = xr.DataArray(arr_, dims=('y', 'x'), coords=coords)
             mds = xr.Dataset(mvars, attrs=ds.attrs)
-            # the epoch the model is referenced to
-            mds = mds.assign_coords(date=np.datetime64(int(dday[_master]), 'D'))
             if 'spatial_ref' in ds.coords:
                 mds = mds.assign_coords(spatial_ref=ds.spatial_ref)
             model_result[burst_id] = mds
@@ -255,9 +253,19 @@ class BatchComplex(BatchCore):
 
             phi_d = velocity * t_d + height * ele2phase_d + Re(car_d * conj(seasonal))
 
-        with `car_d = exp(2j*pi*t_d)`, `t_d` in years from the first date, and
+        with `t_d` in years from the stack's origin date (the date of the
+        smallest |BPR| of THIS stack, whatever `baseline` says, the first date
+        without BPR), `car_d = exp(2j*pi*tc_d)` on CALENDAR years `tc_d` (days
+        since 1970-01-01 / 365.25, so the seasonal phase is the phase of the
+        calendar year and does not depend on the stack's start) and
         `ele2phase_d = BPR_d / median(R sin(incidence))` -- the same geometry
         fit1d_network() fitted against, so the two are exact inverses.
+
+        The model carries no epoch. The origin only sets the level of an
+        unreferenced series (the velocity term, one constant per pixel), and
+        every difference, `ref=` and pair prediction is independent of it. An
+        older stored model with a scalar `date` coordinate predicts as without
+        it: the value is ignored.
 
         The scatterer's constant phase is NOT part of the model: fit1d_network() profiles
         it out by rotation rather than gauging it to an epoch, so the prediction
@@ -380,43 +388,29 @@ class BatchComplex(BatchCore):
                     f"predict() needs {missing} in the model for '{key}'. "
                     "Pass the Batch returned by fit1d_network().")
 
-            # TIME ORIGIN MUST MATCH THE FIT. utils_fit1d zeroes t at the MASTER
-            # -- argmin|B_perp| -- not at the first date, because there the phase
-            # is zero by construction and the height term vanishes with the
-            # baseline carrying it. Velocity and height absorb an origin shift
-            # into the free constant, but car = exp(2j*pi*t) does NOT: getting
-            # this wrong rotates the fitted annual by exp(2j*pi*delta) and leaves
-            # a residual annual of amplitude 2|sin(pi*delta)|*|seasonal|, so
-            # removing the model ADDS a seasonal. Days, as the kernel uses,
-            # not seconds.
+            # THE ORIGIN OF t IS THE STACK'S OWN ZERO-BASELINE DATE, found here
+            # as trend2d() finds it: the date of the smallest |BPR|, read from the
+            # stack whatever `baseline` says -- that argument decides whether the
+            # height term is applied, not where time starts, so predict(model) and
+            # predict(model, baseline=None), the two calls inside mix(), share one
+            # origin. Without BPR it is the first date. The model records no epoch
+            # (a scalar `date` of an older stored model is not read). The origin
+            # sets the level of an unreferenced series only: the velocity term is
+            # one constant per pixel and every difference is independent of it.
+            # The ANNUAL term does not use it: it runs on calendar years, the time
+            # of the fit's annual columns (utils_fit1d.calendar_years), so its
+            # phase does not depend on this stack's start. Days, as the kernel
+            # uses, not seconds.
             dday = (np.asarray(ds.coords['date'].values)
                     .astype('datetime64[D]').astype(np.float64))
-            # BPR is read for the ORIGIN even when baseline is None -- that
-            # argument decides whether the height term is applied, not where
-            # time starts. With no baseline the kernel has B = zeros, so
-            # argmin|B| is index 0 and the origin is the first date; this
-            # reproduces that too.
             _b = None
-            if baseline and baseline in ds:
-                _b = np.asarray(ds[baseline].values, dtype=float)
+            if isinstance(ds, xr.Dataset) and 'BPR' in ds:
+                _b = np.asarray(ds['BPR'].values, dtype=float)
                 while _b.ndim > 1:
                     _b = np.nanmean(_b, axis=-1)
-            if _b is None or _b.shape != dday.shape:
-                _b = np.zeros_like(dday)
-            # THE MODEL CARRIES ITS OWN EPOCH, in a scalar `date` coordinate
-            # every fit writes -- the master for the per-date fits, the median
-            # acquisition for Batch.fit1d(), which sees only baseline
-            # DIFFERENCES and cannot recover argmin|B| from them. Reading it
-            # back is what makes predict() the exact inverse of whichever fit
-            # produced the model rather than of one of them. The fallback stays
-            # for a model written before the coordinate existed.
-            t0 = None
-            if 'date' in mds.coords and mds.coords['date'].ndim == 0:
-                t0 = float(np.asarray(mds.coords['date'].values)
-                           .astype('datetime64[D]').astype(np.float64))
-            if t0 is None:
-                t0 = float(dday[int(np.argmin(np.abs(_b)))])
-            t = utils_fit1d.model_time(dday, t0)
+            _, _m = utils_fit1d.master_time_origin(dday, _b)
+            t = utils_fit1d.model_time(dday, float(dday[_m]))
+            t_cal = utils_fit1d.calendar_years(dday)
 
             # ele2phase per date: BPR / median(R sin(inc)), and
             # elevation_phase() = 4 pi / (lambda R sin(inc))
@@ -443,7 +437,7 @@ class BatchComplex(BatchCore):
             # OPTIONAL: fit1d_network() fits an annual term and fit1d() does not, and
             # a model without the variable HAS none rather than an unknown one.
             sea = mds['seasonal'].data if 'seasonal' in mds else None
-            pred = utils_fit1d.predict_dates(vel, hgt, sea, t, ele2phase)
+            pred = utils_fit1d.predict_dates(vel, hgt, sea, t, ele2phase, t_cal)
             if ref is not None:
                 # WHICH ACQUISITION READS ZERO -- see the docstring. Every
                 # difference is invariant to this, so it cannot change a
@@ -460,10 +454,10 @@ class BatchComplex(BatchCore):
             # dimension 'x': length 2915 on the data but length 23330 on
             # coordinate 'x'". The planes are built from the model's rasters,
             # so the model's axes are the ones that describe them.
-            # BARE AXES, not the model's DataArrays. The model carries its epoch
-            # as a SCALAR `date` coordinate, and that scalar travels with any
-            # coordinate or variable taken from it -- which then collides with
-            # the `date` DIMENSION this prediction has:
+            # BARE AXES, not the model's DataArrays. A model stored before the fits
+            # dropped their epoch carries it as a SCALAR `date` coordinate, which
+            # travels with any coordinate or variable taken from it and then
+            # collides with the `date` DIMENSION this prediction has:
             # "dimension 'date' already exists as a scalar variable".
             coords = {'date': np.asarray(da_xr.coords['date'].values),
                       'y': np.asarray(mds.coords['y'].values),

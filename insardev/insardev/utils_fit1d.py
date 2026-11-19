@@ -266,14 +266,14 @@ def fit1d_pairs(data, A, weight=None, dh_prior=None, dh_col=None):
 
 def model_time(days, t0):
     """
-    Years from the epoch t0 on a day count: the time axis of predict(), (days - t0) / 365.25.
+    Years from the epoch t0 on a day count: the time axis of the velocity term, (days - t0) / 365.25.
 
     Parameters
     ----------
     days : np.ndarray
         Float64 days of the observations (a numpy datetime64[D] read as float).
     t0 : float
-        The epoch in the same days: the model's `date` coordinate, or the median or master date.
+        The epoch in the same days: the stack's zero-baseline (master) date, found on the predicted stack.
 
     Returns
     -------
@@ -285,6 +285,33 @@ def model_time(days, t0):
     >>> t = model_time(np.array([0.0, 365.25]), 0.0)
     """
     return ((days - t0) / 365.25).astype(np.float64)
+
+
+def calendar_years(days):
+    """
+    Calendar years of a day count: (days since 1970-01-01) / 365.25, the time axis of the annual term.
+
+    The one calendar time of the fit and of predict(): the annual columns of the pair fit and the annual term of
+    predict_dates() and predict_pairs() are built on it, so they are exact inverses and a fitted seasonal phase
+    means the same on every stack, whatever date the stack starts on. A phase phi peaks phi / (2 pi) of a year
+    after 1 January, to within a day. The velocity term keeps its own time (the years from the stack's origin
+    date, or t_rep - t_ref of a pair); this one carries no origin.
+
+    Parameters
+    ----------
+    days : np.ndarray
+        Days since 1970-01-01 (a numpy datetime64[D] read as float64).
+
+    Returns
+    -------
+    np.ndarray
+        Float64 years.
+
+    Examples
+    --------
+    >>> cal = calendar_years(np.array([0.0, 365.25]))
+    """
+    return np.asarray(days, dtype=np.float64) / 365.25
 
 
 def elevation_to_phase(baseline, wavelength, fac):
@@ -331,8 +358,8 @@ def _unpack(blocks, use_hgt, use_sea):
     return vel, hgt, sea
 
 
-def _predict_dates_block(*blocks, t, e2p, use_hgt, use_sea):
-    """All dates of one YX block: the dates looped in numpy inside the one task."""
+def _predict_dates_block(*blocks, t, e2p, use_hgt, use_sea, t_cal=None):
+    """All dates of one YX block: the dates looped in numpy inside the one task. The annual term runs on t_cal (t when None)."""
     vel, hgt, sea = _unpack(blocks, use_hgt, use_sea)
     out = np.empty((len(t),) + vel.shape, dtype=np.float32)
     for i in range(len(t)):
@@ -341,14 +368,14 @@ def _predict_dates_block(*blocks, t, e2p, use_hgt, use_sea):
             # height is NaN where no baseline was available; a NaN would poison the whole date
             phi = phi - np.nan_to_num(hgt) * float(e2p[i])
         if sea is not None:
-            car = np.exp(2j * np.pi * float(t[i]))
+            car = np.exp(2j * np.pi * float((t if t_cal is None else t_cal)[i]))
             phi = phi + (sea.real * car.real + sea.imag * car.imag)
         out[i] = phi
     return out
 
 
-def _predict_pairs_block(*blocks, t_ref, t_rep, e2p, use_hgt, use_sea):
-    """All pairs of one YX block: the pairs looped in numpy inside the one task."""
+def _predict_pairs_block(*blocks, t_ref, t_rep, e2p, use_hgt, use_sea, cal_ref=None, cal_rep=None):
+    """All pairs of one YX block: the pairs looped in numpy inside the one task. The annual terms run on cal_ref, cal_rep (t_ref, t_rep when None)."""
     vel, hgt, sea = _unpack(blocks, use_hgt, use_sea)
     out = np.empty((len(t_rep),) + vel.shape, dtype=np.float32)
     for i in range(len(t_rep)):
@@ -356,8 +383,10 @@ def _predict_pairs_block(*blocks, t_ref, t_rep, e2p, use_hgt, use_sea):
         phi = vel * float(t_rep[i] - t_ref[i])
         if e2p is not None:
             phi = phi - np.nan_to_num(hgt) * float(e2p[i])
-        dcos = float(np.cos(2 * np.pi * t_rep[i]) - np.cos(2 * np.pi * t_ref[i]))
-        dsin = float(np.sin(2 * np.pi * t_rep[i]) - np.sin(2 * np.pi * t_ref[i]))
+        a_ref = (t_ref if cal_ref is None else cal_ref)[i]
+        a_rep = (t_rep if cal_rep is None else cal_rep)[i]
+        dcos = float(np.cos(2 * np.pi * a_rep) - np.cos(2 * np.pi * a_ref))
+        dsin = float(np.sin(2 * np.pi * a_rep) - np.sin(2 * np.pi * a_ref))
         phi = phi + (sea.real * dcos + sea.imag * dsin)
         out[i] = phi
     return out
@@ -378,14 +407,14 @@ def _model_blockwise(kernel, n, vel, hgt, sea, use_hgt, use_sea, **kw):
                         use_hgt=use_hgt, use_sea=use_sea, **kw)
 
 
-def predict_dates(vel, hgt, sea, t, e2p):
+def predict_dates(vel, hgt, sea, t, e2p, t_cal=None):
     """
     Modelled phase per DATE, one plane per date: vel*t - hgt*e2p + the annual term.
 
     The per-date series of predict(), published as master*conj(date) so that it is the same radians
     displacement_los() converts: an SLC phase runs opposite to a pair in velocity and seasonal, and
     identical in height, whose per-date term +height*e2p already differences to -height*e2p per pair.
-    The annual term is Re(seasonal*conj(car)) with car = exp(2j*pi*t).
+    The annual term is Re(seasonal*conj(car)) with car = exp(2j*pi*t_cal), on calendar years (calendar_years()).
 
     Parameters
     ----------
@@ -396,9 +425,12 @@ def predict_dates(vel, hgt, sea, t, e2p):
     sea : dask array or np.ndarray or None
         Complex annual term per pixel, (y, x); None when the model has none.
     t : np.ndarray
-        Years of each date from the model epoch, float64 (n,).
+        Years of each date from the stack's origin date (the zero-baseline date), float64 (n,); the velocity term.
     e2p : np.ndarray or None
         Height-to-phase factor per date (n,); None leaves the height term out.
+    t_cal : np.ndarray or None
+        Calendar years of each date, calendar_years() of the day counts, float64 (n,); the annual term. None: the annual
+        runs on t, right only where t is already calendar years.
 
     Returns
     -------
@@ -408,20 +440,22 @@ def predict_dates(vel, hgt, sea, t, e2p):
     Examples
     --------
     >>> planes = predict_dates(vel, hgt, sea, t, e2p)
+    >>> planes = predict_dates(vel, hgt, sea, t, e2p, t_cal=calendar_years(np.array([0.0, 365.25])))
     """
     t = np.asarray(t, dtype=np.float64)
     e2p = None if e2p is None else np.asarray(e2p)
+    t_cal = None if t_cal is None else np.asarray(t_cal, dtype=np.float64)
     return _model_blockwise(_predict_dates_block, len(t), vel, hgt, sea, e2p is not None, sea is not None,
-                            t=t, e2p=e2p)
+                            t=t, e2p=e2p, t_cal=t_cal)
 
 
-def predict_pairs(vel, hgt, sea, t_ref, t_rep, e2p):
+def predict_pairs(vel, hgt, sea, t_ref, t_rep, e2p, cal_ref=None, cal_rep=None):
     """
     Modelled phase per PAIR, one plane per pair: vel*(t_rep - t_ref) - hgt*e2p + the annual difference.
 
     The pair convention of fit1d(): the columns of its design, so the prediction subtracts from the
     pairs directly. The annual term is Re(seasonal)*dcos + Im(seasonal)*dsin, with the cosine and sine
-    differences of the two epochs.
+    differences of the two epochs on calendar years (calendar_years()).
 
     Parameters
     ----------
@@ -432,11 +466,14 @@ def predict_pairs(vel, hgt, sea, t_ref, t_rep, e2p):
     sea : dask array or np.ndarray
         Complex annual term per pixel, (y, x); required (a model without it raises here).
     t_ref : np.ndarray
-        Years of each pair's reference date from the model epoch, float64 (n,).
+        Years of each pair's reference date, float64 (n,); the velocity term uses t_rep - t_ref, so no origin enters.
     t_rep : np.ndarray
-        Years of each pair's repeat date from the model epoch, float64 (n,).
+        Years of each pair's repeat date, float64 (n,).
     e2p : np.ndarray or None
         Height-to-phase factor per pair (n,); None leaves the height term out.
+    cal_ref, cal_rep : np.ndarray or None
+        Calendar years of each pair's reference and repeat date, calendar_years() of the day counts, float64 (n,); the
+        annual term. None: the annual runs on t_ref, t_rep, right only where those are already calendar years.
 
     Returns
     -------
@@ -446,12 +483,15 @@ def predict_pairs(vel, hgt, sea, t_ref, t_rep, e2p):
     Examples
     --------
     >>> planes = predict_pairs(vel, hgt, sea, t_ref, t_rep, e2p)
+    >>> planes = predict_pairs(vel, hgt, sea, t_ref, t_rep, e2p, cal_ref=calendar_years(np.array([0.0])), cal_rep=calendar_years(np.array([365.25])))
     """
     t_ref = np.asarray(t_ref, dtype=np.float64)
     t_rep = np.asarray(t_rep, dtype=np.float64)
     e2p = None if e2p is None else np.asarray(e2p)
+    cal_ref = None if cal_ref is None else np.asarray(cal_ref, dtype=np.float64)
+    cal_rep = None if cal_rep is None else np.asarray(cal_rep, dtype=np.float64)
     return _model_blockwise(_predict_pairs_block, len(t_rep), vel, hgt, sea, e2p is not None, sea is not None,
-                            t_ref=t_ref, t_rep=t_rep, e2p=e2p)
+                            t_ref=t_ref, t_rep=t_rep, e2p=e2p, cal_ref=cal_ref, cal_rep=cal_rep)
 
 
 def reference_plane(planes, index):
@@ -1740,6 +1780,11 @@ def _3d_fit_frame(date_values, bperp, geometry, n):
     Pulled out because the stages run in separate tasks under `union=True` and
     each has to rebuild the same frame; deriving it twice from the same inputs
     is exact, while passing it between tasks would let the two drift.
+
+    The last value, `car`, is exp(2j*pi*t) on the master-relative t and is not used:
+    the network fits no annual term. An annual term built from this frame must run
+    on calendar_years() of the day counts, not on t, or its phase would depend on
+    the stack's start (the pair fit and predict() build it that way).
     """
     t = np.asarray(date_values)
     if t.dtype.kind == 'M':
@@ -4268,16 +4313,15 @@ def _fit3d_level_report(level_id, infos, debug=False, tag=''):
     return tabs
 
 
-def _fit3d_model(ds, da_xr, both, date_values, bp):
+def _fit3d_model(ds, da_xr, both):
     """The six planes of one burst as the model dataset, variables named by
     QUANTITY alone. `both` is (6, y, x) complex64: label, velocity, height,
     seasonal, coherence, level -- the planes every stage writes.
 
     rmse is sqrt(-2 ln gamma), derived here rather than carried as a seventh
     plane: the two are exact inverses, so shipping both through the graph
-    would move the same information twice. The `date` coordinate is the
-    MASTER, where B_perp is smallest -- where the fit zeroes its t -- so
-    predict() reads the origin instead of reconstructing it.
+    would move the same information twice. The model carries no epoch:
+    predict() finds its origin on the stack it predicts.
     """
     import numpy as np
     import xarray as xr
@@ -4299,14 +4343,6 @@ def _fit3d_model(ds, da_xr, both, date_values, bp):
                       ('level', lv_)):
         mvars[nm_] = xr.DataArray(arr_, dims=('y', 'x'), coords=coords)
     mds = xr.Dataset(mvars, attrs=ds.attrs)
-    _dd = (np.asarray(date_values).astype('datetime64[D]')
-           .astype(np.float64))
-    _b3 = (np.zeros_like(_dd) if bp is None
-           else np.asarray(bp, float).ravel())
-    if _b3.shape != _dd.shape:
-        _b3 = np.zeros_like(_dd)
-    mds = mds.assign_coords(
-        date=np.datetime64(int(_dd[int(np.argmin(np.abs(_b3)))]), 'D'))
     if 'spatial_ref' in ds.coords:
         mds = mds.assign_coords(spatial_ref=ds.spatial_ref)
     return mds
@@ -4610,7 +4646,6 @@ def _fit3d_union(self, threshold, window, cell, baseline, level,
     chain = _s['chain']
     _kw_of, _kw_net = _s['kw_of'], _s['kw_net']
     _cores, _width = _s['cores'], _s['width']
-    date_values, bp = _s['date_values'], _s['bperp']
     # ---- LEVEL 1: the PS test over the WHOLE scene's candidates ------
     # The winner grids are merged onto one cell lattice and tested
     # together. A chunk here is a fraction of the PS extent wide, so a
@@ -4676,7 +4711,7 @@ def _fit3d_union(self, threshold, window, cell, baseline, level,
         both = da.concatenate(
             [da.concatenate([_cells[(key, i, j)] for j in range(_nc)],
                             axis=2) for i in range(_nr)], axis=1)
-        model_result[key] = _fit3d_model(ds, da_xr, both, date_values, bp)
+        model_result[key] = _fit3d_model(ds, da_xr, both)
     graph_check('_fit3d_union', model_result, self)
     return Batch(model_result)
 
@@ -5058,11 +5093,13 @@ _FIT1D_SCREEN_TOP = 0.01
 # ---------------------------------------------------------------------------
 
 def pair_time_origin(ref_days, rep_days):
-    """Median acquisition day of a pair set, and the pair epochs in years from it.
+    """Median acquisition day of a pair set, and the pair epochs in years from it: the time of the rate.
 
     ref_days, rep_days: float64[n] acquisition days of each pair's reference and
     repeat. Returns (t0_day, t_ref, t_rep). The master is not recoverable from
-    differences, so the median acquisition is the origin (days, as elsewhere).
+    differences, so the median acquisition is the origin of the rate column
+    (t_rep - t_ref, which no origin changes). The annual columns do not use it:
+    they run on calendar_years().
     """
     t0_day = float(np.median(np.unique(np.concatenate([ref_days, rep_days]))))
     t_ref = (ref_days - t0_day) / 365.25
@@ -5079,20 +5116,26 @@ def ele2phase(bp, lam, fac):
     return bp / ((4.0 * np.pi / lam) / fac)
 
 
-def fit1d_pair_design(e2p, t_ref, t_rep, seasonal):
+def fit1d_pair_design(e2p, t_ref, t_rep, seasonal, cal_ref=None, cal_rep=None):
     """Design matrix of the pair model, float64[n, k].
 
     Columns: the rate (t_rep - t_ref), the height (-e2p) when e2p is not None,
-    and the annual cos/sin differences when `seasonal` is true.
+    and the annual cos/sin differences when `seasonal` is true. The annual
+    columns run on calendar years, cal_ref and cal_rep (calendar_years() of the
+    pair days), so the fitted seasonal phase is the phase of the calendar year on
+    every stack; None takes t_ref, t_rep, right only where those are calendar
+    years. predict_pairs() builds the same columns.
     """
     dt = t_rep - t_ref
+    a_ref = t_ref if cal_ref is None else cal_ref
+    a_rep = t_rep if cal_rep is None else cal_rep
     cols = [dt]
     has_h = e2p is not None
     if has_h:
         cols.append(-e2p)
     if seasonal:
-        cols.append(np.cos(2 * np.pi * t_rep) - np.cos(2 * np.pi * t_ref))
-        cols.append(np.sin(2 * np.pi * t_rep) - np.sin(2 * np.pi * t_ref))
+        cols.append(np.cos(2 * np.pi * a_rep) - np.cos(2 * np.pi * a_ref))
+        cols.append(np.sin(2 * np.pi * a_rep) - np.sin(2 * np.pi * a_ref))
     return np.stack(cols, axis=1).astype(np.float64)
 
 

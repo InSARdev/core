@@ -769,14 +769,14 @@ class Batch(BatchCore):
               `coherence`  exp(-rmse^2/2) of the reported model
               `rmse`       sqrt(-2 ln coherence), radians, n/(n-k) inflated
 
-            plus a scalar `date` coordinate: the epoch the model is
-            referenced to, which is what every fit here carries so predict()
-            never has to guess. A pairs batch holds only baseline DIFFERENCES,
-            so the master that fit1d_network() anchors on is not recoverable from it and
-            the median acquisition is used instead -- recorded rather than
-            assumed. Rate and height are indifferent to the origin; the annual
-            is not, and a model fitted on one origin and removed on another
-            leaves a residual annual of 2|sin(pi delta)| |seasonal|.
+            The model carries no epoch. Rate and height need none (a pair is a
+            difference), and the annual is built on CALENDAR time: its columns
+            run on years = (days since 1970-01-01) / 365.25, so `seasonal` has
+            the phase of the calendar year whatever date the pair set starts
+            on, and a model fitted on one stack is removed from another with no
+            origin to agree on. The phase phi of seasonal = |s| exp(i phi) puts
+            the peak of the annual |s| cos(2 pi t - phi) phi / (2 pi) of a year
+            after 1 January, to within a day.
 
             The model keeps the data's (y, x) chunks: one task per block holds all its pairs; chunk2d() sizes the blocks.
 
@@ -836,9 +836,10 @@ class Batch(BatchCore):
                   .astype('datetime64[D]').astype(np.float64))
             pd_ = (np.asarray(pd.to_datetime(da_.coords['rep'].values).values)
                    .astype('datetime64[D]').astype(np.float64))
-            # the median acquisition origin (utils_fit1d.pair_time_origin): the master
-            # is not recoverable from differences
-            t0_day, t_ref, t_rep = utils_fit1d.pair_time_origin(rd, pd_)
+            # the rate time: years about the median acquisition (utils_fit1d.pair_time_origin;
+            # t_rep - t_ref needs no origin). The annual runs on calendar years instead
+            _, t_ref, t_rep = utils_fit1d.pair_time_origin(rd, pd_)
+            cal_ref, cal_rep = utils_fit1d.calendar_years(rd), utils_fit1d.calendar_years(pd_)
 
             if 'radar_wavelength' not in ds:
                 raise KeyError(
@@ -908,7 +909,7 @@ class Batch(BatchCore):
             # ever appear in the diagnostic printed below.
             has_h = e2p is not None
             fit_seasonal = bool(max_seasonal and max_seasonal > 0)
-            A = utils_fit1d.fit1d_pair_design(e2p, t_ref, t_rep, fit_seasonal)
+            A = utils_fit1d.fit1d_pair_design(e2p, t_ref, t_rep, fit_seasonal, cal_ref, cal_rep)
             k = A.shape[1]
             if A.shape[0] < k + 1:
                 raise ValueError(
@@ -925,7 +926,7 @@ class Batch(BatchCore):
             terms = 'velocity' + (', height' if has_h else '') \
                 + (', seasonal' if fit_seasonal else '')
             msg = (f"fit1d('{key}'): {A.shape[0]} pairs, {k} parameters "
-                   f"({terms}), date {np.datetime64(int(t0_day), 'D')}\n"
+                   f"({terms})\n"
                    f"  per radian of residual the design gives "
                    f"sigma_velocity {s_v:.3f} mm/yr"
                    + (f", sigma_height {s_h:.3f} m" if has_h else "")
@@ -976,7 +977,6 @@ class Batch(BatchCore):
                               ('rmse', res[4].real.astype(np.float32))):
                 mvars[nm_] = xr.DataArray(arr_, dims=('y', 'x'), coords=coords)
             mds = xr.Dataset(mvars, attrs=ds.attrs)
-            mds = mds.assign_coords(date=np.datetime64(int(t0_day), 'D'))
             if 'spatial_ref' in ds.coords:
                 mds = mds.assign_coords(spatial_ref=ds.spatial_ref)
             model_result[key] = mds
@@ -1009,11 +1009,16 @@ class Batch(BatchCore):
         -height*ele2phase_p. That asymmetry is why no global sign converts one
         into the other.
 
-        The epoch comes from the model's scalar `date` coordinate, which every
-        fit records, so a model fitted against one origin is never removed
-        against another. Only the annual cares, and it cares completely: a
-        mismatch of delta years leaves a residual annual of
-        2|sin(pi delta)|*|seasonal|.
+        The model carries no epoch, and none is needed. The annual term runs on
+        CALENDAR time, (days since 1970-01-01) / 365.25, the time of the fit's
+        annual columns, so a model fitted on one stack is removed from any other
+        with the same phase. A pair prediction uses no origin at all (the rate
+        is t_rep - t_ref). A per-date prediction takes the origin of its velocity
+        term from the predicted stack: the date of the smallest |BPR| of the
+        stack, whatever `baseline` says, the first date without BPR; it sets the
+        level of an unreferenced series only. An older stored model that still
+        has a scalar `date` coordinate predicts as without it: the value is
+        ignored.
 
         Parameters
         ----------
@@ -1028,7 +1033,7 @@ class Batch(BatchCore):
 
         ref : None, int, str or datetime
             Which acquisition reads zero in the returned per-date series.
-            None keeps the model's own anchor -- the master, where B_perp is
+            None keeps the stack's own anchor -- the master, where B_perp is
             smallest and the height term vanishes with the baseline that
             carries it. That is the right anchor for the FIT and an awkward one
             to look at, since the series then runs negative before the master
@@ -1087,21 +1092,14 @@ class Batch(BatchCore):
             lam = float(np.asarray(ds['radar_wavelength'].values).ravel()[0])
             meter2rad = 4.0 * np.pi / lam
 
-            # the epoch the model was fitted against
-            t0 = None
-            if 'date' in mds.coords and mds.coords['date'].ndim == 0:
-                t0 = float(np.asarray(mds.coords['date'].values)
-                           .astype('datetime64[D]').astype(np.float64))
-
             if per_pair:
                 rd = (np.asarray(pd.to_datetime(da_.coords['ref'].values).values)
                       .astype('datetime64[D]').astype(np.float64))
                 pd_ = (np.asarray(pd.to_datetime(da_.coords['rep'].values).values)
                        .astype('datetime64[D]').astype(np.float64))
-                if t0 is None:
-                    t0 = float(np.median(np.unique(np.concatenate([rd, pd_]))))
-                t_ref = utils_fit1d.model_time(rd, t0)
-                t_rep = utils_fit1d.model_time(pd_, t0)
+                # a pair needs no origin: the rate is t_rep - t_ref and the annual is calendar time
+                t_ref = utils_fit1d.calendar_years(rd)
+                t_rep = utils_fit1d.calendar_years(pd_)
                 bp = None
                 for src in (da_.coords, ds):
                     if baseline and baseline in src:
@@ -1115,11 +1113,18 @@ class Batch(BatchCore):
                     bp = np.asarray(ds[baseline].values, dtype=float)
                     while bp.ndim > 1:
                         bp = np.nanmean(bp, axis=-1)
-                if t0 is None:
-                    _b = bp if (bp is not None and bp.shape == dday.shape) \
-                        else np.zeros_like(dday)
-                    t0 = float(dday[int(np.argmin(np.abs(_b)))])
-                t_d = utils_fit1d.model_time(dday, t0)
+                # THE ORIGIN OF t: the stack's own zero-baseline date, the smallest |BPR| read
+                # from the stack whatever `baseline` says (as BatchComplex.predict and trend2d
+                # do), so predict(model) and predict(model, baseline=None) share one origin;
+                # the first date without BPR. The model records no epoch.
+                _bpr = None
+                if isinstance(ds, xr.Dataset) and 'BPR' in ds:
+                    _bpr = np.asarray(ds['BPR'].values, dtype=float)
+                    while _bpr.ndim > 1:
+                        _bpr = np.nanmean(_bpr, axis=-1)
+                _, _m = utils_fit1d.master_time_origin(dday, _bpr)
+                t_d = utils_fit1d.model_time(dday, float(dday[_m]))
+                t_cal = utils_fit1d.calendar_years(dday)
 
             # ele2phase = B_perp / median(R sin(incidence)), from
             # elevation_phase() = 4 pi / (lambda R sin(inc))
@@ -1158,9 +1163,10 @@ class Batch(BatchCore):
             # a model without the variable HAS none rather than an unknown one.
             sea = mds['seasonal'].data if 'seasonal' in mds else None
             if per_pair:
+                # t_ref, t_rep are calendar years: the annual runs on them as they are
                 pred = utils_fit1d.predict_pairs(vel, hgt, sea, t_ref, t_rep, e2p)
             else:
-                pred = utils_fit1d.predict_dates(vel, hgt, sea, t_d, e2p)
+                pred = utils_fit1d.predict_dates(vel, hgt, sea, t_d, e2p, t_cal)
             if ref is not None:
                 if per_pair:
                     raise TypeError(
@@ -1171,8 +1177,9 @@ class Batch(BatchCore):
                 pred = utils_fit1d.reference_plane(pred, _i)
 
             dim = 'pair' if per_pair else 'date'
-            # BARE axes: the model's scalar `date` coordinate travels with any
-            # DataArray taken from it and then collides with a `date` dimension
+            # BARE axes: the scalar `date` coordinate of a model stored before the fits dropped
+            # their epoch travels with any DataArray taken from it and then collides with a
+            # `date` dimension
             coords = {dim: np.asarray(da_.coords[dim].values),
                       'y': np.asarray(mds.coords['y'].values),
                       'x': np.asarray(mds.coords['x'].values)}
