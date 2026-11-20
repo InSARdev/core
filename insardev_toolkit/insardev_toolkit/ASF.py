@@ -514,6 +514,10 @@ _ASF_BURST_HOST = 'https://sentinel1-burst.asf.alaska.edu'
 # Cloudflare Worker cache proxy for NISAR (handles auth internally)
 # API: /GRANULE_ID/OFFSET.bin → 128MB block at OFFSET
 _NISAR_CACHE_PROXY = 'https://nisar-cache-asf.insar.dev'
+# The first request of a NISAR granule's metadata (64 MiB, _NisarRemoteFile): the superblock and most of the structure
+_NISAR_HEAD_BYTES = 64 * 1024 * 1024
+# The page of every further metadata read of a NISAR granule (16 MiB, _NisarRemoteFile): the structure past the head
+_NISAR_PAGE_BYTES = 16 * 1024 * 1024
 # The largest byte range the NISAR direct route reads at once (64 MiB): one block of chunks, written before the next is read
 _NISAR_BLOCK_BYTES = 64 * 1024 * 1024
 # Cloudflare Worker cache proxy for ALOS-2 (handles auth internally)
@@ -564,6 +568,308 @@ _NISAR_NAME = re.compile(
     r'_(?P<direction>[AD])_(?P<frame>\d{3})_(?P<mode>\d{4})_(?P<polarization>[A-Z]{4})_(?P<x>[A-Z])'
     r'_(?P<start>\d{8}T\d{6})_(?P<stop>\d{8}T\d{6})_(?P<crid>[A-Z]\d{5})_(?P<processing>[A-Z])'
     r'_(?P<coverage>[A-Z])_(?P<source>[A-Z])_(?P<counter>\d{3})$')
+
+
+class _NisarRemoteFile(io.RawIOBase):
+    """A read-only, seekable file over one remote NISAR granule, for h5py: `h5py.File(remote, 'r')` reads the granule's
+    metadata wherever the granule stores it, without downloading the granule.
+
+    Design: on creation the first _NISAR_HEAD_BYTES (64 MiB, at most the file) are read in one request; they hold the
+    HDF5 superblock, whose end-of-file address is the size of the file, and most of the structure (groups, object
+    headers, chunk indexes). Every later read of bytes that are not kept fetches the _NISAR_PAGE_BYTES-aligned pages
+    (16 MiB, the last page clipped at the size) that cover them, one request per missing page: the structure past the
+    head arrives on demand. prefetch(ranges) fetches the given byte ranges that are not kept (the values of the metadata
+    datasets, which a granule may store gigabytes past its structure) in ONE request of the route, and keeps them as
+    they are. Everything fetched is kept for the life of the object (one granule); the requests and bytes fetched are
+    counted in the attributes requests and bytes_read.
+
+    Every network operation is the route's read_ranges(ranges): it takes a list of (offset, length) and returns a list
+    of bytes of exactly those lengths, with the route's own retries.
+
+    Examples
+    --------
+    >>> remote = _NisarRemoteFile(lambda ranges: [data[offset:offset + length] for offset, length in ranges])
+    """
+
+    def __init__(self, read_ranges, size=None):
+        """
+        Parameters
+        ----------
+        read_ranges : callable
+            read_ranges(ranges) -> a list of bytes, one per (offset, length) of ranges, of exactly that length: one
+            network operation of the route, with its retries.
+        size : int or None
+            The size of the file when the route knows it (the direct route's HEAD); None reads it from the superblock.
+
+        Raises
+        ------
+        IOError
+            When the head does not start with the HDF5 signature (the route retries it), or a read gives other
+            lengths than the ones asked for.
+        ValueError
+            When size is given and differs from the end-of-file address of the superblock, or the superblock version
+            is not 0, 1, 2 or 3.
+
+        Examples
+        --------
+        >>> _NisarRemoteFile(read_ranges, size=file_size)
+        """
+        import struct
+        super().__init__()
+        self._read_ranges = read_ranges
+        self._position = 0
+        # page index -> the bytes of the page; the ranges of prefetch: sorted starts and (start, end, bytes)
+        self._pages = {}
+        self._starts = []
+        self._ranges = []
+        self.requests = 0
+        self.bytes_read = 0
+        length = _NISAR_HEAD_BYTES if size is None else min(_NISAR_HEAD_BYTES, size)
+        head = self._fetch([(0, length)])[0]
+        if not bytes(head[:8]) == b'\x89HDF\r\n\x1a\n':
+            raise IOError(f'NISAR metadata is not HDF5: the first bytes are {bytes(head[:100])!r}')
+        # the end-of-file address of the superblock (little-endian unsigned 64 bit): version 0 at bytes 40-48,
+        # version 1 at 44-52 (4 more bytes of the indexed storage K), versions 2 and 3 at 28-36
+        version = head[8]
+        field = {0: 40, 1: 44, 2: 28, 3: 28}.get(version)
+        if field is None:
+            raise ValueError(f'NISAR metadata: HDF5 superblock version {version} is not supported')
+        eof = struct.unpack('<Q', bytes(head[field:field + 8]))[0]
+        if size is not None and size != eof:
+            raise ValueError(f'NISAR file size {size} differs from the end of file {eof} of its HDF5 superblock')
+        self.size = eof
+        # the head kept as pages (a head padded past a smaller file is cut at its end)
+        view = memoryview(head)[:min(len(head), eof)]
+        for k in range(0, len(view), _NISAR_PAGE_BYTES):
+            self._pages[k // _NISAR_PAGE_BYTES] = view[k:k + _NISAR_PAGE_BYTES]
+
+    def _fetch(self, ranges):
+        """
+        The bytes of the ranges by one call of read_ranges, counted in requests and bytes_read.
+
+        Parameters
+        ----------
+        ranges : list of tuple
+            (offset, length) of each range.
+
+        Returns
+        -------
+        list of bytes
+            The bytes of each range.
+
+        Raises
+        ------
+        IOError
+            When read_ranges gives other lengths than the ones asked for.
+
+        Examples
+        --------
+        >>> remote._fetch([(0, 16)])
+        """
+        data = self._read_ranges(list(ranges))
+        if len(data) != len(ranges) or any(len(d) != n for d, (_, n) in zip(data, ranges)):
+            raise IOError(f'NISAR metadata read: got {[len(d) for d in data]} bytes for the ranges {list(ranges)}')
+        self.requests += 1
+        self.bytes_read += sum(n for _, n in ranges)
+        return data
+
+    def _range(self, start, end):
+        """
+        The kept range of prefetch that holds the bytes start..end, as (its start, its bytes), or None.
+
+        Parameters
+        ----------
+        start : int
+            First byte.
+        end : int
+            Byte after the last one.
+
+        Returns
+        -------
+        tuple or None
+            (range start, range bytes) or None.
+
+        Examples
+        --------
+        >>> remote._range(0, 16)
+        """
+        import bisect
+        i = bisect.bisect_right(self._starts, start) - 1
+        if i >= 0:
+            first, last, data = self._ranges[i]
+            if end <= last:
+                return first, data
+        return None
+
+    def _pieces(self, start, end, fetch=True):
+        """
+        The bytes start..end as pieces, page by page: a kept page, else a kept range of prefetch, else (fetch) the page
+        fetched now and kept.
+
+        Parameters
+        ----------
+        start : int
+            First byte.
+        end : int
+            Byte after the last one, at most the size.
+        fetch : bool
+            True fetches the missing pages; False gives None when a piece is not kept.
+
+        Returns
+        -------
+        list of memoryview or None
+            The pieces in order, or None (fetch False) when some bytes are not kept.
+
+        Examples
+        --------
+        >>> remote._pieces(0, 16)
+        """
+        pieces = []
+        page = _NISAR_PAGE_BYTES
+        for k in range(start // page, (end - 1) // page + 1):
+            a, b = max(start, k * page), min(end, (k + 1) * page)
+            if k not in self._pages:
+                kept = self._range(a, b)
+                if kept is not None:
+                    first, data = kept
+                    pieces.append(memoryview(data)[a - first:b - first])
+                    continue
+                if not fetch:
+                    return None
+                length = min(page, self.size - k * page)
+                self._pages[k] = memoryview(self._fetch([(k * page, length)])[0])
+            pieces.append(self._pages[k][a - k * page:b - k * page])
+        return pieces
+
+    def prefetch(self, ranges):
+        """
+        Fetch the given byte ranges that are not kept in ONE call of read_ranges and keep them as they are (not as
+        pages); ranges past the end of the file are cut at it, empty ones ignored.
+
+        Parameters
+        ----------
+        ranges : iterable of tuple
+            (offset, length) of each range, such as the storage of the values of the metadata datasets.
+
+        Examples
+        --------
+        >>> remote.prefetch([(0, 16), (1024, 16)])
+        """
+        import bisect
+        missing = set()
+        for offset, length in ranges:
+            length = min(length, self.size - offset)
+            if offset < 0 or length <= 0:
+                continue
+            if self._pieces(offset, offset + length, fetch=False) is None:
+                missing.add((offset, length))
+        if not missing:
+            return
+        missing = sorted(missing)
+        for (offset, length), data in zip(missing, self._fetch(missing)):
+            i = bisect.bisect_right(self._starts, offset)
+            self._starts.insert(i, offset)
+            self._ranges.insert(i, (offset, offset + length, data))
+
+    def readable(self):
+        """
+        Whether the file can be read: always True.
+
+        Examples
+        --------
+        >>> remote.readable()
+        True
+        """
+        return True
+
+    def seekable(self):
+        """
+        Whether the file supports seek: always True.
+
+        Examples
+        --------
+        >>> remote.seekable()
+        True
+        """
+        return True
+
+    def tell(self):
+        """
+        The current position in the file.
+
+        Examples
+        --------
+        >>> remote.tell()
+        """
+        return self._position
+
+    def seek(self, offset, whence=0):
+        """
+        Move the position: from the start (whence 0), the current position (1) or the end (2).
+
+        Parameters
+        ----------
+        offset : int
+            The offset in bytes.
+        whence : int, optional
+            0, 1 or 2 as io.IOBase.seek. Default 0.
+
+        Returns
+        -------
+        int
+            The new position.
+
+        Raises
+        ------
+        ValueError
+            For another whence or a negative position.
+
+        Examples
+        --------
+        >>> remote.seek(0, 2)
+        """
+        if whence == 0:
+            position = offset
+        elif whence == 1:
+            position = self._position + offset
+        elif whence == 2:
+            position = self.size + offset
+        else:
+            raise ValueError(f'whence {whence} is not 0, 1 or 2')
+        if position < 0:
+            raise ValueError(f'negative seek position {position}')
+        self._position = position
+        return position
+
+    def readinto(self, buffer):
+        """
+        Read bytes from the current position into a buffer: the bytes not kept are fetched as the pages that cover
+        them.
+
+        Parameters
+        ----------
+        buffer : bytearray or memoryview
+            The buffer to fill.
+
+        Returns
+        -------
+        int
+            The number of bytes read: 0 at the end of the file.
+
+        Examples
+        --------
+        >>> remote.readinto(bytearray(96))
+        """
+        n = min(len(buffer), max(0, self.size - self._position))
+        if n == 0:
+            return 0
+        out = memoryview(buffer).cast('B')
+        pos = 0
+        for piece in self._pieces(self._position, self._position + n):
+            out[pos:pos + len(piece)] = piece
+            pos += len(piece)
+        self._position += n
+        return n
 
 
 class ASF(progressbar_joblib):
@@ -2199,7 +2505,12 @@ class ASF(progressbar_joblib):
         """Internal: Download NISAR RSLC granules with per-polarization output.
 
         With an account (the direct route) each granule is read through HTTP Range requests on one login session:
-        1. Its size (HEAD) and its first 128 MB, which hold the metadata and the chunk byte offsets.
+        1. Its size (HEAD) and its metadata, read by h5py through _NisarRemoteFile wherever the granule stores it (no
+           128 MB limit): a 64 MiB head (_NISAR_HEAD_BYTES), 16 MiB pages (_NISAR_PAGE_BYTES) on demand for the rest
+           of the structure (the chunk byte offsets, the geolocation grid), and the values of the copied metadata
+           datasets in one batch of ranges, merged into regions of at most _NISAR_BLOCK_BYTES (gaps up to 16 MB read
+           through), one Range request each. The copy omits metadata/RFI (see _read_nisar_metadata_direct). The
+           metadata progress bar counts the bytes fetched.
         2. Its data in blocks of at most _NISAR_BLOCK_BYTES (64 MiB): the chunks (all of them, or those the bbox
            reaches) merged into chunk-aligned regions (ASF._nisar_merge_chunks_to_regions, gaps up to 16 MB read
            through), one Range request each; the chunks of a block are written to the output at once
@@ -2271,7 +2582,6 @@ class ASF(progressbar_joblib):
         import numpy as np
         import pandas as pd
         from tqdm.auto import tqdm
-        from io import BytesIO
         from datetime import datetime, timedelta
         import os
         import time
@@ -2378,23 +2688,62 @@ class ASF(progressbar_joblib):
 
             file_size = read(f'{granule_id} size', size)
 
-            # Download 128MB metadata block (same as cache path) with progress bar
-            with tqdm(total=128*1024*1024, unit='B', unit_scale=True,
-                      desc=f"{short_name} metadata", leave=False,
-                      dynamic_ncols=False, ncols=80, mininterval=0.3, smoothing=0,
-                      disable=(position is not None)) as meta_pbar:
-                meta_bar = meta_pbar if position is None else None
-                layout, metadata_buffer = read(f'{granule_id} metadata', lambda: self._detect_nisar_layout_fast(
-                    url, auth_tuple, file_size, http_session=http_session, pbar=meta_bar,
-                    min_rate=min_rate, min_rate_window=min_rate_window
-                ), meta_bar)
+            # the signed URL of a read is the one the next read uses (the metadata reads and the data blocks)
+            signed_url = None
+            # the metadata progress bar of the current stage: the bytes the metadata reads fetch (no fixed total)
+            meta_bar = [None]
+
+            def metadata_bar():
+                """A progress bar of the metadata bytes fetched, current while it is open: its total grows by each
+                region before it is read."""
+                bar = tqdm(total=0, unit='B', unit_scale=True, desc=f"{short_name} metadata", leave=False,
+                           dynamic_ncols=False, ncols=80, mininterval=0.3, smoothing=0,
+                           disable=(position is not None))
+                meta_bar[0] = bar if position is None else None
+                return bar
+
+            def read_ranges(ranges):
+                """The bytes of each (offset, length) of ranges (_NisarRemoteFile): the ranges merged into regions of
+                at most _NISAR_BLOCK_BYTES (gaps up to 16 MB read through), each region read on its own (read, with its
+                attempts), then each range sliced out of its region."""
+                import bisect
+                regions = []
+                for start, length, _ in ASF._nisar_merge_chunks_to_regions(
+                        [(int(o), int(n)) for o, n in ranges], 16 * 1024 * 1024, max_size=_NISAR_BLOCK_BYTES):
+                    end = start + length
+                    if meta_bar[0] is not None:
+                        meta_bar[0].total += length
+                        meta_bar[0].refresh()
+
+                    def fetch(start=start, end=end):
+                        nonlocal signed_url
+                        data, signed_url = ASF._byte_range(
+                            url, start, end, auth_tuple, min_rate, min_rate_window,
+                            pbar=meta_bar[0], http_session=http_session, signed_url=signed_url
+                        )
+                        # the head of the granule is HDF5, or the answer is broken (retried)
+                        if start == 0 and not data.startswith(b'\x89HDF'):
+                            raise IOError(f'Server returned invalid response (not HDF5): {bytes(data[:100])!r}')
+                        return data
+
+                    regions.append((start, read(f'{granule_id} metadata bytes {start}..{end}', fetch, meta_bar[0])))
+                starts = [r[0] for r in regions]
+                out = []
+                for offset, length in ranges:
+                    start, data = regions[bisect.bisect_right(starts, offset) - 1]
+                    out.append(data[offset - start:offset - start + length])
+                return out
+
+            # the metadata through a file object over the granule: its 64 MiB head, then pages on demand
+            with metadata_bar():
+                remote = _NisarRemoteFile(read_ranges, size=file_size)
 
             if debug and position is None:
-                print(f"  File size: {file_size/(1024**3):.2f} GB, Layout: {layout}, Metadata: 128MB")
+                print(f"  File size: {file_size/(1024**3):.2f} GB, metadata head: "
+                      f"{remote.bytes_read/(1024**2):.0f} MiB")
 
-            # Get available polarizations from metadata buffer (no remote access)
-            from io import BytesIO
-            with h5py.File(BytesIO(bytes(metadata_buffer)), 'r') as h5_meta:
+            # Get available polarizations from the granule's metadata
+            with metadata_bar(), h5py.File(remote, 'r') as h5_meta:
                 swaths_path = 'science/LSAR/RSLC/swaths'
                 if swaths_path not in h5_meta:
                     raise ValueError(
@@ -2447,11 +2796,8 @@ class ASF(progressbar_joblib):
                 freq_str = '+'.join(f for f in freq_list if f == 'A' or (f == 'B' and has_freq_b))
                 print(f"NISAR {track}_{frame}: downloading {pols_to_download} (frequency{freq_str})")
 
-            if layout != 'A':
-                raise NotImplementedError(f"NISAR Layout B (metadata at end) not supported: {granule_id}")
-
-            # Layout A: metadata at start - use 128MB buffer for everything
-            with h5py.File(BytesIO(bytes(metadata_buffer)), 'r') as h5_meta:
+            # the chunk indexes and the geolocation grid through the same file object
+            with metadata_bar(), h5py.File(remote, 'r') as h5_meta:
                 # Get chunk info for pols we're actually downloading
                 all_chunk_info = {}
                 for pol in pols_to_download:
@@ -2463,7 +2809,7 @@ class ASF(progressbar_joblib):
                         chunk_info_b = get_chunk_info(h5_meta, pol, 'B')
                     all_chunk_info[pol] = (chunk_info_a, chunk_info_b)
 
-                # Calculate bbox pixel indices if bbox provided (uses geolocationGrid from 128MB buffer)
+                # Calculate bbox pixel indices if bbox provided (uses the granule's geolocationGrid)
                 bbox_info = None
                 if bbox is not None:
                     first_ci_a = next((ci_a for ci_a, _ in all_chunk_info.values() if ci_a), None)
@@ -2529,7 +2875,6 @@ class ASF(progressbar_joblib):
                 # Download and write each polarization
                 downloaded_files = []
                 os.makedirs(out_dir, exist_ok=True)
-                signed_url = None  # Will be extracted from first request and reused
 
                 for pol in pols_to_download:
                     out_name = f"NSR_{track:03d}_{frame:03d}_{datetime_str}_{pol}.h5"
@@ -2553,8 +2898,9 @@ class ASF(progressbar_joblib):
                                   f"Data: {total_data_b/(1024**3):.2f} GB, "
                                   f"Span: {span_size_b/(1024**3):.2f} GB ({overhead_b:.1f}% overhead)")
 
-                    # Read metadata from pre-downloaded buffer (no remote access)
-                    metadata = self._read_nisar_metadata_direct(pol, metadata_buffer)
+                    # the metadata of the polarization: the values of its datasets fetched in one batch of ranges
+                    with metadata_bar():
+                        metadata = self._read_nisar_metadata_direct(pol, remote)
 
                     write_debug = debug and (position is None)
                     if write_debug:
@@ -2614,6 +2960,13 @@ class ASF(progressbar_joblib):
         When bbox is provided, downloads only the aligned blocks covering the bbox.
         For full downloads, also uses aligned blocks to maximize cache efficiency.
 
+        The metadata of a granule is read by h5py through _NisarRemoteFile wherever the granule stores it (no 128 MB
+        limit): a 64 MiB head (_NISAR_HEAD_BYTES) and 16 MiB pages (_NISAR_PAGE_BYTES) on demand for the structure,
+        each by the single-block API, and the values of the copied metadata datasets in one batch: one multi-offset
+        request, or as few as the proxy's limits allow (at most _NISAR_HEAD_BYTES per request; a total below 1 MiB, the
+        proxy's minimum, is padded with bytes of the file around the ranges, which are discarded). Every request has the
+        retries of the route. The copy omits metadata/RFI (see _read_nisar_metadata_direct).
+
         Parameters
         ----------
         basedir : str
@@ -2657,14 +3010,11 @@ class ASF(progressbar_joblib):
         import numpy as np
         import pandas as pd
         from tqdm.auto import tqdm
-        from io import BytesIO
         import os
-        import struct
         import time
         from joblib import Parallel, delayed
         from .HTTP import final, attempts, send, read_body, MAGIC_HDF5
 
-        MAX_BLOCK = 128 * 1024 * 1024  # 128 MB max block
         # Minimum total of a multi-range request (.../ranges.bin), the proxy's own message: "Total size 426567 below min 1048576".
         # A block below it is fetched chunk by chunk with the single-range form (.../OFFSET/LENGTH.bin): measured on 2026-10-12,
         # the proxy answers the two chunks of the failing block (228477 and 198090 bytes) with HTTP 200.
@@ -2884,27 +3234,93 @@ class ASF(progressbar_joblib):
                         raise
                     time.sleep(timeout_second)
 
-        def fetch_metadata(granule_id):
-            """The metadata block of a granule (ASF._cache_range); a body that is not HDF5 is retried, as a
-            broken transfer."""
-            def request():
-                content, cache_hit = ASF._cache_range(_NISAR_CACHE_PROXY, granule_id, 0, MAX_BLOCK, min_rate,
-                                                      min_rate_window)
-                if not content.startswith(MAGIC_HDF5):
-                    raise IOError(f'Cache returned invalid metadata (not HDF5): {content[:100]!r}')
-                return content, cache_hit
-            return retried('metadata', request)
+        # The most bytes of one metadata request to the proxy (single-block or multi-offset): 64 MiB, below the proxy's
+        # 128 MB top limit
+        MAX_METADATA_REQUEST = _NISAR_HEAD_BYTES
+        # The longest list of ranges of one multi-offset metadata request, in characters of its URL path
+        MAX_METADATA_RANGES_CHARS = 8192
 
-        def patch_hdf5_superblock(data):
-            """Patch HDF5 superblock EOF to match buffer size."""
-            data = bytearray(data)
-            version = data[8]
-            if version == 0:
-                data[40:48] = struct.pack('<Q', len(data))
-            else:
-                data[28:36] = struct.pack('<Q', len(data))
-                data[44:48] = struct.pack('<I', self._hdf5_lookup3_hash(bytes(data[0:44])))
-            return data
+        def metadata_ranges(gid, file_size):
+            """read_ranges of _NisarRemoteFile for granule gid: the bytes of each (offset, length) of ranges, each
+            request retried on its own ('metadata'). One range: single-block requests (ASF._cache_range) of at most
+            MAX_METADATA_REQUEST each; a head (offset 0) that is not HDF5 is retried, as a broken transfer. Several
+            ranges: merged where they touch, cut into pieces of at most MAX_METADATA_REQUEST and packed in order into
+            as few multi-offset requests (/GID/off_len,.../ranges.bin) as the limits allow (a total of at most
+            MAX_METADATA_REQUEST, a list of at most MAX_METADATA_RANGES_CHARS); a request below MIN_MULTI_BLOCK is
+            padded with the bytes after its last piece, up to the end of the file (file_size(), the size from the
+            superblock), then before its first one, and the padding discarded."""
+            import bisect
+
+            def single(offset, length):
+                def request():
+                    content, _ = ASF._cache_range(_NISAR_CACHE_PROXY, gid, offset, length, min_rate, min_rate_window)
+                    if offset == 0 and not content.startswith(MAGIC_HDF5):
+                        raise IOError(f'Cache returned invalid metadata (not HDF5): {content[:100]!r}')
+                    return content
+                return retried('metadata', request)
+
+            def multi(pieces):
+                total = sum(n for _, n in pieces)
+                url = f"{_NISAR_CACHE_PROXY}/{gid}/{','.join(f'{o}_{n}' for o, n in pieces)}/ranges.bin"
+
+                def request():
+                    # an uncoded answer carries its Content-Length; never more than the ranges is read
+                    with send(requests.get, url, headers={'Accept-Encoding': 'identity'}, stream=True,
+                              timeout=120) as resp:
+                        content = read_body(resp, min_rate, min_rate_window, limit=total)
+                    if len(content) != total:
+                        raise IOError(f'Response size mismatch: got {len(content)}, expected {total}')
+                    return content
+                return retried('metadata', request)
+
+            def read_ranges(ranges):
+                if len(ranges) == 1:
+                    offset, length = ranges[0]
+                    return [b''.join(single(o, min(MAX_METADATA_REQUEST, offset + length - o))
+                                     for o in range(offset, offset + length, MAX_METADATA_REQUEST))]
+                spans = []
+                for o, n in sorted(set(ranges)):
+                    if spans and o <= spans[-1][1]:
+                        spans[-1][1] = max(spans[-1][1], o + n)
+                    else:
+                        spans.append([o, o + n])
+                pieces = [(o, min(MAX_METADATA_REQUEST, end - o))
+                          for start, end in spans for o in range(start, end, MAX_METADATA_REQUEST)]
+                groups, current, total, chars = [], [], 0, 0
+                for o, n in pieces:
+                    text = len(f'{o}_{n},')
+                    if current and (total + n > MAX_METADATA_REQUEST or chars + text > MAX_METADATA_RANGES_CHARS):
+                        groups.append(current)
+                        current, total, chars = [], 0, 0
+                    current.append((o, n))
+                    total += n
+                    chars += text
+                groups.append(current)
+                got = {}
+                for group in groups:
+                    sent = list(group)
+                    need = MIN_MULTI_BLOCK - sum(n for _, n in group)
+                    if need > 0:
+                        o, n = sent[-1]
+                        after = max(0, min(need, file_size() - (o + n)))
+                        sent[-1] = (o, n + after)
+                        o, n = sent[0]
+                        before = max(0, min(need - after, o))
+                        sent[0] = (o - before, n + before)
+                    content = multi(sent)
+                    # the pieces in the answer: each sent piece in order, the requested bytes inside it
+                    pos = 0
+                    for (o, n), (sent_o, sent_n) in zip(group, sent):
+                        got[o] = content[pos + o - sent_o:pos + o - sent_o + n]
+                        pos += sent_n
+                data = {start: b''.join(got[o] for o in range(start, end, MAX_METADATA_REQUEST)) for start, end in spans}
+                starts = [s for s, _ in spans]
+                out = []
+                for offset, length in ranges:
+                    start = starts[bisect.bisect_right(starts, offset) - 1]
+                    out.append(data[start][offset - start:offset - start + length])
+                return out
+            return read_ranges
 
         # Process granules (the bbox is validated by download())
         granule_ids = [g.replace('.h5', '') for g in granules]
@@ -2950,15 +3366,14 @@ class ASF(progressbar_joblib):
 
         for gid in granule_ids:
 
-            # 1. Fetch metadata for this granule
+            # 1. The metadata of this granule through a file object over it: its 64 MiB head, then pages on demand
             if debug:
                 print(f"Fetching metadata for {gid}...")
-            meta_raw, _ = fetch_metadata(gid)
-            meta_buf = patch_hdf5_superblock(meta_raw)
+            remote = _NisarRemoteFile(metadata_ranges(gid, lambda: remote.size))
             if debug:
-                print(f"  Metadata: {len(meta_buf)/(1024**2):.1f}MB")
+                print(f"  Metadata head: {remote.bytes_read/(1024**2):.1f}MB")
 
-            with h5py.File(BytesIO(bytes(meta_buf)), 'r') as h5:
+            with h5py.File(remote, 'r') as h5:
                 swaths = h5['science/LSAR/RSLC/swaths']
                 avail_pols = [k for k in swaths['frequencyA'].keys() if k in ['HH','HV','VH','VV']]
                 pols = ASF._nisar_pols(polarizations, avail_pols, gid)
@@ -3066,7 +3481,7 @@ class ASF(progressbar_joblib):
                           total=total_size, unit='B', unit_scale=True, unit_divisor=1024,
                           smoothing=0) as pbar, \
                         self._nisar_stream_writer(out_path, pol, ci_a, ci_b,
-                                                  lambda: self._read_nisar_metadata_direct(pol, meta_buf), bbox_info) as write:
+                                                  lambda: self._read_nisar_metadata_direct(pol, remote), bbox_info) as write:
 
                     # Download blocks via multi-offset API
                     if blocks_to_download:
@@ -3105,8 +3520,8 @@ class ASF(progressbar_joblib):
                     release_workers()
                 all_downloaded.append(out_name)
 
-            # Free metadata buffer after all pols done
-            del meta_buf
+            # the granule's metadata file object is released after all pols
+            del remote
 
         if all_downloaded:
             return pd.DataFrame({'file': all_downloaded})
@@ -3352,93 +3767,45 @@ class ASF(progressbar_joblib):
             return pd.DataFrame({'file': written})
         return None
 
-    def _detect_nisar_layout_fast(self, url, auth_tuple, file_size, http_session=None, pbar=None,
-                                  min_rate='100KB', min_rate_window=60):
-        """Download 128MB metadata block and detect layout.
+    def _read_nisar_metadata_direct(self, pol, remote):
+        """Read the metadata datasets of one polarization of a NISAR granule, to copy into its output file.
 
-        Downloads first 128MB (same as cache path), patches HDF5 superblock,
-        and tries to read metadata. Contains all metadata including geolocationGrid.
+        The granule is opened by h5py through remote (_NisarRemoteFile): its structure is read from the head and the
+        pages remote fetches on demand. The datasets to copy are collected (every dataset but the SLC rasters and the
+        objects of the other polarizations; an object whose structure cannot be read is skipped), then the storage of
+        their values (contiguous: its offset and size; chunked: the offset and size of every chunk; compact or not
+        allocated: nothing) is fetched by remote.prefetch in one batch, wherever the granule stores it, and the values
+        are read. A value that cannot be read raises, with the dataset's path: nothing is dropped silently.
 
-        Returns: (layout, metadata_buffer) where layout is 'A' or 'B' and
-                 metadata_buffer is the patched 128MB buffer for reuse.
-
-        Raises
-        ------
-        IOError
-            When the answer is shorter than min(128 MB, file_size), a truncated transfer that the caller retries,
-            before the HDF5 checks; a longer answer is never read beyond 128 MB (HTTP.read_body limit).
-        """
-        import requests
-        import struct
-        import h5py
-        from io import BytesIO
-        from .HTTP import send, read_body
-
-        METADATA_SIZE = 128 * 1024 * 1024  # 128 MB - matches cache path
-
-        # Download first 128MB (reuse session if provided)
-        # an uncoded answer carries its Content-Length (HTTP.read_body refuses a longer one)
-        headers = {'Range': f'bytes=0-{METADATA_SIZE-1}', 'Accept-Encoding': 'identity'}
-        if http_session:
-            response = send(http_session.get, url, headers=headers, stream=True, timeout=(10, 300))
-        else:
-            response = send(requests.get, url, headers=headers, auth=auth_tuple, stream=True, timeout=(10, 300))
-
-        # Stream download with progress; a transfer slower than min_rate is cut (HTTP.read_body) and retried;
-        # never more than the range is read: a longer response raises
-        with response:
-            data = bytearray(read_body(response, min_rate, min_rate_window, progress=pbar.update if pbar else None,
-                                       limit=METADATA_SIZE))
-        # a shorter answer is a truncated transfer: refused before the HDF5 checks
-        expected = min(METADATA_SIZE, file_size)
-        if len(data) < expected:
-            raise IOError(f'Truncated metadata download: got {len(data)} bytes of {expected} expected')
-
-        # Validate HDF5 magic bytes
-        if data[:4] != b'\x89HDF':
-            try:
-                import json
-                error = json.loads(bytes(data).decode('utf-8', errors='replace'))
-                msg = error.get('message', error.get('error', str(error)))
-                raise Exception(f'Server returned error instead of HDF5: {msg}')
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                raise Exception(f'Server returned invalid response (not HDF5): {bytes(data[:100])!r}')
-
-        # Patch HDF5 superblock EOF
-        version = data[8]
-        if version == 0:
-            data[40:48] = struct.pack('<Q', len(data))
-        else:
-            data[28:36] = struct.pack('<Q', len(data))
-            data[44:48] = struct.pack('<I', self._hdf5_lookup3_hash(bytes(data[0:44])))
-
-        # Try to read a metadata dataset
-        try:
-            with h5py.File(BytesIO(bytes(data)), 'r') as h5_test:
-                # Try to read a small metadata dataset (attitude/time is usually small)
-                _ = h5_test['science/LSAR/RSLC/metadata/attitude/time'][()]
-                return 'A', data  # Success - metadata is at start
-        except:
-            return 'B', data  # Failed - metadata is at end
-
-    def _read_nisar_metadata_direct(self, pol, metadata_buffer):
-        """Read metadata from pre-downloaded buffer.
-
-        Uses metadata_buffer (from layout A download) to read all metadata
-        datasets - NO remote access needed.
+        The group science/LSAR/RSLC/metadata/RFI and everything below it is not copied (never listed, prefetched or
+        read): it holds the RFI detection statistics of the focusing stage in raw-data geometry (the raw slow time and
+        raw slant range of analysis blocks; hitCount is a 1024-bin spectrum per block, 61 MiB uncompressed in a validated
+        granule), which no processor of the focused SLC uses; it is not downloaded, to limit the downloaded size.
+        calibrationInformation/.../rfiLikelihood is outside it and is copied.
 
         Parameters
         ----------
         pol : str
             Polarization being processed (e.g., 'HH').
-        metadata_buffer : bytearray
-            Pre-downloaded metadata buffer: the patched first 128 MB of the file (_detect_nisar_layout_fast, or
-            the metadata block of the cache proxy).
+        remote : _NisarRemoteFile
+            The file object over the granule.
 
-        Returns dict with all metadata datasets to copy.
+        Returns
+        -------
+        dict
+            {dataset path: {'data', 'dtype', 'shape', 'attrs'}}, '_group_attrs' {group path: attributes} and
+            '_root_attrs'.
+
+        Raises
+        ------
+        OSError
+            When the values of a dataset cannot be read (the text names the dataset).
+
+        Examples
+        --------
+        >>> metadata = asf._read_nisar_metadata_direct('HH', remote)
         """
         import h5py
-        from io import BytesIO
 
         # ALL main SLC datasets to skip (stored later in file)
         all_slc = {f'science/LSAR/RSLC/swaths/frequency{f}/{p}'
@@ -3447,9 +3814,14 @@ class ASF(progressbar_joblib):
         # Other polarizations to skip (their metadata may be stored later)
         other_pols = {'HH', 'HV', 'VH', 'VV'} - {pol}
 
+        # RFI detection statistics in raw-data geometry, unused for the focused SLC: not downloaded
+        rfi = 'science/LSAR/RSLC/metadata/RFI'
+
         def should_skip_path(path):
-            """Check if path should be skipped - SLC or other-pol data."""
+            """Check if path should be skipped - SLC, other-pol data or metadata/RFI."""
             if path in all_slc:
+                return True
+            if path == rfi or path.startswith(f'{rfi}/'):
                 return True
             # Skip paths containing other polarizations
             for other_pol in other_pols:
@@ -3478,12 +3850,23 @@ class ASF(progressbar_joblib):
                     pass  # Skip inaccessible items
             return datasets, groups
 
+        def storage(ds):
+            """The (offset, size) byte ranges that store the values of ds in the file."""
+            layout = ds.id.get_create_plist().get_layout()
+            if layout == h5py.h5d.CONTIGUOUS:
+                offset, size = ds.id.get_offset(), ds.id.get_storage_size()
+                return [(offset, size)] if offset is not None and size else []
+            if layout == h5py.h5d.CHUNKED:
+                chunks = (ds.id.get_chunk_info(i) for i in range(ds.id.get_num_chunks()))
+                return [(c.byte_offset, c.size) for c in chunks if c.byte_offset is not None and c.size]
+            # compact (the values are in the object header, read with the structure) or virtual
+            return []
+
         metadata = {}
 
-        # Read everything from local buffer - no remote access
-        with h5py.File(BytesIO(bytes(metadata_buffer)), 'r') as h5_local:
+        with h5py.File(remote, 'r') as h5:
             # Use safe iteration that checks paths before accessing
-            datasets, groups = iterate_safe(h5_local)
+            datasets, groups = iterate_safe(h5)
 
             # Collect group attributes
             metadata['_group_attrs'] = {}
@@ -3492,71 +3875,25 @@ class ASF(progressbar_joblib):
                     metadata['_group_attrs'][path] = dict(grp.attrs)
 
             # Root attributes
-            metadata['_root_attrs'] = dict(h5_local.attrs)
+            metadata['_root_attrs'] = dict(h5.attrs)
 
-            # Read dataset values
+            # the values of every dataset to copy, fetched in one batch wherever the granule stores them
+            remote.prefetch([r for _, ds in datasets for r in storage(ds)])
+
+            # Read dataset values: a value that cannot be read raises
             for path, ds in datasets:
                 try:
-                    metadata[path] = {
-                        'data': ds[()],
-                        'dtype': ds.dtype,
-                        'shape': ds.shape,
-                        'attrs': dict(ds.attrs)
-                    }
-                except Exception:
-                    pass
+                    data = ds[()]
+                except Exception as e:
+                    raise OSError(f'NISAR metadata {path}: its values cannot be read: {e}') from e
+                metadata[path] = {
+                    'data': data,
+                    'dtype': ds.dtype,
+                    'shape': ds.shape,
+                    'attrs': dict(ds.attrs)
+                }
 
         return metadata
-
-    @staticmethod
-    def _hdf5_lookup3_hash(data):
-        """Jenkins lookup3 hash for HDF5 superblock checksum."""
-        def rot(x, k):
-            return ((x << k) | (x >> (32 - k))) & 0xffffffff
-
-        def mix(a, b, c):
-            a = (a - c) & 0xffffffff; a ^= rot(c, 4); c = (c + b) & 0xffffffff
-            b = (b - a) & 0xffffffff; b ^= rot(a, 6); a = (a + c) & 0xffffffff
-            c = (c - b) & 0xffffffff; c ^= rot(b, 8); b = (b + a) & 0xffffffff
-            a = (a - c) & 0xffffffff; a ^= rot(c, 16); c = (c + b) & 0xffffffff
-            b = (b - a) & 0xffffffff; b ^= rot(a, 19); a = (a + c) & 0xffffffff
-            c = (c - b) & 0xffffffff; c ^= rot(b, 4); b = (b + a) & 0xffffffff
-            return a, b, c
-
-        def final(a, b, c):
-            c ^= b; c = (c - rot(b, 14)) & 0xffffffff
-            a ^= c; a = (a - rot(c, 11)) & 0xffffffff
-            b ^= a; b = (b - rot(a, 25)) & 0xffffffff
-            c ^= b; c = (c - rot(b, 16)) & 0xffffffff
-            a ^= c; a = (a - rot(c, 4)) & 0xffffffff
-            b ^= a; b = (b - rot(a, 14)) & 0xffffffff
-            c ^= b; c = (c - rot(b, 24)) & 0xffffffff
-            return a, b, c
-
-        import struct
-        length = len(data)
-        a = b = c = (0xdeadbeef + length) & 0xffffffff
-
-        i = 0
-        while i + 12 <= length:
-            a = (a + struct.unpack('<I', data[i:i+4])[0]) & 0xffffffff
-            b = (b + struct.unpack('<I', data[i+4:i+8])[0]) & 0xffffffff
-            c = (c + struct.unpack('<I', data[i+8:i+12])[0]) & 0xffffffff
-            a, b, c = mix(a, b, c)
-            i += 12
-
-        remaining = length - i
-        if remaining > 0:
-            tail = data[i:] + bytes(12 - remaining)
-            for j, shift in enumerate([0, 8, 16, 24][:min(remaining, 4)]):
-                a = (a + (tail[j] << shift)) & 0xffffffff
-            for j, shift in enumerate([0, 8, 16, 24][:max(0, min(remaining - 4, 4))]):
-                b = (b + (tail[4 + j] << shift)) & 0xffffffff
-            for j, shift in enumerate([0, 8, 16, 24][:max(0, min(remaining - 8, 4))]):
-                c = (c + (tail[8 + j] << shift)) & 0xffffffff
-            a, b, c = final(a, b, c)
-
-        return c
 
     @staticmethod
     def _nisar_stream_writer(out_path, pol, chunk_info_a, chunk_info_b, get_metadata, crop_info=None):
