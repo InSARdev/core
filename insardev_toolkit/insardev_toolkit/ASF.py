@@ -8,6 +8,7 @@
 # See the LICENSE file in the insardev_toolkit directory for license terms.
 # ----------------------------------------------------------------------------
 from .progressbar_joblib import progressbar_joblib
+import re
 
 # ============================================================================
 # Minimal asf_search replacement (replaces ~9000 lines with ~150 lines)
@@ -305,6 +306,10 @@ class _RangeReader(io.RawIOBase):
         size : int
             The size of the remote file in bytes.
 
+        The error of the last failed read is kept in the attribute error (None at start): zipfile reports a failed
+        read of the archive's directory as BadZipFile ('File is not a zip file'), so the caller raises the error
+        itself.
+
         Examples
         --------
         >>> _RangeReader(lambda start, end: data[start:end], len(data))
@@ -315,6 +320,7 @@ class _RangeReader(io.RawIOBase):
         self._position = 0
         self._block = 64 * 1024
         self._cache = {}
+        self.error = None
 
     def readable(self):
         """
@@ -412,7 +418,12 @@ class _RangeReader(io.RawIOBase):
         missing = [k for k in range(first, last + 1) if k not in self._cache]
         if missing:
             start = missing[0] * self._block
-            data = self._read(start, min(self._size, (missing[-1] + 1) * self._block))
+            try:
+                data = self._read(start, min(self._size, (missing[-1] + 1) * self._block))
+            except Exception as e:
+                # kept for the caller: zipfile replaces it by BadZipFile
+                self.error = e
+                raise
             for k in range(missing[0], missing[-1] + 1):
                 self._cache[k] = data[k * self._block - start:(k + 1) * self._block - start]
         data = b''.join(self._cache[k] for k in range(first, last + 1))
@@ -503,12 +514,19 @@ _ASF_BURST_HOST = 'https://sentinel1-burst.asf.alaska.edu'
 # Cloudflare Worker cache proxy for NISAR (handles auth internally)
 # API: /GRANULE_ID/OFFSET.bin → 128MB block at OFFSET
 _NISAR_CACHE_PROXY = 'https://nisar-cache-asf.insar.dev'
+# The largest byte range the NISAR direct route reads at once (64 MiB): one block of chunks, written before the next is read
+_NISAR_BLOCK_BYTES = 64 * 1024 * 1024
+# Cloudflare Worker cache proxy for ALOS-2 (handles auth internally)
+# API: /FILE_ID/OFFSET/LENGTH.bin → LENGTH bytes (≤128MB) of the granule's ZIP at OFFSET
+_ALOS2_CACHE_PROXY = 'https://alos2-cache-asf.insar.dev'
 _NISAR_BLOCK_SIZE = 128 * 1024 * 1024  # 128 MB blocks
 # Minimum side of a NISAR bbox crop on the ground: smaller crops cannot be processed accurately
 _NISAR_MIN_CROP_KM = 20
 # The ALOS-2 line window of a bbox is rounded outward to multiples of this many image lines: a margin for the
 # resampling and for the shifts between dates, as the 512 x 512 chunks of a NISAR crop give
 _ALOS2_LINE_BLOCK = 512
+# The largest block of ALOS-2 image records read and written at once (64 MiB), below the proxy's 128 MB per range
+_ALOS2_BLOCK_BYTES = 64 * 1024 * 1024
 # The ALOS-2 ScanSAR subswath footprints in the catalog polygon of a scene (ASF.search: the catalog holds one polygon per
 # scene, none per subswath), measured against JAXA's line coordinates: session/patches/alos2/PLAN.md, U0 and its
 # 2026-11-20 extension (23 right- and 18 left-looking scenes). Lengths in km, in the tangent plane at the scene centre.
@@ -540,6 +558,12 @@ _ALOS2_FOOTPRINT = {
     # move points along track (zero-Doppler images)
     'along_km': {'R': 3.0, 'L': 5.0},
 }
+# NISAR product name (fileID): level config product cycle track direction frame mode polarization x start stop crid processing coverage source counter
+_NISAR_NAME = re.compile(
+    r'^NISAR_L(?P<level>\d)_(?P<config>[A-Z]{2})_(?P<product>[A-Z]+)_(?P<cycle>\d{3})_(?P<track>\d{3})'
+    r'_(?P<direction>[AD])_(?P<frame>\d{3})_(?P<mode>\d{4})_(?P<polarization>[A-Z]{4})_(?P<x>[A-Z])'
+    r'_(?P<start>\d{8}T\d{6})_(?P<stop>\d{8}T\d{6})_(?P<crid>[A-Z]\d{5})_(?P<processing>[A-Z])'
+    r'_(?P<coverage>[A-Z])_(?P<source>[A-Z])_(?P<counter>\d{3})$')
 
 
 class ASF(progressbar_joblib):
@@ -924,8 +948,8 @@ class ASF(progressbar_joblib):
         An ALOS-2 subswath is named by the granule's fileID (the column sceneName of ASF.search) and the subswath
         F1..F5, as JAXA names its files: 'ALOS2592361150-250512-WBDR1.1__A-F2'. A fileID without its subswath, a
         scene name without the product code, another product or subswath raise a one-line ValueError before anything is
-        downloaded. ALOS-2 is read directly from ASF and needs an Earthdata account, ASF(username, password): without
-        one a subswath to download raises a ValueError before any request (there is no ALOS-2 cache proxy yet). Its
+        downloaded. The Earthdata account is optional, as for NISAR: with one, ASF(username, password), ALOS-2 is read
+        directly from ASF; without one, ASF(), through the cache proxy alos2-cache-asf.insar.dev. Its
         files are cropped CEOS files in a folder per (path, frame, subswath), with the path
         (14 * orbit + 23) mod 207 + 1 and the date of the ID: <basedir>/086_1150_F2/AL2_086_1150_F2_20250512_HH.img
         (and _HV.img) and AL2_086_1150_F2_20250512.led. The image files keep the line records (prefix and samples) of
@@ -1137,11 +1161,6 @@ class ASF(progressbar_joblib):
         # Return early if nothing to download (no network call!)
         if not s1_needed and not nisar_needed and not alos2_needed:
             return None
-
-        # ALOS-2 is read from ASF itself, before any request or folder
-        if alos2_needed and self.username is None:
-            raise ValueError("ALOS-2 downloads need an Earthdata account, ASF(username, password): there is no ALOS-2 "
-                             "cache proxy yet. Nothing was downloaded.")
 
         # Prepare session only when actually needed
         if session is None:
@@ -1611,7 +1630,11 @@ class ASF(progressbar_joblib):
         A signed URL expires about an hour after the redirect that gave it, and the server refuses it with HTTP 403
         from then on: a request to signed_url answered 403 is made once more for the same range without it, through
         http_session (its redirect gives a new signed URL, returned) or else with auth_tuple. A 403 of that repeated
-        request, or of a request made without signed_url, raises; every other error raises as it is.
+        request, or of a request made without signed_url, raises; every other error raises as it is. A response
+        longer than the range (a server that ignores Range answers 200 with the whole file) raises IOError, and is
+        never read beyond the range (HTTP.read_body limit). The request asks for an uncoded answer
+        (Accept-Encoding: identity), so the response comes with its Content-Length and a longer one is refused before
+        a byte of it is read.
 
         Parameters
         ----------
@@ -1647,7 +1670,8 @@ class ASF(progressbar_joblib):
         from .HTTP import send, read_body, answer
 
         size = end - start
-        headers = {'Range': f'bytes={start}-{end-1}'}  # HTTP Range is inclusive
+        # HTTP Range is inclusive; an uncoded answer carries its Content-Length (HTTP.read_body refuses a longer one)
+        headers = {'Range': f'bytes={start}-{end-1}', 'Accept-Encoding': 'identity'}
 
         returned_signed_url = signed_url
 
@@ -1681,11 +1705,91 @@ class ASF(progressbar_joblib):
             if content_length > 0 and content_length < size:
                 raise Exception(f'Truncated range response: expected {size} bytes, server reports {content_length}')
             # a transfer slower than min_rate is cut (HTTP.read_body) and retried
-            result = read_body(r, min_rate, min_rate_window, progress=pbar.update if pbar else None)
+            # never more than the range is read: a server that ignores Range (200, the whole file) raises
+            result = read_body(r, min_rate, min_rate_window, progress=pbar.update if pbar else None, limit=size)
 
         if len(result) < size:
             raise Exception(f'Truncated download: got {len(result)} bytes of {size} expected')
         return result, returned_signed_url
+
+    @staticmethod
+    def _cache_range(proxy, granule_id, offset, length, min_rate, min_rate_window, session=None):
+        """Fetch a byte range of a granule from a cache proxy: GET <proxy>/<granule_id>/<offset>/<length>.bin.
+
+        The request is shared by the NISAR and ALOS-2 downloads through the cache proxies (no account). An error
+        raises as it is (HTTP.send); the caller retries. The request asks for an uncoded answer
+        (Accept-Encoding: identity), so the response comes with its Content-Length and a longer one is refused before
+        a byte of it is read. Both proxies, alos2-cache-asf.insar.dev and nisar-cache-asf.insar.dev (from its next
+        deploy), name their upstream answer in the headers X-Upstream-* (status, length, range, via, host, redirected,
+        ms), which the errors quote, and an upstream status other than 206 (the Range ignored, the body the whole file)
+        is refused before a byte of the body is read; a proxy answer without these headers keeps the texts without the
+        note.
+
+        Parameters
+        ----------
+        proxy : str
+            Base URL of the cache proxy, such as _NISAR_CACHE_PROXY or _ALOS2_CACHE_PROXY.
+        granule_id : str
+            The granule ID the proxy knows: a NISAR granule ID, or the fileID of an ALOS-2 granule.
+        offset : int
+            First byte of the range in the granule's file.
+        length : int
+            Number of bytes of the range, at most 128 MB (the proxy's limit).
+        min_rate : str or float
+            Minimum transfer rate (HTTP.read_body), a size string such as '100KB' or a number; a slower transfer is
+            cut.
+        min_rate_window : float
+            Seconds over which min_rate is averaged from the first byte.
+        session : requests.Session or None
+            Session that reuses its connection; None makes a new one.
+
+        Returns
+        -------
+        tuple
+            (content, cache_hit): the bytes of the range, and whether the proxy or the CDN served them from its cache
+            (the header X-Cache or cf-cache-status is HIT).
+
+        Raises
+        ------
+        IOError
+            When the response does not hold exactly length bytes, a truncated transfer that the caller retries; a
+            response longer than length is never read beyond it (HTTP.read_body limit). Also when the proxy's
+            X-Upstream-Status is not 206, before the body is read.
+
+        Examples
+        --------
+        >>> content, cache_hit = ASF._cache_range(_ALOS2_CACHE_PROXY, 'ALOS2592361150-250512-WBDR1.1__A', 0, 16,
+        ...                                       '100KB', 60)
+        """
+        import requests
+        from .HTTP import send, read_body
+
+        url = f"{proxy}/{granule_id}/{offset}/{length}.bin"
+        sess = session or requests.Session()
+        # a transfer slower than min_rate is cut (HTTP.read_body) and retried; an uncoded answer carries its
+        # Content-Length (HTTP.read_body refuses a longer one)
+        with send(sess.get, url, headers={'Accept-Encoding': 'identity'}, stream=True, timeout=120) as resp:
+            # both proxies (ALOS-2 and NISAR, the latter from its next deploy) name their upstream answer
+            # (X-Upstream-*); an answer without these headers keeps the texts without the note
+            h = resp.headers
+            upstream = h.get('X-Upstream-Status')
+            note = '' if upstream is None else (
+                f" (proxy upstream: status {upstream}, length {h.get('X-Upstream-Length', 'none')}, "
+                f"range {h.get('X-Upstream-Range', 'none')}, via {h.get('X-Upstream-Via', 'none')}, "
+                f"host {h.get('X-Upstream-Host', 'none')}, redirected {h.get('X-Upstream-Redirected', 'none')}, "
+                f"{h.get('X-Upstream-Ms', 'none')} ms, cache {h.get('cf-cache-status', 'none')})")
+            # an upstream answer other than 206 ignored the Range: refused before a byte of its body is read
+            if upstream is not None and upstream != '206':
+                raise IOError(f'Cache proxy: the upstream answered {upstream} for {length} bytes at {offset}, '
+                              f'not the range{note}')
+            # never more than the range is read: a longer response raises
+            content = read_body(resp, min_rate, min_rate_window, limit=length)
+            # Check both X-Cache (proxy) and cf-cache-status (CDN) headers
+            cache_hit = (resp.headers.get('X-Cache', '').upper() == 'HIT' or
+                        resp.headers.get('cf-cache-status', '').upper() == 'HIT')
+        if len(content) != length:
+            raise IOError(f'Cache response size mismatch: got {len(content)}, expected {length}{note}')
+        return content, cache_hit
 
     @staticmethod
     def _nisar_get_chunk_info(h5, pol, frequency='A'):
@@ -1760,7 +1864,7 @@ class ASF(progressbar_joblib):
         return track, frame, datetime_str
 
     @staticmethod
-    def _nisar_merge_chunks_to_regions(chunks, gap_threshold=1024*1024):
+    def _nisar_merge_chunks_to_regions(chunks, gap_threshold=1024*1024, max_size=None):
         """Merge adjacent chunks into contiguous regions allowing small gaps.
 
         Parameters
@@ -1769,11 +1873,19 @@ class ASF(progressbar_joblib):
             List of {'offset': int, 'size': int, ...} dicts, or (offset, size) tuples
         gap_threshold : int
             Maximum gap in bytes to merge (default 1MB)
+        max_size : int or None
+            The longest region in bytes: a region is closed before a chunk that would make it longer than max_size
+            (from its first byte to the chunk's end), and a single chunk longer than max_size is a region of its own.
+            None: no limit.
 
         Returns
         -------
         list of (region_start, region_size, chunk_list)
             chunk_list contains the original chunks in this region
+
+        Examples
+        --------
+        >>> ASF._nisar_merge_chunks_to_regions([(0, 40), (40, 40), (80, 40)], gap_threshold=0, max_size=100)
         """
         if not chunks:
             return []
@@ -1791,7 +1903,8 @@ class ASF(progressbar_joblib):
         region_chunks = [sorted_chunks[0]]
 
         for chunk in sorted_chunks[1:]:
-            if chunk['offset'] <= region_end + gap_threshold:
+            if chunk['offset'] <= region_end + gap_threshold and \
+                    (max_size is None or chunk['offset'] + chunk['size'] - region_start <= max_size):
                 # Extend current region
                 region_end = max(region_end, chunk['offset'] + chunk['size'])
                 region_chunks.append(chunk)
@@ -2085,13 +2198,17 @@ class ASF(progressbar_joblib):
                          n_jobs, joblib_backend, skip_exist, retries, timeout_second, min_rate, min_rate_window, debug):
         """Internal: Download NISAR RSLC granules with per-polarization output.
 
-        Uses single HTTP Range request approach (verified 9.2 min for one pol):
-        1. Query chunk byte offsets from remote HDF5 (metadata only, ~10 sec)
-        2. Download entire byte span in ONE HTTP Range request (~9 min)
-        3. Parse chunks locally and write output HDF5 (~2 sec)
-
-        This is ~46x faster than per-chunk HTTP requests.
-        Uses joblib for parallel downloads when n_jobs > 1.
+        With an account (the direct route) each granule is read through HTTP Range requests on one login session:
+        1. Its size (HEAD) and its first 128 MB, which hold the metadata and the chunk byte offsets.
+        2. Its data in blocks of at most _NISAR_BLOCK_BYTES (64 MiB): the chunks (all of them, or those the bbox
+           reaches) merged into chunk-aligned regions (ASF._nisar_merge_chunks_to_regions, gaps up to 16 MB read
+           through), one Range request each; the chunks of a block are written to the output at once
+           (ASF._nisar_stream_writer) and its bytes released before the next block is read.
+        Every network operation of a granule is a read retried on its own (the session does not raise:
+        _ASFSession.auth_with_creds falls back to basic auth), so there is no granule-level retry, which would only
+        repeat a read that has used its attempts. A read that fails after its attempts raises through
+        _nisar_stream_writer, which removes its .tmp file. Without an account the cache proxy is used
+        (_download_nisar_via_cache).
 
         Output naming: NSR_{track}_{frame}_{datetime}_{pol}.h5
         (same naming for all frequency modes - check datasets to see what's included)
@@ -2128,11 +2245,12 @@ class ASF(progressbar_joblib):
             True skips the polarization files that exist (ASF._nisar_exists), and a granule whose files all exist is
             not downloaded; False downloads them again.
         retries : int
-            Attempts per granule, the first one included; 0 makes one attempt, as 1 does (HTTP.attempts). A failure
-            that a retry cannot change (HTTP.final), a format error (ValueError) and an empty file (EmptyFileError)
-            are not retried.
+            Attempts of each read of a granule (the HEAD of its size, its metadata, each block of data), the first
+            one included; 0 makes one attempt, as 1 does (HTTP.attempts). A failure that a retry cannot change
+            (HTTP.final), a format error (ValueError) and an empty file (EmptyFileError) are not retried. Every failed
+            attempt is printed, and the bytes it counted in the progress bar are taken back.
         timeout_second : float
-            Seconds waited between the attempts of one granule, not after the last one.
+            Seconds waited between the attempts of one read, not after the last one.
         min_rate : str or float
             Bytes per second each byte-range request of a granule (the metadata read and the data ranges) must keep,
             a size string such as '100KB' or a number, averaged over min_rate_window seconds from its first byte, or
@@ -2194,73 +2312,28 @@ class ASF(progressbar_joblib):
         # Use shared helper for chunk info
         get_chunk_info = ASF._nisar_get_chunk_info
 
-        def download_filtered_chunks(url, chunk_info, bbox_info, freq, auth_tuple, pbar=None,
-                                      http_session=None, signed_url=None, gap_threshold=16*1024*1024):
-            """Download only chunks overlapping bbox, merging with 16MB gap threshold.
-
-            Uses larger gap threshold (16MB) to reduce HTTP requests while still
-            skipping large gaps between chunk regions.
-
-            Parameters
-            ----------
-            url : str
-                URL of the granule's HDF5 file; the byte-range requests go to it, unless signed_url is given.
-            chunk_info : dict
-                Output from _nisar_get_chunk_info()
-            bbox_info : dict
-                Output from _nisar_bbox_to_pixel_indices()
-            freq : str
-                'A' or 'B' (to look up correct rg_start/rg_end keys)
-            auth_tuple : tuple
-                (user, password) for the basic-auth byte-range request, used when neither signed_url nor http_session
-                is given.
-            pbar : tqdm or None
-                Progress bar updated with the bytes received; None shows no progress.
-            http_session : requests.Session or None
-                Session that reuses its connection for the byte-range requests.
-            signed_url : str or None
-                Signed URL the byte-range requests go to directly, without the OAuth redirect. None: the first request
-                goes to url, and with http_session the CloudFront URL it is redirected to is returned for the next call.
-            gap_threshold : int
-                Maximum gap in bytes to merge (default 16MB)
-
-            Returns
-            -------
-            tuple: (chunk_data_dict, signed_url)
-                chunk_data_dict maps chunk byte offset -> chunk bytes
-            """
-            # Filter chunks to bbox
-            rg_start_key = f'rg_start_{freq.lower()}'
-            rg_end_key = f'rg_end_{freq.lower()}'
-            filtered_chunks = ASF._nisar_filter_chunks_by_pixel_range(
-                chunk_info,
-                bbox_info['az_start'], bbox_info['az_end'],
-                bbox_info[rg_start_key], bbox_info[rg_end_key]
-            )
-
-            if not filtered_chunks:
-                return {}, signed_url
-
-            # Merge into regions with 16MB gap threshold
-            regions = ASF._nisar_merge_chunks_to_regions(filtered_chunks, gap_threshold)
-
-            # Download each region
-            chunk_data = {}
-            current_signed_url = signed_url
-
-            for region_start, region_size, region_chunks in regions:
-                region_end = region_start + region_size
-                region_bytes, current_signed_url = ASF._byte_range(
-                    url, region_start, region_end, auth_tuple, min_rate, min_rate_window,
-                    pbar=pbar, http_session=http_session, signed_url=current_signed_url
-                )
-
-                # Extract individual chunks from region
-                for chunk in region_chunks:
-                    rel_offset = chunk['offset'] - region_start
-                    chunk_data[chunk['offset']] = region_bytes[rel_offset:rel_offset + chunk['size']]
-
-            return chunk_data, current_signed_url
+        def read(what, request, pbar=None):
+            """The result of request() (a network operation of a granule) with the attempts of retries
+            (HTTP.attempts): a format error (ValueError) or an empty file (EmptyFileError) raises at once, a failure
+            that a retry cannot change (HTTP.final) at its first attempt; every failed attempt is printed, and the
+            bytes it counted in pbar are taken back."""
+            n = attempts(retries)
+            for k in range(1, n + 1):
+                before = None if pbar is None else pbar.n
+                try:
+                    return request()
+                except (ValueError, EmptyFileError):
+                    # format errors and empty files are permanent - don't retry
+                    raise
+                except Exception as e:
+                    if pbar is not None:
+                        # the bytes are counted while they are read: each byte is counted once
+                        pbar.update(before - pbar.n)
+                    stop = final(e)
+                    print(f"ERROR downloading {what} (attempt {k}/{n}){' (not retried)' if stop else ''}: {e}")
+                    if stop or k == n:
+                        raise
+                    time.sleep(timeout_second)
 
         # Use shared helper for granule ID parsing
         parse_nisar_granule_id = ASF._nisar_parse_granule_id
@@ -2294,24 +2367,27 @@ class ASF(progressbar_joblib):
             auth_tuple = (self.username, self.password)
             http_session = self._get_asf_session()
 
-            # Get file size (HEAD request)
-            head_resp = send(http_session.head, url, allow_redirects=True, timeout=(10, 30))
-            file_size = head_resp.headers.get('Content-Length')
-            if file_size is None:
-                # a broken answer, retried
-                raise IOError(f'{url}: no Content-Length in the answer')
-            file_size = int(file_size)
+            def size():
+                # Get file size (HEAD request)
+                head_resp = send(http_session.head, url, allow_redirects=True, timeout=(10, 30))
+                file_size = head_resp.headers.get('Content-Length')
+                if file_size is None:
+                    # a broken answer, retried
+                    raise IOError(f'{url}: no Content-Length in the answer')
+                return int(file_size)
+
+            file_size = read(f'{granule_id} size', size)
 
             # Download 128MB metadata block (same as cache path) with progress bar
             with tqdm(total=128*1024*1024, unit='B', unit_scale=True,
                       desc=f"{short_name} metadata", leave=False,
                       dynamic_ncols=False, ncols=80, mininterval=0.3, smoothing=0,
                       disable=(position is not None)) as meta_pbar:
-                layout, metadata_buffer = self._detect_nisar_layout_fast(
-                    url, auth_tuple, file_size, http_session=http_session,
-                    pbar=meta_pbar if position is None else None,
+                meta_bar = meta_pbar if position is None else None
+                layout, metadata_buffer = read(f'{granule_id} metadata', lambda: self._detect_nisar_layout_fast(
+                    url, auth_tuple, file_size, http_session=http_session, pbar=meta_bar,
                     min_rate=min_rate, min_rate_window=min_rate_window
-                )
+                ), meta_bar)
 
             if debug and position is None:
                 print(f"  File size: {file_size/(1024**3):.2f} GB, Layout: {layout}, Metadata: 128MB")
@@ -2400,31 +2476,24 @@ class ASF(progressbar_joblib):
                             print(f"  Bbox {bbox} -> pixels az[{bbox_info['az_start']}:{bbox_info['az_end']}], "
                                   f"rg_a[{bbox_info.get('rg_start_a', 'N/A')}:{bbox_info.get('rg_end_a', 'N/A')}]")
 
-            # Calculate total SLC size (filtered by bbox if provided)
+            def blocks(chunk_info, freq):
+                """The blocks read of one frequency: the chunks (those the bbox reaches with a bbox) merged into
+                chunk-aligned regions of at most _NISAR_BLOCK_BYTES, gaps up to 16 MB read through."""
+                if bbox_info is not None:
+                    chunks = ASF._nisar_filter_chunks_by_pixel_range(
+                        chunk_info, bbox_info['az_start'], bbox_info['az_end'],
+                        bbox_info[f'rg_start_{freq.lower()}'], bbox_info[f'rg_end_{freq.lower()}']
+                    )
+                else:
+                    chunks = chunk_info['chunks']
+                return ASF._nisar_merge_chunks_to_regions(chunks, 16 * 1024 * 1024, max_size=_NISAR_BLOCK_BYTES)
+
+            # Calculate total SLC size: the bytes of the blocks read
             total_slc_size = 0
-            GAP_THRESHOLD = 16 * 1024 * 1024  # 16MB - same as download_filtered_chunks
             for pol, (chunk_info_a, chunk_info_b) in all_chunk_info.items():
-                if chunk_info_a:
-                    if bbox_info is not None:
-                        # Calculate size of merged regions (16MB gap threshold)
-                        filtered = ASF._nisar_filter_chunks_by_pixel_range(
-                            chunk_info_a, bbox_info['az_start'], bbox_info['az_end'],
-                            bbox_info['rg_start_a'], bbox_info['rg_end_a']
-                        )
-                        regions = ASF._nisar_merge_chunks_to_regions(filtered, GAP_THRESHOLD)
-                        total_slc_size += sum(r[1] for r in regions)
-                    else:
-                        total_slc_size += chunk_info_a['max_end'] - chunk_info_a['min_offset']
-                if chunk_info_b:
-                    if bbox_info is not None:
-                        filtered = ASF._nisar_filter_chunks_by_pixel_range(
-                            chunk_info_b, bbox_info['az_start'], bbox_info['az_end'],
-                            bbox_info['rg_start_b'], bbox_info['rg_end_b']
-                        )
-                        regions = ASF._nisar_merge_chunks_to_regions(filtered, GAP_THRESHOLD)
-                        total_slc_size += sum(r[1] for r in regions)
-                    else:
-                        total_slc_size += chunk_info_b['max_end'] - chunk_info_b['min_offset']
+                for freq, chunk_info in (('A', chunk_info_a), ('B', chunk_info_b)):
+                    if chunk_info:
+                        total_slc_size += sum(r[1] for r in blocks(chunk_info, freq))
 
             # Check for empty SLC data (incompatible format)
             if total_slc_size == 0:
@@ -2487,99 +2556,48 @@ class ASF(progressbar_joblib):
                     # Read metadata from pre-downloaded buffer (no remote access)
                     metadata = self._read_nisar_metadata_direct(pol, metadata_buffer)
 
-                    # Download frequencyA data
-                    downloaded_data_a = None
-                    if chunk_info_a is not None:
-                        if bbox_info is not None:
-                            # Bbox mode: merged regions with 16MB gap threshold
-                            downloaded_data_a, signed_url = download_filtered_chunks(
-                                url, chunk_info_a, bbox_info, 'A', auth_tuple,
-                                pbar=pbar, http_session=http_session, signed_url=signed_url
-                            )
-                        else:
-                            # Full download: single Range request for entire span
-                            downloaded_data_a, signed_url = ASF._byte_range(
-                                url,
-                                chunk_info_a['min_offset'],
-                                chunk_info_a['max_end'],
-                                auth_tuple,
-                                min_rate,
-                                min_rate_window,
-                                pbar=pbar,
-                                http_session=http_session,
-                                signed_url=signed_url
-                            )
+                    write_debug = debug and (position is None)
+                    if write_debug:
+                        n_chunks_total = sum(len(ci['chunks']) for ci in (chunk_info_a, chunk_info_b) if ci is not None)
+                        print(f"    Writing {n_chunks_total} chunks + {len(metadata)-1} metadata datasets...")
 
-                    # Download frequencyB data
-                    downloaded_data_b = None
-                    if chunk_info_b is not None:
-                        if bbox_info is not None:
-                            # Bbox mode: merged regions with 16MB gap threshold
-                            downloaded_data_b, signed_url = download_filtered_chunks(
-                                url, chunk_info_b, bbox_info, 'B', auth_tuple,
-                                pbar=pbar, http_session=http_session, signed_url=signed_url
-                            )
-                        else:
-                            # Full download: single Range request for entire span
-                            downloaded_data_b, signed_url = ASF._byte_range(
-                                url,
-                                chunk_info_b['min_offset'],
-                                chunk_info_b['max_end'],
-                                auth_tuple,
-                                min_rate,
-                                min_rate_window,
-                                pbar=pbar,
-                                http_session=http_session,
-                                signed_url=signed_url
-                            )
+                    # frequencyA, then frequencyB: each block read (its own attempts) and its chunks written at once
+                    with self._nisar_stream_writer(out_path, pol, chunk_info_a, chunk_info_b, lambda: metadata,
+                                                   bbox_info) as write:
+                        for freq, chunk_info in (('A', chunk_info_a), ('B', chunk_info_b)):
+                            if chunk_info is None:
+                                continue
+                            for start, length, chunks in blocks(chunk_info, freq):
+                                end = start + length
 
-                    # Write output HDF5 (suppress debug output in parallel mode)
-                    self._write_nisar_pol_h5_from_bytes(
-                        downloaded_data_a, chunk_info_a, metadata, pol, out_path,
-                        track, frame, datetime_str, debug and (position is None),
-                        downloaded_data_b=downloaded_data_b, chunk_info_b=chunk_info_b,
-                        crop_info=bbox_info
-                    )
+                                def fetch(start=start, end=end):
+                                    # the signed URL of a read is the one the next read uses
+                                    nonlocal signed_url
+                                    data, signed_url = ASF._byte_range(
+                                        url, start, end, auth_tuple, min_rate, min_rate_window,
+                                        pbar=pbar, http_session=http_session, signed_url=signed_url
+                                    )
+                                    return data
+
+                                data = read(f'{granule_id} bytes {start}..{end}', fetch, pbar)
+                                write((c['offset'], data[c['offset'] - start:c['offset'] - start + c['size']])
+                                      for c in chunks)
+                                # the block's bytes are released before the next block is read
+                                del data
+
+                    if write_debug:
+                        print(f"    Done: {os.path.getsize(out_path) / (1024**3):.2f} GB written")
 
                     downloaded_files.append(out_name)
 
             return downloaded_files
 
-        def download_with_retry(granule, position=None):
-            """Download single granule with retry logic: retries=0 makes one attempt (HTTP.attempts), and a failure
-            that a retry cannot change (HTTP.final) raises at its first attempt."""
-            n = attempts(retries)
-            for retry in range(n):
-                try:
-                    return download_nisar_granule(
-                        granule, basedir, polarizations, skip_exist, debug, position=position
-                    )
-                except (ValueError, EmptyFileError):
-                    # Format errors and empty files are permanent - don't retry
-                    raise
-                except Exception as e:
-                    stop = final(e)
-                    print(f"ERROR downloading {granule} (attempt {retry+1}/{n}){' (not retried)' if stop else ''}: "
-                          f"{e}")
-                    if stop or retry + 1 == n:
-                        raise
-                    time.sleep(timeout_second)
-
-        # Process granules (sequential when n_jobs=1, single granule, or debug=True)
-        if n_jobs == 1 or len(granules) == 1 or debug:
-            # Sequential processing (also when debug=True for easier debugging)
-            all_downloaded = []
-            for granule in granules:
-                files = download_with_retry(granule)
-                all_downloaded.extend(files)
-        else:
-            # Sequential downloads with clear progress bars
-            # (parallel progress bars have display issues; sequential is cleaner UX
-            # and similar speed since downloads share bandwidth anyway)
-            all_downloaded = []
-            for i, granule in enumerate(granules):
-                files = download_with_retry(granule)  # No position = clean single bar
-                all_downloaded.extend(files)
+        # Process granules one after another (n_jobs and debug do not change it): each read of a granule has its own
+        # attempts, so a granule is not retried as a whole
+        all_downloaded = []
+        for granule in granules:
+            files = download_nisar_granule(granule, basedir, polarizations, skip_exist, debug)
+            all_downloaded.extend(files)
 
         if all_downloaded:
             return pd.DataFrame({'file': all_downloaded})
@@ -2850,45 +2868,28 @@ class ASF(progressbar_joblib):
 
             return aligned_blocks
 
-        def fetch_cache_range(granule_id, offset, length, session=None):
-            """Fetch range from cache proxy using new API.
-
-            Returns (content, cache_hit) tuple.
-            """
-            url = f"{_NISAR_CACHE_PROXY}/{granule_id}/{offset}/{length}.bin"
-            sess = session or requests.Session()
-            # a transfer slower than min_rate is cut (HTTP.read_body) and retried
-            with send(sess.get, url, stream=True, timeout=120) as resp:
-                content = read_body(resp, min_rate, min_rate_window)
-                # Check both X-Cache (proxy) and cf-cache-status (CDN) headers
-                cache_hit = (resp.headers.get('X-Cache', '').upper() == 'HIT' or
-                            resp.headers.get('cf-cache-status', '').upper() == 'HIT')
-            if len(content) != length:
-                raise ValueError(f'Cache response size mismatch: got {len(content)}, expected {length}')
-            return content, cache_hit
-
         def retried(what, request):
             """request() with the retries of the cache proxy: retries=0 makes one attempt (HTTP.attempts), and a
             failure that a retry cannot change (HTTP.final, such as HTTP 404) raises at its first attempt, logged as
-            not retried; the last failure is logged too."""
+            not retried; every failed attempt is logged."""
             n = attempts(retries)
             for retry in range(n):
                 try:
                     return request()
                 except Exception as e:
                     stop = final(e)
-                    if debug or stop or retry + 1 == n:
-                        print(f'ERROR: {what} download attempt {retry+1}/{n} failed'
-                              f'{" (not retried)" if stop else ""}: {e}')
+                    print(f'ERROR: {what} download attempt {retry+1}/{n} failed'
+                          f'{" (not retried)" if stop else ""}: {e}')
                     if stop or retry + 1 == n:
                         raise
                     time.sleep(timeout_second)
 
         def fetch_metadata(granule_id):
-            """The metadata block of a granule (fetch_cache_range); a body that is not HDF5 is retried, as a
+            """The metadata block of a granule (ASF._cache_range); a body that is not HDF5 is retried, as a
             broken transfer."""
             def request():
-                content, cache_hit = fetch_cache_range(granule_id, 0, MAX_BLOCK)
+                content, cache_hit = ASF._cache_range(_NISAR_CACHE_PROXY, granule_id, 0, MAX_BLOCK, min_rate,
+                                                      min_rate_window)
                 if not content.startswith(MAGIC_HDF5):
                     raise IOError(f'Cache returned invalid metadata (not HDF5): {content[:100]!r}')
                 return content, cache_hit
@@ -2922,9 +2923,12 @@ class ASF(progressbar_joblib):
             import requests
             url = f"{_NISAR_CACHE_PROXY}/{gid}/{offsets_str}/ranges.bin"
             def request():
-                # a transfer slower than min_rate is cut (HTTP.read_body) and retried
-                with send(requests.get, url, stream=True, timeout=120) as resp:
-                    content = read_body(resp, min_rate, min_rate_window)
+                # a transfer slower than min_rate is cut (HTTP.read_body) and retried; an uncoded answer carries
+                # its Content-Length (HTTP.read_body refuses a longer one)
+                with send(requests.get, url, headers={'Accept-Encoding': 'identity'}, stream=True,
+                          timeout=120) as resp:
+                    # never more than the ranges is read: a longer response raises
+                    content = read_body(resp, min_rate, min_rate_window, limit=total_size)
                     # Check both X-Cache (proxy) and cf-cache-status (CDN) headers
                     cache_hit = (resp.headers.get('X-Cache', '').upper() == 'HIT' or
                                 resp.headers.get('cf-cache-status', '').upper() == 'HIT')
@@ -2935,13 +2939,11 @@ class ASF(progressbar_joblib):
             return retried('block', request)
 
         def download_single_chunk(gid, offset, length):
-            """Download single chunk via single-block API (for small blocks)."""
-            import requests
-            url = f"{_NISAR_CACHE_PROXY}/{gid}/{offset}/{length}.bin"
+            """Download single chunk via single-block API (for small blocks); an answer that is not exactly the
+            chunk raises IOError (ASF._cache_range), retried."""
             def request():
-                # a transfer slower than min_rate is cut (HTTP.read_body) and retried
-                with send(requests.get, url, stream=True, timeout=120) as resp:
-                    return (offset, length, read_body(resp, min_rate, min_rate_window))
+                content, _ = ASF._cache_range(_NISAR_CACHE_PROXY, gid, offset, length, min_rate, min_rate_window)
+                return (offset, length, content)
             return retried('single chunk', request)
 
         all_downloaded = []
@@ -3112,13 +3114,18 @@ class ASF(progressbar_joblib):
 
     def _download_alos2(self, basedir, ids, polarizations, bbox, n_jobs, skip_exist, retries, timeout_second, min_rate,
                         min_rate_window, debug):
-        """Internal: download ALOS-2 ScanSAR subswaths directly from ASF (Earthdata account), cropped to a bbox.
+        """Internal: download ALOS-2 ScanSAR subswaths from ASF, cropped to a bbox: directly with an Earthdata
+        account, through the cache proxy _ALOS2_CACHE_PROXY without one (the account is optional, as for NISAR).
 
         A granule at ASF is one stored (uncompressed) ZIP archive. Its directory is read through byte ranges
         (zipfile over _RangeReader), then only the leader file (LED) and the line records of the subswaths' image
-        files (IMG) that the bbox reaches are read, every read a byte range of ASF._byte_range on one login session
-        per granule, reusing the signed URL of the first redirect. Each image file is streamed to disk in blocks of
-        about 64 MiB (utils_alos2_ceos.write_crop: a temporary file renamed when complete).
+        files (IMG) that the bbox reaches are read. With an account every read is a byte range of ASF._byte_range on
+        one login session per granule, reusing the signed URL of the first redirect; without one every read is
+        ASF._cache_range of the granule's fileID on _ALOS2_CACHE_PROXY, on one requests.Session per granule (no
+        Earthdata session, no signed URL). Each image file is streamed to disk in blocks of at most
+        _ALOS2_BLOCK_BYTES (64 MiB), below the proxy's 128 MB (utils_alos2_ceos.write_crop: a temporary file renamed
+        when complete). Each byte-range read has its own attempts: a failed block is read again, not the whole file.
+        The catalog search for the size of each granule is the public one in both cases.
 
         Parameters
         ----------
@@ -3140,9 +3147,10 @@ class ASF(progressbar_joblib):
         skip_exist : bool
             True skips the image files that exist; False downloads them again.
         retries : int
-            Attempts of the catalog search and of each granule, the first one included; 0 makes one attempt
-            (HTTP.attempts). A failure that a retry cannot change (HTTP.final), a format error (ValueError) and an
-            empty file (EmptyFileError) are not retried.
+            Attempts of the catalog search and of each byte-range read (the ZIP directory, the LED, the image heads,
+            each block of image records), the first one included; 0 makes one attempt (HTTP.attempts). A failure that
+            a retry cannot change (HTTP.final), a format error (ValueError) and an empty file (EmptyFileError) are not
+            retried. Every failed attempt is printed.
         timeout_second : float
             Seconds waited between the attempts.
         min_rate : str or float
@@ -3159,6 +3167,9 @@ class ASF(progressbar_joblib):
 
         Examples
         --------
+        >>> # without an account, through the cache proxy
+        >>> ASF()._download_alos2('data', ['ALOS2100352900-160401-WBDR1.1__D-F3'], None, None, None, True, 30, 3, '100KB',
+        ...                       60, False)
         >>> asf = ASF('user', 'pass')
         >>> asf._download_alos2('data', ['ALOS2100352900-160401-WBDR1.1__D-F3'], None, None, None, True, 30, 3, '100KB', 60,
         ...                     False)
@@ -3191,21 +3202,70 @@ class ASF(progressbar_joblib):
             raise ValueError(f"Granules not found in ASF: {missing}")
 
         def download_granule(fileID, subswaths, written):
+            """One granule, with no retry of its own: every network operation of a granule is a byte-range read
+            with its own attempts (the ZIP directory, the LED, the image heads, the blocks; the login session does
+            not raise, _ASFSession.auth_with_creds falls back to basic auth), so a granule-level retry would only
+            repeat a read that has used its attempts. A read that fails after its attempts raises (write_crop
+            removes its .tmp)."""
             url, size = catalog[fileID]
-            if debug:
-                print(f"ALOS-2 URL: {url}")
-            session = self._get_asf_session()
-            signed = [None]
+            if self.username is None:
+                # through the cache proxy: no Earthdata session, no signed URL
+                if debug:
+                    print(f"ALOS-2 URL: {_ALOS2_CACHE_PROXY}/{fileID}")
+                session = requests.Session()
+
+                def fetch(start, end, pbar=None):
+                    data, _ = ASF._cache_range(_ALOS2_CACHE_PROXY, fileID, start, end - start, min_rate,
+                                               min_rate_window, session)
+                    if pbar is not None:
+                        pbar.update(len(data))
+                    return data
+            else:
+                if debug:
+                    print(f"ALOS-2 URL: {url}")
+                session = self._get_asf_session()
+                signed = [None]
+
+                def fetch(start, end, pbar=None):
+                    # the first request follows the login redirect, the next ones go to its signed URL
+                    data, signed[0] = ASF._byte_range(url, start, end, None, min_rate, min_rate_window, pbar=pbar,
+                                                      http_session=session, signed_url=signed[0])
+                    return data
 
             def read(start, end, pbar=None):
-                # the first request follows the login redirect, the next ones go to its signed URL
-                data, signed[0] = ASF._byte_range(url, start, end, None, min_rate, min_rate_window, pbar=pbar,
-                                                  http_session=session, signed_url=signed[0])
-                return data
+                """The bytes start..end (end exclusive) of the granule's ZIP with the attempts of retries
+                (HTTP.attempts): a format error (ValueError) or an empty file (EmptyFileError) raises at once, a
+                failure that a retry cannot change (HTTP.final) at its first attempt; every failed attempt is
+                printed, and the bytes it counted in pbar are taken back."""
+                n = attempts(retries)
+                for k in range(1, n + 1):
+                    before = None if pbar is None else pbar.n
+                    try:
+                        return fetch(start, end, pbar)
+                    except (ValueError, EmptyFileError):
+                        # format errors and empty files are permanent - don't retry
+                        raise
+                    except Exception as e:
+                        if pbar is not None:
+                            # the direct route counts the bytes while it reads: each byte is counted once
+                            pbar.update(before - pbar.n)
+                        stop = final(e)
+                        print(f"ERROR downloading {fileID} bytes {start}..{end} (attempt {k}/{n})"
+                              f"{' (not retried)' if stop else ''}: {e}")
+                        if stop or k == n:
+                            raise
+                        time.sleep(timeout_second)
 
             reader = _RangeReader(read, size)
-            with zipfile.ZipFile(reader) as archive:
-                members = {os.path.basename(m.filename): m for m in archive.infolist()}
+            try:
+                with zipfile.ZipFile(reader) as archive:
+                    members = {os.path.basename(m.filename): m for m in archive.infolist()}
+            except zipfile.BadZipFile as e:
+                # zipfile reports a failed read as 'File is not a zip file': the read's own error is raised (after
+                # its attempts)
+                if reader.error is not None:
+                    raise reader.error from e
+                raise
 
             def member_data(name):
                 # (offset of the member's data, its size): the data follows the local header
@@ -3273,7 +3333,7 @@ class ASF(progressbar_joblib):
                             raise ValueError(f"ALOS-2 IMG-{p} of {subswath_id} has {member_size} bytes, expected "
                                              f"{720 + image['lines'] * record_length}")
                         first = offset + 720
-                        step = max(1, (64 * 1024 * 1024) // record_length)
+                        step = max(1, _ALOS2_BLOCK_BYTES // record_length)
                         # one block of records in memory at a time
                         blocks = (read(first + a * record_length, first + min(end, a + step) * record_length, pbar)
                                   for a in range(start, end, step))
@@ -3283,28 +3343,10 @@ class ASF(progressbar_joblib):
                         if name not in written:
                             written.append(name)
 
-        def download_with_retry(fileID, subswaths, written):
-            """One granule with retries: retries=0 makes one attempt (HTTP.attempts), and a failure that a retry
-            cannot change (HTTP.final) raises at its first attempt."""
-            n = attempts(retries)
-            for retry in range(n):
-                try:
-                    return download_granule(fileID, subswaths, written)
-                except (ValueError, EmptyFileError):
-                    # format errors and empty files are permanent - don't retry
-                    raise
-                except Exception as e:
-                    stop = final(e)
-                    print(f"ERROR downloading {fileID} (attempt {retry+1}/{n}){' (not retried)' if stop else ''}: "
-                          f"{e}")
-                    if stop or retry + 1 == n:
-                        raise
-                    time.sleep(timeout_second)
-
-        # the subswaths one after another; a file written by a failed attempt stays listed
+        # the subswaths one after another (each read with its own attempts)
         written = []
         for fileID, subswaths in granules.items():
-            download_with_retry(fileID, subswaths, written)
+            download_granule(fileID, subswaths, written)
 
         if written:
             return pd.DataFrame({'file': written})
@@ -3319,6 +3361,12 @@ class ASF(progressbar_joblib):
 
         Returns: (layout, metadata_buffer) where layout is 'A' or 'B' and
                  metadata_buffer is the patched 128MB buffer for reuse.
+
+        Raises
+        ------
+        IOError
+            When the answer is shorter than min(128 MB, file_size), a truncated transfer that the caller retries,
+            before the HDF5 checks; a longer answer is never read beyond 128 MB (HTTP.read_body limit).
         """
         import requests
         import struct
@@ -3329,15 +3377,22 @@ class ASF(progressbar_joblib):
         METADATA_SIZE = 128 * 1024 * 1024  # 128 MB - matches cache path
 
         # Download first 128MB (reuse session if provided)
-        headers = {'Range': f'bytes=0-{METADATA_SIZE-1}'}
+        # an uncoded answer carries its Content-Length (HTTP.read_body refuses a longer one)
+        headers = {'Range': f'bytes=0-{METADATA_SIZE-1}', 'Accept-Encoding': 'identity'}
         if http_session:
             response = send(http_session.get, url, headers=headers, stream=True, timeout=(10, 300))
         else:
             response = send(requests.get, url, headers=headers, auth=auth_tuple, stream=True, timeout=(10, 300))
 
-        # Stream download with progress; a transfer slower than min_rate is cut (HTTP.read_body) and retried
+        # Stream download with progress; a transfer slower than min_rate is cut (HTTP.read_body) and retried;
+        # never more than the range is read: a longer response raises
         with response:
-            data = bytearray(read_body(response, min_rate, min_rate_window, progress=pbar.update if pbar else None))
+            data = bytearray(read_body(response, min_rate, min_rate_window, progress=pbar.update if pbar else None,
+                                       limit=METADATA_SIZE))
+        # a shorter answer is a truncated transfer: refused before the HDF5 checks
+        expected = min(METADATA_SIZE, file_size)
+        if len(data) < expected:
+            raise IOError(f'Truncated metadata download: got {len(data)} bytes of {expected} expected')
 
         # Validate HDF5 magic bytes
         if data[:4] != b'\x89HDF':
@@ -3775,95 +3830,6 @@ class ASF(progressbar_joblib):
 
         return contextlib.contextmanager(stream)()
 
-    def _write_nisar_pol_h5_from_bytes(self, downloaded_data, chunk_info, metadata, pol,
-                                        out_path, track, frame, datetime_str, debug,
-                                        downloaded_data_b=None, chunk_info_b=None,
-                                        crop_info=None, data_offset_a=None, data_offset_b=None):
-        """Write single-polarization NISAR HDF5 from downloaded byte data.
-
-        Copies ALL metadata from source file (geolocationGrid, attitude, calibration,
-        processingInformation, etc.) - only excludes SLC data for other polarizations.
-
-        Supports three modes:
-        - FrequencyA only: downloaded_data present, downloaded_data_b is None
-        - FrequencyB only: downloaded_data is None, downloaded_data_b present
-        - Both frequencies: both present
-
-        The file is written at its temporary name chunk by chunk and renamed at the end (_nisar_stream_writer).
-
-        When crop_info is provided, crops SLC data and coordinate arrays to bbox extent, and sets
-        identification/zeroDopplerStartTime and zeroDopplerEndTime to the crop's first and last lines.
-
-        Parameters
-        ----------
-        downloaded_data : bytes, dict, or None
-            Raw bytes from HTTP Range request covering frequencyA chunks,
-            OR dict mapping chunk_offset -> chunk_bytes (for cache proxy).
-        chunk_info : dict or None
-            Chunk metadata from get_chunk_info() for frequencyA.
-        metadata : dict
-            ALL metadata from _read_nisar_metadata_direct().
-        pol : str
-            The polarization written: 'HH', 'HV', 'VH' or 'VV'.
-        out_path : str
-            The HDF5 file written; it is written at its temporary name and renamed at the end.
-        track : int
-            Track number of the granule (from _nisar_parse_granule_id); not read by this function.
-        frame : int
-            Frame number of the granule (from _nisar_parse_granule_id); not read by this function.
-        datetime_str : str
-            Datetime of the granule (from _nisar_parse_granule_id); not read by this function.
-        debug : bool
-            Print the number of chunks to write and the size of the written file.
-        downloaded_data_b : bytes, dict, or None
-            Raw bytes or dict for frequencyB (ionospheric correction / quick look).
-        chunk_info_b : dict, optional
-            Chunk metadata for frequencyB.
-        crop_info : dict, optional
-            Bbox crop: the output is cropped to chunk-aligned bounds. None writes the full extent.
-        data_offset_a : int, optional
-            Override min_offset for bytes mode (for bbox-filtered downloads).
-        data_offset_b : int, optional
-            Override min_offset for frequencyB bytes.
-        """
-        import os
-
-        # Determine which frequencies are being written
-        has_freq_a = downloaded_data is not None and chunk_info is not None
-        has_freq_b = downloaded_data_b is not None and chunk_info_b is not None
-
-        # Count total chunks
-        n_chunks_total = 0
-        if has_freq_a:
-            n_chunks_total += len(chunk_info['chunks'])
-        if has_freq_b:
-            n_chunks_total += len(chunk_info_b['chunks'])
-
-        if debug:
-            print(f"    Writing {n_chunks_total} chunks + {len(metadata)-1} metadata datasets...")
-
-        def pairs(data, ci, data_offset):
-            """The (chunk_offset, chunk_bytes) of one frequency: from a dict, or sliced from a byte range at data_offset."""
-            min_offset = data_offset if data_offset is not None else ci['min_offset']
-            for chunk in ci['chunks']:
-                if isinstance(data, dict):
-                    if chunk['offset'] in data:
-                        yield chunk['offset'], data[chunk['offset']]
-                else:
-                    offset_in_data = chunk['offset'] - min_offset
-                    yield chunk['offset'], data[offset_in_data:offset_in_data + chunk['size']]
-
-        with self._nisar_stream_writer(out_path, pol, chunk_info if has_freq_a else None,
-                                       chunk_info_b if has_freq_b else None, lambda: metadata, crop_info) as write:
-            if has_freq_a:
-                write(pairs(downloaded_data, chunk_info, data_offset_a))
-            if has_freq_b:
-                write(pairs(downloaded_data_b, chunk_info_b, data_offset_b))
-
-        if debug:
-            file_size = os.path.getsize(out_path)
-            print(f"    Done: {file_size / (1024**3):.2f} GB written")
-
     @staticmethod
     def update(basedir, skip_exist=True, n_jobs=8, joblib_backend='loky', retries=30, timeout_second=3, min_rate='100KB',
                min_rate_window=60):
@@ -4088,6 +4054,49 @@ class ASF(progressbar_joblib):
         return gpd.GeoDataFrame.from_features(rows, crs='EPSG:4326')
 
     @staticmethod
+    def _nisar_latest(features):
+        """
+        The NISAR catalog features with, for each acquisition, only the most recent production product.
+
+        An acquisition is the (level, product, track, direction, frame, mode, polarization, start) of the product name
+        (_NISAR_NAME). Its products are ranked by the config PR (production) above any other (such as UR, urgent
+        response), then the five digits of the CRID as a number (P05036 > P05023 > X05010 > X05009), then the product
+        counter as a number; the highest rank is kept. The kept features keep their catalog order. A feature whose
+        fileID is not a NISAR product name is kept as it is.
+
+        Parameters
+        ----------
+        features : list of dict
+            The GeoJSON features as the catalog returns them (properties with fileID).
+
+        Returns
+        -------
+        list of dict
+            The kept features, in catalog order.
+
+        Examples
+        --------
+        >>> old = {'properties': {'fileID': 'NISAR_L1_PR_RSLC_033_113_D_079_4005_DHDH_A_20261020T011329_20261020T011403_P05023_N_F_J_001'}}
+        >>> new = {'properties': {'fileID': 'NISAR_L1_PR_RSLC_033_113_D_079_4005_DHDH_A_20261020T011329_20261020T011403_P05036_P_F_J_001'}}
+        >>> ASF._nisar_latest([old, new]) == [new]
+        True
+        """
+        keys, best = [], {}
+        for index, feature in enumerate(features):
+            m = _NISAR_NAME.match(feature['properties'].get('fileID') or '')
+            if m is None:
+                keys.append(None)
+                continue
+            key = tuple(m.group(name) for name in
+                        ('level', 'product', 'track', 'direction', 'frame', 'mode', 'polarization', 'start'))
+            rank = (m.group('config') == 'PR', int(m.group('crid')[1:]), int(m.group('counter')))
+            keys.append(key)
+            if key not in best or rank > best[key][0]:
+                best[key] = (rank, index)
+        return [feature for index, (feature, key) in enumerate(zip(features, keys))
+                if key is None or best[key][1] == index]
+
+    @staticmethod
     def search(geometry, startTime=None, stopTime=None, flightDirection=None,
                platform='SENTINEL-1', processingLevel='auto', polarization=None, beamMode='auto'):
         """
@@ -4101,6 +4110,13 @@ class ASF(progressbar_joblib):
         ASF.download with a bbox warns about a subswath the bbox does not reach. The column sceneName is the subswath ID
         `<fileID>-F<n>` that ASF.download takes, `subswath` is 'F1'..'F5' and the geometry is the predicted subswath
         footprint.
+
+        NISAR (platform='NISAR'): one row per acquisition, the most recent production product of it
+        (ASF._nisar_latest). The catalog holds BETA, PROVISIONAL and VALIDATED versions of one acquisition and the
+        reprocessed products of earlier acquisitions, and ASF.download writes them all to the same file. An acquisition
+        is the (level, product, track, direction, frame, mode, polarization, start) of the product name; its products
+        are ranked by the config PR (production) above any other (such as UR, urgent response), then the five digits of
+        the CRID as a number (P05036 > P05023 > X05010 > X05009), then the product counter as a number.
 
         Parameters
         ----------
@@ -4128,7 +4144,7 @@ class ASF(progressbar_joblib):
         Returns
         -------
         geopandas.GeoDataFrame
-            The catalog rows (Sentinel-1 bursts, ALOS-2 subswaths) with their footprints, CRS EPSG:4326.
+            The catalog rows (Sentinel-1 bursts, ALOS-2 subswaths, NISAR products) with their footprints, CRS EPSG:4326.
 
         Raises
         ------
@@ -4210,7 +4226,11 @@ class ASF(progressbar_joblib):
                     return requested <= {p.strip().upper() for p in pols}
                 supported = [f for f in supported if held(f)]
             return ASF._alos2_subswath_rows(supported, geometry)
-        gdf = gpd.GeoDataFrame.from_features([product.geojson() for product in results], crs="EPSG:4326")
+        features = [product.geojson() for product in results]
+        # NISAR: per acquisition the most recent production product (the versions are written to the same file)
+        if names and all(name.upper() == 'NISAR' for name in names):
+            features = ASF._nisar_latest(features)
+        gdf = gpd.GeoDataFrame.from_features(features, crs="EPSG:4326")
         if 'burst' in gdf.columns:
             gdf['fullBurstID'] = gdf['burst'].apply(lambda b: b['fullBurstID'])
         return gdf

@@ -521,21 +521,47 @@ def iter_body(response, min_rate='100KB', min_rate_window: float = 60, progress=
         raise IOError(f'truncated body: {size} of {expected} bytes')
 
 
-def read_body(response, min_rate='100KB', min_rate_window: float = 60, progress=None) -> bytes:
+def read_body(response, min_rate='100KB', min_rate_window: float = 60, progress=None, limit=None) -> bytes:
     """
     The whole body of a response requested with stream=True, read by iter_body(): cut when the transfer stays
     slower than min_rate. For a body needed in memory anyway, such as a burst or a NISAR block; a body that is
     stored as a file is written from iter_body() as it arrives.
 
-    Parameters and Raises as iter_body().
+    A server may answer a range request with more bytes than the range, up to the whole file (HTTP allows it to
+    ignore Range and answer 200), and this function would collect them all. With limit, the length of the range,
+    the body is never read beyond it: an uncompressed body (no Content-Encoding, or identity) whose Content-Length
+    is larger than limit raises before any byte is read, and any body raises as soon as its decoded bytes would pass
+    limit, so at most one network read (64 KB, decoded) beyond limit is held. The Content-Length of a compressed
+    body counts its compressed bytes, not the decoded ones the limit applies to, so it is not checked beforehand.
+
+    Parameters
+    ----------
+    response, min_rate, min_rate_window, progress
+        As iter_body().
+    limit : int, optional
+        Largest body accepted, in bytes; None reads the body to its end, whatever its length. Default None.
 
     Returns
     -------
     bytes
         The response body, transparently decoded.
+
+    Raises
+    ------
+    IOError
+        With limit: a body longer than limit ('range response longer than the <limit> bytes requested').
+    Others as iter_body().
     """
+    if limit is not None:
+        # a compressed body announces its compressed length, the limit applies to the decoded bytes
+        encoding = response.headers.get('Content-Encoding', 'identity').lower()
+        expected = response.headers.get('Content-Length')
+        if expected is not None and encoding == 'identity' and int(expected) > limit:
+            raise IOError(f'range response longer than the {limit} bytes requested')
     body = bytearray()
     for chunk in iter_body(response, min_rate, min_rate_window, progress):
+        if limit is not None and len(body) + len(chunk) > limit:
+            raise IOError(f'range response longer than the {limit} bytes requested')
         body += chunk
     return bytes(body)
 
