@@ -123,7 +123,8 @@ class Satellite(progressbar_joblib, datagrid):
         FileNotFoundError
             A closest approach of the repeat orbit outside its search window (satellite_baseline): the error
             names the group and the date and the window used. For Sentinel-1 the window is half the duration
-            of the repeat burst (num_patches x num_valid_az / PRF / 2 of its PRM); Nisar: half the duration of the repeat granule (granule_duration of its PRM).
+            of the repeat burst (num_patches x num_valid_az / PRF / 2 of its PRM); ALOS-2 the same, half the duration of
+            the repeat record (its records hold their orbit file, the LED); Nisar: half the duration of the repeat granule (granule_duration of its PRM).
         ValueError
             An orbit that cannot be used: a Sentinel-1 orbit file that does not cover its burst or
             holds a state vector that is not finite, or a baseline that is not finite.
@@ -174,8 +175,9 @@ class Satellite(progressbar_joblib, datagrid):
                     # the origin is the first date and never moves: it only shifts the whole scale,
                     # so moving it would hide a defect instead of reporting one
                     origin, origin_date = names[0], name_dates[0]
-                    # Sentinel-1 (the records hold an orbit file): the closest-approach search half window is half the
-                    # repeat burst's duration from its PRM, as the transform uses it. NISAR: half the repeat granule's duration (granule_duration of its PRM).
+                    # Sentinel-1 and ALOS-2 (the records hold an orbit file; ALOS-2's is the LED): the closest-approach
+                    # search half window is half the repeat burst's or record's duration from its PRM, as the transform
+                    # uses it. NISAR: half the repeat granule's duration (granule_duration of its PRM).
                     s1 = 'orbit' in records.columns
                     origins.setdefault(origin_date, []).append(group)
                     values = {}

@@ -15,3 +15,5 @@ from .PRM import PRM
 from .S1 import S1
 # NISAR processing
 from .Nisar import Nisar
+# ALOS-2 processing
+from .Alos2 import Alos2
