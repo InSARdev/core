@@ -1028,59 +1028,8 @@ def _precise_footprint(outlines, dy, dx):
     return shapely.to_wkb(widened)
 
 
-def get_utm_epsg(lat, lon):
-    """Get UTM EPSG code for given lat/lon coordinates."""
-    zone_num = int((lon + 180) // 6) + 1
-    return 32600 + zone_num if lat >= 0 else 32700 + zone_num
-
-
-def proj(ys, xs, to_epsg, from_epsg):
-    """Project coordinates between EPSG codes.
-
-    Parameters
-    ----------
-    ys : array-like
-        Y coordinates (latitude for EPSG:4326)
-    xs : array-like
-        X coordinates (longitude for EPSG:4326)
-    to_epsg : int
-        Target EPSG code
-    from_epsg : int
-        Source EPSG code
-
-    Returns
-    -------
-    tuple
-        (ys_new, xs_new) in target CRS
-    """
-    from pyproj import CRS, Transformer
-    from_crs = CRS.from_epsg(from_epsg)
-    to_crs = CRS.from_epsg(to_epsg)
-    transformer = Transformer.from_crs(from_crs, to_crs, always_xy=True)
-    xs_new, ys_new = transformer.transform(xs, ys)
-    del transformer, from_crs, to_crs
-    return ys_new, xs_new
-
-
-# the points projected on each edge of a bbox (bbox_grid_bounds): the extreme of a curved edge between two of them
-# is missed by at most 0.06 mm for a bbox up to 1 degree wide and 2.7 mm up to 6 degrees (UTM, measured)
-BBOX_EDGE_POINTS = 1025
-
-
-def bbox_grid_bounds(bbox, epsg, dy, dx):
-    """The grid edges (y_min, y_max, x_min, x_max) in EPSG epsg that cover a WGS84 bbox [lon_min, lat_min, lon_max,
-    lat_max]: its projected extent, snapped outward to multiples of the spacing (dy, dx). The four EDGES are projected
-    (BBOX_EDGE_POINTS points each), not two corners: a lon/lat rectangle is not a rectangle in the output CRS, and its
-    extreme x/y can lie at any corner or inside a curved edge (a parallel across a UTM central meridian). The S1 and
-    NISAR transforms crop their grid to these edges."""
-    t = np.linspace(0.0, 1.0, BBOX_EDGE_POINTS)
-    lon = np.r_[bbox[0] + (bbox[2] - bbox[0]) * t, np.full(t.size, bbox[2]),
-                bbox[2] - (bbox[2] - bbox[0]) * t, np.full(t.size, bbox[0])]
-    lat = np.r_[np.full(t.size, bbox[1]), bbox[1] + (bbox[3] - bbox[1]) * t,
-                np.full(t.size, bbox[3]), bbox[3] - (bbox[3] - bbox[1]) * t]
-    ys, xs = proj(lat, lon, from_epsg=4326, to_epsg=epsg)
-    return (float(dy * np.floor(np.min(ys) / dy)), float(dy * np.ceil(np.max(ys) / dy)),
-            float(dx * np.floor(np.min(xs) / dx)), float(dx * np.ceil(np.max(xs) / dx)))
+# moved to insardev_toolkit.utils_grid (one implementation, shared with the downloaders' crop windows)
+from insardev_toolkit.utils_grid import get_utm_epsg, proj, BBOX_EDGE_POINTS, bbox_grid_bounds
 
 
 def orbit_defect(orbit_df, start=None, stop=None):

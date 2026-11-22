@@ -3552,10 +3552,15 @@ class ASF(progressbar_joblib):
             The requested polarizations; those the product lacks are skipped (download() names them in a WARNING).
             None: every one the product has (HH and HV of an HH+HV product, HH of an HH product).
         bbox : tuple or None
-            (west, south, east, north) in WGS84 degrees: only the lines of a subswath that the bbox reaches at any
-            height from -500 to 9000 m are stored (utils_alos2_orbit.bbox_window), rounded outward to multiples of
-            _ALOS2_LINE_BLOCK lines (512) and ending at the image's last line at most; a subswath it does not reach
-            gets a WARNING and nothing is stored. None stores the whole subswath.
+            (west, south, east, north) in WGS84 degrees: only the lines of a subswath that the transform's UTM grid
+            of the bbox reaches at any height from -500 to 9000 m are stored (utils_alos2_orbit.bbox_window over
+            utils_grid.transform_region: the grid rectangles of the bbox plus 100 m, in lon/lat), rounded outward to
+            multiples of _ALOS2_LINE_BLOCK lines (512) and ending at the image's last line at most. The grid is first
+            taken in the UTM zone of the bbox centre; the transform takes the zone of the centroid of the stored
+            footprint, so the prefixes of the window's first and last lines are read (JAXA's lon/lat of their first,
+            mid and last pixel) and, when their span reaches another UTM zone or hemisphere, the window is computed
+            again over the grids of all those zones (once; a zone still outside raises RuntimeError). A subswath the
+            bbox does not reach gets a WARNING and nothing is stored. None stores the whole subswath.
         n_jobs : int or None
             Not used: the subswaths are downloaded one after another. Kept for the signature shared with the other
             downloads.
@@ -3596,8 +3601,10 @@ class ASF(progressbar_joblib):
         from tqdm.auto import tqdm
         from .HTTP import final, attempts
         from .utils_files import EmptyFileError, exists
+        import numpy as np
         from .utils_alos2_orbit import led_orbit, led_sampling_rate, bbox_window
-        from .utils_alos2_ceos import image_info, write_crop
+        from .utils_alos2_ceos import image_info, write_crop, prefix_lonlat, DESCRIPTOR, PREFIX
+        from .utils_grid import get_utm_epsg, transform_region
 
         # the subswaths of each granule, in the order of the IDs
         granules = {}
@@ -3712,14 +3719,49 @@ class ASF(progressbar_joblib):
                 head = read(img[pols[0]][0], img[pols[0]][0] + 1264)
                 image = image_info(head)
                 if bbox is not None:
-                    window = bbox_window(orbit, image, sampling_rate, tuple(bbox))
+
+                    def span_zones(window):
+                        """The UTM EPSG codes of every zone and hemisphere between the minimum and maximum of JAXA's
+                        lon/lat of the first, mid and last pixel of the window's first and last lines (one prefix
+                        read each): the span of the stored footprint, which holds its centroid.
+
+                        Examples
+                        --------
+                        >>> span_zones((6144, 22016))
+                        """
+                        lon, lat = [], []
+                        for line in (window[0], window[1] - 1):
+                            first = img[pols[0]][0] + DESCRIPTOR + line * image['record_length']
+                            line_lon, line_lat = prefix_lonlat(read(first, first + PREFIX))
+                            lon.extend(line_lon)
+                            lat.extend(line_lat)
+                        # a longitude every 6 degrees from the west end, and the east end: one in every zone between
+                        lons = np.r_[np.arange(min(lon), max(lon), 6.0), max(lon)]
+                        return {get_utm_epsg(y, x) for y in (min(lat), max(lat)) for x in lons}
+
+                    # the transform's UTM grid of the bbox: first in the zone of the bbox centre, then (once) in every
+                    # zone the stored lines span
+                    epsgs = {get_utm_epsg(0.5 * (bbox[1] + bbox[3]), 0.5 * (bbox[0] + bbox[2]))}
+                    for attempt in (1, 2):
+                        window = bbox_window(orbit, image, sampling_rate, transform_region(tuple(bbox), epsgs))
+                        if window is None:
+                            break
+                        # rounded outward on the image's grid of _ALOS2_LINE_BLOCK lines
+                        window = ((window[0] // _ALOS2_LINE_BLOCK) * _ALOS2_LINE_BLOCK,
+                                  min(image['lines'], -(-window[1] // _ALOS2_LINE_BLOCK) * _ALOS2_LINE_BLOCK))
+                        zones = span_zones(window)
+                        if zones <= epsgs:
+                            break
+                        if attempt == 2:
+                            raise RuntimeError(f"ALOS-2 {subswath_id}: lines {window[0]}..{window[1]} reach UTM "
+                                               f"{sorted(zones - epsgs)} outside the grid of {sorted(epsgs)}")
+                        epsgs |= zones
                     if window is None:
                         print(f"WARNING: bbox {tuple(bbox)} does not reach {subswath_id} at heights -500 to 9000 m: "
                               f"nothing stored")
                         continue
-                    # rounded outward on the image's grid of _ALOS2_LINE_BLOCK lines
-                    window = ((window[0] // _ALOS2_LINE_BLOCK) * _ALOS2_LINE_BLOCK,
-                              min(image['lines'], -(-window[1] // _ALOS2_LINE_BLOCK) * _ALOS2_LINE_BLOCK))
+                    if debug:
+                        print(f"{subswath_id}: the grid of the bbox in EPSG {sorted(epsgs)}")
                 else:
                     window = (0, image['lines'])
                 start, end = window

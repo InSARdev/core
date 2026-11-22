@@ -133,6 +133,38 @@ def image_info(head):
             'date': day.isoformat()}
 
 
+def prefix_lonlat(prefix):
+    """
+    Read JAXA's longitude and latitude of the first, mid and last pixel of a line from its record prefix.
+
+    Parameters
+    ----------
+    prefix : bytes
+        The first 544 bytes of a line record (or more).
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        (lon, lat): float64 arrays of 3 values, degrees on the WGS84 ellipsoid at height 0, of the first, mid and last
+        pixel: the big-endian int32 fields at bytes 205, 209, 213 (longitude) and 193, 197, 201 (latitude), in 1e-6
+        degrees.
+
+    Raises
+    ------
+    ValueError
+        If the prefix is shorter than 544 bytes.
+
+    Examples
+    --------
+    >>> prefix_lonlat(open('IMG-HH-ALOS2...-F1', 'rb').read(1264)[720:])
+    """
+    if len(prefix) < PREFIX:
+        raise ValueError(f'IMG line prefix has {len(prefix)} bytes, expected {PREFIX}')
+    lat = np.array([_int32(prefix, b) for b in (193, 197, 201)], dtype=np.float64) * 1e-6
+    lon = np.array([_int32(prefix, b) for b in (205, 209, 213)], dtype=np.float64) * 1e-6
+    return lon, lat
+
+
 def crop_header(descriptor, lines):
     """
     Rewrite the line counts of an IMG file descriptor for a crop of `lines` line records.
