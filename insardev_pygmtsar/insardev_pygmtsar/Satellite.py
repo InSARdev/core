@@ -378,6 +378,8 @@ class Satellite(progressbar_joblib, datagrid):
             factor_x = int(np.round(size_x / _size[0]))
             dem = dem[::max(1, factor_y), ::max(1, factor_x)]
             dem.plot.imshow(cmap='gray', alpha=alpha, add_colorbar=True, ax=ax)
+            # the map frame is the DEM: no autoscale margin (a footprint vertex a fraction of a DEM pixel outside the image opens an empty 5 % strip)
+            ax.margins(0)
 
         cmap_obj = matplotlib.colormaps[cmap]
         colors = dict([(v, cmap_obj(k)) for k, v in enumerate(records.index.unique())])
