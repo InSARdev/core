@@ -61,6 +61,63 @@ def _short_reason(error):
     return type(error).__name__
 
 
+# the query of a URL or of a request path in a text: a signed URL's query is its signature
+_URL_QUERY = re.compile(r'''(/[^\s?'"]*)\?[^\s'")]*[^\s'"):]''')
+
+
+def _redact(text):
+    """
+    A text with the query of every URL and request path in it replaced by '?<query removed>' (scheme, host and path
+    kept): the text of a failed request to a signed URL (requests names the URL it could not reach, its query the
+    signature that opens the file for about an hour) is printed or raised without it.
+
+    Parameters
+    ----------
+    text : str
+        The text, such as the message of a requests error.
+
+    Returns
+    -------
+    str
+        The text without the queries.
+
+    Examples
+    --------
+    >>> _redact("Max retries exceeded with url: /data/file.zip?Expires=1&Signature=abc (Caused by ...)")
+    'Max retries exceeded with url: /data/file.zip?<query removed> (Caused by ...)'
+    """
+    return _URL_QUERY.sub(r'\1?<query removed>', text)
+
+
+def _redacted(error):
+    """
+    The error with the queries removed from its text (_redact), raised by the download code in its place: when its
+    text holds a query, its arguments become the redacted text and its chained errors (which hold the URL too) are
+    dropped; the error's type is kept. An error whose text holds no query is returned unchanged.
+
+    Parameters
+    ----------
+    error : BaseException
+        The error of a failed request.
+
+    Returns
+    -------
+    BaseException
+        The same error object.
+
+    Examples
+    --------
+    >>> raise _redacted(e)
+    """
+    text = str(error)
+    clean = _redact(text)
+    if clean != text:
+        error.args = (clean,)
+        error.__cause__ = None
+        error.__suppress_context__ = True
+    return error
+
+
 class _ASFSession(requests.Session):
     """Authenticated session for ASF/Earthdata downloads.
 
@@ -531,6 +588,8 @@ _NISAR_MIN_CROP_KM = 20
 _ALOS2_LINE_BLOCK = 512
 # The largest block of ALOS-2 image records read and written at once (64 MiB), below the proxy's 128 MB per range
 _ALOS2_BLOCK_BYTES = 64 * 1024 * 1024
+# The refusal of an ALOS-1 FBS SLC (ASF._alos1_catalog by the catalog beam mode, ASF._download_alos1 by the LED)
+_ALOS1_FBS_SLC = 'ALOS-1 product {}: FBS SLC is not supported (ALOS-1 SLC is FBD and PLR)'
 # The ALOS-2 ScanSAR subswath footprints in the catalog polygon of a scene (ASF.search: the catalog holds one polygon per
 # scene, none per subswath), measured against JAXA's line coordinates: session/patches/alos2/PLAN.md, U0 and its
 # 2026-11-20 extension (23 right- and 18 left-looking scenes). Lengths in km, in the tangent plane at the scene centre.
@@ -919,12 +978,13 @@ class ASF(progressbar_joblib):
         Parameters
         ----------
         granule_name : str
-            Granule identifier (S1 burst, NISAR granule or ALOS-2 subswath).
+            Granule identifier (S1 burst, NISAR granule, ALOS-2 subswath or ALOS-1 PALSAR product).
 
         Returns
         -------
         str
-            'S1' for Sentinel-1, 'NISAR' for NISAR, 'ALOS2' for ALOS-2 (a name starting with ALOS2).
+            'S1' for Sentinel-1, 'NISAR' for NISAR, 'ALOS2' for ALOS-2 (a name starting with ALOS2), 'ALOS1' for
+            ALOS-1 PALSAR (a name starting with ALPSRP).
 
         Raises
         ------
@@ -935,6 +995,8 @@ class ASF(progressbar_joblib):
         --------
         >>> ASF._detect_mission('ALOS2592361150-250512-WBDR1.1__A-F2')
         'ALOS2'
+        >>> ASF._detect_mission('ALPSRP131296360-L1.1')
+        'ALOS1'
         """
         if granule_name.startswith('S1_') and granule_name.endswith('-BURST'):
             return 'S1'
@@ -942,9 +1004,11 @@ class ASF(progressbar_joblib):
             return 'NISAR'
         elif granule_name.startswith('ALOS2'):
             return 'ALOS2'
+        elif granule_name.startswith('ALPSRP'):
+            return 'ALOS1'
         else:
             raise ValueError(f"Unknown mission for granule: {granule_name}. "
-                           f"Expected S1_*-BURST, NISAR_* or ALOS2* format.")
+                           f"Expected S1_*-BURST, NISAR_*, ALOS2* or ALPSRP* format.")
 
     @staticmethod
     def _burst_exists(basedir, burst):
@@ -1242,14 +1306,296 @@ class ASF(progressbar_joblib):
         # every file is checked, so that an empty one raises
         return all([exists(path) for path in files])
 
+    @staticmethod
+    def _alos1_parse(granule):
+        """
+        Parse the ID of one ALOS-1 PALSAR L1.1 (SLC) product, `ALPSRP<orbit><frame>-L1.1`, or L1.0 (raw signal data)
+        product, `ALPSRP<orbit><frame>-L1.0`, without network.
+
+        The ID is the product's fileID in the ASF catalog (the column sceneName of ASF.search): ALPSRP + orbit (5
+        digits) + frame (4 digits) + '-L1.1' or '-L1.0' (measured 2026-11-23: the L1.0 fileID, such as
+        'ALPSRP055006360-L1.0', and its ZIP 'ALPSRP055006360-L1.0.zip'). The path is (46 * orbit + 84) mod 671 + 1
+        (checked against the catalog's pathNumber of 17,500 L1.1 products of 283 paths, 3..671, 2026-11-22). The ID
+        holds no date: 'date' is the UTC date of the scene centre predicted from the orbit and the frame, t =
+        2006-01-24T01:30:51.5 UTC + 5923.0978 s * (orbit + frame / 7200), fitted to the catalog's scene centres of the
+        same 17,500 products (largest error 214 s): it can be one day off for a scene within minutes of midnight. The
+        files of a product are named with the date of its first image line (ASF._download_alos1); ASF._alos1_complete
+        looks for them within one day of this date (a path and frame repeat every 46 days).
+
+        Parameters
+        ----------
+        granule : str
+            The product ID, such as 'ALPSRP131296360-L1.1' or 'ALPSRP055006360-L1.0'.
+
+        The level is the ID's suffix, 'L1.1' or 'L1.0': the supported levels, which ASF.download and the file names
+        (ASF._alos1_path) follow (info['level']).
+
+        Returns
+        -------
+        dict
+            'scene' (ALPSRP + orbit + frame), 'fileID', 'level' ('L1.1' or 'L1.0'), 'orbit', 'frame', 'path' and
+            'date' ('YYYYMMDD', predicted).
+
+        Raises
+        ------
+        ValueError
+            One line, for an ID that is not an ALOS-1 PALSAR product ID, a scene name without the '-L1.1' or '-L1.0'
+            suffix, or a product of another level than L1.1 and L1.0.
+
+        Examples
+        --------
+        >>> ASF._alos1_parse('ALPSRP131296360-L1.1')['path']
+        119
+        >>> ASF._alos1_parse('ALPSRP131296360-L1.1')['date']
+        '20080712'
+        >>> ASF._alos1_parse('ALPSRP055006360-L1.0')['level']
+        'L1.0'
+        """
+        import re
+        from datetime import datetime, timedelta, timezone
+        m = re.match(r'^(ALPSRP(\d{5})(\d{4}))(?:-(.+))?$', granule)
+        if m is None:
+            raise ValueError(f"Not an ALOS-1 PALSAR product ID: {granule}")
+        if m.group(4) is None:
+            raise ValueError(f"ALOS-1 ID {granule} needs the product suffix: use {granule}-L1.1 (SLC) or "
+                             f"{granule}-L1.0 (raw) (column sceneName of ASF.search)")
+        # the supported levels (the ID suffix)
+        if m.group(4) not in ('L1.1', 'L1.0'):
+            raise ValueError(f"ALOS-1 product {granule} is not supported: only the L1.1 (SLC) and L1.0 (raw) products "
+                             f"are")
+        orbit, frame = int(m.group(2)), int(m.group(3))
+        centre = datetime(2006, 1, 24, 1, 30, 51, 500000, tzinfo=timezone.utc) + \
+            timedelta(seconds=5923.0978 * (orbit + frame / 7200))
+        return {'scene': m.group(1), 'fileID': granule, 'level': m.group(4), 'orbit': orbit, 'frame': frame,
+                'path': (46 * orbit + 84) % 671 + 1, 'date': centre.strftime('%Y%m%d')}
+
+    @staticmethod
+    def _alos1_path(basedir, info, polarization=None):
+        """
+        The file of an ALOS-1 product: `<basedir>/<path>_<frame>_<offnadir>/AL1_<path>_<frame>_<offnadir>_<YYYYMMDD>_<pol>.img`,
+        or its `.led` (no polarization) for polarization=None; <offnadir> is the off-nadir angle in tenths of a degree
+        (3 digits). The one place where the names of the ALOS-1 files are formed, per level (info['level']): an L1.1
+        (SLC) product as above, an L1.0 (raw) product in the folder `<path>_<frame>_<offnadir>_raw` with the same code,
+        `AL1_<path>_<frame>_<offnadir>_<YYYYMMDD>_<pol>.raw` and its own `.led` (the leader files of the two levels
+        differ). Raw and SLC files never share a folder.
+
+        Parameters
+        ----------
+        basedir : str
+            The download folder.
+        info : dict
+            The product as ASF._alos1_parse gives it, with 'offnadir' (degrees, from the product's leader file) and
+            'date' ('YYYYMMDD', of the first image line) added by the download.
+        polarization : str or None, optional
+            The polarization of the image file; None for the leader file. Default None.
+
+        Returns
+        -------
+        str
+            The path of the file.
+
+        Examples
+        --------
+        >>> ASF._alos1_path('data', dict(ASF._alos1_parse('ALPSRP131296360-L1.1'), offnadir=34.3), 'HV')
+        'data/119_6360_343/AL1_119_6360_343_20080712_HV.img'
+        >>> ASF._alos1_path('data', dict(ASF._alos1_parse('ALPSRP055006360-L1.0'), offnadir=34.3, date='20070205'), 'HH')
+        'data/118_6360_343_raw/AL1_118_6360_343_20070205_HH.raw'
+        """
+        import os
+        name = f"{info['path']:03d}_{info['frame']:04d}_{int(round(info['offnadir'] * 10)):03d}"
+        raw = info['level'] == 'L1.0'
+        suffix = '.led' if polarization is None else f"_{polarization}{'.raw' if raw else '.img'}"
+        return os.path.join(basedir, f"{name}_raw" if raw else name, f"AL1_{name}_{info['date']}{suffix}")
+
+    @staticmethod
+    def _alos1_pols(polarizations, available, granule):
+        """
+        The polarizations of an ALOS-1 product to download: the requested ones that it has (a WARNING names the
+        others), or every one it has for polarizations=None. The product's polarizations are its image files, the same
+        for its L1.1 (SLC) and L1.0 (raw) products (FBS: HH or VV; FBD: HH and HV or VV and VH; PLR: HH, HV, VH and
+        VV).
+
+        Parameters
+        ----------
+        polarizations : list or None
+            The requested polarizations.
+        available : list
+            The polarizations of the product.
+        granule : str
+            The product ID, for the WARNING.
+
+        Returns
+        -------
+        list
+            The polarizations to download.
+
+        Examples
+        --------
+        >>> ASF._alos1_pols(None, ['HH', 'HV'], 'ALPSRP131296360-L1.1')
+        ['HH', 'HV']
+        >>> ASF._alos1_pols(['HV'], ['HH', 'HV'], 'ALPSRP131296360-L1.1')
+        ['HV']
+        """
+        if polarizations is None:
+            return list(available)
+        missing = [p for p in polarizations if p not in available]
+        if missing:
+            print(f'WARNING: Polarizations {missing} not available in {granule}')
+        return [p for p in polarizations if p in available]
+
+    @staticmethod
+    def _alos1_complete(basedir, info, polarizations):
+        """
+        Whether every file of an ALOS-1 product already exists, for skip_exist=True, without network.
+
+        The files of a product are found by its path and frame and a date within one day of the predicted date of
+        ASF._alos1_parse, at any off-nadir angle (a path and frame repeat every 46 days, so at most one product
+        matches), in the folder of its level (ASF._alos1_path: `<path>_<frame>_<offnadir>` for L1.1 with `.img` image
+        files, `<path>_<frame>_<offnadir>_raw` for L1.0 with `.raw` image files). The product is complete when its
+        `.led` exists and either the image file of every requested polarization exists, or the image files that exist
+        are as many as the product's image channels (the number of channels of the data set summary record of the
+        `.led`, bytes 389-392): every polarization the product has. With polarizations=None only the second rule
+        applies.
+
+        Parameters
+        ----------
+        basedir : str
+            The download folder.
+        info : dict
+            The product as ASF._alos1_parse gives it.
+        polarizations : list or None
+            The requested polarizations (None: every one the product has).
+
+        Returns
+        -------
+        bool
+            True when every file exists. An empty file raises.
+
+        Raises
+        ------
+        ValueError
+            When more than one leader file matches the product.
+
+        Examples
+        --------
+        >>> ASF._alos1_complete('data', ASF._alos1_parse('ALPSRP131296360-L1.1'), None)
+        False
+        >>> ASF._alos1_complete('data', ASF._alos1_parse('ALPSRP055006360-L1.0'), ['HH'])
+        False
+        """
+        import os
+        from glob import glob
+        from datetime import datetime, timedelta
+        from .utils_files import exists
+        from .utils_alos2_orbit import _record, _field
+        day = datetime.strptime(info['date'], '%Y%m%d')
+        dates = [(day + timedelta(days=k)).strftime('%Y%m%d') for k in (-1, 0, 1)]
+        name = f"{info['path']:03d}_{info['frame']:04d}"
+        raw = info['level'] == 'L1.0'
+        folder, extension = (f'{name}_???_raw', '.raw') if raw else (f'{name}_???', '.img')
+        leds = sorted({p for d in dates for p in glob(os.path.join(folder, f'AL1_{name}_???_{d}.led'),
+                                                         root_dir=basedir)})
+        if not leds:
+            return False
+        if len(leds) > 1:
+            raise ValueError(f"Multiple ALOS-1 leader files found for {info['fileID']}: {leds}")
+        led_path = os.path.join(basedir, leds[0])
+        if not exists(led_path):
+            return False
+        stem = led_path[:-len('.led')]
+        # every file is checked, so that an empty one raises
+        stored = [p for p in ('HH', 'HV', 'VH', 'VV') if exists(f'{stem}_{p}{extension}')]
+        if polarizations is not None and all(p in stored for p in polarizations):
+            return True
+        with open(led_path, 'rb') as f:
+            led = f.read()
+        record = _record(led, 10)
+        if record is None:
+            raise ValueError(f'{led_path} has no data set summary record (type 10)')
+        return len(stored) == int(_field(record, 389, 392))
+
+    @staticmethod
+    def _alos1_catalog(ids, retries, timeout_second):
+        """
+        The catalog entries of ALOS-1 products, found by one catalog search before any of them is downloaded, and
+        the refusal of an FBS SLC by its catalog beam mode.
+
+        ASF.download calls it before the download of any mission starts, so a refused product leaves nothing of the
+        call written; ASF._download_alos1 reads its products' URLs and footprints from it. An L1.1 product whose
+        catalog beamModeType is FBS (ALPSRP055006360-L1.1: FBS, polarization HH, measured 2026-11-23) is an FBS SLC,
+        which is not supported (ALOS-1 SLC is FBD and PLR): a plain one-line ValueError. The leader file's channel
+        count stays the final check (ASF._download_alos1).
+
+        Parameters
+        ----------
+        ids : list
+            ALOS-1 product IDs (ASF._alos1_parse), such as 'ALPSRP131296360-L1.1' or 'ALPSRP055006360-L1.0'.
+        retries : int
+            Attempts of the catalog search, the first one included (HTTP.attempts).
+        timeout_second : float
+            Seconds waited between the attempts.
+
+        Returns
+        -------
+        dict
+            {fileID: (url, footprint GeoJSON geometry or None, beamModeType or None)}.
+
+        Raises
+        ------
+        ValueError
+            One line, for a product the catalog does not hold or an FBS SLC.
+
+        Examples
+        --------
+        >>> ASF._alos1_catalog(['ALPSRP131296360-L1.1', 'ALPSRP055006360-L1.0'], 30, 3)
+        """
+        products = {i: ASF._alos1_parse(i) for i in dict.fromkeys(ids)}
+        print(f"Connecting to ASF...", end='\r', flush=True)
+        search_results = asf_search.granule_search(list(products), retries=retries, timeout_second=timeout_second)
+        print(f"Searching ASF for {len(products)} product(s)... done ({len(search_results)} found)")
+        catalog = {}
+        for result in search_results:
+            feature = result.geojson()
+            props = feature['properties']
+            catalog.setdefault(props['fileID'], (props['url'], feature.get('geometry'), props.get('beamModeType')))
+        missing = [g for g in products if g not in catalog]
+        if missing:
+            raise ValueError(f"Granules not found in ASF: {missing}")
+        for fileID, info in products.items():
+            if info['level'] == 'L1.1' and catalog[fileID][2] == 'FBS':
+                # the message of the leader file's refusal (ASF._download_alos1)
+                raise ValueError(_ALOS1_FBS_SLC.format(fileID))
+        return catalog
+
     # https://asf.alaska.edu/datasets/data-sets/derived-data-sets/sentinel-1-bursts/
     def download(self, basedir, bursts, polarization=None, frequency=None, bbox=None, session=None, n_jobs=None, joblib_backend='loky', skip_exist=True,
                         retries=30, timeout_second=3, min_rate='100KB', min_rate_window=60, debug=False):
         """
         Download SAR data from ASF.
 
-        Supports Sentinel-1 bursts, NISAR RSLC granules and ALOS-2 PALSAR-2 ScanSAR L1.1 subswaths (the 5-subswath
-        products in HH or HH+HV). Mission is auto-detected from ID format.
+        Supports Sentinel-1 bursts, NISAR RSLC granules, ALOS-2 PALSAR-2 ScanSAR L1.1 subswaths (the 5-subswath
+        products in HH or HH+HV), ALOS-1 PALSAR L1.1 (SLC) products of the stripmap modes FBD and PLR and ALOS-1 PALSAR
+        L1.0 (raw signal data) products of the stripmap modes FBS, FBD and PLR. Mission is auto-detected from ID format.
+
+        An ALOS-1 product is named by its fileID in the ASF catalog (the column sceneName of ASF.search):
+        'ALPSRP131296360-L1.1' (SLC) or 'ALPSRP055006360-L1.0' (raw). A scene name without '-L1.1' or '-L1.0' or a
+        product of another level raises a one-line ValueError before anything is downloaded. An FBS SLC raises a
+        one-line ValueError (ALOS-1 SLC is FBD and PLR; FBS is downloaded raw only). It is refused before anything is
+        downloaded when its catalog beam mode is FBS, and in any case when its leader file, read first, holds one
+        polarization channel. The catalog entries of the ALOS-1 products are looked up before the download of any
+        mission starts, so a refused or missing ALOS-1 product leaves nothing of the call written (Sentinel-1, NISAR
+        and ALOS-2 IDs of the same call included). ALOS-1 needs an Earthdata account, ASF(username, password): there is no
+        cache proxy for it, and ASF() raises a one-line ValueError for a product to download. Its files are cropped CEOS
+        files in a folder per (path, frame, off-nadir angle in tenths of a degree), with the path (46 * orbit + 84) mod
+        671 + 1, the off-nadir angle of the product's leader file and the date of its first image line:
+        <basedir>/119_6360_343/AL1_119_6360_343_20080712_HH.img (and _HV.img) and AL1_119_6360_343_20080712.led. The raw
+        products of one path, frame and off-nadir angle (FBS, FBD and PLR dates) share the folder
+        <basedir>/118_6360_343_raw, with the same code: AL1_118_6360_343_20070205_HH.raw and its own leader file
+        AL1_118_6360_343_20070205.led (the line records of the raw signal data, ASF._alos1_path); raw and SLC files
+        never share a folder. The image and leader files are written as for ALOS-2. The ZIP of a product stores its
+        files uncompressed or deflate-compressed (the '-L1.1.zip' packaging of some FBS and PLR products): the lines of
+        a stored image file are read by byte ranges, those of a compressed one by decompressing it from its start to the
+        last line kept (never the whole file in memory).
 
         An ALOS-2 subswath is named by the granule's fileID (the column sceneName of ASF.search) and the subswath
         F1..F5, as JAXA names its files: 'ALOS2592361150-250512-WBDR1.1__A-F2'. A fileID without its subswath, a
@@ -1289,11 +1635,13 @@ class ASF(progressbar_joblib):
             - S1 burst: 'S1_262885_IW2_20190702T032452_VV_69C5-BURST'
             - NISAR RSLC: 'NISAR_L1_PR_RSLC_006_172_A_008_2005_DHDH_A_20251204T024618_...'
             - ALOS-2 subswath: 'ALOS2592361150-250512-WBDR1.1__A-F2'
+            - ALOS-1 product: 'ALPSRP131296360-L1.1' (SLC), 'ALPSRP055006360-L1.0' (raw)
             - Newline-separated string of multiple IDs
         polarization : None, str, or list, optional
             Polarization(s) to download.
             - None: S1 uses pol from name, NISAR downloads all available, ALOS-2 HH and HV of an HH+HV product,
-              HH of an HH product (a requested polarization the product lacks gets a WARNING and is skipped)
+              HH of an HH product (a requested polarization the product lacks gets a WARNING and is skipped),
+              ALOS-1 every polarization of the product (FBS one, FBD two, PLR four)
             - 'VV': Download only VV (S1) or 'HH' (NISAR)
             - ['VV', 'VH']: Download both polarizations
             An empty list raises a ValueError.
@@ -1324,6 +1672,9 @@ class ASF(progressbar_joblib):
             shifts between dates; the image's last line ends the last block). A listed subswath that the bbox does
             not reach gets a WARNING and nothing is stored for it (no folder, no file). The same 20 km minimum and
             checks apply.
+            ALOS-1: the same as ALOS-2, for the whole product image. An ALOS-1 raw (L1.0) frame keeps the lines that
+            hold every echo of the transform's grid: its beam-centre lines widened on each side by half the synthetic
+            aperture (utils_alos2_orbit.raw_window), rounded outward to multiples of 512 lines.
         session : asf_search.ASFSession, optional
             Authenticated session. Created automatically if None.
         n_jobs : int or None, optional
@@ -1342,7 +1693,10 @@ class ASF(progressbar_joblib):
             all exist is skipped without network access. The NISAR bbox checks apply to every download that will
             happen, and to nothing else. The files of an ALOS-2 subswath are its .led and the .img of every
             polarization to download, known from the ID alone: a subswath whose files all exist is skipped without
-            network access and without an account.
+            network access and without an account. The files of an ALOS-1 product are its .led and the .img (.raw for
+            L1.0) of every requested polarization, or of every polarization the product has (the channel count of its
+            stored .led):
+            a product whose files all exist is skipped without network access and without an account.
         retries : int, optional
             Number of attempts of each request, the first one included; 0 makes one attempt, as 1 does
             (HTTP.attempts). A failure that a retry cannot change (HTTP.final, such as HTTP 404) is not retried.
@@ -1363,7 +1717,7 @@ class ASF(progressbar_joblib):
         -------
         pandas.DataFrame or None
             The files downloaded by this call (the column 'burst' for Sentinel-1: the bursts stored by this call;
-            'file' for NISAR and for the ALOS-2 image files), or None when nothing is downloaded (every file exists,
+            'file' for NISAR and for the ALOS-2 and ALOS-1 image files), or None when nothing is downloaded (every file exists,
             or no burst is stored).
 
         Examples
@@ -1379,6 +1733,10 @@ class ASF(progressbar_joblib):
         >>> asf.download('data/freqB/', 'NISAR_L1_PR_RSLC_006_172_A_008_...', polarization='HH', frequency='B')
         >>> # ALOS-2: HH and HV of subswath F3 of an HH+HV scene, the lines a 22 x 22 km bbox reaches
         >>> asf.download('data/', 'ALOS2100352900-160401-WBDR1.1__D-F3', bbox=(-121.228, 35.504, -120.978, 35.704))
+        >>> # ALOS-1: HH and HV of an FBD product, the lines a 20 x 20 km bbox reaches
+        >>> asf.download('data/', 'ALPSRP131296360-L1.1', bbox=(-72.2092, -40.545, -72.0908, -40.455))
+        >>> # ALOS-1 raw: HH of an FBS frame, the echoes of a 20 x 21 km bbox
+        >>> asf.download('data/', 'ALPSRP055006360-L1.0', bbox=(-72.27, -40.595, -72.03, -40.405))
         """
         import pandas as pd
         from .HTTP import attempts
@@ -1401,6 +1759,7 @@ class ASF(progressbar_joblib):
         s1_bursts = []
         nisar_granules = []
         alos2_ids = []
+        alos1_ids = []
         for burst in bursts:
             mission = self._detect_mission(burst)
             if mission == 'S1':
@@ -1409,11 +1768,15 @@ class ASF(progressbar_joblib):
                 nisar_granules.append(burst)
             elif mission == 'ALOS2':
                 alos2_ids.append(burst)
-        # every ALOS-2 ID is checked before any request or folder (a one-line ValueError)
+            elif mission == 'ALOS1':
+                alos1_ids.append(burst)
+        # every ALOS-2 and ALOS-1 ID is checked before any request or folder (a one-line ValueError)
         alos2_info = {i: self._alos2_parse(i) for i in alos2_ids}
+        alos1_info = {i: self._alos1_parse(i) for i in alos1_ids}
 
         # an empty polarization list selects nothing to download and raises, before any request or folder
-        pols = polarizations(polarization, "'HH' or ['HH', 'HV']" if (nisar_granules or alos2_ids) and not s1_bursts
+        pols = polarizations(polarization, "'HH' or ['HH', 'HV']"
+                             if (nisar_granules or alos2_ids or alos1_ids) and not s1_bursts
                              else "'VV' or ['VV', 'VH']")
 
         # Require explicit frequency for NISAR to prevent accidental large downloads
@@ -1451,10 +1814,13 @@ class ASF(progressbar_joblib):
             # ALOS-2 subswaths with a missing file (the polarizations of a product follow from its mode)
             alos2_needed = [i for i, p in alos2_pols.items()
                             if p and not self._alos2_complete(basedir, alos2_info[i], p)]
+            # ALOS-1 products with a missing file (the polarizations of a product are known from its stored leader file)
+            alos1_needed = [i for i in dict.fromkeys(alos1_ids) if not self._alos1_complete(basedir, alos1_info[i], pols)]
         else:
             s1_needed = s1_bursts
             nisar_needed = nisar_granules
             alos2_needed = [i for i, p in alos2_pols.items() if p]
+            alos1_needed = list(dict.fromkeys(alos1_ids))
 
         # NISAR bbox crop: checked for the granules that will be downloaded, before any network call (session, S1
         # and both NISAR paths); a granule skipped as existing is not checked
@@ -1463,10 +1829,20 @@ class ASF(progressbar_joblib):
         # the same minimum for the ALOS-2 subswaths that will be downloaded
         if alos2_needed and bbox is not None:
             self._nisar_check_bbox(bbox, mission='ALOS-2')
+        # and for the ALOS-1 products that will be downloaded, which need an account (no cache proxy for ALOS-1)
+        if alos1_needed and bbox is not None:
+            self._nisar_check_bbox(bbox, mission='ALOS-1')
+        if alos1_needed and self.username is None:
+            raise ValueError("ALOS-1 needs an Earthdata account, ASF(username, password): there is no cache proxy for "
+                             "ALOS-1. Nothing was downloaded.")
 
         # Return early if nothing to download (no network call!)
-        if not s1_needed and not nisar_needed and not alos2_needed:
+        if not s1_needed and not nisar_needed and not alos2_needed and not alos1_needed:
             return None
+
+        # the catalog entries of the ALOS-1 products that will be downloaded, before the download of any mission: an
+        # FBS SLC (its catalog beam mode) or a product missing from the catalog raises with nothing of the call written
+        alos1_catalog = self._alos1_catalog(alos1_needed, retries, timeout_second) if alos1_needed else None
 
         # Prepare session only when actually needed
         if session is None:
@@ -1494,6 +1870,14 @@ class ASF(progressbar_joblib):
         if alos2_needed:
             df = self._download_alos2(basedir, alos2_needed, pols, bbox, n_jobs, skip_exist, retries, timeout_second,
                                       min_rate, min_rate_window, debug)
+            if df is not None:
+                results.append(df)
+
+        # Download ALOS-1 products of both levels (the ID suffix of ASF._alos1_parse): L1.1, the cropped SLC products,
+        # and L1.0, the cropped raw frames (ASF._download_alos1 follows info['level'])
+        if alos1_needed:
+            df = self._download_alos1(basedir, alos1_needed, pols, bbox, n_jobs, skip_exist, retries, timeout_second,
+                                      min_rate, min_rate_window, debug, catalog=alos1_catalog)
             if df is not None:
                 results.append(df)
 
@@ -2626,7 +3010,7 @@ class ASF(progressbar_joblib):
             """The result of request() (a network operation of a granule) with the attempts of retries
             (HTTP.attempts): a format error (ValueError) or an empty file (EmptyFileError) raises at once, a failure
             that a retry cannot change (HTTP.final) at its first attempt; every failed attempt is printed, and the
-            bytes it counted in pbar are taken back."""
+            bytes it counted in pbar are taken back. The printed and the raised text hold no URL query (_redacted)."""
             n = attempts(retries)
             for k in range(1, n + 1):
                 before = None if pbar is None else pbar.n
@@ -2640,9 +3024,11 @@ class ASF(progressbar_joblib):
                         # the bytes are counted while they are read: each byte is counted once
                         pbar.update(before - pbar.n)
                     stop = final(e)
-                    print(f"ERROR downloading {what} (attempt {k}/{n}){' (not retried)' if stop else ''}: {e}")
+                    # the text of a failed request to the signed URL without its query (its signature): _redact
+                    print(f"ERROR downloading {what} (attempt {k}/{n}){' (not retried)' if stop else ''}: "
+                          f"{_redact(str(e))}")
                     if stop or k == n:
-                        raise
+                        raise _redacted(e)
                     time.sleep(timeout_second)
 
         # Use shared helper for granule ID parsing
@@ -3527,6 +3913,229 @@ class ASF(progressbar_joblib):
             return pd.DataFrame({'file': all_downloaded})
         return None
 
+    @staticmethod
+    def _crop_window(bbox, orbit, image, sampling_rate, prefix, prefix_length, label, doppler=None):
+        """Internal: the line window of an ALOS-2 subswath or an ALOS-1 image that a cropped download stores: the lines
+        that the transform's UTM grid of the bbox reaches at any height from -500 to 9000 m.
+
+        The grid is utils_grid.transform_region(bbox, zones) (the grid rectangles of the bbox plus 100 m, in lon/lat),
+        mapped by utils_alos2_orbit.bbox_window with the image's Doppler centroid, and the window is rounded outward to
+        multiples of _ALOS2_LINE_BLOCK lines (512), ending at the image's last line at most. The zones: first the UTM zone
+        of the bbox centre; the transform takes the zone of the centroid of the stored footprint, so the prefixes of the
+        window's first and last lines are read (JAXA's lon/lat of their first, mid and last pixel) and, when their span
+        reaches another UTM zone or hemisphere, the window is computed again over the grids of all those zones (once).
+
+        Parameters
+        ----------
+        bbox : tuple
+            (west, south, east, north) in WGS84 degrees.
+        orbit : dict
+            The LED orbit (utils_alos2_orbit.led_orbit).
+        image : dict
+            The image (utils_alos2_ceos.image_info).
+        sampling_rate : float
+            The range sampling rate in Hz (utils_alos2_orbit.led_sampling_rate).
+        prefix : callable
+            prefix(line) returns the prefix bytes of the 0-based image line (one read).
+        prefix_length : int
+            The length of the line prefix: utils_alos2_ceos.PREFIX (544) for ALOS-2, PREFIX_ALOS1 (412) for ALOS-1.
+        label : str
+            The mission and the ID, for the error message ('ALOS-2 <subswath ID>').
+        doppler : tuple of float or None, optional
+            (constant, slope, wavelength) of the image's Doppler centroid (utils_alos2_orbit.geo2rdr). None (default):
+            zero Doppler (ALOS-2 L1.1).
+
+        Returns
+        -------
+        tuple
+            (window, zones): window (start, end), 0-based lines, end exclusive, or None when the bbox reaches the image
+            at no height; zones the set of the EPSG codes of the grid.
+
+        Raises
+        ------
+        RuntimeError
+            The lines of the second window reach a zone outside its grid.
+
+        Examples
+        --------
+        >>> ASF._crop_window((-72.9, -41.39, -72.5, -41.19), orbit, image, 32e6, prefix, 544, 'ALOS-2 <ID>')
+        """
+        import numpy as np
+        from .utils_alos2_orbit import bbox_window
+        from .utils_alos2_ceos import prefix_lonlat
+        from .utils_grid import get_utm_epsg, transform_region
+
+        def span_zones(window):
+            """The UTM EPSG codes of every zone and hemisphere between the minimum and maximum of JAXA's lon/lat of the
+            first, mid and last pixel of the window's first and last lines (one prefix read each): the span of the stored
+            footprint, which holds its centroid.
+
+            Examples
+            --------
+            >>> span_zones((6144, 22016))
+            """
+            lon, lat = [], []
+            for line in (window[0], window[1] - 1):
+                line_lon, line_lat = prefix_lonlat(prefix(line), prefix_length)
+                lon.extend(line_lon)
+                lat.extend(line_lat)
+            # a longitude every 6 degrees from the west end, and the east end: one in every zone between
+            lons = np.r_[np.arange(min(lon), max(lon), 6.0), max(lon)]
+            return {get_utm_epsg(y, x) for y in (min(lat), max(lat)) for x in lons}
+
+        # the transform's UTM grid of the bbox: first in the zone of the bbox centre, then (once) in every zone the stored
+        # lines span
+        epsgs = {get_utm_epsg(0.5 * (bbox[1] + bbox[3]), 0.5 * (bbox[0] + bbox[2]))}
+        for attempt in (1, 2):
+            window = bbox_window(orbit, image, sampling_rate, transform_region(tuple(bbox), epsgs), doppler=doppler)
+            if window is None:
+                break
+            # rounded outward on the image's grid of _ALOS2_LINE_BLOCK lines
+            window = ((window[0] // _ALOS2_LINE_BLOCK) * _ALOS2_LINE_BLOCK,
+                      min(image['lines'], -(-window[1] // _ALOS2_LINE_BLOCK) * _ALOS2_LINE_BLOCK))
+            zones = span_zones(window)
+            if zones <= epsgs:
+                break
+            if attempt == 2:
+                raise RuntimeError(f"{label}: lines {window[0]}..{window[1]} reach UTM {sorted(zones - epsgs)} outside "
+                                   f"the grid of {sorted(epsgs)}")
+            epsgs |= zones
+        return window, epsgs
+
+    def _alos_zip(self, fileID, url, size, label, retries, timeout_second, min_rate, min_rate_window, debug):
+        """Internal: the byte-range access to one product ZIP at ASF, shared by the ALOS-2 and the ALOS-1 downloads
+        (ASF._download_alos2, ASF._download_alos1): the reads with their attempts, the ZIP directory and the offset of a
+        member's data.
+
+        With an account every read is a byte range of ASF._byte_range on one login session, the first request following
+        the login redirect and the next ones going to its signed URL. Without one (ALOS-2 only) every read is
+        ASF._cache_range of the fileID on _ALOS2_CACHE_PROXY, on one requests.Session (no Earthdata session, no signed
+        URL). The ZIP directory is read through byte ranges (zipfile over _RangeReader).
+
+        Parameters
+        ----------
+        fileID : str
+            The product's fileID: the name of its reads in the messages, and the ID the cache proxy knows.
+        url : str
+            The catalog URL of the product's ZIP.
+        size : int or None
+            The ZIP's size in bytes. None (with an account only): the size the server reports, the Content-Range of the
+            one-byte range 0-0
+            (the catalog size can differ from it, ASF._download_alos1), with the attempts of retries; its one-byte body
+            is read, so the connection goes back to the pool for the next reads, and the signed URL of its redirect is
+            kept for them.
+        label : str
+            'ALOS-2' or 'ALOS-1': the mission in the messages.
+        retries, timeout_second, min_rate, min_rate_window, debug
+            As ASF._download_alos2.
+
+        Returns
+        -------
+        tuple
+            (read, infos, data_offset): read(start, end, pbar=None) the bytes start..end (end exclusive) of the ZIP with
+            the attempts of retries (HTTP.attempts): a format error (ValueError) or an empty file (EmptyFileError)
+            raises at once, a failure that a retry cannot change (HTTP.final) at its first attempt; every failed
+            attempt is printed, the bytes it counted in pbar taken back, and the query of a URL in its text removed
+            (_redacted: a signed URL's query is its signature), also in the error raised; infos the members
+            (zipfile.ZipFile.infolist); data_offset(member) the offset of a member's data, after its local header.
+
+        Examples
+        --------
+        >>> read, infos, data_offset = ASF('user', 'pass')._alos_zip('ALPSRP055006360-L1.0', url, None, 'ALOS-1', 30, 3,
+        ...                                                          '100KB', 60, False)
+        """
+        import os
+        import time
+        import zipfile
+        from .HTTP import final, attempts, send
+        from .utils_files import EmptyFileError
+
+        def attempt(what, request, pbar=None):
+            """request() with the attempts of retries; every failed one printed as 'ERROR <what> ...'."""
+            n = attempts(retries)
+            for k in range(1, n + 1):
+                before = None if pbar is None else pbar.n
+                try:
+                    return request()
+                except (ValueError, EmptyFileError):
+                    # format errors and empty files are permanent - don't retry
+                    raise
+                except Exception as e:
+                    if pbar is not None:
+                        # the direct route counts the bytes while it reads: each byte is counted once
+                        pbar.update(before - pbar.n)
+                    stop = final(e)
+                    print(f"ERROR {what} (attempt {k}/{n}){' (not retried)' if stop else ''}: {_redact(str(e))}")
+                    if stop or k == n:
+                        raise _redacted(e)
+                    time.sleep(timeout_second)
+
+        signed = [None]
+        if self.username is None:
+            # through the cache proxy: no Earthdata session, no signed URL
+            if debug:
+                print(f"{label} URL: {_ALOS2_CACHE_PROXY}/{fileID}")
+            session = requests.Session()
+
+            def fetch(start, end, pbar=None):
+                data, _ = ASF._cache_range(_ALOS2_CACHE_PROXY, fileID, start, end - start, min_rate, min_rate_window,
+                                           session)
+                if pbar is not None:
+                    pbar.update(len(data))
+                return data
+        else:
+            if debug:
+                print(f"{label} URL: {url}")
+            session = self._get_asf_session()
+
+            def fetch(start, end, pbar=None):
+                # the first request follows the login redirect, the next ones go to its signed URL
+                data, signed[0] = ASF._byte_range(url, start, end, None, min_rate, min_rate_window, pbar=pbar,
+                                                  http_session=session, signed_url=signed[0])
+                return data
+
+        def read(start, end, pbar=None):
+            return attempt(f'downloading {fileID} bytes {start}..{end}', lambda: fetch(start, end, pbar), pbar)
+
+        def remote_size():
+            with send(session.get, url, headers={'Range': 'bytes=0-0', 'Accept-Encoding': 'identity'}, stream=True,
+                      timeout=(10, 300)) as r:
+                if 'cloudfront.net' in r.url:
+                    signed[0] = r.url
+                m = re.match(r'^bytes 0-0/(\d+)$', r.headers.get('Content-Range', ''))
+                if m is None:
+                    raise ValueError(f"{label} product {fileID}: no file size in the answer to a byte range "
+                                     f"(HTTP {r.status_code}, Content-Range {r.headers.get('Content-Range')!r})")
+                # the one byte of the range 0-0, read only after its Content-Range is checked
+                r.content
+                return int(m.group(1))
+
+        if size is None:
+            size = attempt(f'reading the size of {fileID}', remote_size)
+        reader = _RangeReader(read, size)
+        try:
+            with zipfile.ZipFile(reader) as archive:
+                infos = archive.infolist()
+        except zipfile.BadZipFile as e:
+            # zipfile reports a failed read as 'File is not a zip file': the read's own error is raised (after its
+            # attempts)
+            if reader.error is not None:
+                raise reader.error from e
+            raise
+
+        def data_offset(member):
+            # the data follows the local header
+            reader.seek(member.header_offset)
+            header = reader.read(30)
+            if header[:4] != b'PK\x03\x04':
+                raise ValueError(f"{label} member {os.path.basename(member.filename)}: no local header at "
+                                 f"{member.header_offset}")
+            name_length = int.from_bytes(header[26:28], 'little')
+            extra_length = int.from_bytes(header[28:30], 'little')
+            return member.header_offset + 30 + name_length + extra_length
+
+        return read, infos, data_offset
+
     def _download_alos2(self, basedir, ids, polarizations, bbox, n_jobs, skip_exist, retries, timeout_second, min_rate,
                         min_rate_window, debug):
         """Internal: download ALOS-2 ScanSAR subswaths from ASF, cropped to a bbox: directly with an Earthdata
@@ -3559,8 +4168,9 @@ class ASF(progressbar_joblib):
             taken in the UTM zone of the bbox centre; the transform takes the zone of the centroid of the stored
             footprint, so the prefixes of the window's first and last lines are read (JAXA's lon/lat of their first,
             mid and last pixel) and, when their span reaches another UTM zone or hemisphere, the window is computed
-            again over the grids of all those zones (once; a zone still outside raises RuntimeError). A subswath the
-            bbox does not reach gets a WARNING and nothing is stored. None stores the whole subswath.
+            again over the grids of all those zones (once; a zone still outside raises RuntimeError): ASF._crop_window,
+            zero Doppler. A subswath the bbox does not reach gets a WARNING and nothing is stored. None stores the whole
+            subswath.
         n_jobs : int or None
             Not used: the subswaths are downloaded one after another. Kept for the signature shared with the other
             downloads.
@@ -3595,16 +4205,11 @@ class ASF(progressbar_joblib):
         ...                     False)
         """
         import os
-        import time
-        import zipfile
         import pandas as pd
         from tqdm.auto import tqdm
-        from .HTTP import final, attempts
-        from .utils_files import EmptyFileError, exists
-        import numpy as np
-        from .utils_alos2_orbit import led_orbit, led_sampling_rate, bbox_window
-        from .utils_alos2_ceos import image_info, write_crop, prefix_lonlat, DESCRIPTOR, PREFIX
-        from .utils_grid import get_utm_epsg, transform_region
+        from .utils_files import exists
+        from .utils_alos2_orbit import led_orbit, led_sampling_rate
+        from .utils_alos2_ceos import image_info, write_crop, DESCRIPTOR, PREFIX
 
         # the subswaths of each granule, in the order of the IDs
         granules = {}
@@ -3630,79 +4235,19 @@ class ASF(progressbar_joblib):
             repeat a read that has used its attempts. A read that fails after its attempts raises (write_crop
             removes its .tmp)."""
             url, size = catalog[fileID]
-            if self.username is None:
-                # through the cache proxy: no Earthdata session, no signed URL
-                if debug:
-                    print(f"ALOS-2 URL: {_ALOS2_CACHE_PROXY}/{fileID}")
-                session = requests.Session()
-
-                def fetch(start, end, pbar=None):
-                    data, _ = ASF._cache_range(_ALOS2_CACHE_PROXY, fileID, start, end - start, min_rate,
-                                               min_rate_window, session)
-                    if pbar is not None:
-                        pbar.update(len(data))
-                    return data
-            else:
-                if debug:
-                    print(f"ALOS-2 URL: {url}")
-                session = self._get_asf_session()
-                signed = [None]
-
-                def fetch(start, end, pbar=None):
-                    # the first request follows the login redirect, the next ones go to its signed URL
-                    data, signed[0] = ASF._byte_range(url, start, end, None, min_rate, min_rate_window, pbar=pbar,
-                                                      http_session=session, signed_url=signed[0])
-                    return data
-
-            def read(start, end, pbar=None):
-                """The bytes start..end (end exclusive) of the granule's ZIP with the attempts of retries
-                (HTTP.attempts): a format error (ValueError) or an empty file (EmptyFileError) raises at once, a
-                failure that a retry cannot change (HTTP.final) at its first attempt; every failed attempt is
-                printed, and the bytes it counted in pbar are taken back."""
-                n = attempts(retries)
-                for k in range(1, n + 1):
-                    before = None if pbar is None else pbar.n
-                    try:
-                        return fetch(start, end, pbar)
-                    except (ValueError, EmptyFileError):
-                        # format errors and empty files are permanent - don't retry
-                        raise
-                    except Exception as e:
-                        if pbar is not None:
-                            # the direct route counts the bytes while it reads: each byte is counted once
-                            pbar.update(before - pbar.n)
-                        stop = final(e)
-                        print(f"ERROR downloading {fileID} bytes {start}..{end} (attempt {k}/{n})"
-                              f"{' (not retried)' if stop else ''}: {e}")
-                        if stop or k == n:
-                            raise
-                        time.sleep(timeout_second)
-
-            reader = _RangeReader(read, size)
-            try:
-                with zipfile.ZipFile(reader) as archive:
-                    members = {os.path.basename(m.filename): m for m in archive.infolist()}
-            except zipfile.BadZipFile as e:
-                # zipfile reports a failed read as 'File is not a zip file': the read's own error is raised (after
-                # its attempts)
-                if reader.error is not None:
-                    raise reader.error from e
-                raise
+            # the reads with their attempts, the ZIP directory, the members' data (shared with ALOS-1)
+            read, infos, data_offset = self._alos_zip(fileID, url, size, 'ALOS-2', retries, timeout_second, min_rate,
+                                                      min_rate_window, debug)
+            members = {os.path.basename(m.filename): m for m in infos}
 
             def member_data(name):
-                # (offset of the member's data, its size): the data follows the local header
+                # (offset of the member's data, its size)
                 member = members.get(name)
                 if member is None:
                     raise ValueError(f"ALOS-2 granule {fileID} has no {name}")
                 if member.compress_type != 0:
                     raise ValueError(f"ALOS-2 member {name} is compressed (method {member.compress_type}), not stored")
-                reader.seek(member.header_offset)
-                header = reader.read(30)
-                if header[:4] != b'PK\x03\x04':
-                    raise ValueError(f"ALOS-2 member {name}: no local header at {member.header_offset}")
-                name_length = int.from_bytes(header[26:28], 'little')
-                extra_length = int.from_bytes(header[28:30], 'little')
-                return member.header_offset + 30 + name_length + extra_length, member.file_size
+                return data_offset(member), member.file_size
 
             led_offset, led_size = member_data(f'LED-{fileID}')
             led = read(led_offset, led_offset + led_size)
@@ -3720,42 +4265,13 @@ class ASF(progressbar_joblib):
                 image = image_info(head)
                 if bbox is not None:
 
-                    def span_zones(window):
-                        """The UTM EPSG codes of every zone and hemisphere between the minimum and maximum of JAXA's
-                        lon/lat of the first, mid and last pixel of the window's first and last lines (one prefix
-                        read each): the span of the stored footprint, which holds its centroid.
+                    def prefix(line):
+                        # the 544-byte prefix of an image line of the first polarization (one byte-range read)
+                        first = img[pols[0]][0] + DESCRIPTOR + line * image['record_length']
+                        return read(first, first + PREFIX)
 
-                        Examples
-                        --------
-                        >>> span_zones((6144, 22016))
-                        """
-                        lon, lat = [], []
-                        for line in (window[0], window[1] - 1):
-                            first = img[pols[0]][0] + DESCRIPTOR + line * image['record_length']
-                            line_lon, line_lat = prefix_lonlat(read(first, first + PREFIX))
-                            lon.extend(line_lon)
-                            lat.extend(line_lat)
-                        # a longitude every 6 degrees from the west end, and the east end: one in every zone between
-                        lons = np.r_[np.arange(min(lon), max(lon), 6.0), max(lon)]
-                        return {get_utm_epsg(y, x) for y in (min(lat), max(lat)) for x in lons}
-
-                    # the transform's UTM grid of the bbox: first in the zone of the bbox centre, then (once) in every
-                    # zone the stored lines span
-                    epsgs = {get_utm_epsg(0.5 * (bbox[1] + bbox[3]), 0.5 * (bbox[0] + bbox[2]))}
-                    for attempt in (1, 2):
-                        window = bbox_window(orbit, image, sampling_rate, transform_region(tuple(bbox), epsgs))
-                        if window is None:
-                            break
-                        # rounded outward on the image's grid of _ALOS2_LINE_BLOCK lines
-                        window = ((window[0] // _ALOS2_LINE_BLOCK) * _ALOS2_LINE_BLOCK,
-                                  min(image['lines'], -(-window[1] // _ALOS2_LINE_BLOCK) * _ALOS2_LINE_BLOCK))
-                        zones = span_zones(window)
-                        if zones <= epsgs:
-                            break
-                        if attempt == 2:
-                            raise RuntimeError(f"ALOS-2 {subswath_id}: lines {window[0]}..{window[1]} reach UTM "
-                                               f"{sorted(zones - epsgs)} outside the grid of {sorted(epsgs)}")
-                        epsgs |= zones
+                    window, epsgs = ASF._crop_window(bbox, orbit, image, sampling_rate, prefix, PREFIX,
+                                                     f'ALOS-2 {subswath_id}')
                     if window is None:
                         print(f"WARNING: bbox {tuple(bbox)} does not reach {subswath_id} at heights -500 to 9000 m: "
                               f"nothing stored")
@@ -3804,6 +4320,412 @@ class ASF(progressbar_joblib):
         written = []
         for fileID, subswaths in granules.items():
             download_granule(fileID, subswaths, written)
+
+        if written:
+            return pd.DataFrame({'file': written})
+        return None
+
+    def _download_alos1(self, basedir, ids, polarizations, bbox, n_jobs, skip_exist, retries, timeout_second, min_rate,
+                        min_rate_window, debug, catalog=None):
+        """Internal: download ALOS-1 PALSAR L1.1 (SLC) and L1.0 (raw signal data) products directly from ASF with an
+        Earthdata account, cropped to a bbox (download() refuses ASF() without an account for ALOS-1: there is no cache
+        proxy).
+
+        A product at ASF is one ZIP archive. Its size is the one the server reports (the Content-Range of a one-byte
+        range), never the catalog size, which can differ from it: for 79 of the 109 L1.0 products of orbit 5500 (-14
+        to +11 bytes) and for none of 232 L1.1 products (measured 2026-11-23). Its directory is read through byte ranges
+        (zipfile over _RangeReader), then only the leader file (LED) and the line records of the image files (IMG, one
+        per polarization) that the bbox reaches are read, as for ALOS-2 (ASF._alos_zip, shared with
+        ASF._download_alos2): every read is a byte range of ASF._byte_range on one login session per product, reusing
+        the signed URL of the first redirect. The members are found by their names
+        (LED-<scene>-<code>, IMG-<pol>-<scene>-<code>, in a folder or not), each by its own ZIP method: a stored member
+        (0) is read by byte ranges of the window's lines; a deflate-compressed member (8) is read from its start and
+        decompressed as it arrives (raw deflate) up to the window's last line, nothing after it, the lines before the
+        window dropped, at most _ALOS2_BLOCK_BYTES of compressed and of decompressed data in memory at a time. The LED is
+        read whole either way; another method raises a one-line ValueError. The off-nadir angle of the file names is the nominal off-nadir angle of the data set
+        summary record of the LED (bytes 1839-1854), the date the date of the first image line. Each image file is
+        streamed to disk in blocks of at most _ALOS2_BLOCK_BYTES (64 MiB) (utils_alos2_ceos.write_crop: a temporary file
+        renamed when complete). The image line prefix of ALOS-1 is 412 bytes (utils_alos2_ceos.PREFIX_ALOS1).
+
+        An FBS SLC is not supported (ALOS-1 SLC is FBD and PLR): a plain one-line ValueError. It is refused twice.
+        First by the catalog search of all the products (ASF._alos1_catalog, which ASF.download calls before the
+        download of any mission), before anything is downloaded: an L1.1 product whose catalog beamModeType is FBS, so
+        nothing of the call is written. Then by its LED, the final check, read first for each product: an L1.1 product
+        whose LED has one image channel (the data set summary record, bytes 389-392: FBS 1, FBD 2, PLR 4, measured on
+        L1.1 and L1.0 leader files), and nothing of it is written.
+
+        An L1.0 (raw) product is stored as its leader file and the whole line records (412-byte line header, 8-bit I, Q
+        echo samples, fill) of the window, as they are in the source (only the record sequence numbers renumbered, as
+        for L1.1; no missing-line repair): ASF._alos1_path, `<path>_<frame>_<offnadir>_raw/...<pol>.raw`. Its members
+        are deflate-compressed (measured on 21 products and the 109 of orbit 5500), read as above; the leader file is
+        stored with the first image file, once its lines are found. A raw download reads no SLC (L1.1) product.
+
+        Parameters
+        ----------
+        basedir : str
+            Output directory; the files of a product go into its folder <path>_<frame>_<offnadir> under it.
+        ids : list
+            ALOS-1 product IDs (ASF._alos1_parse), such as 'ALPSRP131296360-L1.1' or 'ALPSRP055006360-L1.0'.
+        polarizations : list or None
+            The requested polarizations; those the product lacks get a WARNING and are skipped (ASF._alos1_pols).
+            None: every one the product has.
+        bbox : tuple or None
+            (west, south, east, north) in WGS84 degrees: only the lines of the image that the transform's UTM grid of
+            the bbox reaches at any height from -500 to 9000 m are stored, rounded outward to multiples of
+            _ALOS2_LINE_BLOCK lines (512) and ending at the image's last line at most: the rule of ALOS-2
+            (ASF._crop_window), with the image's Doppler centroid of the LED (ALOS-1 L1.1 is not zero-Doppler) and the
+            412-byte prefixes of the window's first and last lines (of a compressed member: one decompression stream
+            from its start). A raw (L1.0) frame keeps the lines whose own time tags (the line headers) fall in the time
+            span of utils_alos2_orbit.raw_window: the beam-centre times of the transform's region
+            (utils_grid.transform_region of the bbox in every UTM zone of the frame's longitude span, the catalog
+            footprint: the raw line prefixes hold no ground coordinates) at the beam-centre Doppler of the raw leader
+            file's own yaw and orbit (utils_alos2_orbit.raw_doppler: the raw leader files hold no Doppler centroid),
+            widened on each side by half the synthetic aperture and by the margin of the frame's steering state, from
+            JAXA's yaw steering mode flag of the leader file (utils_alos2_orbit.raw_margin: ALOS1_DOPPLER_MARGIN steered,
+            ALOS1_DOPPLER_MARGIN_UNSTEERED not); a raw leader file without a readable attitude data record or with
+            another flag value raises a one-line ValueError naming the product. A span
+            outside the frame's own time span (from its first line: its time, and its lines at the line rate of line 1
+            plus utils_alos2_orbit.ALOS1_FRAME_END_SLACK) gets a WARNING before the member is read. The lines are
+            selected while the first image streams from its first line (utils_alos2_ceos.select_lines), rounded outward
+            to _ALOS2_LINE_BLOCK lines and clipped to the frame, so a PRF change inside the frame moves no line; the
+            other polarizations take the same lines, and so does a resumed download: the lines of an image of the
+            product already stored (utils_alos2_ceos.crop_lines). A product it does not reach gets a WARNING and
+            nothing is stored (no folder is created). None stores the whole image.
+        n_jobs : int or None
+            Not used: the products are downloaded one after another. Kept for the signature shared with the other
+            downloads.
+        skip_exist : bool
+            True skips the image files that exist; False downloads them again.
+        retries : int
+            Attempts of the catalog search and of each byte-range read (the ZIP directory, the LED, the image heads,
+            each block of image records), the first one included; 0 makes one attempt (HTTP.attempts). A failure that
+            a retry cannot change (HTTP.final), a format error (ValueError) and an empty file (EmptyFileError) are not
+            retried. Every failed attempt is printed.
+        timeout_second : float
+            Seconds waited between the attempts.
+        min_rate : str or float
+            Bytes per second each byte-range request must keep (HTTP.read_body).
+        min_rate_window : float
+            Seconds over which the rate is averaged.
+        debug : bool
+            Print the URLs and the line windows.
+        catalog : dict or None
+            The catalog entries of the products as ASF._alos1_catalog gives them (ASF.download looks them up before
+            the download of any mission). None: looked up here (ASF._alos1_catalog).
+
+        Returns
+        -------
+        pandas.DataFrame or None
+            The column 'file': the names of the image files written, or None when none is written.
+
+        Examples
+        --------
+        >>> asf = ASF('user', 'pass')
+        >>> asf._download_alos1('data', ['ALPSRP131296360-L1.1'], None, None, None, True, 30, 3, '100KB', 60, False)
+        >>> asf._download_alos1('data', ['ALPSRP055006360-L1.0'], ['HH'], (-72.27, -40.595, -72.03, -40.405), None, True, 30, 3, '100KB', 60, False)
+        """
+        import os
+        import re
+        import zlib
+        import zipfile
+        import numpy as np
+        import pandas as pd
+        import shapely.geometry
+        from tqdm.auto import tqdm
+        from .utils_files import exists
+        from itertools import chain
+        from .utils_alos2_orbit import (led_orbit, led_sampling_rate, led_attitude, raw_doppler, raw_margin, raw_window,
+                                        _record, _field, ALOS1_FRAME_END_SLACK)
+        from .utils_alos2_ceos import image_info, write_crop, select_lines, crop_lines, DESCRIPTOR, PREFIX_ALOS1
+        from .utils_grid import get_utm_epsg, transform_region
+
+        products = {i: ASF._alos1_parse(i) for i in dict.fromkeys(ids)}
+
+        # the catalog entries (an FBS SLC by its catalog beam mode is refused there, before any product is downloaded);
+        # the LED (below) stays the final check
+        if catalog is None:
+            catalog = ASF._alos1_catalog(list(products), retries, timeout_second)
+
+        def download_product(fileID, info, written):
+            """One product, with no retry of its own: every network operation is a byte-range read with its own
+            attempts (as ASF._download_alos2). A read that fails after its attempts raises (write_crop removes its
+            .tmp)."""
+            url, footprint, _ = catalog[fileID]
+            raw = info['level'] == 'L1.0'
+            # the reads with their attempts, the ZIP directory (its size the one the server reports), the members' data
+            # (shared with ALOS-2)
+            read, infos, data_offset = self._alos_zip(fileID, url, None, 'ALOS-1', retries, timeout_second, min_rate,
+                                                      min_rate_window, debug)
+
+            # the LED and the image files of the product, by their names (in a folder or not)
+            scene = info['scene']
+            members = {}
+            # the code of the level in the member names: H1.1__A, P1.1__D (L1.1), H1.0__A, P1.0__A (L1.0)
+            digit = '0' if raw else '1'
+            for member in infos:
+                m = re.match(rf'^(LED|IMG-(HH|HV|VH|VV))-{scene}-[A-Z]1\.{digit}__[AD]$', os.path.basename(member.filename))
+                if m is not None:
+                    members[m.group(2) or 'LED'] = member
+            if 'LED' not in members:
+                raise ValueError(f"ALOS-1 product {fileID} has no LED-{scene}-* member")
+            available = [p for p in ('HH', 'HV', 'VH', 'VV') if p in members]
+            if not available:
+                raise ValueError(f"ALOS-1 product {fileID} has no IMG-*-{scene}-* member")
+
+            def member_data(key):
+                # (offset of the member's data, the member): stored (method 0) or deflate-compressed (method 8) members
+                member = members[key]
+                if member.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+                    raise ValueError(f"ALOS-1 member {os.path.basename(member.filename)} of {fileID} has the compression "
+                                     f"method {member.compress_type}, neither stored (0) nor deflate (8)")
+                return data_offset(member), member
+
+            def inflate(offset, member, first, last, chunk):
+                """The bytes first..last (end exclusive) of a deflate-compressed member, decompressed as its data
+                arrives (raw deflate): the compressed data is read from its start in reads of at most `chunk` bytes
+                until the byte `last` is decompressed, and nothing after it; every piece holds at most
+                _ALOS2_BLOCK_BYTES decompressed bytes (bounded memory, never the whole member). The member ends early
+                only when no compressed data is left and the decompressor gives no more output: a call that reaches the
+                output limit can hold back output with all its input consumed, which the next call gives. Yields the
+                pieces."""
+                name = os.path.basename(member.filename)
+                inflater = zlib.decompressobj(-15)
+                position, stop, at, pending = offset, offset + member.compress_size, 0, b''
+                while at < last:
+                    if not pending and position < stop and not inflater.eof:
+                        pending = read(position, min(stop, position + chunk))
+                        position += len(pending)
+                    out = inflater.decompress(pending, _ALOS2_BLOCK_BYTES)
+                    pending = inflater.unconsumed_tail
+                    if not out and not pending and (position >= stop or inflater.eof):
+                        raise ValueError(f"ALOS-1 member {name} of {fileID} ends at {at} bytes, before byte {last}")
+                    lo, hi = max(at, first), min(at + len(out), last)
+                    if lo < hi:
+                        yield out[lo - at:hi - at]
+                    at += len(out)
+
+            def member_bytes(key, first, last, chunk=_ALOS2_BLOCK_BYTES):
+                """The bytes first..last of a member, stored or compressed, in one piece (the LED, the image heads)."""
+                offset, member = member_data(key)
+                if member.compress_type == zipfile.ZIP_STORED:
+                    return read(offset + first, offset + last)
+                return b''.join(inflate(offset, member, first, last, chunk))
+
+            def records(key, start, end, record_length, pbar):
+                """The image records start..end (0-based lines, end exclusive) of a member in blocks of whole records,
+                each at most _ALOS2_BLOCK_BYTES: byte ranges of a stored member, or the streamed decompression of a
+                compressed one up to the last record (pbar counts the records' bytes)."""
+                offset, member = member_data(key)
+                step = max(1, _ALOS2_BLOCK_BYTES // record_length)
+                first = DESCRIPTOR + start * record_length
+                if member.compress_type == zipfile.ZIP_STORED:
+                    for a in range(start, end, step):
+                        yield read(offset + first + (a - start) * record_length,
+                                   offset + first + (min(end, a + step) - start) * record_length, pbar)
+                    return
+                block = bytearray()
+                for piece in inflate(offset, member, first, DESCRIPTOR + end * record_length, _ALOS2_BLOCK_BYTES):
+                    block += piece
+                    while len(block) >= step * record_length:
+                        out = bytes(block[:step * record_length])
+                        del block[:step * record_length]
+                        pbar.update(len(out))
+                        yield out
+                if block:
+                    pbar.update(len(block))
+                    yield bytes(block)
+
+            # the LED first: an FBS SLC (one image channel) is refused before anything of it is written (the final check,
+            # after the catalog's beam mode)
+            led = member_bytes('LED', 0, members['LED'].file_size)
+            summary = _record(led, 10)
+            if summary is None:
+                raise ValueError(f"ALOS-1 LED of {fileID} has no data set summary record (type 10)")
+            if not raw and int(_field(summary, 389, 392)) == 1:
+                raise ValueError(_ALOS1_FBS_SLC.format(fileID))
+            pols = ASF._alos1_pols(polarizations, available, fileID)
+            if not pols:
+                return
+            head_length = DESCRIPTOR + PREFIX_ALOS1
+            # the head of a compressed member: read in 64 KiB of compressed data at a time (one read holds it)
+            head = member_bytes(pols[0], 0, head_length, 64 * 1024)
+            image = image_info(head, PREFIX_ALOS1, raw)
+            record_length = image['record_length']
+            # the off-nadir angle of the LED and the date of the first image line name the files
+            info = dict(info, offnadir=float(_field(summary, 1839, 1854)), date=image['date'].replace('-', ''))
+            if bbox is not None and raw:
+                # the beam-centre Doppler from the raw leader file's own yaw and orbit (the raw leader files hold no
+                # Doppler centroid; a raw download reads no L1.1 product): utils_alos2_orbit.raw_doppler; raw_window adds
+                # the margin of the frame's steering state (raw_margin) on both sides. The line rate: the header PRF,
+                # half of it for PLR (4 channels)
+                wavelength = float(_field(summary, 501, 516))
+                rate = image['prf'] / (2 if int(_field(summary, 389, 392)) == 4 else 1)
+                orbit, sampling_rate = led_orbit(led), led_sampling_rate(led)
+                try:
+                    attitude = led_attitude(led)
+                    doppler = raw_doppler(orbit, attitude, image, sampling_rate, wavelength, rate)
+                    margin = raw_margin(led)
+                except ValueError as e:
+                    raise ValueError(f"ALOS-1 product {fileID}: {e}") from None
+                # the transform's region in every UTM zone of the frame's longitude span (the catalog footprint): the
+                # zone of the focused image's footprint is one of them
+                if not footprint:
+                    raise ValueError(f"ALOS-1 product {fileID}: the catalog gives no footprint")
+                west, south, east, north = shapely.geometry.shape(footprint).bounds
+                epsgs = {get_utm_epsg(y, x) for y in (south, north) for x in np.r_[np.arange(west, east, 6.0), east]}
+                # the time span of the echoes of the region; the lines are selected by their own time tags while the
+                # first image streams (below), so the line rate of the frame (a PLR frame's lines come at half its
+                # header PRF) and a PRF change inside it move no line
+                span = raw_window(orbit, image, sampling_rate, transform_region(tuple(bbox), epsgs), wavelength, doppler,
+                                  margin=margin)
+                if span is None:
+                    print(f"WARNING: bbox {tuple(bbox)} does not reach {fileID} at heights -500 to 9000 m: "
+                          f"nothing stored")
+                    return
+                # the frame's own time span, from its first line: a span before its first line or after its end (its
+                # lines at the line rate of line 1, plus ALOS1_FRAME_END_SLACK for a PRF change) holds none of its
+                # lines, and the member is not read
+                if span[1] < image['time'] or span[0] > image['time'] + image['lines'] / rate + ALOS1_FRAME_END_SLACK:
+                    print(f"WARNING: bbox {tuple(bbox)} does not reach {fileID} at heights -500 to 9000 m "
+                          f"(its time span is outside the frame): nothing stored")
+                    return
+                window = None
+                if debug:
+                    print(f"{fileID}: the grid of the bbox in EPSG {sorted(epsgs)}, Doppler {doppler[0]:.3f} + "
+                          f"{doppler[1]:.6g} * R Hz, margin {margin[0]} s, seconds {span[0]:.3f}..{span[1]:.3f} of "
+                          f"{image['date']}")
+            elif bbox is not None:
+                # the image's Doppler centroid fd1 + fdd1 * R (Hz, R the slant range in m), as GMTSAR's ALOS
+                # preprocessing reads it from the data set summary record: bytes 1735-1750 (Hz) and 1751-1766 (Hz/km);
+                # the radar wavelength bytes 501-516 (m).
+                # Measured 2026-11-23 against JAXA's per-line ground points (prefix bytes 193-216): with this Doppler the
+                # predicted line is constant across the swath (spread 0.04 lines) but 4.24 (FBD, path 119) and 5.23 (FBS, path 118)
+                # lines off. The line times are whole milliseconds, plus a fixed 2.74 ms ALOS-1 offset between the line time tag
+                # and JAXA's geolocation (GMTSAR adds +4 lines, ALOS_llt2rat.c). It is not applied here: the windows hold the
+                # transform grid with at least 252 lines to spare. It belongs to the ALOS-1 preprocessor.
+                doppler = (float(_field(summary, 1735, 1750)), 1e-3 * float(_field(summary, 1751, 1766)),
+                           float(_field(summary, 501, 516)))
+                stream = {'pieces': None, 'at': 0, 'kept': b'', 'next': 0, 'prefixes': {}}
+
+                def prefix(line):
+                    """The 412-byte prefix of an image line of the first polarization: a byte-range read of a stored
+                    member; of a compressed one, from one decompression stream from its start that goes on forward as
+                    far as a call needs and keeps the prefix of every line it passes (412 bytes a line), so that a
+                    second pass reads no line again; one piece of decompressed data in memory."""
+                    first = DESCRIPTOR + line * record_length
+                    offset, member = member_data(pols[0])
+                    if member.compress_type == zipfile.ZIP_STORED:
+                        return read(offset + first, offset + first + PREFIX_ALOS1)
+                    if stream['pieces'] is None:
+                        stream['pieces'] = inflate(offset, member, 0, member.file_size, _ALOS2_BLOCK_BYTES)
+                    while line not in stream['prefixes']:
+                        piece = next(stream['pieces'])
+                        # the end of the previous piece stays: a prefix may begin in it
+                        stream['kept'] = stream['kept'][-PREFIX_ALOS1:] + piece
+                        stream['at'] += len(piece)
+                        start = stream['at'] - len(stream['kept'])
+                        while (stream['next'] < image['lines']
+                               and DESCRIPTOR + stream['next'] * record_length + PREFIX_ALOS1 <= stream['at']):
+                            a = DESCRIPTOR + stream['next'] * record_length - start
+                            stream['prefixes'][stream['next']] = stream['kept'][a:a + PREFIX_ALOS1]
+                            stream['next'] += 1
+                    return stream['prefixes'][line]
+
+                # the line window of the bbox: the window rule shared with ALOS-2
+                window, epsgs = ASF._crop_window(bbox, led_orbit(led), image, led_sampling_rate(led), prefix,
+                                                 PREFIX_ALOS1, f'ALOS-1 {fileID}', doppler)
+                # the decompressed data kept for the prefixes is released
+                stream.update(pieces=None, kept=b'', prefixes={})
+                if window is None:
+                    print(f"WARNING: bbox {tuple(bbox)} does not reach {fileID} at heights -500 to 9000 m: "
+                          f"nothing stored")
+                    return
+                if debug:
+                    print(f"{fileID}: the grid of the bbox in EPSG {sorted(epsgs)}, Doppler {doppler[0]} + "
+                          f"{doppler[1]} * R Hz")
+            else:
+                window = (0, image['lines'])
+            if debug and window is not None:
+                print(f"{fileID}: lines {window[0]}..{window[1]} of {image['lines']}, {record_length} bytes each")
+
+            led_path = ASF._alos1_path(basedir, info)
+
+            def store_led():
+                # the folder is created when a file is written
+                os.makedirs(os.path.dirname(led_path), exist_ok=True)
+                if not exists(led_path):
+                    with open(led_path + '.tmp', 'wb') as f:
+                        f.write(led)
+                    os.replace(led_path + '.tmp', led_path)
+
+            todo = [p for p in pols if not (skip_exist and exists(ASF._alos1_path(basedir, info, p)))]
+            if window is None:
+                # a resumed raw crop: the lines of an image of the product already stored (and not written again), so
+                # that every polarization holds the same lines (the line tags of a PLR frame's VH and VV lie half a line
+                # period from HH and HV: their own selection can move the window by one block)
+                for q in available:
+                    stored = ASF._alos1_path(basedir, info, q)
+                    if q not in todo and exists(stored):
+                        with open(stored, 'rb') as f:
+                            window = crop_lines(f.read(head_length), record_length)
+                        if window[1] > image['lines']:
+                            raise ValueError(f"ALOS-1 {os.path.basename(stored)} holds lines {window[0]}..{window[1]}, "
+                                             f"beyond the {image['lines']} lines of {fileID}")
+                        break
+            # the LED of a raw crop is stored with its first image, once its lines are found
+            if window is not None:
+                store_led()
+            desc = os.path.basename(led_path)[:-len('.led')]
+            total = None if window is None else len(todo) * (window[1] - window[0]) * record_length
+            with tqdm(total=total, unit='B', unit_scale=True, desc=desc, leave=True, dynamic_ncols=False, ncols=80,
+                      mininterval=0.3, smoothing=0) as pbar:
+                for p in todo:
+                    own = head if p == pols[0] else member_bytes(p, 0, head_length, 64 * 1024)
+                    own_image = image_info(own, PREFIX_ALOS1, raw)
+                    if any(own_image[k] != image[k] for k in ('lines', 'record_length', 'pixels')):
+                        raise ValueError(f"ALOS-1 IMG-{p} of {fileID} has another size than IMG-{pols[0]}")
+                    member_size = members[p].file_size
+                    if member_size != DESCRIPTOR + image['lines'] * record_length:
+                        raise ValueError(f"ALOS-1 IMG-{p} of {fileID} has {member_size} bytes, expected "
+                                         f"{DESCRIPTOR + image['lines'] * record_length}")
+                    img_path = ASF._alos1_path(basedir, info, p)
+                    if window is None:
+                        # the first image of a raw crop: the records stream from line 1 and the lines whose time tags meet
+                        # the span are kept (utils_alos2_ceos.select_lines), the window rounded outward to
+                        # _ALOS2_LINE_BLOCK lines and clipped to the frame; nothing is read after its last line, and the
+                        # other polarizations take the same lines
+                        found = {}
+                        blocks = select_lines(records(p, 0, image['lines'], record_length, pbar), record_length,
+                                              image['lines'], image['date'], span[0], span[1], _ALOS2_LINE_BLOCK, found)
+                        # the first block of the window, before the folder is created: none when no line lies in the span
+                        first = next(blocks, None)
+                        if first is None:
+                            print(f"WARNING: bbox {tuple(bbox)} does not reach {fileID} at heights -500 to 9000 m "
+                                  f"(no line of the frame in its time span): nothing stored")
+                            return
+                        os.makedirs(os.path.dirname(img_path), exist_ok=True)
+                        write_crop(img_path, own[:DESCRIPTOR], chain([first], blocks), None, record_length)
+                        window = (found['start'], found['end'])
+                        pbar.total = pbar.n + (len(todo) - 1) * (window[1] - window[0]) * record_length
+                        pbar.refresh()
+                        if debug:
+                            print(f"{fileID}: lines {window[0]}..{window[1]} of {image['lines']}, {record_length} bytes "
+                                  f"each")
+                        store_led()
+                    else:
+                        # one block of records in memory at a time
+                        os.makedirs(os.path.dirname(img_path), exist_ok=True)
+                        write_crop(img_path, own[:DESCRIPTOR], records(p, window[0], window[1], record_length, pbar),
+                                   window[1] - window[0], record_length)
+                    name = os.path.basename(img_path)
+                    if name not in written:
+                        written.append(name)
+            store_led()
+
+        # the products one after another (each read with its own attempts)
+        written = []
+        for fileID, info in products.items():
+            download_product(fileID, info, written)
 
         if written:
             return pd.DataFrame({'file': written})
@@ -4433,6 +5355,80 @@ class ASF(progressbar_joblib):
         return gpd.GeoDataFrame.from_features(rows, crs='EPSG:4326')
 
     @staticmethod
+    def _alos1_rows(features, polarization=None):
+        """
+        The rows of ASF.search for ALOS-1 PALSAR: one row per L1.1 (SLC) product of the stripmap modes FBD and PLR and
+        per L1.0 (raw signal data) product of the stripmap modes FBS, FBD and PLR, with the products holding every
+        requested polarization.
+
+        A product of another level or mode (found with an explicit processingLevel or beamMode), an FBS SLC among them
+        (FBS is downloaded raw only), is dropped with one WARNING (ASF.download does not support it). The polarizations
+        of a product are its catalog polarization: 'HH', 'VV', 'HH+HV', 'VV+VH', or 'quadrature' (PLR: HH, HV, VH and
+        VV). The catalog's own polarization filter matches
+        the whole value ('HH' finds no HH+HV product, measured 2026-11-22), so the filter is applied to the rows here.
+
+        Parameters
+        ----------
+        features : list of dict
+            The GeoJSON features of ALOS-1 products as the catalog returns them (properties with fileID, beamModeType,
+            polarization).
+        polarization : str, list or None, optional
+            The polarizations a product must hold: 'HH' keeps the HH, HH+HV and PLR products, 'HH+HV' or 'HV' the
+            HH+HV and PLR products, 'VV' the VV, VV+VH and PLR products. None (default) keeps every product (VV and
+            VV+VH included).
+
+        Returns
+        -------
+        geopandas.GeoDataFrame
+            One row per product in catalog order: the catalog properties with `sceneName` = the fileID (the ID
+            ASF.download takes, such as 'ALPSRP131296360-L1.1' or 'ALPSRP055006360-L1.0'), `beamMode` = the catalog
+            beamModeType, the catalog processingLevel ('L1.1' or 'L1.0'), and the catalog footprint as geometry; CRS
+            EPSG:4326.
+
+        Examples
+        --------
+        >>> product = {'type': 'Feature', 'properties': {'fileID': 'ALPSRP131296360-L1.1', 'beamModeType': 'FBD',
+        ...            'polarization': 'HH+HV'}, 'geometry': {'type': 'Polygon', 'coordinates': [[[-72.89, -40.297],
+        ...            [-72.684, -40.813], [-71.885, -40.621], [-72.097, -40.107], [-72.89, -40.297]]]}}
+        >>> ASF._alos1_rows([product], 'HV')['sceneName'].tolist()
+        ['ALPSRP131296360-L1.1']
+        """
+        import geopandas as gpd
+
+        def pols_of(value):
+            # the catalog polarization of a product as a set of polarizations
+            value = value or ''
+            if isinstance(value, str):
+                value = ['HH', 'HV', 'VH', 'VV'] if value.strip().lower() == 'quadrature' \
+                    else value.replace(',', '+').split('+')
+            return {p.strip().upper() for p in value}
+
+        def modes(fileID):
+            # the modes of the products ASF.download takes, by the level of an ID that ASF._alos1_parse accepts: the
+            # SLC (L1.1) of FBD and PLR, the raw (L1.0) of FBS, FBD and PLR
+            try:
+                level = ASF._alos1_parse(fileID or '')['level']
+            except ValueError:
+                return ()
+            return ('FBD', 'PLR') if level == 'L1.1' else ('FBS', 'FBD', 'PLR')
+
+        supported = [f for f in features if f['properties'].get('beamModeType') in modes(f['properties'].get('fileID'))]
+        if len(supported) < len(features):
+            print(f'WARNING: {len(features) - len(supported)} ALOS-1 products other than the L1.1 products of the '
+                  f'modes FBD and PLR and the L1.0 products of the modes FBS, FBD and PLR are dropped (ASF.download '
+                  f'does not support them).')
+        if polarization is not None:
+            requested = pols_of('+'.join([polarization] if isinstance(polarization, str) else list(polarization)))
+            supported = [f for f in supported if requested <= pols_of(f['properties'].get('polarization'))]
+        rows = [{'type': 'Feature', 'geometry': f['geometry'],
+                 'properties': {**f['properties'], 'sceneName': f['properties']['fileID'],
+                                'beamMode': f['properties'].get('beamModeType')}}
+                for f in supported]
+        if not rows:
+            return gpd.GeoDataFrame(columns=['geometry', 'sceneName', 'beamMode'], geometry='geometry', crs='EPSG:4326')
+        return gpd.GeoDataFrame.from_features(rows, crs='EPSG:4326')
+
+    @staticmethod
     def _nisar_latest(features):
         """
         The NISAR catalog features with, for each acquisition, only the most recent production product.
@@ -4490,6 +5486,13 @@ class ASF(progressbar_joblib):
         `<fileID>-F<n>` that ASF.download takes, `subswath` is 'F1'..'F5' and the geometry is the predicted subswath
         footprint.
 
+        ALOS-1 PALSAR (platform='ALOS', searched alone): one row per L1.1 (SLC) product of the stripmap modes FBD and
+        PLR (FBS is downloaded raw only), or with processingLevel='L1.0' one row per raw signal data product of the
+        stripmap modes FBS, FBD and PLR (ASF._alos1_rows): the column sceneName is the product ID that ASF.download
+        takes, such as 'ALPSRP131296360-L1.1' or 'ALPSRP055006360-L1.0', with the catalog columns pathNumber,
+        frameNumber, offNadirAngle, polarization, startTime, processingLevel, beamMode (the catalog beamModeType) and
+        the catalog footprint.
+
         NISAR (platform='NISAR'): one row per acquisition, the most recent production product of it
         (ASF._nisar_latest). The catalog holds BETA, PROVISIONAL and VALIDATED versions of one acquisition and the
         reprocessed products of earlier acquisitions, and ASF.download writes them all to the same file. An acquisition
@@ -4506,33 +5509,38 @@ class ASF(progressbar_joblib):
         flightDirection : str, optional
             'A' or 'ASCENDING', 'D' or 'DESCENDING'; None for both.
         platform : str or list, optional
-            One platform name, a comma-separated string or a list, such as 'SENTINEL-1', 'SENTINEL-1C' or 'ALOS-2'.
-            ALOS-2 cannot be mixed with other platforms. Default 'SENTINEL-1'.
+            One platform name, a comma-separated string or a list, such as 'SENTINEL-1', 'SENTINEL-1C', 'ALOS-2' or
+            'ALOS' (ALOS-1 PALSAR). ALOS-2 and ALOS cannot be mixed with other platforms. Default 'SENTINEL-1'.
         processingLevel : str, optional
-            The catalog processing level; 'auto' is the burst level for Sentinel-1 and no filter for ALOS-2.
-            Default 'auto'.
+            The catalog processing level; 'auto' is the burst level for Sentinel-1, no filter for ALOS-2 and L1.1 (SLC)
+            for ALOS; 'L1.0' selects the ALOS raw products. Default 'auto'.
         polarization : str, optional
             For Sentinel-1 the catalog filter, such as 'VV'. For ALOS-2 the products holding every named
             polarization: None or 'HH' keeps the HH and HH+HV products, 'HH+HV' or 'HV' the HH+HV products only.
-            Default None.
+            For ALOS the same rule (a PLR product holds HH, HV, VH and VV). Default None.
         beamMode : str, optional
             The catalog beam mode; 'auto' is IW for Sentinel-1, the 5-subswath ScanSAR products in HH and HH+HV for
-            ALOS-2, and no filter for other platforms. An ALOS-2 product of another mode, found with an explicit
-            beamMode, is dropped with a WARNING (ASF.download does not support it). Default 'auto'.
+            ALOS-2, FBD and PLR for the ALOS L1.1 products, FBS, FBD and PLR for the ALOS L1.0 products, and no filter
+            for other platforms. An ALOS-2 or ALOS product of another mode (an FBS SLC among them, or an ALOS product
+            of another level), found with an explicit beamMode or processingLevel, is dropped with a WARNING
+            (ASF.download does not support it). Default 'auto'.
 
         Returns
         -------
         geopandas.GeoDataFrame
-            The catalog rows (Sentinel-1 bursts, ALOS-2 subswaths, NISAR products) with their footprints, CRS EPSG:4326.
+            The catalog rows (Sentinel-1 bursts, ALOS-2 subswaths, ALOS-1 products, NISAR products) with their
+            footprints, CRS EPSG:4326.
 
         Raises
         ------
         ValueError
-            For a platform list that names ALOS-2 and other platforms.
+            For a platform list that names ALOS-2 or ALOS and other platforms.
 
         Examples
         --------
         >>> ASF.search(geometry=AOI, startTime='2016-01-01', stopTime='2023-12-31', flightDirection='D', platform='ALOS-2')
+        >>> ASF.search(geometry=AOI, startTime='2006-01-01', stopTime='2011-12-31', flightDirection='A', platform='ALOS')
+        >>> ASF.search(geometry=AOI, startTime='2006-01-01', stopTime='2011-12-31', platform='ALOS', processingLevel='L1.0')
         """
         import geopandas as gpd
         import shapely
@@ -4565,18 +5573,28 @@ class ASF(progressbar_joblib):
         alos2 = [name for name in names if name.upper() == 'ALOS-2']
         if alos2 and len(alos2) != len(names):
             raise ValueError(f'ALOS-2 is searched alone: platform={platform!r} names other platforms too.')
+        alos1 = [name for name in names if name.upper() == 'ALOS']
+        if alos1 and len(alos1) != len(names):
+            raise ValueError(f'ALOS is searched alone: platform={platform!r} names other platforms too.')
         sentinel1 = bool(names) and all(name.upper() in S1_PLATFORMS for name in names)
-        # 'auto' is the burst level of every Sentinel-1 platform name; ALOS-2 has no processing level in the catalog
+        # 'auto' is the burst level of every Sentinel-1 platform name; ALOS-2 has no processing level in the catalog;
+        # ALOS-1 is the L1.1 (SLC) level
         if isinstance(processingLevel, str) and processingLevel=='auto':
             if sentinel1:
                 processingLevel = asf_search.PRODUCT_TYPE.BURST
             elif alos2:
                 processingLevel = None
-        # 'auto' is IW for Sentinel-1 and the 5-subswath ScanSAR products (WBD: HH+HV, WBS: HH) for ALOS-2
+            elif alos1:
+                processingLevel = 'L1.1'
+        # 'auto' is IW for Sentinel-1, the 5-subswath ScanSAR products (WBD: HH+HV, WBS: HH) for ALOS-2 and for ALOS-1
+        # the stripmap modes of the SLC products (FBD, PLR; FBS is downloaded raw only) or of the raw products (FBS,
+        # FBD, PLR)
         if isinstance(beamMode, str) and beamMode=='auto':
-            beamMode = 'IW' if sentinel1 else 'WBD,WBS' if alos2 else None
+            beamMode = ('IW' if sentinel1 else 'WBD,WBS' if alos2
+                        else ('FBD,PLR' if processingLevel == 'L1.1' else 'FBS,FBD,PLR') if alos1 else None)
 
-        # search bursts; the ALOS-2 polarizations are filtered on the rows (the catalog's 'HH+HV' filter returns none)
+        # search bursts; the ALOS-2 and ALOS-1 polarizations are filtered on the rows (the catalog's 'HH+HV' filter
+        # returns no ALOS-2 product; for ALOS-1 it matches the whole value)
         results = asf_search.search(
             start=startTime,
             end=stopTime,
@@ -4584,9 +5602,11 @@ class ASF(progressbar_joblib):
             intersectsWith=geometry.wkt,
             platform=','.join(names) if names else platform,
             processingLevel=processingLevel,
-            polarization=None if alos2 else polarization,
+            polarization=None if (alos2 or alos1) else polarization,
             beamMode=beamMode,
         )
+        if alos1:
+            return ASF._alos1_rows([product.geojson() for product in results], polarization)
         if alos2:
             import re
             features = [product.geojson() for product in results]
