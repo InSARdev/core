@@ -185,8 +185,9 @@ class Batches(tuple):
 
         Returns
         -------
-        tuple
-            Tuple of Batch objects for unpacking.
+        Batches
+            In save mode the input batches (the archive is written, nothing is read back);
+            in open mode the batches read from the archive.
 
         Examples
         --------
@@ -204,6 +205,7 @@ class Batches(tuple):
         import tempfile
         import os
         import fsspec
+        from . import utils_io
 
         if not store.endswith('.zip'):
             raise ValueError(f"Archive store must have '.zip' extension, got: {store}")
@@ -229,7 +231,10 @@ class Batches(tuple):
             # This avoids ZipStore's duplicate entry problem
             temp_dir = tempfile.mkdtemp()
             try:
-                result = self.snapshot(store=temp_dir, caption=caption or 'Archiving...', debug=debug)
+                # an archive is an export: zarr's default codec ('auto'), not the snapshot codec;
+                # the snapshot's result is lazy over temp_dir, deleted below, so it is not returned
+                utils_io._snapshot(*self, store=temp_dir, caption=caption or 'Archiving...',
+                                   debug=debug, wrapper=Batches, compressors='auto')
                 # Create zip with specified compression level
                 # Use fsspec for cloud storage support
                 with fsspec.open(store, 'wb') as f:
@@ -242,7 +247,7 @@ class Batches(tuple):
             finally:
                 import shutil
                 shutil.rmtree(temp_dir)
-            return result
+            return self
 
     def downsample(self, *args, **kwargs):
         """Apply downsample to all batches."""
