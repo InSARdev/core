@@ -3969,30 +3969,6 @@ def _fit3d_select_ps(parts, kw, threads):
     return out
 
 
-def _fit3d_ps_raster_for_dask(test, oy, ox, ny, nx):
-    """The PS test written back onto ONE chunk of a burst's pixel grid.
-
-    The test answers per lattice cell; the winner knows which pixel it is,
-    so its coherence goes back to that pixel, NaN elsewhere. EVERY winner
-    inside the chunk is written, whichever burst it was scanned from --
-    the rule fit1d_network() writes its nodes by, so a burst whose grid overlaps
-    another's shows the same points the model will carry there.
-    """
-    import numpy as np
-    out = np.full((int(ny), int(nx)), np.nan, np.float32)
-    if test is None:
-        return out
-    g = np.asarray(test['g']).ravel()
-    yy = np.asarray(test['wiy']).ravel()
-    xx = np.asarray(test['wix']).ravel()
-    m = (yy >= 0) & (xx >= 0) & np.isfinite(g)
-    yy = yy[m] - int(oy)
-    xx = xx[m] - int(ox)
-    ok = (yy >= 0) & (yy < int(ny)) & (xx >= 0) & (xx < int(nx))
-    out[yy[ok], xx[ok]] = g[m][ok]
-    return out
-
-
 def _fit3d_level1_for_dask(parts, kw, threads):
     """THE PS TEST, then the one network over whatever it certified.
 
