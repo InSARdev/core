@@ -2058,8 +2058,8 @@ class Stack:
                 raise ValueError("store path is required to open snapshot")
             if len(self) > 0 and utils_io.write_wanted(store, storage_options, overwrite):
                 # Non-empty Stack: save itself, then reopen
-                utils_io.save(dict(self.items()), class_names=['Stack'], store=store, storage_options=storage_options,
-                             caption=caption or 'Snapshotting...', debug=debug)
+                utils_io._save(dict(self.items()), class_names=['Stack'], store=store, storage_options=storage_options,
+                               caption=caption or 'Snapshotting...', debug=debug, compressors=utils_io._SNAPSHOT_COMPRESSOR)
             return utils_io.open(store=store, storage_options=storage_options,
                                 n_jobs=-1, debug=debug)
 

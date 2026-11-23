@@ -102,20 +102,42 @@ def _zarr_codecs_to_ts(zarr_codecs):
     """Convert zarr v3 codec config to TensorStore codec list."""
     ts_codecs = []
     for codec in zarr_codecs:
-        name = codec.name if hasattr(codec, 'name') else str(codec)
+        # the class name, never str(codec): a blosc codec with cname='zstd' holds 'zstd' in its text and would be taken for zstd
+        name = codec.name if hasattr(codec, 'name') else type(codec).__name__
         if 'bytes' in name.lower():
             endian = getattr(codec, 'endian', None)
             if endian is not None:
                 endian = str(endian.value) if hasattr(endian, 'value') else str(endian)
             ts_codecs.append({'name': 'bytes', 'configuration': {'endian': endian or 'little'}})
         elif 'zstd' in name.lower():
-            ts_codecs.append({'name': 'zstd', 'configuration': {'level': int(getattr(codec, 'level', 0))}})
+            ts_codecs.append({'name': 'zstd', 'configuration': {
+                'level': int(getattr(codec, 'level', 0)), 'checksum': bool(getattr(codec, 'checksum', False))}})
         elif 'blosc' in name.lower():
-            ts_codecs.append({'name': 'blosc', 'configuration': {
-                'cname': str(getattr(codec, 'cname', 'lz4')), 'clevel': int(getattr(codec, 'clevel', 5))}})
+            # every parameter of zarr's blosc codec (cname and shuffle are strings, or enums of an older zarr); TensorStore
+            # writes its own shuffle and typesize for a missing one
+            cname = getattr(codec, 'cname', 'lz4')
+            shuffle = getattr(codec, 'shuffle', 'noshuffle')
+            config = {'cname': str(getattr(cname, 'value', cname)), 'clevel': int(getattr(codec, 'clevel', 5)),
+                      'shuffle': str(getattr(shuffle, 'value', shuffle))}
+            # typesize and blocksize only when the codec holds a value (zarr's blosc codec may hold None)
+            for key in ('typesize', 'blocksize'):
+                value = getattr(codec, key, None)
+                if value is not None:
+                    config[key] = int(value)
+            ts_codecs.append({'name': 'blosc', 'configuration': config})
         elif 'gzip' in name.lower():
             ts_codecs.append({'name': 'gzip', 'configuration': {'level': int(getattr(codec, 'level', 6))}})
     return ts_codecs or [{'name': 'bytes', 'configuration': {'endian': 'little'}}]
+
+# WHY zstd level -1 for what snapshot() writes (SNAPIO, measured). A snapshot is a temporary that saves memory, and it
+# holds complex data (the stack's complex VV is 98.4 % of its bytes). On complex64 stack chunks zstd level 0 (zarr's
+# default) stores a full chunk at 0.931 of its raw size and decodes at 0.6-1.05 GB/s on one thread; level -1 stores it at
+# 1.000 (as is) and decodes at 40-42 GB/s, so a zarr chunk read takes 0.10 s instead of 0.80 s; the whole Gastein VV takes
+# 0.744 of its raw size against 0.799 (edge chunks 0.298 against 0.320). The stack's float32 geometry variables (ele, azi,
+# rng) compress worse with -1 by 14.7, 37.4 and 17.3 % of their raw size, which is about 0.2 % of a stack snapshot (they
+# are 1.6 % of its bytes), so one codec serves all variables of a snapshot. save() keeps zarr's default ('auto'): its
+# stores are results kept on disk, where the size counts.
+_SNAPSHOT_COMPRESSOR = zarr.codecs.ZstdCodec(level=-1)
 
 def _make_ts_target(zarr_array, store_path, var_name, group_path=None, storage_options=None):
     """Build a picklable TensorStore target from an existing zarr v3 array."""
@@ -228,10 +250,18 @@ def snapshot(*args, store: str | None = None, storage_options: dict[str, str] | 
         True (default) writes the store, replacing an existing one. False keeps an existing complete store
         (see write_wanted) and returns it opened.
     """
+    return _snapshot(*args, store=store, storage_options=storage_options, caption=caption,
+                     debug=debug, overwrite=overwrite, compressors=_SNAPSHOT_COMPRESSOR, **kwargs)
+
+def _snapshot(*args, store: str | None = None, storage_options: dict[str, str] | None = None,
+                caption: str | None = 'Snapshotting...',
+                debug=False, overwrite: bool = True, compressors='auto', **kwargs):
+    """The body of snapshot(): `compressors` is zarr's argument of create_array, _SNAPSHOT_COMPRESSOR (zstd level -1) for a
+    snapshot (a temporary) and 'auto' (zarr's default, zstd level 0) for the write of Batches.archive (an export)."""
     # call the function without data arguments to only open existing store
     if len(args) > 0 and write_wanted(store, storage_options, overwrite):
-        save(*args, store=store, storage_options=storage_options, caption=caption,
-             debug=debug, **kwargs)
+        _save(*args, store=store, storage_options=storage_options, caption=caption,
+              debug=debug, compressors=compressors, **kwargs)
     # Release input references and worker memory before opening the result
     import gc
     del args, kwargs
@@ -273,6 +303,15 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
     Interleaved outputs from the same burst are written together to avoid
     duplicate computation.
     """
+    return _save(*args, store=store, storage_options=storage_options, caption=caption, debug=debug,
+                 class_names=class_names, wrapper=wrapper)
+
+def _save(*args, store, storage_options: dict[str, str] | None = None,
+            caption: str | None = 'Saving...', debug=False,
+            class_names: list[str] | None = None, wrapper: type | None = None,
+            compressors='auto'):
+    """The body of save() and of snapshot()'s write: `compressors` is zarr's argument of create_array, 'auto' (zarr's
+    default, zstd level 0) for save() and _SNAPSHOT_COMPRESSOR (zstd level -1) for a snapshot."""
     import warnings
     import xarray as xr
     import dask
@@ -387,6 +426,7 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
                         dtype=da_xr.dtype,
                         dimension_names=dim_names,
                         overwrite=True,
+                        compressors=compressors,
                         fill_value=0 if fill_value is None else fill_value,
                     )
                     # THE VARIABLE'S OWN ATTRIBUTES: the metadata pass below
@@ -416,6 +456,7 @@ def save(*args, store, storage_options: dict[str, str] | None = None,
                         chunks=da_xr.shape,
                         dimension_names=dim_names,
                         overwrite=True,
+                        compressors=compressors,
                         **({} if fill_value is None else {'fill_value': fill_value}),
                     )
                     if da_xr.attrs:

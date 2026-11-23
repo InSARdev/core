@@ -4060,8 +4060,8 @@ class BatchCore(dict):
                 debug=False, overwrite: bool = True, **kwargs):
         # Only save if this batch has data; otherwise just open existing store. overwrite=False keeps a complete store.
         if len(self) > 0 and utils_io.write_wanted(store, storage_options, overwrite):
-            utils_io.save(self, store=store, storage_options=storage_options, caption=caption,
-                         debug=debug)
+            utils_io._save(self, store=store, storage_options=storage_options, caption=caption,
+                           debug=debug, compressors=utils_io._SNAPSHOT_COMPRESSOR)
         return utils_io.open(store=store, storage_options=storage_options,
                             n_jobs=-1, debug=debug)
 
