@@ -35,13 +35,21 @@ The Cache APIs at insar.dev provide fast access to Sentinel-1 data via NASA ASF 
 - **Integrated data access** — download Sentinel-1 bursts with their orbits, NISAR polarizations and frequencies, DEM, land mask, and map tiles
 - **Runs anywhere** — locally on MacOS/Linux/Windows, on Google Colab, GitHub runners, Docker containers, and even Raspberry Pi 4 & 5
 
-## Interactive Examples on Google Colab
+## Interactive Examples on Google Colab: ALOS-2, NISAR, Sentinel-1
 
 All examples have been tested on free Google Colab instances (2 slow vCPUs, 12 GB of RAM, and very slow disk access), which are temporary and can disconnect at any time. Not every long run succeeds, and Google Colab does not guarantee that processing will complete. A $10/month Google Colab subscription provides access to larger runtimes, where complete PolSAR and InSAR analyses can often be performed in just a few minutes. However, resources are still not guaranteed, so shorter processing runs reduce the risk of interruption.
 
 For faster processing, preprocess Sentinel-1 or NISAR data at a lower resolution, then save and reuse the preprocessed Zarr stacks to complete InSAR analysis in minutes. For NISAR, use frequency B to reduce download size and processing time. If you need higher resolution, simply rerun the same proven pipeline with frequency A.
 
 You can easily share your results publicly or with selected users, allowing others to reproduce them quickly and for free. This makes the examples ideal for educators and students.
+
+### ALOS-2
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1ptfI7thylL2ILOGpB5mrDH1Cx8Nc2h3a?usp=sharing) **Puyehue-Cordón Caulle Uplift, Chile (2015–2017).** Line-of-sight (LOS) velocity of the uplift at Puyehue-Cordón Caulle from 18 ALOS-2 PALSAR-2 ScanSAR HH dates (descending path 129, frame 4450, subswath F4, February 2015 – February 2017): 143 interferograms with ERA5 and IONEX atmospheric corrections, unwrapped, with the orbital ramp removed, inverted by `fit1d()`. The velocity map, the series and the rates of the quiet and the uplift phases are compared on 500 m cells to Fig. 6 of [Euillades et al. (2017)](https://doi.org/10.1016/j.jvolgeores.2017.06.023) (r = 0.89 within 12 km of the uplift), and the repeatability is checked on two independent halves of the pairs. Only the lines of the area of interest in one subswath and one polarization are downloaded: 15 GB instead of 1.15 TB of full scenes. The image shows our velocity map, the paper's Fig. 6a and their difference.
+
+<img src="assets/PuyehueCordonCaulle_Uplift_2015_2017.jpg" />
+
+### NISAR
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1Sl0gUW693FNRuyZlePR-gy3IFaybmMlX?usp=sharing) NISAR L-band FrequencyA/B Split-Spectrum HH Time Series Analysis for Mexico City Subsidence.
 
@@ -54,6 +62,8 @@ You can easily share your results publicly or with selected users, allowing othe
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1v_XQmHI2ox2LHRDLY3kxFK97IKQUKWZI?usp=sharing) **Anak Krakatau Eruption, Indonesia (2026).** Animated NISAR L-band frequency B HH/HV RGB composite (R = HH, G = HV, B = HH/HV) of the Krakatau archipelago, seen through the ash plume and clouds of the 4–8 September eruption: nine ascending acquisitions from 26 June to 12 October 2026, with a multi-temporal speckle filter and daily frames interpolated in time (PCHIP). Only a 22 × 22 km crop of each frame is downloaded (0.65 GB for the whole series).
 
 [<img src="assets/Krakatau_Eruption_2026.webp" />](assets/Krakatau_Eruption_2026.mp4)
+
+### Sentinel-1
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1iIvllZPzzZQFdLoTw3PI51nYjTS83LxZ?usp=sharing) **Gastein Valley, Austria (2023–2026).** Persistent and distributed scatterer (PS/DS) line-of-sight velocity around Bad Gastein from 91 Sentinel-1A VV dates (descending path 95, one IW2 burst), geocoded at full resolution on an 8 × 2 m grid. A PS network is solved and DS are attached to it, and the results are exported to GeoPackage. The image shows the LOS velocities of 3 reference areas over a satellite basemap.
 
