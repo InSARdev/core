@@ -588,8 +588,6 @@ _NISAR_MIN_CROP_KM = 20
 _ALOS2_LINE_BLOCK = 512
 # The largest block of ALOS-2 image records read and written at once (64 MiB), below the proxy's 128 MB per range
 _ALOS2_BLOCK_BYTES = 64 * 1024 * 1024
-# The refusal of an ALOS-1 FBS SLC (ASF._alos1_catalog by the catalog beam mode, ASF._download_alos1 by the LED)
-_ALOS1_FBS_SLC = 'ALOS-1 product {}: FBS SLC is not supported (ALOS-1 SLC is FBD and PLR)'
 # The ALOS-2 ScanSAR subswath footprints in the catalog polygon of a scene (ASF.search: the catalog holds one polygon per
 # scene, none per subswath), measured against JAXA's line coordinates: session/patches/alos2/PLAN.md, U0 and its
 # 2026-11-20 extension (23 right- and 18 left-looking scenes). Lengths in km, in the tangent plane at the scene centre.
@@ -1517,14 +1515,10 @@ class ASF(progressbar_joblib):
     @staticmethod
     def _alos1_catalog(ids, retries, timeout_second):
         """
-        The catalog entries of ALOS-1 products, found by one catalog search before any of them is downloaded, and
-        the refusal of an FBS SLC by its catalog beam mode.
+        The catalog entries of ALOS-1 products, found by one catalog search before any of them is downloaded.
 
-        ASF.download calls it before the download of any mission starts, so a refused product leaves nothing of the
-        call written; ASF._download_alos1 reads its products' URLs and footprints from it. An L1.1 product whose
-        catalog beamModeType is FBS (ALPSRP055006360-L1.1: FBS, polarization HH, measured 2026-11-23) is an FBS SLC,
-        which is not supported (ALOS-1 SLC is FBD and PLR): a plain one-line ValueError. The leader file's channel
-        count stays the final check (ASF._download_alos1).
+        ASF.download calls it before the download of any mission starts, so a product missing from the catalog leaves
+        nothing of the call written; ASF._download_alos1 reads its products' URLs and footprints from it.
 
         Parameters
         ----------
@@ -1543,7 +1537,7 @@ class ASF(progressbar_joblib):
         Raises
         ------
         ValueError
-            One line, for a product the catalog does not hold or an FBS SLC.
+            One line, for a product the catalog does not hold.
 
         Examples
         --------
@@ -1561,10 +1555,6 @@ class ASF(progressbar_joblib):
         missing = [g for g in products if g not in catalog]
         if missing:
             raise ValueError(f"Granules not found in ASF: {missing}")
-        for fileID, info in products.items():
-            if info['level'] == 'L1.1' and catalog[fileID][2] == 'FBS':
-                # the message of the leader file's refusal (ASF._download_alos1)
-                raise ValueError(_ALOS1_FBS_SLC.format(fileID))
         return catalog
 
     # https://asf.alaska.edu/datasets/data-sets/derived-data-sets/sentinel-1-bursts/
@@ -1574,21 +1564,22 @@ class ASF(progressbar_joblib):
         Download SAR data from ASF.
 
         Supports Sentinel-1 bursts, NISAR RSLC granules, ALOS-2 PALSAR-2 ScanSAR L1.1 subswaths (the 5-subswath
-        products in HH or HH+HV), ALOS-1 PALSAR L1.1 (SLC) products of the stripmap modes FBD and PLR and ALOS-1 PALSAR
-        L1.0 (raw signal data) products of the stripmap modes FBS, FBD and PLR. Mission is auto-detected from ID format.
+        products in HH or HH+HV), ALOS-1 PALSAR L1.1 (SLC) products and ALOS-1 PALSAR L1.0 (raw signal data) products
+        of the stripmap modes FBS, FBD and PLR. Mission is auto-detected from ID format.
 
         An ALOS-1 product is named by its fileID in the ASF catalog (the column sceneName of ASF.search):
         'ALPSRP131296360-L1.1' (SLC) or 'ALPSRP055006360-L1.0' (raw). A scene name without '-L1.1' or '-L1.0' or a
-        product of another level raises a one-line ValueError before anything is downloaded. An FBS SLC raises a
-        one-line ValueError (ALOS-1 SLC is FBD and PLR; FBS is downloaded raw only). It is refused before anything is
-        downloaded when its catalog beam mode is FBS, and in any case when its leader file, read first, holds one
-        polarization channel. The catalog entries of the ALOS-1 products are looked up before the download of any
-        mission starts, so a refused or missing ALOS-1 product leaves nothing of the call written (Sentinel-1, NISAR
-        and ALOS-2 IDs of the same call included). ALOS-1 needs an Earthdata account, ASF(username, password): there is no
-        cache proxy for it, and ASF() raises a one-line ValueError for a product to download. Its files are cropped CEOS
-        files in a folder per (path, frame, off-nadir angle in tenths of a degree), with the path (46 * orbit + 84) mod
-        671 + 1, the off-nadir angle of the product's leader file and the date of its first image line:
-        <basedir>/119_6360_343/AL1_119_6360_343_20080712_HH.img (and _HV.img) and AL1_119_6360_343_20080712.led. The raw
+        product of another level raises a one-line ValueError before anything is downloaded. An FBS SLC (one
+        polarization, HH or VV, with twice the range samples of FBD: 32 MHz sampling) is downloaded the same way as an
+        FBD SLC, its samples unchanged. The
+        catalog entries of the ALOS-1 products are looked up before the download of any mission starts, so a missing
+        ALOS-1 product leaves nothing of the call written (Sentinel-1, NISAR and ALOS-2 IDs of the same call included).
+        ALOS-1 needs an Earthdata account, ASF(username, password): there is no cache proxy for it, and ASF() raises a
+        one-line ValueError for a product to download. Its files are cropped CEOS files in a folder per (path, frame,
+        off-nadir angle in tenths of a degree), with the path (46 * orbit + 84) mod 671 + 1, the off-nadir angle of the
+        product's leader file and the date of its first image line:
+        <basedir>/119_6360_343/AL1_119_6360_343_20080712_HH.img (and _HV.img) and AL1_119_6360_343_20080712.led; the SLC
+        dates of one path, frame and off-nadir angle (FBS, FBD and PLR) share it. The raw
         products of one path, frame and off-nadir angle (FBS, FBD and PLR dates) share the folder
         <basedir>/118_6360_343_raw, with the same code: AL1_118_6360_343_20070205_HH.raw and its own leader file
         AL1_118_6360_343_20070205.led (the line records of the raw signal data, ASF._alos1_path); raw and SLC files
@@ -1735,6 +1726,8 @@ class ASF(progressbar_joblib):
         >>> asf.download('data/', 'ALOS2100352900-160401-WBDR1.1__D-F3', bbox=(-121.228, 35.504, -120.978, 35.704))
         >>> # ALOS-1: HH and HV of an FBD product, the lines a 20 x 20 km bbox reaches
         >>> asf.download('data/', 'ALPSRP131296360-L1.1', bbox=(-72.2092, -40.545, -72.0908, -40.455))
+        >>> # ALOS-1: HH of an FBS product, the lines a 20 x 21 km bbox reaches
+        >>> asf.download('data/', 'ALPSRP055006360-L1.1', bbox=(-72.27, -40.595, -72.03, -40.405))
         >>> # ALOS-1 raw: HH of an FBS frame, the echoes of a 20 x 21 km bbox
         >>> asf.download('data/', 'ALPSRP055006360-L1.0', bbox=(-72.27, -40.595, -72.03, -40.405))
         """
@@ -1840,8 +1833,8 @@ class ASF(progressbar_joblib):
         if not s1_needed and not nisar_needed and not alos2_needed and not alos1_needed:
             return None
 
-        # the catalog entries of the ALOS-1 products that will be downloaded, before the download of any mission: an
-        # FBS SLC (its catalog beam mode) or a product missing from the catalog raises with nothing of the call written
+        # the catalog entries of the ALOS-1 products that will be downloaded, before the download of any mission: a
+        # product missing from the catalog raises with nothing of the call written
         alos1_catalog = self._alos1_catalog(alos1_needed, retries, timeout_second) if alos1_needed else None
 
         # Prepare session only when actually needed
@@ -4347,12 +4340,10 @@ class ASF(progressbar_joblib):
         streamed to disk in blocks of at most _ALOS2_BLOCK_BYTES (64 MiB) (utils_alos2_ceos.write_crop: a temporary file
         renamed when complete). The image line prefix of ALOS-1 is 412 bytes (utils_alos2_ceos.PREFIX_ALOS1).
 
-        An FBS SLC is not supported (ALOS-1 SLC is FBD and PLR): a plain one-line ValueError. It is refused twice.
-        First by the catalog search of all the products (ASF._alos1_catalog, which ASF.download calls before the
-        download of any mission), before anything is downloaded: an L1.1 product whose catalog beamModeType is FBS, so
-        nothing of the call is written. Then by its LED, the final check, read first for each product: an L1.1 product
-        whose LED has one image channel (the data set summary record, bytes 389-392: FBS 1, FBD 2, PLR 4, measured on
-        L1.1 and L1.0 leader files), and nothing of it is written.
+        The L1.1 (SLC) products of the modes FBS, FBD and PLR are read and written the same way: the image channels of
+        the data set summary record (bytes 389-392) are FBS 1, FBD 2, PLR 4 (measured on L1.1 and L1.0 leader files),
+        and the record length of each image file is its own (its file descriptor), so the twice as many range samples
+        of an FBS image (32 MHz sampling, FBD 16 MHz) change nothing in the crop.
 
         An L1.0 (raw) product is stored as its leader file and the whole line records (412-byte line header, 8-bit I, Q
         echo samples, fill) of the window, as they are in the source (only the record sequence numbers renumbered, as
@@ -4441,8 +4432,7 @@ class ASF(progressbar_joblib):
 
         products = {i: ASF._alos1_parse(i) for i in dict.fromkeys(ids)}
 
-        # the catalog entries (an FBS SLC by its catalog beam mode is refused there, before any product is downloaded);
-        # the LED (below) stays the final check
+        # the catalog entries (a product missing from the catalog raises there, before any product is downloaded)
         if catalog is None:
             catalog = ASF._alos1_catalog(list(products), retries, timeout_second)
 
@@ -4535,14 +4525,11 @@ class ASF(progressbar_joblib):
                     pbar.update(len(block))
                     yield bytes(block)
 
-            # the LED first: an FBS SLC (one image channel) is refused before anything of it is written (the final check,
-            # after the catalog's beam mode)
+            # the LED first
             led = member_bytes('LED', 0, members['LED'].file_size)
             summary = _record(led, 10)
             if summary is None:
                 raise ValueError(f"ALOS-1 LED of {fileID} has no data set summary record (type 10)")
-            if not raw and int(_field(summary, 389, 392)) == 1:
-                raise ValueError(_ALOS1_FBS_SLC.format(fileID))
             pols = ASF._alos1_pols(polarizations, available, fileID)
             if not pols:
                 return
@@ -5357,12 +5344,11 @@ class ASF(progressbar_joblib):
     @staticmethod
     def _alos1_rows(features, polarization=None):
         """
-        The rows of ASF.search for ALOS-1 PALSAR: one row per L1.1 (SLC) product of the stripmap modes FBD and PLR and
-        per L1.0 (raw signal data) product of the stripmap modes FBS, FBD and PLR, with the products holding every
-        requested polarization.
+        The rows of ASF.search for ALOS-1 PALSAR: one row per L1.1 (SLC) product and per L1.0 (raw signal data) product
+        of the stripmap modes FBS, FBD and PLR, with the products holding every requested polarization.
 
-        A product of another level or mode (found with an explicit processingLevel or beamMode), an FBS SLC among them
-        (FBS is downloaded raw only), is dropped with one WARNING (ASF.download does not support it). The polarizations
+        A product of another level or mode (found with an explicit processingLevel or beamMode) is dropped with one
+        WARNING (ASF.download does not support it). The polarizations
         of a product are its catalog polarization: 'HH', 'VV', 'HH+HV', 'VV+VH', or 'quadrature' (PLR: HH, HV, VH and
         VV). The catalog's own polarization filter matches
         the whole value ('HH' finds no HH+HV product, measured 2026-11-22), so the filter is applied to the rows here.
@@ -5404,19 +5390,18 @@ class ASF(progressbar_joblib):
             return {p.strip().upper() for p in value}
 
         def modes(fileID):
-            # the modes of the products ASF.download takes, by the level of an ID that ASF._alos1_parse accepts: the
-            # SLC (L1.1) of FBD and PLR, the raw (L1.0) of FBS, FBD and PLR
+            # the modes of the products ASF.download takes, for an ID that ASF._alos1_parse accepts (an SLC, L1.1, or
+            # a raw product, L1.0): FBS, FBD and PLR
             try:
-                level = ASF._alos1_parse(fileID or '')['level']
+                ASF._alos1_parse(fileID or '')
             except ValueError:
                 return ()
-            return ('FBD', 'PLR') if level == 'L1.1' else ('FBS', 'FBD', 'PLR')
+            return ('FBS', 'FBD', 'PLR')
 
         supported = [f for f in features if f['properties'].get('beamModeType') in modes(f['properties'].get('fileID'))]
         if len(supported) < len(features):
-            print(f'WARNING: {len(features) - len(supported)} ALOS-1 products other than the L1.1 products of the '
-                  f'modes FBD and PLR and the L1.0 products of the modes FBS, FBD and PLR are dropped (ASF.download '
-                  f'does not support them).')
+            print(f'WARNING: {len(features) - len(supported)} ALOS-1 products other than the L1.1 and L1.0 products '
+                  f'of the modes FBS, FBD and PLR are dropped (ASF.download does not support them).')
         if polarization is not None:
             requested = pols_of('+'.join([polarization] if isinstance(polarization, str) else list(polarization)))
             supported = [f for f in supported if requested <= pols_of(f['properties'].get('polarization'))]
@@ -5486,9 +5471,10 @@ class ASF(progressbar_joblib):
         `<fileID>-F<n>` that ASF.download takes, `subswath` is 'F1'..'F5' and the geometry is the predicted subswath
         footprint.
 
-        ALOS-1 PALSAR (platform='ALOS', searched alone): one row per L1.1 (SLC) product of the stripmap modes FBD and
-        PLR (FBS is downloaded raw only), or with processingLevel='L1.0' one row per raw signal data product of the
-        stripmap modes FBS, FBD and PLR (ASF._alos1_rows): the column sceneName is the product ID that ASF.download
+        ALOS-1 PALSAR (platform='ALOS', searched alone): one row per L1.1 (SLC) product of the stripmap modes FBS, FBD
+        and PLR, or with processingLevel='L1.0' one row per raw signal data product of the same modes
+        (ASF._alos1_rows): the default search lists SLC products only, the L1.0 search raw products only. The column
+        sceneName is the product ID that ASF.download
         takes, such as 'ALPSRP131296360-L1.1' or 'ALPSRP055006360-L1.0', with the catalog columns pathNumber,
         frameNumber, offNadirAngle, polarization, startTime, processingLevel, beamMode (the catalog beamModeType) and
         the catalog footprint.
@@ -5520,9 +5506,9 @@ class ASF(progressbar_joblib):
             For ALOS the same rule (a PLR product holds HH, HV, VH and VV). Default None.
         beamMode : str, optional
             The catalog beam mode; 'auto' is IW for Sentinel-1, the 5-subswath ScanSAR products in HH and HH+HV for
-            ALOS-2, FBD and PLR for the ALOS L1.1 products, FBS, FBD and PLR for the ALOS L1.0 products, and no filter
-            for other platforms. An ALOS-2 or ALOS product of another mode (an FBS SLC among them, or an ALOS product
-            of another level), found with an explicit beamMode or processingLevel, is dropped with a WARNING
+            ALOS-2, FBS, FBD and PLR for the ALOS L1.1 and L1.0 products, and no filter for other platforms. An ALOS-2
+            or ALOS product of another mode (or an ALOS product of another level), found with an explicit beamMode or
+            processingLevel, is dropped with a WARNING
             (ASF.download does not support it). Default 'auto'.
 
         Returns
@@ -5587,11 +5573,9 @@ class ASF(progressbar_joblib):
             elif alos1:
                 processingLevel = 'L1.1'
         # 'auto' is IW for Sentinel-1, the 5-subswath ScanSAR products (WBD: HH+HV, WBS: HH) for ALOS-2 and for ALOS-1
-        # the stripmap modes of the SLC products (FBD, PLR; FBS is downloaded raw only) or of the raw products (FBS,
-        # FBD, PLR)
+        # the stripmap modes FBS, FBD and PLR of the SLC or of the raw products
         if isinstance(beamMode, str) and beamMode=='auto':
-            beamMode = ('IW' if sentinel1 else 'WBD,WBS' if alos2
-                        else ('FBD,PLR' if processingLevel == 'L1.1' else 'FBS,FBD,PLR') if alos1 else None)
+            beamMode = 'IW' if sentinel1 else 'WBD,WBS' if alos2 else 'FBS,FBD,PLR' if alos1 else None
 
         # search bursts; the ALOS-2 and ALOS-1 polarizations are filtered on the rows (the catalog's 'HH+HV' filter
         # returns no ALOS-2 product; for ALOS-1 it matches the whole value)

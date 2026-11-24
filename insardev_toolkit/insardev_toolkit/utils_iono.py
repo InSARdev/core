@@ -280,7 +280,7 @@ def _source(index, epoch):
     Parameters
     ----------
     index : dict - The index of _index().
-    epoch : pandas.Timestamp - The epoch of the map (UTC, on the whole hour).
+    epoch : pandas.Timestamp - The epoch of the map (UTC, on the whole hour, or two hours in the CODE files up to 2014).
 
     Returns
     -------
@@ -299,6 +299,33 @@ def _source(index, epoch):
         raise ValueError(f'ERROR: the IONEX map of {epoch:%Y-%m-%d %H:%M} is not in {index["path"]}: repeat the IONEX '
                          f'download of {epoch:%Y-%m-%d}')
     return index['where'][k]
+
+
+def _plan_maps(index, stamps):
+    """For each time, the two bracketing maps and the weight of the second (utils_tropo._plan), at the spacing of the maps of the day
+    file of the time's UTC day: one hour, or two hours in the CODE files up to 2014. A day without a day file in the index takes
+    _STEP_HOURS, and _source then names its missing map.
+
+    Parameters
+    ----------
+    index : dict - The index of _index().
+    stamps : list of pandas.Timestamp - The times, naive UTC.
+
+    Returns
+    -------
+    list of tuple - (e0, e1, w) per time; a time on a map gives (e0, None, 0.0).
+
+    Examples
+    --------
+    >>> _plan_maps({'seconds': np.array([0.0, 7200.0]), 'where': [('IONEX/codg0010.70i.Z', 0), ('IONEX/codg0010.70i.Z', 1)]}, [pd.Timestamp('1970-01-01 01:00')])
+    [(Timestamp('1970-01-01 00:00:00'), Timestamp('1970-01-01 02:00:00'), 0.5)]
+    """
+    # the spacing of each day file: its second map less its first, by the epoch of its first map
+    step = {int(index['seconds'][k - 1]): float(index['seconds'][k] - index['seconds'][k - 1])
+            for k, (_, m) in enumerate(index['where']) if m == 1}
+    hour = pd.Timedelta(hours=1).total_seconds()
+    return [p for t in stamps
+            for p in _plan([t], step.get(int(utils_epochs._seconds(t.normalize())), hour * _STEP_HOURS) / hour)]
 
 
 def _day_maps(read, k, epoch):
@@ -434,7 +461,7 @@ def verify(path, times):
     stamps = _times(times)
     vrt = _vrt(path)
     index = _index(vrt)
-    epochs = sorted({e for e0, e1, w in _plan(stamps, _STEP_HOURS) for e in (e0, e1) if e is not None})
+    epochs = sorted({e for e0, e1, w in _plan_maps(index, stamps) for e in (e0, e1) if e is not None})
     key = (vrt, os.stat(vrt).st_mtime_ns, tuple(epochs))
     if key in _VERIFIED:
         return
@@ -479,7 +506,7 @@ def delay(path, times, wavelength, factor):
     fac = _factor(factor)
     index = _index(_vrt(path))
     lat, lon = _lattice(index)
-    plan = _plan(stamps, _STEP_HOURS)
+    plan = _plan_maps(index, stamps)
     epochs = sorted({e for e0, e1, w in plan for e in (e0, e1) if e is not None})
     reads, grids = _days(index, epochs, lat, lon)
     shell = dask.delayed(_shell)(list(reads.values()))

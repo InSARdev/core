@@ -395,12 +395,51 @@ class IONEX(datagrid, progressbar_joblib, AtmosphereModel):
         maps = IONEX._decode_maps(text)
         if maps['epochs'][0] != (day.year, day.month, day.day, 0, 0, 0):
             raise ValueError(f'ERROR: the IONEX file of {day} starts at {maps["epochs"][0]}, not at the day')
-        if maps['interval'] <= 0:
-            raise ValueError(f'ERROR: the IONEX file of {day} has INTERVAL {maps["interval"]}, not a positive interval')
-        expected = 86400 // maps['interval'] + 1
-        if len(maps['epochs']) != expected:
-            raise ValueError(f'ERROR: the IONEX file of {day} has {len(maps["epochs"])} maps, {expected} expected')
+        epochs = IONEX._day_epochs(IONEX._header(text), day, f'the IONEX file of {day}')
+        if [dt.datetime(*e) for e in maps['epochs']] != epochs:
+            raise ValueError(f'ERROR: the IONEX file of {day} has maps that are not {maps["interval"]} s apart from 00:00 to 24:00, '
+                             f'as its header says')
         return text
+
+    @staticmethod
+    def _day_epochs(head, day, what):
+        """The epochs of the maps of a day file, from its header alone: 00:00 of its day to 24:00 (00:00 of the next day), INTERVAL
+        seconds apart, as the header says. CODE published 13 maps two hours apart up to 2014 and 25 maps one hour apart since.
+
+        Parameters
+        ----------
+        head : dict - The header values of IONEX._header.
+        day : datetime.date or pandas.Timestamp - The UTC day of the file.
+        what : str - The file, for the messages.
+
+        Returns
+        -------
+        list of datetime.datetime - The epochs of the maps, first to last.
+
+        Raises
+        ------
+        ValueError: When INTERVAL is not a positive divisor of the day, # OF MAPS is not one more than the maps of a day at INTERVAL, the
+        header has no EPOCH OF FIRST MAP or EPOCH OF LAST MAP, the first map is not at 00:00 of the day, or the last map is not at 24:00.
+
+        Examples
+        --------
+        >>> IONEX._day_epochs({'interval': 7200, 'maps': 13, 'first': (2007, 7, 18, 0, 0, 0), 'last': (2007, 7, 19, 0, 0, 0)}, dt.date(2007, 7, 18), 'codg1990.07i.Z')[-1]
+        datetime.datetime(2007, 7, 19, 0, 0)
+        """
+        interval, count = head['interval'], head['maps']
+        if interval <= 0 or 86400 % interval:
+            raise ValueError(f'ERROR: {what} has INTERVAL {interval}, not a positive interval that divides the day')
+        if count != 86400 // interval + 1:
+            raise ValueError(f'ERROR: {what} has {count} maps, {86400 // interval + 1} expected at INTERVAL {interval} s')
+        if head['first'] is None or head['last'] is None:
+            raise ValueError(f'ERROR: {what} has no EPOCH OF FIRST MAP or EPOCH OF LAST MAP')
+        start = dt.datetime(day.year, day.month, day.day)
+        if dt.datetime(*head['first']) != start:
+            raise ValueError(f'ERROR: {what} starts at {dt.datetime(*head["first"])}, not at its day {start:%Y-%m-%d} 00:00')
+        epochs = [start + dt.timedelta(seconds=interval * k) for k in range(count)]
+        if dt.datetime(*head['last']) != epochs[-1]:
+            raise ValueError(f'ERROR: {what} has its last map at {dt.datetime(*head["last"])}, not at {epochs[-1]}')
+        return epochs
 
     @staticmethod
     def _text(body, what):

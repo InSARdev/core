@@ -1330,9 +1330,8 @@ def sources(folder):
 
 
 # the IONEX day files as published (IONEX.download stores basedir/IONEX/<name>): the long CODE name from 2022-11-27, the
-# short one before; the maps of 00:00 to 24:00, one hour apart
+# short one before; the maps of 00:00 to 24:00, INTERVAL apart (one hour, or two hours in the CODE files up to 2014)
 _DAY_FILE = re.compile(r'COD0OPSFIN_(\d{4})(\d{3})0000_01D_01H_GIM\.INX\.gz|codg(\d{3})0\.(\d{2})i\.Z')
-_IONEX_MAPS = 25
 _IONEX_UNITS = 'seconds since 1970-01-01 00:00:00'
 
 
@@ -1382,7 +1381,8 @@ def _read_day(path, day):
 
     Parameters: path (str, basedir/IONEX/<name>); day (pandas.Timestamp, the UTC day of the file name). Returns: dict with
     epochs (DatetimeIndex) and grid (first node, step and count of lon and lat, ascending). Raises: ValueError, one ERROR:
-    line, for an unreadable file or header, not 25 maps one hour apart, a first map not at the day, or no regular grid.
+    line, for an unreadable file or header, maps that do not run from 00:00 of the day to 24:00 at its INTERVAL
+    (IONEX._day_epochs), or no regular grid.
 
     Examples
     --------
@@ -1394,17 +1394,7 @@ def _read_day(path, day):
         head = IONEX._header(text)
     except ValueError as e:
         raise ValueError(f'ERROR: {path}: {str(e).removeprefix("ERROR: ")}') from None
-    if head['maps'] != _IONEX_MAPS:
-        raise ValueError(f'ERROR: {path} has {head["maps"]} maps, {_IONEX_MAPS} expected')
-    if head['interval'] != 3600:
-        raise ValueError(f'ERROR: {path} has INTERVAL {head["interval"]} s, 3600 expected')
-    if head['first'] is None or head['last'] is None:
-        raise ValueError(f'ERROR: {path} has no EPOCH OF FIRST MAP or EPOCH OF LAST MAP')
-    epochs = pd.Timestamp(*head['first']) + pd.to_timedelta(3600 * np.arange(_IONEX_MAPS), unit='s')
-    if epochs[-1] != pd.Timestamp(*head['last']):
-        raise ValueError(f'ERROR: {path} has its last map at {pd.Timestamp(*head["last"])}, not at {epochs[-1]}')
-    if epochs[0] != day:
-        raise ValueError(f'ERROR: {path} starts at {epochs[0]}, not at its day {day:%Y-%m-%d} 00:00')
+    epochs = IONEX._day_epochs(head, day, path)
     lon0, dlon = _axis(np.sort(np.asarray(head['lon'], dtype=np.float64)), 'lon', path)
     lat0, dlat = _axis(np.sort(np.asarray(head['lat'], dtype=np.float64)), 'lat', path)
     grid = {'lon0': lon0, 'dlon': dlon, 'nlon': len(head['lon']), 'lat0': lat0, 'dlat': dlat, 'nlat': len(head['lat'])}
@@ -1442,12 +1432,17 @@ def _days_listed(vrt, base):
     lat, lon, seconds = values('lat'), values('lon'), values('epoch')
     if lat is None or lon is None or seconds is None or 'tec' not in arrays:
         return {}, None, None
+    # the maps of a source run from its offset to the offset of the next source (or the end): a listed day of maps from 00:00 to 24:00
+    # at one spacing (25 one hour apart, 13 two hours apart); another slice is not listed, and its day file is read again
+    sources = sorted((int(source.find('DestSlab').get('offset').split(',')[0]), (source.find('SourceFilename').text or '').strip())
+                     for source in arrays['tec'].iter('Source'))
     listed = {}
-    for source in arrays['tec'].iter('Source'):
-        name = (source.find('SourceFilename').text or '').strip()
-        start = int(source.find('DestSlab').get('offset').split(',')[0])
-        epochs = seconds[start:start + _IONEX_MAPS]
-        if len(epochs) == _IONEX_MAPS:
+    for n, (start, name) in enumerate(sources):
+        stop = sources[n + 1][0] if n + 1 < len(sources) else seconds.size
+        epochs = seconds[start:stop]
+        steps = np.diff(epochs)
+        if (len(epochs) >= 2 and epochs[0] % 86400 == 0 and epochs[-1] - epochs[0] == 86400 and steps[0] > 0
+                and np.all(steps == steps[0])):
             listed[os.path.normpath(os.path.join(base, name))] = [float(s) for s in epochs]
     return listed, lat, lon
 
@@ -1462,7 +1457,7 @@ def index_days(basedir, source='IONEX'):
 
     Parameters: basedir (str, the download folder with the IONEX subfolder); source (str, 'IONEX'). Returns: None.
     Raises: ValueError, one ERROR: line, when the source is not IONEX, there is no day file, two files hold one day, a day
-    file is unreadable or lacks its 25 maps, or the grids differ.
+    file is unreadable or its maps do not run from 00:00 of its day to 24:00 at its INTERVAL, or the grids differ.
 
     Examples
     --------
