@@ -5499,7 +5499,9 @@ class ASF(progressbar_joblib):
             'ALOS' (ALOS-1 PALSAR). ALOS-2 and ALOS cannot be mixed with other platforms. Default 'SENTINEL-1'.
         processingLevel : str, optional
             The catalog processing level; 'auto' is the burst level for Sentinel-1, no filter for ALOS-2 and L1.1 (SLC)
-            for ALOS; 'L1.0' selects the ALOS raw products. Default 'auto'.
+            for ALOS; 'L1.0' selects the ALOS raw products. An ALOS search is of one level: None (no filter) or a value
+            naming both 'L1.0' and 'L1.1' raises ValueError, as raw and SLC products are never listed together.
+            Default 'auto'.
         polarization : str, optional
             For Sentinel-1 the catalog filter, such as 'VV'. For ALOS-2 the products holding every named
             polarization: None or 'HH' keeps the HH and HH+HV products, 'HH+HV' or 'HV' the HH+HV products only.
@@ -5520,7 +5522,8 @@ class ASF(progressbar_joblib):
         Raises
         ------
         ValueError
-            For a platform list that names ALOS-2 or ALOS and other platforms.
+            For a platform list that names ALOS-2 or ALOS and other platforms, or an ALOS search with processingLevel
+            None or naming both 'L1.0' and 'L1.1'.
 
         Examples
         --------
@@ -5572,6 +5575,14 @@ class ASF(progressbar_joblib):
                 processingLevel = None
             elif alos1:
                 processingLevel = 'L1.1'
+        # ALOS: raw (L1.0) and SLC (L1.1) products are never listed together
+        if alos1:
+            levels = [] if processingLevel is None else \
+                [processingLevel] if isinstance(processingLevel, str) else list(processingLevel)
+            levels = {level.strip().upper() for name in levels for level in str(name).split(',')} - {''}
+            if not levels or {'L1.0', 'L1.1'} <= levels:
+                raise ValueError(f"ALOS is searched at one level: processingLevel='L1.1' (SLC) or 'L1.0' (raw), "
+                                 f"not {processingLevel!r}.")
         # 'auto' is IW for Sentinel-1, the 5-subswath ScanSAR products (WBD: HH+HV, WBS: HH) for ALOS-2 and for ALOS-1
         # the stripmap modes FBS, FBD and PLR of the SLC or of the raw products
         if isinstance(beamMode, str) and beamMode=='auto':

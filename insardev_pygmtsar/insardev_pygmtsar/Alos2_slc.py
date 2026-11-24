@@ -68,7 +68,7 @@ class Alos2_slc(Satellite):
         Raises
         ------
         ValueError
-            No IMG files, or dates of one sceneId with different range sampling rates.
+            No IMG files.
 
         Examples
         --------
@@ -107,12 +107,10 @@ class Alos2_slc(Satellite):
             exists(self._led_path(img_path))
 
         records = []
-        rates = {}
         for prefix, img_path in img_files:
             led_path = self._led_path(img_path)
             prm = alos2_prm(img_path, led_path)
             timing = alos2_timing(img_path, led_path)
-            rates.setdefault(prefix, set()).add(prm['rng_samp_rate'])
             records.append({
                 'sceneId': prefix,
                 'polarization': prm['polarization'],
@@ -129,9 +127,6 @@ class Alos2_slc(Satellite):
                 'band': 'L',
                 'geometry': alos2_footprint(img_path)
             })
-        for prefix, values in rates.items():
-            if len(values) > 1:
-                raise ValueError(f'{prefix}: the dates have different range sampling rates ({", ".join(f"{v:.1f}" for v in sorted(values))} Hz)')
 
         df = pd.DataFrame(records)
         df = gpd.GeoDataFrame(df, geometry='geometry', crs=4326) \

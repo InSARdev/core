@@ -52,7 +52,7 @@ def _process_chunk_nisar(iy, ix, chunk_y, chunk_x, n_y, n_x,
     import zarr
     import os
     from .utils_nisar import nisar_slc
-    from .utils_satellite import precise_transform_dir
+    from .utils_satellite import precise_transform_dir, azimuth_demodulate, azimuth_carrier_restore
 
     jy = min(iy + chunk_y, n_y)
     jx = min(ix + chunk_x, n_x)
@@ -117,20 +117,8 @@ def _process_chunk_nisar(iy, ix, chunk_y, chunk_x, n_y, n_x,
         slc_im = slc_chunk.imag.astype(np.float32)
         del slc_chunk
 
-        carrier = (2 * np.pi * doppler) * np.arange(azi_min, azi_max, dtype=np.float64)
-        cos_k, sin_k = np.cos(carrier).astype(np.float32)[:, None], np.sin(carrier).astype(np.float32)[:, None]
-        del carrier
-        for r0 in range(0, slc_re.shape[0], 512):
-            re_, im_ = slc_re[r0:r0 + 512], slc_im[r0:r0 + 512]
-            c_, s_ = cos_k[r0:r0 + 512], sin_k[r0:r0 + 512]
-            # times exp(-i carrier): re c + im s, im c - re s, in place (one temporary block at a time)
-            t_ = re_ * s_
-            re_ *= c_
-            re_ += im_ * s_
-            im_ *= c_
-            im_ -= t_
-            del re_, im_, c_, s_, t_
-        del cos_k, sin_k
+        # times exp(-2 pi i f k) at the absolute scene lines k = azi_min .. azi_max - 1, in place, in row blocks
+        azimuth_demodulate(slc_re, slc_im, doppler, azi_min)
 
         block_re = cv2.remap(slc_re, rng_local, azi_local,
                              interpolation=cv2.INTER_LANCZOS4,
@@ -142,12 +130,7 @@ def _process_chunk_nisar(iy, ix, chunk_y, chunk_x, n_y, n_x,
 
         # Restore the carrier exp(2 pi i f azi) at the exact output position (the scene line azi_local + azi_min,
         # exact in float64), in row blocks
-        for r0 in range(0, block_re.shape[0], 512):
-            phase = (2 * np.pi * doppler) * (azi_local[r0:r0 + 512].astype(np.float64) + azi_min)
-            cos_c, sin_c = np.cos(phase).astype(np.float32), np.sin(phase).astype(np.float32)
-            re_, im_ = block_re[r0:r0 + 512], block_im[r0:r0 + 512]
-            re_[:], im_[:] = re_ * cos_c - im_ * sin_c, re_ * sin_c + im_ * cos_c
-            del phase, cos_c, sin_c, re_, im_
+        azimuth_carrier_restore(block_re, block_im, doppler, azi_local, azi_min)
         proj_re[by0:by1, bx0:bx1] = block_re
         proj_im[by0:by1, bx0:bx1] = block_im
         del azi_local, block_re, block_im

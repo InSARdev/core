@@ -579,9 +579,24 @@ def progress_persisted(persisted, desc):
     RuntimeError
         The graph needs data the cluster no longer holds.
     """
+    from insardev_toolkit.progressbar import progressbar
+
+    wait_known(persisted)
+    progressbar(persisted, desc=desc)
+
+
+def wait_known(persisted):
+    """
+    Wait until the scheduler has every key of a distributed persist; raise when it refuses the graph
+    (the first part of progress_persisted, which see).
+
+    Raises
+    ------
+    RuntimeError
+        The graph needs data the cluster no longer holds.
+    """
     import time
     from distributed.client import futures_of
-    from insardev_toolkit.progressbar import progressbar
 
     futures = futures_of(persisted)
     if futures:
@@ -599,7 +614,7 @@ def progress_persisted(persisted, desc):
                                    'Recompute it from its source.')
             time.sleep(delay)
             delay = min(2 * delay, 1.0)
-    progressbar(persisted, desc=desc)
+    return futures
 
 
 _RESTART_SETTING = 'distributed.deploy.lost-worker-timeout'

@@ -17,3 +17,5 @@ from .S1 import S1
 from .Nisar import Nisar
 # ALOS-2 processing
 from .Alos2 import Alos2
+# ALOS-1 processing
+from .Alos1 import Alos1

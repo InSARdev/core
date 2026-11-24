@@ -535,13 +535,386 @@ class Batches(tuple):
         graph_check('interferogram', [intf_look, corr_look], sources)
         return Batches([intf_look, corr_look])
 
-    def compute(self):
-        """Compute all batches at once via dask.persist().
+    # compute(): the memory one persist of every grid holds, in bytes per full-resolution pixel of every grid it computes:
+    # 32 = 8 * 4, the 4 data copies (input, output, temporaries) of one 8-byte complex value (the user's rule, 2026-11-24).
+    # The measured peaks (dask's managed bytes at their peak per pixel of _compute_estimate; the ALOS-2 route
+    # pairs().interferogram(400).goldstein(800).downsample(100)) stay below it: 5.0 to 24.1 B over (4, 16) and (32, 32) with
+    # 4 to 143 pairs, and between runs the same batch varies (14.2 to 19.5 B at (32, 32) with 143 pairs). The share is the
+    # part of the available memory that persist may take.
+    _COMPUTE_BYTES_PER_PIXEL = 32
+    _COMPUTE_MEMORY_SHARE = 0.5
 
-        Persists all bursts across all batches in a single scheduler
-        submission. Data stays in worker memory. Preserves shared computation
-        between dependent batches (e.g., phase and correlation). For
-        memory-constrained sequential processing, use snapshot().
+    def _compute_blocks(self, lazy):
+        """(client, dim, {burst: chunks of the stacked dimension}) of the lazy batches, or None for one persist.
+
+        A GRID is one 2-D grid of a burst: one index of the stacked (leading) dimension of its 3-D variables, a pair or a
+        date. None (one persist): no Client; no lazy 3-D variable; the stacked dimension not the same in every batch and
+        burst, or chunked differently between the variables of one burst; or one block along it (the 1-D chunking, a
+        pass over the spatial blocks, as snapshot() does it).
+        """
+        try:
+            from dask.distributed import get_client
+            client = get_client()
+        except (ValueError, ImportError):
+            return None
+        batches = [batch for batch, l in zip(self, lazy) if l]
+        dim = None
+        for batch in batches:
+            for value in batch.values():
+                for arr in BatchCore._vars_of(value).values():
+                    if arr.ndim >= 3 and hasattr(arr.data, 'dask'):
+                        if dim is None:
+                            dim = arr.dims[0]
+                        elif arr.dims[0] != dim:
+                            return None
+        if dim is None:
+            return None
+        blocks = {}
+        for batch in batches:
+            for key, value in batch.items():
+                for arr in BatchCore._vars_of(value).values():
+                    if dim in arr.dims and hasattr(arr.data, 'dask'):
+                        chunks = arr.data.chunks[arr.dims.index(dim)]
+                        if blocks.setdefault(key, chunks) != chunks:
+                            return None
+        if all(len(chunks) == 1 for chunks in blocks.values()):
+            return None
+        return client, dim, blocks
+
+    @staticmethod
+    def _compute_estimate(batches, dim, blocks):
+        """The memory one persist of the lazy batches would hold, in bytes, from dask's own sizes, before computing.
+
+        One persist of every grid lets dask's order start nearly every grid before it finishes any, and each started grid
+        holds about one full-resolution image: the memory grows linearly with the grids. A burst's full-resolution pixels
+        per grid are the largest 2-D extent of the arrays its graph reads and makes (the shape of every 3-D layer without
+        its leading dimension, and the variable's own); the estimate is _COMPUTE_BYTES_PER_PIXEL times those pixels times
+        the burst's grids, summed over the bursts.
+        """
+        import math
+        pixels = 0
+        for key, chunks in blocks.items():
+            grids = sum(chunks)
+            extent = 0
+            for batch in batches:
+                value = batch.get(key)
+                if value is None:
+                    continue
+                for arr in BatchCore._vars_of(value).values():
+                    if dim not in arr.dims or not hasattr(arr.data, 'dask'):
+                        continue
+                    axis = arr.dims.index(dim)
+                    extent = max(extent, math.prod(n for i, n in enumerate(arr.shape) if i != axis))
+                    for layer in arr.data.__dask_graph__().layers.values():
+                        shape = (layer.collection_annotations or {}).get('shape')
+                        if shape and len(shape) == 3 and all(isinstance(n, (int, np.integer)) for n in shape):
+                            extent = max(extent, math.prod(shape[1:]))
+            pixels += grids * extent
+        return Batches._COMPUTE_BYTES_PER_PIXEL * pixels
+
+    @staticmethod
+    def _compute_cgroup_free(root='/sys/fs/cgroup'):
+        """The free memory of the container's cgroup in bytes, or None when no cgroup memory limit applies.
+
+        cgroup v2: memory.max minus memory.current; v1: memory/memory.limit_in_bytes minus memory/memory.usage_in_bytes
+        (the limit a host reports as 'max' or as a number above the host's memory is no limit). root is the cgroup folder
+        (a temporary one in the test).
+        """
+        import os
+        import psutil
+        total = psutil.virtual_memory().total
+        for limit_file, usage_file in (('memory.max', 'memory.current'),
+                                       ('memory/memory.limit_in_bytes', 'memory/memory.usage_in_bytes')):
+            limit_path, usage_path = os.path.join(root, limit_file), os.path.join(root, usage_file)
+            if not (os.path.isfile(limit_path) and os.path.isfile(usage_path)):
+                continue
+            with open(limit_path) as f:
+                limit = f.read().strip()
+            with open(usage_path) as f:
+                usage = f.read().strip()
+            if not limit.isdigit() or not usage.isdigit() or int(limit) >= total:
+                continue
+            return max(int(limit) - int(usage), 0)
+        return None
+
+    @staticmethod
+    def _compute_limit(cgroup_root='/sys/fs/cgroup'):
+        """The memory one persist may hold, in bytes: _COMPUTE_MEMORY_SHARE of the available memory now, the smaller of the
+        host's (psutil reports the host's memory inside a container) and the cgroup's free memory when a cgroup limit
+        exists (_compute_cgroup_free). On macOS dask's memory management is off, so the workers' memory_limit bounds
+        nothing; the available memory is the limit. It is the memory of the machine this process runs on, the client's:
+        the workers of a remote cluster are not measured."""
+        import psutil
+        available = psutil.virtual_memory().available
+        cgroup = Batches._compute_cgroup_free(cgroup_root)
+        if cgroup is not None:
+            available = min(available, cgroup)
+        return Batches._COMPUTE_MEMORY_SHARE * available
+
+    @staticmethod
+    def _compute_units(blocks):
+        """The units of a windowed compute(): block j of the stacked dimension of every burst together (the same pair
+        index of every batch and burst), in order. [{burst: slice}, ...]"""
+        units = []
+        for j in range(max(len(chunks) for chunks in blocks.values())):
+            unit = {}
+            for key, chunks in blocks.items():
+                if j < len(chunks):
+                    start = sum(chunks[:j])
+                    unit[key] = slice(start, start + chunks[j])
+            units.append(unit)
+        return units
+
+    @staticmethod
+    def _unit_part(value, dim, part, first):
+        """The part of one burst a unit computes: its grids `part` of the stacked dimension, and the lazy variables
+        without that dimension in the burst's first unit only."""
+        if dim not in value.dims:
+            return value if first else None
+        if isinstance(value, xr.DataArray):
+            return value.isel({dim: part})
+        if not first:
+            other = [v for v in value.data_vars if dim not in value[v].dims and hasattr(value[v].data, 'dask')]
+            value = value.drop_vars(other)
+        return value.isel({dim: part})
+
+    def _unit_parts(self, batches, dim, unit, units, seen):
+        """The lazy parts of every batch one unit computes; `seen` (the bursts already started) is updated."""
+        parts = []
+        for batch in batches:
+            part = {}
+            for key, value in batch.items():
+                if key in unit:
+                    p = self._unit_part(value, dim, unit[key], key not in seen)
+                elif key not in seen and not any(key in u for u in units):
+                    p = value          # a burst with no stacked grids: whole, with the first unit
+                else:
+                    p = None
+                if p is not None:
+                    part[key] = p
+            parts.append(part)
+        seen.update(k for part in parts for k in part)
+        return parts
+
+    @staticmethod
+    def _join_pieces(pieces, dim):
+        """Join the held pieces of every burst along the stacked dimension, in order."""
+        joined = []
+        for plist in pieces:
+            out = {}
+            for key, ps in plist.items():
+                if len(ps) == 1:
+                    out[key] = ps[0]
+                elif isinstance(ps[0], xr.DataArray):
+                    out[key] = xr.concat(ps, dim=dim, coords='minimal', compat='override', join='override')
+                else:
+                    other = [v for v in ps[0].data_vars if dim not in ps[0][v].dims]
+                    stacked = xr.concat([p.drop_vars(other, errors='ignore') for p in ps], dim=dim, data_vars='minimal',
+                                        coords='minimal', compat='override', join='override')
+                    out[key] = stacked.assign({v: ps[0][v] for v in other})[list(ps[0].data_vars)]
+            joined.append(out)
+        return joined
+
+    @staticmethod
+    def _cull_factory(batches):
+        """cull(value): one burst's part on a graph of only the tasks it needs. The graph of everything is built and
+        optimised once here, as the scheduler would optimise one persist of it (blockwise and linear fusion); a persist of
+        one unit then ships only its own tasks, not the whole graph of every unit (measured: 22 MB pickled per persist at
+        Puyehue (4, 16) 143 pairs, about 4 s a unit), and a task two units share keeps one key."""
+        import dask.array as da
+        from dask._task_spec import convert_legacy_graph
+        from dask.base import collections_to_expr
+        from dask.core import flatten
+        from dask.highlevelgraph import HighLevelGraph
+
+        base_layers, arrays = set(), []
+        for batch in batches:
+            for value in batch.values():
+                for arr in list(BatchCore._vars_of(value).values()) + list(value.coords.values()):
+                    if isinstance(arr.data, da.Array):
+                        arrays.append(arr.data)
+                        base_layers.update(arr.data.__dask_graph__().layers)
+        # the output keys stay, so a unit's parts find their inputs in it
+        base = convert_legacy_graph(dict(collections_to_expr(arrays, True).optimize().__dask_graph__()))
+        del arrays
+
+        class _Keys:
+            """the keys of the base graph and of one part's own top layers, for convert_legacy_graph"""
+            def __init__(self, top):
+                self.top = top
+
+            def __contains__(self, key):
+                return key in self.top or key in base
+
+        class _AllKeys:
+            """the keys of the base graph, of one part's own top layers and of its whole unoptimised graph"""
+            def __init__(self, top, hg):
+                self.top, self.hg = top, hg
+
+            def __contains__(self, key):
+                if key in self.top or key in base:
+                    return True
+                try:
+                    self.hg[key]
+                    return True
+                except (KeyError, TypeError):
+                    return False
+
+        def cull_array(x):
+            hg = x.__dask_graph__()
+            top = {}
+            for name, layer in hg.layers.items():
+                if name not in base_layers:
+                    top.update(layer)
+            top = convert_legacy_graph(top, all_keys=_Keys(top))
+            graph, stack = {}, list(flatten(x.__dask_keys__()))
+            while stack:
+                k = stack.pop()
+                if k in graph:
+                    continue
+                task = top.get(k)
+                if task is None:
+                    task = base.get(k)
+                if task is None:
+                    # an intermediate task the optimised graph fused away (the part needs it directly): its own
+                    # unoptimised task, whose inputs are then found the same way
+                    task = convert_legacy_graph({k: hg[k]}, all_keys=_AllKeys(top, hg)).get(k)
+                    if task is None:
+                        # data already on the cluster ({key: its own Future}, a persisted input): the scheduler
+                        # holds it, the part depends on it as it is
+                        graph[k] = None
+                        continue
+                graph[k] = task
+                stack.extend(d for d in task.dependencies if d not in graph)
+            graph = {k: t for k, t in graph.items() if t is not None}
+            return da.Array(HighLevelGraph.from_collections(x.name, graph, dependencies=()), x.name, x.chunks,
+                            meta=x._meta)
+
+        def cull(value):
+            def one(arr):
+                return arr.copy(data=cull_array(arr.data)) if isinstance(arr.data, da.Array) else arr
+            if isinstance(value, xr.DataArray):
+                out = one(value)
+            else:
+                out = value.assign({v: one(value[v]) for v in value.data_vars})
+            lazy_coords = {c: one(out.coords[c]) for c in out.coords if isinstance(out.coords[c].data, da.Array)}
+            return out.assign_coords(lazy_coords) if lazy_coords else out
+        return cull
+
+    def _compute_window(self, lazy, dim, units, n):
+        """The sliding window of compute(): every unit (one index of the stacked dimension of every batch and burst) is
+        persisted on its own, n units stay in flight, and the units that finish are replaced at once by as many new
+        ones (no barrier: a slow grid holds its own slot only). A refused graph shows as cancelled futures and raises
+        then. The lazy coordinates of every unit are fetched in one compute at the end, every unit is held (as
+        compute() holds its results), and the pieces are joined along the stacked dimension. Returns the persisted
+        batches as dicts, as one dask.persist of the whole would."""
+        import itertools
+        import dask
+        from dask.distributed import as_completed
+        from distributed.client import futures_of
+        from insardev_toolkit.progressbar import tqdm
+        from .utils_dask import wait_known
+
+        batches = [dict(batch) for batch, l in zip(self, lazy) if l]
+        nb = len(batches)
+        cull = self._cull_factory(batches)
+        done = [None] * len(units)
+        seen = set()
+        todo = iter(range(len(units)))
+        ac = as_completed(with_results=False)
+        owner, remaining = {}, {}
+        pbar = tqdm(desc='Computing bursts'.ljust(25), total=len(units))
+
+        def submit(k):
+            """persist the next k units in one call; returns the number of them with nothing to compute"""
+            us = list(itertools.islice(todo, k))
+            if not us:
+                return 0
+            flat = []
+            for u in us:
+                parts = self._unit_parts(batches, dim, units[u], units, seen)
+                flat.extend({key: cull(value) for key, value in part.items()} for part in parts)
+            # the graph is optimised already (_cull_factory): the scheduler takes it as it is, so a task two units
+            # share keeps one key and runs once while both are in flight
+            results = list(dask.persist(*flat, optimize_graph=False))
+            empty = 0
+            for i, u in enumerate(us):
+                done[u] = results[i * nb:(i + 1) * nb]
+                futures = futures_of(done[u])
+                if not futures:
+                    empty += 1
+                    pbar.update(1)
+                    continue
+                remaining[u] = len(futures)
+                for f in futures:
+                    owner.setdefault(f.key, []).append(u)
+                    ac.add(f)
+            return empty
+
+        free = n
+        while free:
+            free = submit(free)
+        for batch in ac.batches():
+            finished = 0
+            for f in batch:
+                u = owner[f.key].pop(0)
+                if f.status == 'error':
+                    f.result()
+                if f.status == 'cancelled':
+                    wait_known(done[u])         # raises the refusal (input data no longer on the cluster)
+                remaining[u] -= 1
+                if not remaining[u]:
+                    del remaining[u]
+                    finished += 1
+            if finished:
+                pbar.update(finished)
+                free = finished
+                while free:
+                    free = submit(free)
+        pbar.close()
+
+        # every unit's lazy coordinates in one compute, then every unit held (as compute() holds its results)
+        lazy_coords = [(u, bi, key, name, coord) for u, results in enumerate(done) for bi, result in enumerate(results)
+                       for key, value in result.items() for name, coord in value.coords.items()
+                       if hasattr(coord.data, 'compute')]
+        values = dask.compute(*[coord.data for *_, coord in lazy_coords]) if lazy_coords else ()
+        done = [[dict(result) for result in results] for results in done]
+        for (u, bi, key, name, coord), val in zip(lazy_coords, values):
+            done[u][bi][key] = done[u][bi][key].assign_coords({name: (coord.dims, val)})
+        pieces = [{key: [] for key in batch} for batch in batches]
+        for results in done:
+            for bi, result in enumerate(results):
+                for key, value in result.items():
+                    pieces[bi][key].append(BatchCore._persisted(value, {}))
+        return self._join_pieces(pieces, dim)
+
+    def compute(self):
+        """Compute all batches; the results stay in the workers' memory.
+
+        All bursts of all batches go in a single scheduler submission (dask.persist), as always, when there is nothing to
+        window: no distributed Client; no lazy 3-D variable; the stacked (leading) dimension not the same in every batch and
+        burst; chunks along it that differ between the variables of one burst; or one block along it per burst (the 1-D
+        chunking, a pass over the spatial blocks).
+
+        With a Client and lazy 3-D variables chunked along their stacked dimension, compute() first estimates, from dask's
+        own sizes and before computing, the memory that single submission would hold: one submission of every grid (a pair
+        or a date of a burst) lets dask's order start nearly every grid before it finishes any, and each started grid
+        holds about one full-resolution image, so the memory grows with the grids. The estimate is 32 bytes per
+        full-resolution pixel of every grid (8 * 4: the 4 data copies, input, output and temporaries, of one 8-byte complex
+        value), see _compute_estimate. When it fits in a share of the available memory (_compute_limit), the single
+        submission runs: it is the fastest. Otherwise the units are computed in a sliding window (_compute_window): a unit
+        is one chunk along the stacked dimension of every burst (one grid when the pairs are chunked by 1, the usual case,
+        else the grids of that chunk), as many units in flight as the Client has workers, the next unit submitted the moment
+        one finishes. The memory is then bounded by the units in flight, not by all of them, and a slow unit does not hold
+        up the others.
+
+        The limit is the memory of the machine this process runs on, the Client's: the smaller of the available memory and,
+        in a container, the cgroup's free memory. The workers of a remote cluster are not measured.
+
+        Both ways preserve the computation the batches share (e.g., the phase
+        and the correlation of one pair run once: the same grid of every batch
+        goes in the same submission) and give the same values, chunks and
+        coordinates. For results that do not fit in memory, use snapshot().
 
         A batch of DataArrays is computed as the DataArrays it holds, and a
         batch with nothing lazy comes back as it is (BatchCore.compute, N81).
@@ -562,10 +935,19 @@ class Batches(tuple):
         all_input_chunks = [{key: BatchCore._input_chunks(v) for key, v in batch.items()}
                             for batch, l in zip(self, lazy) if l]
 
-        # Persist all lazy batches at once — single scheduler submission
-        # progress_persisted extracts futures and blocks until completion
-        all_results = list(dask.persist(*[dict(batch) for batch, l in zip(self, lazy) if l]))
-        progress_persisted(all_results, desc='Computing bursts'.ljust(25))
+        found = self._compute_blocks(lazy)
+        if found is not None:
+            client, dim, blocks = found
+            estimate = self._compute_estimate([batch for batch, l in zip(self, lazy) if l], dim, blocks)
+            if estimate <= self._compute_limit():
+                found = None
+        if found is not None:
+            all_results = self._compute_window(lazy, dim, self._compute_units(blocks), max(len(client.nthreads()), 1))
+        else:
+            # Persist all lazy batches at once — single scheduler submission
+            # progress_persisted extracts futures and blocks until completion
+            all_results = list(dask.persist(*[dict(batch) for batch, l in zip(self, lazy) if l]))
+            progress_persisted(all_results, desc='Computing bursts'.ljust(25))
 
         # Finalize: materialize coordinates, hold the futures, rechunk to match input
         computed = iter(zip(all_results, all_input_chunks))

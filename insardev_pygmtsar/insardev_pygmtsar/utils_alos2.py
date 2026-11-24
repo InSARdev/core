@@ -17,6 +17,9 @@ number, 25 pixels, 37 year, 41 day of year, 45 milliseconds of the day, 57 PRF (
 the day (int64), 117 slant range of the first pixel (integer m), 121 data record window position (ns of two-way delay),
 193/197/201 latitude and 205/209/213 longitude of the first, mid and last pixel (1e-6 degree, on the WGS84 ellipsoid at height 0).
 The lines are read through a memmap of the records: a box is one byte range per line, nothing to decode and no cache to tune.
+The prefix length is the file descriptor's field "prefix data per record" (bytes 277-280, ASCII): 544 in ALOS-2 files, 412 in
+ALOS-1 PALSAR L1.1 files (the first 412 bytes of the ALOS-2 prefix, the same fields; bytes 85-92 and 121-124 are spare and 0
+there). So alos2_image, alos2_prefix, alos2_led, alos2_slc and alos2_footprint read ALOS-1 files too (utils_alos1).
 
 LED: CEOS records; the data set summary (type 10) holds the radar constants and the ellipsoid, the platform position data
 (type 30) the orbit: Earth-fixed state vectors 60 s apart.
@@ -63,7 +66,10 @@ ALOS2_DSS_FIELDS = {
 
 def alos2_image(img_path: str) -> dict:
     """
-    Size, timing fields and near range of an ALOS-2 IMG file, checked against the file size.
+    Size, timing fields and near range of an ALOS-2 (or ALOS-1 L1.1) IMG file, checked against the file size.
+
+    The line prefix length is the descriptor's field "prefix data per record" (bytes 277-280, ASCII): 544 for ALOS-2, 412 for
+    ALOS-1 PALSAR L1.1.
 
     Parameters
     ----------
@@ -73,23 +79,32 @@ def alos2_image(img_path: str) -> dict:
     Returns
     -------
     dict
-        `insardev_toolkit.utils_alos2_ceos.image_info` of the first 720 + 544 bytes: 'lines', 'record_length', 'pixels', 'time'
-        (seconds of day of line 1, the 1 ms field), 'prf' (Hz), 'near_range' (integer m), 'date' ('YYYY-MM-DD').
+        `insardev_toolkit.utils_alos2_ceos.image_info` of the first 720 + prefix bytes: 'lines', 'record_length', 'pixels',
+        'time' (seconds of day of line 1, the 1 ms field), 'prf' (Hz), 'near_range' (integer m), 'date' ('YYYY-MM-DD'); and
+        'prefix' (the line prefix length, bytes).
 
     Raises
     ------
     ValueError
-        The head is not that of a consistent IMG file, or the file size is not 720 + lines x record_length.
+        The head is not that of a consistent IMG file (the prefix length field is not a number among them), or the file size is
+        not 720 + lines x record_length.
 
     Examples
     --------
     >>> alos2_image('129_4450_F4/AL2_129_4450_F4_20150404_HH.img')['lines']
     """
-    from insardev_toolkit.utils_alos2_ceos import image_info, DESCRIPTOR, PREFIX
+    from insardev_toolkit.utils_alos2_ceos import image_info, DESCRIPTOR
 
     with open(img_path, 'rb') as f:
-        head = f.read(DESCRIPTOR + PREFIX)
-    info = image_info(head)
+        head = f.read(DESCRIPTOR)
+        text = head[276:280].decode('ascii', errors='replace').strip()
+        if len(head) < DESCRIPTOR or not text.isdigit():
+            raise ValueError(f'{img_path}: the prefix length (bytes 277-280 of the descriptor) is {text!r}, not a number; '
+                             f'download it again')
+        prefix_length = int(text)
+        head += f.read(prefix_length)
+    info = image_info(head, prefix_length)
+    info['prefix'] = prefix_length
     size = os.path.getsize(img_path)
     lines, record_length = info['lines'], info['record_length']
     expected = DESCRIPTOR + lines * record_length
@@ -101,7 +116,7 @@ def alos2_image(img_path: str) -> dict:
 
 def alos2_prefix(img_path: str, lines) -> dict:
     """
-    Prefix fields of lines of an ALOS-2 IMG file.
+    Prefix fields of lines of an ALOS-2 (or ALOS-1 L1.1) IMG file.
 
     Parameters
     ----------
@@ -115,20 +130,21 @@ def alos2_prefix(img_path: str, lines) -> dict:
     dict
         'line' (image line number), 'pixels', 'year', 'doy' (1-based day of year), 'ms' (milliseconds of the day), 'us'
         (sensor acquisition microseconds of the day, bytes 85-92, int64), 'chirp_linear' (the chirp linear coefficient, bytes
-        77-80, Hz/us), 'near_range' (integer m), 'window' (data record window position, ns of two-way delay) as int64 arrays,
-        'prf' (Hz, the mHz field) a float64 array, and 'lat', 'lon' float64
-        arrays (len, 3) of the first, mid and last pixel in degrees (height 0).
+        77-80, the field's 4 bytes as a big-endian int32), 'near_range' (integer m), 'window' (data record window position, ns
+        of two-way delay) as int64 arrays, 'prf' (Hz, the mHz field) a float64 array, and 'lat', 'lon' float64
+        arrays (len, 3) of the first, mid and last pixel in degrees (height 0). In ALOS-1 files 'us' and 'window' are spare
+        bytes (0).
 
     Examples
     --------
     >>> alos2_prefix('129_4450_F4/AL2_129_4450_F4_20150404_HH.img', [0, 64, 128])['prf']
     """
-    from insardev_toolkit.utils_alos2_ceos import DESCRIPTOR, PREFIX
+    from insardev_toolkit.utils_alos2_ceos import DESCRIPTOR
 
     info = alos2_image(img_path)
     lines = np.asarray(lines, dtype=np.int64).ravel()
     records = np.memmap(img_path, dtype=np.uint8, mode='r', offset=DESCRIPTOR, shape=(info['lines'], info['record_length']))
-    prefix = np.array(records[lines, :PREFIX])
+    prefix = np.array(records[lines, :info['prefix']])
     del records
     # the first 216 bytes as big-endian int32 words: the field at 1-based byte b is the word (b - 1) // 4
     words = np.ascontiguousarray(prefix[:, :216]).view('>i4').astype(np.int64)
@@ -146,9 +162,54 @@ def alos2_prefix(img_path: str, lines) -> dict:
             'lon': words[:, 51:54].astype(np.float64) * 1e-6}
 
 
+def _dss_fields(led: bytes, led_path: str, fields: dict) -> dict:
+    """
+    Numeric ASCII fields of the data set summary record (type 10) of a leader file's bytes.
+
+    Parameters
+    ----------
+    led : bytes
+        The leader file's bytes.
+    led_path : str
+        The leader file named in the error messages.
+    fields : dict
+        name -> (first byte, last byte, scale), 1-based bytes of the record, as ALOS2_DSS_FIELDS.
+
+    Returns
+    -------
+    dict
+        name -> the field's number x scale (float).
+
+    Raises
+    ------
+    ValueError
+        No data set summary record, or a field that is not a finite number.
+
+    Examples
+    --------
+    >>> _dss_fields(open('AL2_129_4450_F4_20150404.led', 'rb').read(), 'AL2_129_4450_F4_20150404.led', ALOS2_DSS_FIELDS)
+    """
+    from insardev_toolkit.utils_alos2_orbit import led_records
+
+    dss = [led[offset:offset + length] for offset, kind, length in led_records(led) if kind == 10]
+    if not dss:
+        raise ValueError(f'{led_path}: no data set summary record (type 10)')
+    dss = dss[0]
+    values = {}
+    for name, (first, last, scale) in fields.items():
+        text = dss[first - 1:last].decode('ascii', errors='replace').strip()
+        try:
+            values[name] = float(text) * scale
+        except ValueError:
+            raise ValueError(f'{led_path}: {name} (bytes {first}-{last} of the data set summary) is {text!r}, not a number') from None
+        if not np.isfinite(values[name]):
+            raise ValueError(f'{led_path}: {name} (bytes {first}-{last} of the data set summary) is {text!r}, not a number')
+    return values
+
+
 def alos2_led(led_path: str) -> dict:
     """
-    Radar constants, ellipsoid and orbit of an ALOS-2 leader (LED) file.
+    Radar constants, ellipsoid and orbit of an ALOS-2 (or ALOS-1 L1.1) leader (LED) file.
 
     Parameters
     ----------
@@ -173,23 +234,11 @@ def alos2_led(led_path: str) -> dict:
     --------
     >>> alos2_led('129_4450_F4/AL2_129_4450_F4_20150404.led')['wavelength']
     """
-    from insardev_toolkit.utils_alos2_orbit import led_records, led_orbit
+    from insardev_toolkit.utils_alos2_orbit import led_orbit
 
     with open(led_path, 'rb') as f:
         led = f.read()
-    dss = [led[offset:offset + length] for offset, kind, length in led_records(led) if kind == 10]
-    if not dss:
-        raise ValueError(f'{led_path}: no data set summary record (type 10)')
-    dss = dss[0]
-    values = {}
-    for name, (first, last, scale) in ALOS2_DSS_FIELDS.items():
-        text = dss[first - 1:last].decode('ascii', errors='replace').strip()
-        try:
-            values[name] = float(text) * scale
-        except ValueError:
-            raise ValueError(f'{led_path}: {name} (bytes {first}-{last} of the data set summary) is {text!r}, not a number') from None
-        if not np.isfinite(values[name]):
-            raise ValueError(f'{led_path}: {name} (bytes {first}-{last} of the data set summary) is {text!r}, not a number')
+    values = _dss_fields(led, led_path, ALOS2_DSS_FIELDS)
     try:
         orbit = led_orbit(led)
     except ValueError as e:
@@ -204,6 +253,91 @@ def alos2_led(led_path: str) -> dict:
             'equatorial_radius': values['semi_major_axis'],
             'polar_radius': values['semi_minor_axis'],
             'orbit': orbit}
+
+
+def _fields_constant(img_path: str, prefix: dict, names) -> None:
+    """
+    Check that prefix fields keep one value over the sampled lines.
+
+    Parameters
+    ----------
+    img_path : str
+        The IMG file named in the error message.
+    prefix : dict
+        The fields of the sampled lines (alos2_prefix).
+    names : iterable of str
+        The fields to check.
+
+    Raises
+    ------
+    ValueError
+        A field takes more than one value.
+
+    Examples
+    --------
+    >>> _fields_constant('AL2_129_4450_F4_20150404_HH.img', alos2_prefix('AL2_129_4450_F4_20150404_HH.img', [0, 64]), ('prf',))
+    """
+    for name in names:
+        values = np.unique(prefix[name])
+        if len(values) > 1:
+            raise ValueError(f'{img_path}: the {name} field changes inside the file ({", ".join(str(v) for v in values)})')
+
+
+def _line_positions(img_path: str, led_path: str, info: dict, orbit: dict, prefix: dict, doppler=None) -> tuple:
+    """
+    JAXA's per-line positions of the sampled lines mapped on the LED orbit.
+
+    The latitude and longitude of the first, mid and last pixel (height 0) of each sampled line are mapped by
+    `insardev_toolkit.utils_alos2_orbit.geo2rdr` to their imaging time and slant range, from the line's millisecond field: at
+    zero Doppler, or at the Doppler centroid `doppler`.
+
+    Parameters
+    ----------
+    img_path : str
+        The IMG file named in the error message.
+    led_path : str
+        The LED file named in the error message.
+    info : dict
+        alos2_image of the IMG file.
+    orbit : dict
+        The LED orbit (alos2_led 'orbit').
+    prefix : dict
+        The fields of the sampled lines (alos2_prefix).
+    doppler : tuple of float, optional
+        (constant Hz, slope Hz/m, wavelength m) of the centroid constant + slope x R, as geo2rdr takes it; None: zero Doppler.
+
+    Returns
+    -------
+    tuple
+        (line_days, t_ms, t, slant_range): the day of each line from line 1's date (int64; the times count on past midnight),
+        the millisecond field in seconds of line 1's day, and the imaging times (s of line 1's day) and slant ranges (m),
+        arrays (lines, 3).
+
+    Raises
+    ------
+    ValueError
+        No solution on the orbit: the files do not belong together or one is damaged.
+
+    Examples
+    --------
+    >>> _line_positions(img, led_path, alos2_image(img), alos2_led(led_path)['orbit'], alos2_prefix(img, [0, 64]))
+    """
+    from insardev_toolkit.utils_alos2_orbit import geo2rdr
+
+    # the date of each line from its prefix, in days from line 1's date: the times count on past midnight
+    pairs, inverse = np.unique(np.stack([prefix['year'], prefix['doy']], axis=1), axis=0, return_inverse=True)
+    pair_days = np.array([(np.datetime64(f'{int(y):04d}-01-01') + np.timedelta64(int(d) - 1, 'D') - np.datetime64(info['date'])).astype(np.int64)
+                          for y, d in pairs], dtype=np.int64)
+    line_days = pair_days[np.ravel(inverse)]
+    t_ms = prefix['ms'] / 1e3 + 86400.0 * line_days
+    # the positions of the sampled lines on the orbit, in seconds of line 1's day
+    day_offset = int((np.datetime64(info['date']) - np.datetime64(orbit['date'])).astype(np.int64))
+    try:
+        t, slant_range = geo2rdr(orbit, prefix['lon'], prefix['lat'], 0.0, (t_ms + 86400.0 * day_offset)[:, None], doppler)
+    except ValueError as e:
+        raise ValueError(f"{img_path}: JAXA's line positions do not follow the orbit of {led_path} ({e}): the files do not "
+                         f"belong together or one is damaged; download them again") from None
+    return line_days, t_ms, t - 86400.0 * day_offset, slant_range
 
 
 def alos2_timing(img_path: str, led_path: str) -> dict:
@@ -253,37 +387,18 @@ def alos2_timing(img_path: str, led_path: str) -> dict:
     --------
     >>> alos2_timing('129_4450_F4/AL2_129_4450_F4_20150404_HH.img', '129_4450_F4/AL2_129_4450_F4_20150404.led')['start']
     """
-    from insardev_toolkit.utils_alos2_orbit import geo2rdr
-
     info = alos2_image(img_path)
     led = alos2_led(led_path)
     lines, pixels = info['lines'], info['pixels']
     # the sampled lines: k = 0, 64, 128, ... and the last line
     k = np.unique(np.append(np.arange(0, lines, ALOS2_TIMING_LINES), lines - 1))
     prefix = alos2_prefix(img_path, k)
-    for name in ('prf', 'pixels', 'near_range', 'window'):
-        values = np.unique(prefix[name])
-        if len(values) > 1:
-            raise ValueError(f'{img_path}: the {name} field changes inside the file ({", ".join(str(v) for v in values)})')
-    orbit = led['orbit']
+    _fields_constant(img_path, prefix, ('prf', 'pixels', 'near_range', 'window'))
     day = datetime.strptime(info['date'], '%Y-%m-%d')
-    # the date of each line from its prefix, in days from line 1's date: the times count on past midnight
-    pairs, inverse = np.unique(np.stack([prefix['year'], prefix['doy']], axis=1), axis=0, return_inverse=True)
-    pair_days = np.array([(np.datetime64(f'{int(y):04d}-01-01') + np.timedelta64(int(d) - 1, 'D') - np.datetime64(info['date'])).astype(np.int64)
-                          for y, d in pairs], dtype=np.int64)
-    line_days = pair_days[np.ravel(inverse)]
-    t_ms = prefix['ms'] / 1e3 + 86400.0 * line_days
-    t_us = prefix['us'] / 1e6 + 86400.0 * line_days
     near_range = SOL / 2.0 * float(prefix['window'][0]) * 1e-9
-
-    # the positions of the sampled lines on the orbit, in seconds of line 1's day
-    day_offset = int((np.datetime64(info['date']) - np.datetime64(orbit['date'])).astype(np.int64))
-    try:
-        t_zd, slant_range = geo2rdr(orbit, prefix['lon'], prefix['lat'], 0.0, (t_ms + 86400.0 * day_offset)[:, None])
-    except ValueError as e:
-        raise ValueError(f"{img_path}: JAXA's line positions do not follow the orbit of {led_path} ({e}): the files do not "
-                         f"belong together or one is damaged; download them again") from None
-    t_zd = t_zd - 86400.0 * day_offset
+    # the positions of the sampled lines on the orbit at zero Doppler, in seconds of line 1's day
+    line_days, t_ms, t_zd, slant_range = _line_positions(img_path, led_path, info, led['orbit'], prefix)
+    t_us = prefix['us'] / 1e6 + 86400.0 * line_days
 
     # the line spacing is the mHz PRF field
     prf = float(prefix['prf'][0])
@@ -363,71 +478,12 @@ def alos2_orbit(led_path: str, img_path: str, t1: float = None, t2: float = None
     --------
     >>> alos2_orbit('129_4450_F4/AL2_129_4450_F4_20150404.led', '129_4450_F4/AL2_129_4450_F4_20150404_HH.img')
     """
-    from insardev_toolkit.utils_alos2_orbit import orbit_state
-    from .utils_satellite import orbit_defect
+    from .utils_satellite import orbit_densify
 
     led = alos2_led(led_path)
     timing = alos2_timing(img_path, led_path)
-    orbit = led['orbit']
-    first, step, count = float(orbit['seconds']), float(orbit['step']), len(orbit['vectors'])
-    last = first + step * (count - 1)
-    times = first + ALOS2_ORBIT_STEP * np.arange(int(np.floor((last - first) / ALOS2_ORBIT_STEP + 1e-9)) + 1)
-    if times[-1] < last - 1e-6:
-        times = np.append(times, last)
-    position, velocity = orbit_state(orbit, times)
-    orbit_day = datetime.strptime(orbit['date'], '%Y-%m-%d')
-
-    ref_date = timing['day']
-
-    # t1/t2 count the days of the scene year (year * 1000 + day), running below day 0 or past Dec 31 when the
-    # record crosses Jan 1: the vectors of the other year are put on that count too, and so is 'clock'
-    year0 = ref_date.year
-
-    records = []
-    for i, t in enumerate(times):
-        days = int(np.floor(t / 86400.0))
-        dt = orbit_day + timedelta(days=days)
-        year = dt.year
-        jd = dt.timetuple().tm_yday - 1  # 0-based julian day
-        sec = float(t - 86400.0 * days)
-        if year == year0:
-            ydf = year * 1000 + jd + sec / 86400.0
-        else:
-            ydf = year0 * 1000 + (jd + (datetime(year, 1, 1) - datetime(year0, 1, 1)).days) + sec / 86400.0
-        # filter by time range if specified, on whole milliseconds: a state vector exactly on the window edge is kept
-        ms = round(ydf * 86400000.0)
-        if t1 is not None and ms < round(t1 * 86400000.0):
-            continue
-        if t2 is not None and ms > round(t2 * 86400000.0):
-            continue
-        records.append({'iy': year, 'id': jd, 'isec': sec,
-                        'px': position[i, 0], 'py': position[i, 1], 'pz': position[i, 2],
-                        'vx': velocity[i, 0], 'vy': velocity[i, 1], 'vz': velocity[i, 2]})
-
-    # an orbit that cannot be used raises: the state vectors must cover the scene's first to last line, without a gap,
-    # and be finite
-    defect = 'does not cover' if len(records) == 0 else None
-    if defect is None:
-        df = pd.DataFrame(records)
-        day = df['id']
-        if (df['iy'] != year0).any():
-            day = day + [(datetime(int(y), 1, 1) - datetime(year0, 1, 1)).days for y in df['iy']]
-        df['clock'] = (24 * 60 * 60) * day + df['isec']
-        scene_start = (ref_date - datetime(year0, 1, 1)).total_seconds() + timing['start']
-        scene_stop = scene_start + (timing['lines'] - 1) / timing['prf']
-        defect = orbit_defect(df, scene_start, scene_stop)
-    if defect is not None:
-        raise ValueError(f'ERROR: Orbit of scene file {led_path} {defect} the scene ({ref_date.date()}). '
-                         f'Delete the scene files and download them again.')
-
-    df.attrs = {
-        'nd': len(df),
-        'iy': int(df['iy'].iloc[0]),
-        'id': int(df['id'].iloc[0]),
-        'isec': float(df['isec'].iloc[0]),
-        'idsec': ALOS2_ORBIT_STEP
-    }
-    return df
+    return orbit_densify(led['orbit'], timing['day'], timing['start'], timing['lines'], timing['prf'], led_path, t1, t2,
+                         step=ALOS2_ORBIT_STEP)
 
 
 def alos2_prm(img_path: str, led_path: str) -> dict:
@@ -533,10 +589,10 @@ def alos2_prm(img_path: str, led_path: str) -> dict:
 
 def alos2_slc(img_path: str, row_slice: slice = None, col_slice: slice = None) -> np.ndarray:
     """
-    Read a box of an ALOS-2 IMG file.
+    Read a box of an ALOS-2 (or ALOS-1 L1.1) IMG file.
 
-    One byte range per line through a memmap of the line records: the pixels after the 544-byte prefix, big-endian complex64,
-    converted to native complex64. The memmap is closed before returning.
+    One byte range per line through a memmap of the line records: the pixels after the line prefix (544 bytes for ALOS-2, 412
+    for ALOS-1: alos2_image), big-endian complex64, converted to native complex64. The memmap is closed before returning.
 
     Parameters
     ----------
@@ -556,9 +612,10 @@ def alos2_slc(img_path: str, row_slice: slice = None, col_slice: slice = None) -
     --------
     >>> alos2_slc('129_4450_F4/AL2_129_4450_F4_20150404_HH.img', slice(0, 64), slice(0, 64))
     """
-    from insardev_toolkit.utils_alos2_ceos import DESCRIPTOR, PREFIX
+    from insardev_toolkit.utils_alos2_ceos import DESCRIPTOR
 
     info = alos2_image(img_path)
+    prefix = info['prefix']
     if row_slice is None:
         row_slice = slice(None)
     if col_slice is None:
@@ -570,7 +627,7 @@ def alos2_slc(img_path: str, row_slice: slice = None, col_slice: slice = None) -
     else:
         cols = slice(None, None, step)
     records = np.memmap(img_path, dtype=np.uint8, mode='r', offset=DESCRIPTOR, shape=(info['lines'], info['record_length']))
-    box = records[row_slice, PREFIX + 8 * first:PREFIX + 8 * stop]
+    box = records[row_slice, prefix + 8 * first:prefix + 8 * stop]
     slc = box.view('>c8')[:, cols].astype(np.complex64)
     del box, records
     return slc
@@ -578,7 +635,7 @@ def alos2_slc(img_path: str, row_slice: slice = None, col_slice: slice = None) -
 
 def alos2_footprint(img_path: str):
     """
-    Footprint of an ALOS-2 IMG file at height 0 from JAXA's per-line positions.
+    Footprint of an ALOS-2 (or ALOS-1 L1.1) IMG file at height 0 from JAXA's per-line positions.
 
     Parameters
     ----------

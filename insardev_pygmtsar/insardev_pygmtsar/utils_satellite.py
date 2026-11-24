@@ -286,7 +286,8 @@ def _process_tile_worker(args):
      orbit_dict, clock_start_days, prf,
      near_range, rng_samp_rate, num_lines, earth_radius,
      n_azi, n_rng, ra, e2,
-     scale_factor, fill_value, row_batch, lookdir, fp_wkb, datum) = args
+     scale_factor, fill_value, row_batch, lookdir, fp_wkb, datum,
+     native, native_lines) = args
 
     iy, jy, ix, jx = tile_bounds
     tile_height = jy - iy
@@ -345,6 +346,12 @@ def _process_tile_worker(args):
     t1 = 86400.0 * clock_start_days + (num_lines - num_lines) / (2.0 * prf)
     npad = 100
     azi_times = t1 + np.arange(-npad, num_lines + npad) / prf
+    # an image focused at its Doppler centroid (native): the zero-Doppler lines native_lines its image covers, with the
+    # same padding; the solved line is counted from line0 - npad
+    line0 = 0
+    if native is not None:
+        line0 = native_lines[0]
+        azi_times = t1 + np.arange(line0 - npad, native_lines[1] + 1 + npad) / prf
     n_azi_times = len(azi_times)
 
     # Interpolate orbit at azimuth times - DONE ONCE PER TILE
@@ -529,7 +536,7 @@ def _process_tile_worker(args):
             # Mark invalid pixels as NaN
             azi_idx_float[no_crossing] = np.nan
             azi_idx_float[invalid_alpha] = np.nan
-            batch_azi_pix[ci:cj] = azi_idx_float - npad
+            batch_azi_pix[ci:cj] = azi_idx_float - npad if native is None else azi_idx_float - npad + line0
 
             # Compute slant range (only for valid azi pixels)
             invalid_azi = np.isnan(azi_idx_float)
@@ -552,9 +559,19 @@ def _process_tile_worker(args):
         # the image (see the margin buffer in _precise_footprint). The buffer cells outside the pre-filter are solved for their
         # ele only, so their azi and rng are emptied too. azi/rng are the 0-based line and bin: the window is the first to the
         # last pixel centre, [0, n - 1]; a pixel without a radar position (NaN azi or rng) is emptied the same way.
-        out_of_bounds = ((batch_azi_pix < 0) | (batch_azi_pix > n_azi - 1) |
-                        (batch_rng_pix < 0) | (batch_rng_pix > n_rng - 1) |
-                        ~np.isfinite(batch_azi_pix) | ~np.isfinite(batch_rng_pix) | ~pre_flat)
+        if native is None:
+            out_of_bounds = ((batch_azi_pix < 0) | (batch_azi_pix > n_azi - 1) |
+                            (batch_rng_pix < 0) | (batch_rng_pix > n_rng - 1) |
+                            ~np.isfinite(batch_azi_pix) | ~np.isfinite(batch_rng_pix) | ~pre_flat)
+        else:
+            # an image focused at its Doppler centroid: the window is that of the image line (the zero-Doppler line plus the
+            # native-Doppler shift of the bin), [0, num_lines - 1]; azi stays the zero-Doppler line
+            with np.errstate(invalid='ignore'):
+                image_line = batch_azi_pix + native_doppler_shift(batch_rng_pix, native)
+                out_of_bounds = ((image_line < 0) | (image_line > num_lines - 1) |
+                                (batch_rng_pix < 0) | (batch_rng_pix > n_rng - 1) |
+                                ~np.isfinite(batch_azi_pix) | ~np.isfinite(batch_rng_pix) | ~pre_flat)
+            del image_line
         batch_azi_pix[out_of_bounds] = np.nan
         batch_rng_pix[out_of_bounds] = np.nan
 
@@ -1062,6 +1079,125 @@ def orbit_defect(orbit_df, start=None, stop=None):
     if not np.isfinite(orbit_df[['px', 'py', 'pz', 'vx', 'vy', 'vz']].to_numpy()).all():
         return 'has invalid (not finite) state vectors for'
     return None
+
+
+def orbit_densify(orbit, day, start, lines, prf, name, t1=None, t2=None, step=10.0):
+    """
+    Orbit state vectors of a scene from a toolkit orbit dict: its vectors densified to `step` seconds.
+
+    The package interpolates orbits by Hermite interpolation with accelerations from finite differences, accurate on vectors
+    10 s apart. The vectors here are the toolkit's 8-point Lagrange states (`insardev_toolkit.utils_alos2_orbit.orbit_state`)
+    at the times first + step k within the span of the orbit dict (its first and last vector included): the orbit of the
+    ALOS-2 LED (`utils_alos2.alos2_orbit`), and of the readers that build their orbit the same way.
+
+    Parameters
+    ----------
+    orbit : dict
+        The toolkit orbit dict (`insardev_toolkit.utils_alos2_orbit.led_orbit`): 'date' 'YYYY-MM-DD' of the first vector,
+        'seconds' its seconds of that day, 'step' the interval between the vectors (s), 'vectors' (n, 6) Earth-fixed x, y, z (m)
+        and vx, vy, vz (m/s), n >= 8.
+    day : datetime
+        Midnight UTC of the scene's reference day: its year is the year of 'clock' and of t1, t2.
+    start : float
+        Seconds of that day of the scene's first line.
+    lines : int
+        The scene's line count.
+    prf : float
+        The line rate (Hz): the last line is at start + (lines - 1) / prf.
+    name : str
+        The scene file named in the error message.
+    t1 : float, optional
+        Start time as year * 1000 + 0-based day + day fraction for filtering.
+    t2 : float, optional
+        End time as year * 1000 + 0-based day + day fraction for filtering.
+    step : float, optional
+        The interval of the returned vectors (s), 10 by default.
+
+    Raises
+    ------
+    ValueError
+        The orbit cannot be used (orbit_defect): its state vectors do not cover the scene's first to last line, have a gap,
+        or one is not finite.
+
+    Returns
+    -------
+    pd.DataFrame
+        The orbit as utils_nisar.nisar_orbit returns it: columns iy (year), id (0-based day), isec (seconds of day), px, py, pz
+        (m), vx, vy, vz (m/s), clock (seconds from Jan 1 of the scene year, continuous through midnight and Jan 1); attrs nd, iy,
+        id, isec and idsec (step).
+
+    Examples
+    --------
+    >>> from datetime import datetime
+    >>> t = 60.0 * np.arange(10)
+    >>> vectors = np.column_stack([7e6 + 0.0 * t, 7500.0 * t, 0.0 * t, 0.0 * t, 7500.0 + 0.0 * t, 0.0 * t])
+    >>> orbit = {'date': '2015-04-04', 'seconds': 36000.0, 'step': 60.0, 'vectors': vectors}
+    >>> orbit_densify(orbit, datetime(2015, 4, 4), 36200.0, 1000, 2000.0, 'scene.led').attrs['nd']
+    55
+    """
+    import pandas as pd
+    from datetime import datetime, timedelta
+    from insardev_toolkit.utils_alos2_orbit import orbit_state
+
+    first, vectors_step, count = float(orbit['seconds']), float(orbit['step']), len(orbit['vectors'])
+    last = first + vectors_step * (count - 1)
+    times = first + step * np.arange(int(np.floor((last - first) / step + 1e-9)) + 1)
+    if times[-1] < last - 1e-6:
+        times = np.append(times, last)
+    position, velocity = orbit_state(orbit, times)
+    orbit_day = datetime.strptime(orbit['date'], '%Y-%m-%d')
+
+    ref_date = day
+
+    # t1/t2 count the days of the scene year (year * 1000 + day), running below day 0 or past Dec 31 when the
+    # record crosses Jan 1: the vectors of the other year are put on that count too, and so is 'clock'
+    year0 = ref_date.year
+
+    records = []
+    for i, t in enumerate(times):
+        days = int(np.floor(t / 86400.0))
+        dt = orbit_day + timedelta(days=days)
+        year = dt.year
+        jd = dt.timetuple().tm_yday - 1  # 0-based julian day
+        sec = float(t - 86400.0 * days)
+        if year == year0:
+            ydf = year * 1000 + jd + sec / 86400.0
+        else:
+            ydf = year0 * 1000 + (jd + (datetime(year, 1, 1) - datetime(year0, 1, 1)).days) + sec / 86400.0
+        # filter by time range if specified, on whole milliseconds: a state vector exactly on the window edge is kept
+        ms = round(ydf * 86400000.0)
+        if t1 is not None and ms < round(t1 * 86400000.0):
+            continue
+        if t2 is not None and ms > round(t2 * 86400000.0):
+            continue
+        records.append({'iy': year, 'id': jd, 'isec': sec,
+                        'px': position[i, 0], 'py': position[i, 1], 'pz': position[i, 2],
+                        'vx': velocity[i, 0], 'vy': velocity[i, 1], 'vz': velocity[i, 2]})
+
+    # an orbit that cannot be used raises: the state vectors must cover the scene's first to last line, without a gap,
+    # and be finite
+    defect = 'does not cover' if len(records) == 0 else None
+    if defect is None:
+        df = pd.DataFrame(records)
+        vector_day = df['id']
+        if (df['iy'] != year0).any():
+            vector_day = vector_day + [(datetime(int(y), 1, 1) - datetime(year0, 1, 1)).days for y in df['iy']]
+        df['clock'] = (24 * 60 * 60) * vector_day + df['isec']
+        scene_start = (ref_date - datetime(year0, 1, 1)).total_seconds() + start
+        scene_stop = scene_start + (lines - 1) / prf
+        defect = orbit_defect(df, scene_start, scene_stop)
+    if defect is not None:
+        raise ValueError(f'ERROR: Orbit of scene file {name} {defect} the scene ({ref_date.date()}). '
+                         f'Delete the scene files and download them again.')
+
+    df.attrs = {
+        'nd': len(df),
+        'iy': int(df['iy'].iloc[0]),
+        'id': int(df['id'].iloc[0]),
+        'isec': float(df['isec'].iloc[0]),
+        'idsec': step
+    }
+    return df
 
 
 def orbit_seconds(orbit_df, clock_start):
@@ -1808,16 +1944,37 @@ def satellite_rat2llt(azi, rng, orbit_time, orbit_pos, orbit_vel,
     return lon, lat, height
 
 
-def radar_extent_polygon(prm):
+def radar_extent_polygon(prm, native=None):
     """The radar extent of a PRM's SLC grid as a closed lon/lat polygon (WKT), the 'geometry' of S1 and NISAR
     stores: its four corner pixel centres, the 0-based (line, bin) (0, 0), (0, N - 1), (M - 1, N - 1), (M - 1, 0),
-    by satellite_rat2llt() without a DEM (the earth_radius sphere)."""
+    by satellite_rat2llt() without a DEM (the earth_radius sphere).
+
+    An image focused at its Doppler centroid (ALOS-1 L1.1, native given) holds the zero-Doppler lines
+    k - native_doppler_shift(j) at its line k and bin j: the corners are its image corners on those zero-Doppler lines,
+    the extent of the data a stripmap transform writes (native_doppler_lines()), about 275 lines along track from the
+    zero-Doppler lines 0 .. M - 1 on raw/alos1_rosamond.
+
+    Parameters
+    ----------
+    prm : PRM
+        The PRM of the SLC, with its orbit.
+    native : dict, optional
+        The native-geometry parameters of the date (native_doppler_shift()). None (default): a zero-Doppler image.
+
+    Returns
+    -------
+    str
+        The polygon as WKT.
+    """
     from shapely.geometry import Polygon
     num_lines = prm.get('num_lines')
     num_rng = prm.get('num_rng_bins')
     orbit = prm.orbit_df
     corner_azi = np.array([0, 0, num_lines - 1, num_lines - 1], dtype=np.float64)
     corner_rng = np.array([0, num_rng - 1, num_rng - 1, 0], dtype=np.float64)
+    if native is not None:
+        # image line k at bin j is the zero-Doppler line k - shift(j)
+        corner_azi = corner_azi - native_doppler_shift(corner_rng, native)
     lookdir = prm.get('lookdir')
     # 'clock' (day * 86400 + isec), the units of 86400 * clock_start
     lon, lat, _ = satellite_rat2llt(
@@ -3007,6 +3164,260 @@ def remap_rows(source, azi_map, rng_map):
     return out
 
 
+def azimuth_demodulate(re, im, doppler, line0):
+    """Demodulate the lines of an SLC box in place: times exp(-2 pi i f k) at the absolute scene line k.
+
+    The azimuth spectrum of an SLC is centred on its Doppler centroid f, and LANCZOS4 (cv2.remap) passes only a band
+    about 0: the box is demodulated before the remap and the carrier is restored at the output positions after it
+    (azimuth_carrier_restore()). The carrier is taken at the absolute scene line k = line0 + row, not at the box's first
+    line, and the products are formed in float32 in blocks of 512 rows, so every sample gets the same values in any
+    box and chunk.
+
+    f must be the true centroid, not one of its aliases f + N: the demodulated samples are the same (k is whole), but
+    the restore at the fractional output line a multiplies the result by exp(2 pi i N a).
+
+    Parameters
+    ----------
+    re, im : np.ndarray
+        The real and imaginary parts of the SLC box (float32, rows are lines), changed in place.
+    doppler : float
+        The Doppler centroid f, cycles per line (a scalar: one value for the date).
+    line0 : int
+        The scene line of the box's first row.
+
+    Examples
+    --------
+    A planted band about the centroid (0.7 of the line rate wide), shifted by 0.3 of a line with LANCZOS4 and
+    compared with the exact FFT shift (the largest error relative to the largest amplitude, and the mean phase error in
+    radians); the centroid f + 1 gives the error exp(2 pi i a), 2 pi 0.3 = 1.885 rad:
+
+    >>> import numpy as np, cv2
+    >>> n, f, a = 256, 0.63, 0.3
+    >>> nu = np.arange(n) / n
+    >>> rs = np.random.default_rng(0)
+    >>> spec = np.where(np.abs(nu - f) < 0.35, rs.normal(size=n) + 1j * rs.normal(size=n), 0)
+    >>> z, exact = np.fft.ifft(spec), np.fft.ifft(spec * np.exp(2j * np.pi * nu * a))
+    >>> azi = np.full((n, 8), a, dtype=np.float32) + np.arange(n, dtype=np.float32)[:, None]
+    >>> rng = np.full((n, 8), 3.0, dtype=np.float32)
+    >>> def shifted(fdc):
+    ...     re = np.repeat(z.real[:, None], 8, axis=1).astype(np.float32)
+    ...     im = np.repeat(z.imag[:, None], 8, axis=1).astype(np.float32)
+    ...     azimuth_demodulate(re, im, fdc, 0)
+    ...     out_re = cv2.remap(re, rng, azi, interpolation=cv2.INTER_LANCZOS4)
+    ...     out_im = cv2.remap(im, rng, azi, interpolation=cv2.INTER_LANCZOS4)
+    ...     azimuth_carrier_restore(out_re, out_im, fdc, azi, 0)
+    ...     return (out_re + 1j * out_im)[8:-8, 3]
+    >>> for fdc in (f, f + 1):
+    ...     err = shifted(fdc) - exact[8:-8]
+    ...     print(f'{np.abs(err).max() / np.abs(exact).max():.4f}', f'{np.angle(np.vdot(exact[8:-8], shifted(fdc))):.3f}')
+    0.0197 0.002
+    1.6186 1.887
+    """
+    carrier = (2 * np.pi * doppler) * np.arange(line0, line0 + re.shape[0], dtype=np.float64)
+    cos_k, sin_k = np.cos(carrier).astype(np.float32)[:, None], np.sin(carrier).astype(np.float32)[:, None]
+    del carrier
+    for r0 in range(0, re.shape[0], 512):
+        re_, im_ = re[r0:r0 + 512], im[r0:r0 + 512]
+        c_, s_ = cos_k[r0:r0 + 512], sin_k[r0:r0 + 512]
+        # times exp(-i carrier): re c + im s, im c - re s, in place (one temporary block at a time)
+        t_ = re_ * s_
+        re_ *= c_
+        re_ += im_ * s_
+        im_ *= c_
+        im_ -= t_
+        del re_, im_, c_, s_, t_
+    del cos_k, sin_k
+
+
+def azimuth_carrier_restore(re, im, doppler, azi, line0):
+    """Restore the carrier of azimuth_demodulate() in place: times exp(2 pi i f (azi + line0)) at the output positions.
+
+    The remapped block (cv2.remap of the demodulated box) is multiplied by the carrier at its exact output position: the
+    scene line azi + line0 (azi the box-local line of each pixel, the remap's map; exact in float64), in float32 in blocks
+    of 512 rows.
+
+    Parameters
+    ----------
+    re, im : np.ndarray
+        The real and imaginary parts of the remapped block (float32), changed in place.
+    doppler : float
+        The Doppler centroid f of azimuth_demodulate(), cycles per line.
+    azi : np.ndarray
+        The box-local line of every pixel of the block (the remap's azimuth map), the shape of re.
+    line0 : int
+        The scene line of the box's first row (that of azimuth_demodulate()).
+
+    Examples
+    --------
+    The planted band of azimuth_demodulate(), shifted by 0.3 of a line; the centroid f + 1 gives the error
+    exp(2 pi i a), 2 pi 0.3 = 1.885 rad:
+
+    >>> import numpy as np, cv2
+    >>> n, f, a = 256, 0.63, 0.3
+    >>> nu = np.arange(n) / n
+    >>> rs = np.random.default_rng(0)
+    >>> spec = np.where(np.abs(nu - f) < 0.35, rs.normal(size=n) + 1j * rs.normal(size=n), 0)
+    >>> z, exact = np.fft.ifft(spec), np.fft.ifft(spec * np.exp(2j * np.pi * nu * a))
+    >>> azi = np.full((n, 8), a, dtype=np.float32) + np.arange(n, dtype=np.float32)[:, None]
+    >>> rng = np.full((n, 8), 3.0, dtype=np.float32)
+    >>> def shifted(fdc):
+    ...     re = np.repeat(z.real[:, None], 8, axis=1).astype(np.float32)
+    ...     im = np.repeat(z.imag[:, None], 8, axis=1).astype(np.float32)
+    ...     azimuth_demodulate(re, im, fdc, 0)
+    ...     out_re = cv2.remap(re, rng, azi, interpolation=cv2.INTER_LANCZOS4)
+    ...     out_im = cv2.remap(im, rng, azi, interpolation=cv2.INTER_LANCZOS4)
+    ...     azimuth_carrier_restore(out_re, out_im, fdc, azi, 0)
+    ...     return (out_re + 1j * out_im)[8:-8, 3]
+    >>> for fdc in (f, f + 1):
+    ...     err = shifted(fdc) - exact[8:-8]
+    ...     print(f'{np.abs(err).max() / np.abs(exact).max():.4f}', f'{np.angle(np.vdot(exact[8:-8], shifted(fdc))):.3f}')
+    0.0197 0.002
+    1.6186 1.887
+    """
+    for r0 in range(0, re.shape[0], 512):
+        phase = (2 * np.pi * doppler) * (azi[r0:r0 + 512].astype(np.float64) + line0)
+        cos_c, sin_c = np.cos(phase).astype(np.float32), np.sin(phase).astype(np.float32)
+        re_, im_ = re[r0:r0 + 512], im[r0:r0 + 512]
+        re_[:], im_[:] = re_ * cos_c - im_ * sin_c, re_ * sin_c + im_ * cos_c
+        del phase, cos_c, sin_c, re_, im_
+
+
+def _native_doppler(bins, native):
+    """The zero-Doppler slant range R of the range bins, the date's Doppler centroid fdc(R) and its effective velocity
+    squared v^2(R) (linear in the bin between its values at the first and the last bin): the terms of native_doppler_shift()
+    and native_doppler_phase().
+
+    Parameters
+    ----------
+    bins : array_like
+        0-based range bins of the date's zero-Doppler geometry.
+    native : dict
+        The native-geometry parameters of the date (native_doppler_shift()).
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        (R in m, fdc in Hz, v^2 in m^2/s^2), float64, the shape of bins.
+
+    Examples
+    --------
+    >>> _native_doppler([0.0], dict(fd1=66.7, fdd1=-8.5e-5, wavelength=0.2360571, prf=2159.827, near_range=846566.6,
+    ...                 range_pixel=9.3685, velocity=(7182.4, 7176.4), pixels=4672))
+    """
+    bins = np.asarray(bins, dtype=np.float64)
+    R = native['near_range'] + bins * native['range_pixel']
+    fdc = native['fd1'] + native['fdd1'] * R
+    v_first, v_last = native['velocity']
+    v2 = v_first * v_first + (v_last * v_last - v_first * v_first) * bins / (native['pixels'] - 1)
+    return R, fdc, v2
+
+
+def native_doppler_shift(bins, native):
+    """The image line of a point of a date focused at its Doppler centroid (ALOS-1 L1.1) minus its zero-Doppler line, in
+    lines, at its zero-Doppler range bin.
+
+    Closed form of the hyperbolic range history R(t)^2 = R^2 + v^2 t^2 (R the zero-Doppler range, v the effective velocity):
+    the point is imaged when its Doppler -2 v^2 t / (wavelength R(t)) is the centroid fdc(R) = fd1 + fdd1 R, so its azimuth
+    time offset is -wavelength fdc(R) R / (2 v^2), times the PRF in lines (R(t) - R is below 1e-6 R: taken as R). v^2 is the
+    effective velocity squared, V.V + (S - P).A at the scene centre (the satellite position S, velocity V and acceleration A,
+    the ground point P), which changes by about 6 m/s across an ALOS-1 swath: it is linear in the bin between its values at
+    the first and the last bin.
+
+    Measured on raw/alos1_rosamond (three dates, ground points of the GLO DEM over the whole swath; unit A3 of the SLC
+    preprocessor plan) against the exact solve (insardev_toolkit utils_alos2_orbit.geo2rdr at the leader's centroid minus at
+    zero Doppler): the shifts are -271 .. -279 lines and this form is within 0.026 lines of them with the velocity at the
+    scene's median height (0.054 lines with the velocity at height 0); one velocity for the whole swath is off by 0.25 lines
+    or more at the swath edges.
+
+    Parameters
+    ----------
+    bins : array_like
+        0-based range bins of the date's zero-Doppler geometry (NaN gives NaN).
+    native : dict
+        The native-geometry parameters of the date: 'fd1' (Hz) and 'fdd1' (Hz/m) of the Doppler centroid fd1 + fdd1 R at the
+        slant range R; 'wavelength' (m); 'prf' (Hz); 'near_range' (m, the slant range of bin 0) and 'range_pixel' (m, the bin
+        spacing c / (2 rng_samp_rate)); 'velocity' (m/s, the effective velocity at the first and the last bin, a pair) and
+        'pixels' (the bins of a line).
+
+    Returns
+    -------
+    numpy.ndarray
+        The image line minus the zero-Doppler line, float64, the shape of bins (negative for a positive centroid).
+
+    Examples
+    --------
+    >>> native = dict(fd1=66.7, fdd1=-8.5e-5, wavelength=0.2360571, prf=2159.827, near_range=846566.6,
+    ...               range_pixel=9.3685, velocity=(7182.4, 7176.4), pixels=4672)
+    >>> np.round(native_doppler_shift([0.0, 2335.0, 4671.0], native), 2)
+    """
+    R, fdc, v2 = _native_doppler(bins, native)
+    return -native['wavelength'] * fdc * R / (2.0 * v2) * native['prf']
+
+
+def native_doppler_phase(bins, native):
+    """The phase in radians of the term exp(i phase) that turns the phase of a date focused at its Doppler centroid (ALOS-1
+    L1.1) into the zero-Doppler phase, at the zero-Doppler range bin: phase = 4 pi / wavelength (R_squint - R).
+
+    The image phase of a point follows its squinted (beam-centre) range R_squint, the range at its Doppler centroid time, and
+    the SLC phase is exp(-4 pi i R / wavelength) (the convention of flat_earth_topo_phase()): the term exp(i phase) leaves
+    exp(-4 pi i R / wavelength) of the zero-Doppler range R. On the hyperbolic range history of native_doppler_shift()
+    R_squint = R / sqrt(1 - s^2), s = wavelength fdc(R) / (2 v). Measured on raw/alos1_rosamond as native_doppler_shift():
+    R_squint - R is 0.46-0.51 m, and this form is within 0.001 fringe of the exact solve.
+
+    Parameters
+    ----------
+    bins : array_like
+        0-based range bins of the date's zero-Doppler geometry (NaN gives NaN).
+    native : dict
+        The native-geometry parameters of the date (native_doppler_shift()).
+
+    Returns
+    -------
+    numpy.ndarray
+        The phase in radians, float64, the shape of bins.
+
+    Examples
+    --------
+    >>> native = dict(fd1=66.7, fdd1=-8.5e-5, wavelength=0.2360571, prf=2159.827, near_range=846566.6,
+    ...               range_pixel=9.3685, velocity=(7182.4, 7176.4), pixels=4672)
+    >>> np.round(native_doppler_phase([0.0, 2335.0, 4671.0], native) / (2 * np.pi), 3)
+    """
+    R, fdc, v2 = _native_doppler(bins, native)
+    s2 = (native['wavelength'] * fdc) ** 2 / (4.0 * v2)
+    return 4.0 * np.pi / native['wavelength'] * R * (1.0 / np.sqrt(1.0 - s2) - 1.0)
+
+
+def native_doppler_lines(native, num_lines):
+    """The zero-Doppler lines that the image of a date focused at its Doppler centroid (ALOS-1 L1.1) covers: the first and the
+    last whole line of the radar grid of compute_conversion_chunked() for its native geometry.
+
+    Image line k at range bin j is the zero-Doppler line k - native_doppler_shift(j); over the image lines 0 .. num_lines - 1 and
+    every bin of the line the zero-Doppler lines span -max(shift) .. num_lines - 1 - min(shift), here rounded outwards to whole
+    lines. On raw/alos1_rosamond (shifts -271 .. -279 lines) that is about 271 .. num_lines + 279: a grid of the zero-Doppler
+    lines 0 .. num_lines - 1 would leave the image's last ~275 lines unsampled and map its first ~275 lines outside the image.
+
+    Parameters
+    ----------
+    native : dict
+        The native-geometry parameters of the date (native_doppler_shift()).
+    num_lines : int
+        The image lines.
+
+    Returns
+    -------
+    tuple of int
+        (first, last) zero-Doppler line, both covered by the image.
+
+    Examples
+    --------
+    >>> native = dict(fd1=66.7, fdd1=-8.5e-5, wavelength=0.2360571, prf=2159.827, near_range=846566.6,
+    ...               range_pixel=9.3685, velocity=(7182.4, 7176.4), pixels=4672)
+    >>> native_doppler_lines(native, 6000)
+    """
+    shift = native_doppler_shift(np.arange(native['pixels'], dtype=np.float64), native)
+    return int(np.floor(-shift.max())), int(np.ceil(num_lines - 1 - shift.min()))
+
+
 def pack_complex_int16(re, im, scale, fill_value):
     """Pack complex samples into int16 real and imaginary parts, int16 = round(value / scale).
 
@@ -3996,7 +4407,8 @@ def compute_conversion_chunked(prm, dem_path, geometry, outdir,
                                compute_topo=True,
                                n_jobs=-1,
                                debug=False,
-                               datum=None):
+                               datum=None,
+                               native=None):
     """
     Compute transform and topo tile-by-tile, writing directly to zarr.
 
@@ -4039,6 +4451,18 @@ def compute_conversion_chunked(prm, dem_path, geometry, outdir,
     datum : str, optional
         The vertical datum of the DEM (Satellite.dem_datum()). None resolves it from dem_path here, once for
         all workers.
+    native : dict, optional
+        The native-geometry parameters of the reference date (the stripmap hook _native_geometry) when its image is focused
+        at its Doppler centroid (ALOS-1): the extent follows the image, image line k at bin j being the zero-Doppler line
+        k - native_doppler_shift(j). The outline is that of the image lines 0 and num_lines - 1 and bins 0 and
+        num_rng_bins - 1; an output pixel keeps its azi and rng (still the zero-Doppler line and bin) when its image line is
+        inside [0, num_lines - 1]; the radar grid of the topo holds the zero-Doppler lines of native_doppler_lines() (its
+        'a' coordinates start there, not at 0). None (default): the zero-Doppler image of lines 0 .. num_lines - 1.
+
+    Examples
+    --------
+    >>> compute_conversion_chunked(prm_ref, 'dem.vrt', record.geometry.iloc[0], 'stack/216_0680_343', epsg=32611,
+    ...                            resolution=(4, 16))
     """
     import os
     import time
@@ -4083,6 +4507,12 @@ def compute_conversion_chunked(prm, dem_path, geometry, outdir,
     # is centred on coordinate k)
     azi_coords = np.arange(0, a_max, 1, dtype=np.float32)
     rng_coords = np.arange(0, r_max, 1, dtype=np.float32)
+    # an image focused at its Doppler centroid (native): the zero-Doppler lines its image lines cover, first .. last (cell k
+    # of the topo is centred on coordinate first + k)
+    native_lines = None
+    if native is not None:
+        native_lines = native_doppler_lines(native, num_lines)
+        azi_coords = np.arange(native_lines[0], native_lines[1] + 1, 1, dtype=np.float32)
     n_azi = len(azi_coords)
     n_rng = len(rng_coords)
 
@@ -4110,36 +4540,27 @@ def compute_conversion_chunked(prm, dem_path, geometry, outdir,
     datum = utils_geoid.dem_datum(dem_path, datum)
 
     # 4 boundary edges: first_row, last_row, first_col, last_col
-    worker_args = []
-    # First row: azi=0, rng varies
-    worker_args.append((
-        np.full(n_rng, azi_coords[0], dtype=np.float32),
-        rng_coords.astype(np.float32),
-        dem_path, orbit_time, orbit_pos, orbit_vel, clock_start, prf,
-        near_range, rng_samp_rate, earth_radius, epsg, lookdir, datum
-    ))
-    # Last row: azi=n_azi-1, rng varies
-    worker_args.append((
-        np.full(n_rng, azi_coords[-1], dtype=np.float32),
-        rng_coords.astype(np.float32),
-        dem_path, orbit_time, orbit_pos, orbit_vel, clock_start, prf,
-        near_range, rng_samp_rate, earth_radius, epsg, lookdir, datum
-    ))
-    # First col: azi varies, rng=0
-    worker_args.append((
-        azi_coords.astype(np.float32),
-        np.full(n_azi, rng_coords[0], dtype=np.float32),
-        dem_path, orbit_time, orbit_pos, orbit_vel, clock_start, prf,
-        near_range, rng_samp_rate, earth_radius, epsg, lookdir, datum
-    ))
-    # Last col: azi varies, rng=n_rng-1
-    worker_args.append((
-        azi_coords.astype(np.float32),
-        np.full(n_azi, rng_coords[-1], dtype=np.float32),
-        dem_path, orbit_time, orbit_pos, orbit_vel, clock_start, prf,
-        near_range, rng_samp_rate, earth_radius, epsg, lookdir, datum
-    ))
-    n_bnd = 2 * n_rng + 2 * n_azi
+    if native is None:
+        edges = [(np.full(n_rng, azi_coords[0], dtype=np.float32), rng_coords.astype(np.float32)),
+                 (np.full(n_rng, azi_coords[-1], dtype=np.float32), rng_coords.astype(np.float32)),
+                 (azi_coords.astype(np.float32), np.full(n_azi, rng_coords[0], dtype=np.float32)),
+                 (azi_coords.astype(np.float32), np.full(n_azi, rng_coords[-1], dtype=np.float32))]
+    else:
+        # the image's edges: image lines 0 and num_lines - 1 at every bin, bins 0 and n_rng - 1 at every image line, at their
+        # zero-Doppler lines (the image line minus the native-Doppler shift of the bin)
+        shift = native_doppler_shift(rng_coords.astype(np.float64), native)
+        image_lines = np.arange(num_lines, dtype=np.float64)
+        edges = [((0.0 - shift).astype(np.float32), rng_coords.astype(np.float32)),
+                 ((num_lines - 1.0 - shift).astype(np.float32), rng_coords.astype(np.float32)),
+                 ((image_lines - shift[0]).astype(np.float32), np.full(num_lines, rng_coords[0], dtype=np.float32)),
+                 ((image_lines - shift[-1]).astype(np.float32), np.full(num_lines, rng_coords[-1], dtype=np.float32))]
+        del shift, image_lines
+    # First row: azi=0, rng varies; last row: azi=n_azi-1, rng varies; first col: azi varies, rng=0; last col: azi
+    # varies, rng=n_rng-1
+    worker_args = [(edge_azi, edge_rng, dem_path, orbit_time, orbit_pos, orbit_vel, clock_start, prf,
+                    near_range, rng_samp_rate, earth_radius, epsg, lookdir, datum) for edge_azi, edge_rng in edges]
+    n_bnd = sum(edge_azi.size for edge_azi, _ in edges)
+    del edges
 
     # Parallel execution - reuse workers (boundary tasks are small)
     import multiprocessing as mp
@@ -4285,7 +4706,8 @@ def compute_conversion_chunked(prm, dem_path, geometry, outdir,
                 orbit_dict, clock_start_days, prf,
                 near_range, rng_samp_rate, num_lines, earth_radius,
                 n_azi, n_rng, ra, e2,
-                scale_factor, fill_value, row_batch, lookdir, fp_wkb, datum
+                scale_factor, fill_value, row_batch, lookdir, fp_wkb, datum,
+                native, native_lines
             ))
 
     if debug:
