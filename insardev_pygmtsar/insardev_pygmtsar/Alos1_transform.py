@@ -35,7 +35,7 @@ class Alos1_transform(Stripmap_transform, Alos1_align):
                   target: str,
                   ref: str,
                   epsg: str | int | None = 'auto',
-                  resolution: tuple[int, int] = (4, 8),
+                  resolution: tuple[int, int] = (8, 16),
                   chunk: tuple[int, int] | None = None,
                   remove_topo_phase: bool = True,
                   remove_tidal_phase: bool = True,
@@ -72,10 +72,10 @@ class Alos1_transform(Stripmap_transform, Alos1_align):
             With None, each scene uses the UTM zone of its own centroid.
             Geocoding is always enabled: epsg=0 (radar coordinates) is not supported and raises ValueError.
         resolution : tuple[int, int], optional
-            The resolution to use in meters per pixel (y, x). Default (4, 8): FBS's native ground range (32 MHz, about
-            7.5 m at the off-nadir angle 34.3 deg), so FBS and FBD (16 MHz) dates mix naturally in one stack; use (4, 16),
-            FBD's native ground range (about 15 m), for an FBD-only stack. A multiple of 4 m as the grids of the other
-            missions.
+            The resolution to use in meters per pixel (y, x). Default (8, 16): about FBD's native ground range (16 MHz
+            range sampling, about 15 m at the off-nadir angle 34.3 deg), the grid of published ALOS-1 deformation maps; FBS
+            (32 MHz) and FBD dates mix in one stack. (4, 8), FBS's native ground range (about 7.5 m), is a finer grid for FBS
+            dates. A multiple of 4 m as the grids of the other missions.
         chunk : None, optional
             Not used, kept for backward compatibility (a WARNING is printed when it is set). The stored chunks
             are those of the S1 rule and a worker processes 2 x 2 of them; rechunk a loaded stack with chunk2d().
