@@ -580,6 +580,9 @@ _NISAR_BLOCK_BYTES = 64 * 1024 * 1024
 # Cloudflare Worker cache proxy for ALOS-2 (handles auth internally)
 # API: /FILE_ID/OFFSET/LENGTH.bin → LENGTH bytes (≤128MB) of the granule's ZIP at OFFSET
 _ALOS2_CACHE_PROXY = 'https://alos2-cache-asf.insar.dev'
+# Cloudflare Worker cache proxy for ALOS-1 PALSAR L1.1 and L1.0 (handles auth internally)
+# API: /FILE_ID/OFFSET/LENGTH.bin → LENGTH bytes (≤128MB) of the product's ZIP at OFFSET
+_ALOS1_CACHE_PROXY = 'https://alos1-cache-asf.insar.dev'
 _NISAR_BLOCK_SIZE = 128 * 1024 * 1024  # 128 MB blocks
 # Minimum side of a NISAR bbox crop on the ground: smaller crops cannot be processed accurately
 _NISAR_MIN_CROP_KM = 20
@@ -619,6 +622,9 @@ _ALOS2_FOOTPRINT = {
     # move points along track (zero-Doppler images)
     'along_km': {'R': 3.0, 'L': 5.0},
 }
+# The range bandwidth in MHz of the ALOS-1 PALSAR stripmap modes (JAXA's PALSAR modes), the `frequency` of the
+# ALOS-1 search rows (ASF._alos1_rows)
+_ALOS1_FREQUENCY = {'FBS': 28, 'FBD': 14, 'PLR': 14}
 # NISAR product name (fileID): level config product cycle track direction frame mode polarization x start stop crid processing coverage source counter
 _NISAR_NAME = re.compile(
     r'^NISAR_L(?P<level>\d)_(?P<config>[A-Z]{2})_(?P<product>[A-Z]+)_(?P<cycle>\d{3})_(?P<track>\d{3})'
@@ -1574,8 +1580,9 @@ class ASF(progressbar_joblib):
         FBD SLC, its samples unchanged. The
         catalog entries of the ALOS-1 products are looked up before the download of any mission starts, so a missing
         ALOS-1 product leaves nothing of the call written (Sentinel-1, NISAR and ALOS-2 IDs of the same call included).
-        ALOS-1 needs an Earthdata account, ASF(username, password): there is no cache proxy for it, and ASF() raises a
-        one-line ValueError for a product to download. Its files are cropped CEOS files in a folder per (path, frame,
+        The Earthdata account is optional, as for ALOS-2 and NISAR: with one, ASF(username, password), ALOS-1 is read
+        directly from ASF; without one, ASF(), through the cache proxy alos1-cache-asf.insar.dev, SLC and raw products
+        alike. Its files are cropped CEOS files in a folder per (path, frame,
         off-nadir angle in tenths of a degree), with the path (46 * orbit + 84) mod 671 + 1, the off-nadir angle of the
         product's leader file and the date of its first image line:
         <basedir>/119_6360_343/AL1_119_6360_343_20080712_HH.img (and _HV.img) and AL1_119_6360_343_20080712.led; the SLC
@@ -1822,12 +1829,10 @@ class ASF(progressbar_joblib):
         # the same minimum for the ALOS-2 subswaths that will be downloaded
         if alos2_needed and bbox is not None:
             self._nisar_check_bbox(bbox, mission='ALOS-2')
-        # and for the ALOS-1 products that will be downloaded, which need an account (no cache proxy for ALOS-1)
+        # and for the ALOS-1 products that will be downloaded (directly with an account, through the cache proxy
+        # without one)
         if alos1_needed and bbox is not None:
             self._nisar_check_bbox(bbox, mission='ALOS-1')
-        if alos1_needed and self.username is None:
-            raise ValueError("ALOS-1 needs an Earthdata account, ASF(username, password): there is no cache proxy for "
-                             "ALOS-1. Nothing was downloaded.")
 
         # Return early if nothing to download (no network call!)
         if not s1_needed and not nisar_needed and not alos2_needed and not alos1_needed:
@@ -2399,21 +2404,21 @@ class ASF(progressbar_joblib):
     def _cache_range(proxy, granule_id, offset, length, min_rate, min_rate_window, session=None):
         """Fetch a byte range of a granule from a cache proxy: GET <proxy>/<granule_id>/<offset>/<length>.bin.
 
-        The request is shared by the NISAR and ALOS-2 downloads through the cache proxies (no account). An error
-        raises as it is (HTTP.send); the caller retries. The request asks for an uncoded answer
-        (Accept-Encoding: identity), so the response comes with its Content-Length and a longer one is refused before
-        a byte of it is read. Both proxies, alos2-cache-asf.insar.dev and nisar-cache-asf.insar.dev (from its next
-        deploy), name their upstream answer in the headers X-Upstream-* (status, length, range, via, host, redirected,
-        ms), which the errors quote, and an upstream status other than 206 (the Range ignored, the body the whole file)
-        is refused before a byte of the body is read; a proxy answer without these headers keeps the texts without the
-        note.
+        The request is shared by the NISAR, ALOS-2 and ALOS-1 downloads through the cache proxies (no account; the
+        ALOS-1 proxy is _ALOS1_CACHE_PROXY, alos1-cache-asf.insar.dev). An error raises as it is (HTTP.send); the
+        caller retries. The request asks for an uncoded answer (Accept-Encoding: identity), so the response comes with
+        its Content-Length and a longer one is refused before a byte of it is read. The proxies,
+        alos1-cache-asf.insar.dev, alos2-cache-asf.insar.dev and nisar-cache-asf.insar.dev (from its next deploy), name
+        their upstream answer in the headers X-Upstream-* (status, length, range, via, host, redirected, ms), which the
+        errors quote, and an upstream status other than 206 (the Range ignored, the body the whole file) is refused
+        before a byte of the body is read; a proxy answer without these headers keeps the texts without the note.
 
         Parameters
         ----------
         proxy : str
-            Base URL of the cache proxy, such as _NISAR_CACHE_PROXY or _ALOS2_CACHE_PROXY.
+            Base URL of the cache proxy, such as _NISAR_CACHE_PROXY, _ALOS2_CACHE_PROXY or _ALOS1_CACHE_PROXY.
         granule_id : str
-            The granule ID the proxy knows: a NISAR granule ID, or the fileID of an ALOS-2 granule.
+            The granule ID the proxy knows: a NISAR granule ID, or the fileID of an ALOS-2 granule or ALOS-1 product.
         offset : int
             First byte of the range in the granule's file.
         length : int
@@ -4001,9 +4006,10 @@ class ASF(progressbar_joblib):
         member's data.
 
         With an account every read is a byte range of ASF._byte_range on one login session, the first request following
-        the login redirect and the next ones going to its signed URL. Without one (ALOS-2 only) every read is
-        ASF._cache_range of the fileID on _ALOS2_CACHE_PROXY, on one requests.Session (no Earthdata session, no signed
-        URL). The ZIP directory is read through byte ranges (zipfile over _RangeReader).
+        the login redirect and the next ones going to its signed URL; without one, the mission's cache proxy
+        (_ALOS2_CACHE_PROXY or _ALOS1_CACHE_PROXY): every read is ASF._cache_range of the fileID on it, on one
+        requests.Session (no Earthdata session, no signed URL). The ZIP directory is read through byte ranges (zipfile
+        over _RangeReader).
 
         Parameters
         ----------
@@ -4012,11 +4018,11 @@ class ASF(progressbar_joblib):
         url : str
             The catalog URL of the product's ZIP.
         size : int or None
-            The ZIP's size in bytes. None (with an account only): the size the server reports, the Content-Range of the
-            one-byte range 0-0
+            The ZIP's size in bytes. None: the size the server reports, with an account the Content-Range of the
+            one-byte range 0-0, without one the proxy's X-Upstream-Range of the one-byte range <proxy>/<fileID>/0/1.bin
             (the catalog size can differ from it, ASF._download_alos1), with the attempts of retries; its one-byte body
-            is read, so the connection goes back to the pool for the next reads, and the signed URL of its redirect is
-            kept for them.
+            is read, so the connection goes back to the pool for the next reads, and the signed URL of its redirect (with
+            an account) is kept for them.
         label : str
             'ALOS-2' or 'ALOS-1': the mission in the messages.
         retries, timeout_second, min_rate, min_rate_window, debug
@@ -4064,15 +4070,16 @@ class ASF(progressbar_joblib):
                     time.sleep(timeout_second)
 
         signed = [None]
+        # the mission's cache proxy (used without an account)
+        proxy = _ALOS1_CACHE_PROXY if label == 'ALOS-1' else _ALOS2_CACHE_PROXY
         if self.username is None:
             # through the cache proxy: no Earthdata session, no signed URL
             if debug:
-                print(f"{label} URL: {_ALOS2_CACHE_PROXY}/{fileID}")
+                print(f"{label} URL: {proxy}/{fileID}")
             session = requests.Session()
 
             def fetch(start, end, pbar=None):
-                data, _ = ASF._cache_range(_ALOS2_CACHE_PROXY, fileID, start, end - start, min_rate, min_rate_window,
-                                           session)
+                data, _ = ASF._cache_range(proxy, fileID, start, end - start, min_rate, min_rate_window, session)
                 if pbar is not None:
                     pbar.update(len(data))
                 return data
@@ -4091,15 +4098,22 @@ class ASF(progressbar_joblib):
             return attempt(f'downloading {fileID} bytes {start}..{end}', lambda: fetch(start, end, pbar), pbar)
 
         def remote_size():
-            with send(session.get, url, headers={'Range': 'bytes=0-0', 'Accept-Encoding': 'identity'}, stream=True,
-                      timeout=(10, 300)) as r:
+            if self.username is None:
+                # the proxy's answer to the one-byte range at 0 names the upstream's range, with its total, in
+                # X-Upstream-Range (also on a cache hit)
+                request = dict(url=f'{proxy}/{fileID}/0/1.bin', headers={'Accept-Encoding': 'identity'})
+                header = 'X-Upstream-Range'
+            else:
+                request = dict(url=url, headers={'Range': 'bytes=0-0', 'Accept-Encoding': 'identity'})
+                header = 'Content-Range'
+            with send(session.get, request['url'], headers=request['headers'], stream=True, timeout=(10, 300)) as r:
                 if 'cloudfront.net' in r.url:
                     signed[0] = r.url
-                m = re.match(r'^bytes 0-0/(\d+)$', r.headers.get('Content-Range', ''))
+                m = re.match(r'^bytes 0-0/(\d+)$', r.headers.get(header, ''))
                 if m is None:
                     raise ValueError(f"{label} product {fileID}: no file size in the answer to a byte range "
-                                     f"(HTTP {r.status_code}, Content-Range {r.headers.get('Content-Range')!r})")
-                # the one byte of the range 0-0, read only after its Content-Range is checked
+                                     f"(HTTP {r.status_code}, {header} {r.headers.get(header)!r})")
+                # the one byte of the range 0-0, read only after its size header is checked
                 r.content
                 return int(m.group(1))
 
@@ -4320,17 +4334,18 @@ class ASF(progressbar_joblib):
 
     def _download_alos1(self, basedir, ids, polarizations, bbox, n_jobs, skip_exist, retries, timeout_second, min_rate,
                         min_rate_window, debug, catalog=None):
-        """Internal: download ALOS-1 PALSAR L1.1 (SLC) and L1.0 (raw signal data) products directly from ASF with an
-        Earthdata account, cropped to a bbox (download() refuses ASF() without an account for ALOS-1: there is no cache
-        proxy).
+        """Internal: download ALOS-1 PALSAR L1.1 (SLC) and L1.0 (raw signal data) products from ASF, cropped to a bbox:
+        directly with an Earthdata account, through the cache proxy _ALOS1_CACHE_PROXY (alos1-cache-asf.insar.dev)
+        without one, SLC and raw products alike (the account is optional, as for ALOS-2 and NISAR).
 
         A product at ASF is one ZIP archive. Its size is the one the server reports (the Content-Range of a one-byte
-        range), never the catalog size, which can differ from it: for 79 of the 109 L1.0 products of orbit 5500 (-14
-        to +11 bytes) and for none of 232 L1.1 products (measured 2026-11-23). Its directory is read through byte ranges
-        (zipfile over _RangeReader), then only the leader file (LED) and the line records of the image files (IMG, one
-        per polarization) that the bbox reaches are read, as for ALOS-2 (ASF._alos_zip, shared with
-        ASF._download_alos2): every read is a byte range of ASF._byte_range on one login session per product, reusing
-        the signed URL of the first redirect. The members are found by their names
+        range; through the proxy its X-Upstream-Range), never the catalog size, which can differ from it: for 79 of the
+        109 L1.0 products of orbit 5500 (-14 to +11 bytes) and for none of 232 L1.1 products (measured 2026-11-23). Its
+        directory is read through byte ranges (zipfile over _RangeReader), then only the leader file (LED) and the line
+        records of the image files (IMG, one per polarization) that the bbox reaches are read, as for ALOS-2
+        (ASF._alos_zip, shared with ASF._download_alos2): with an account every read is a byte range of ASF._byte_range
+        on one login session per product, reusing the signed URL of the first redirect; without one every read is
+        ASF._cache_range of the product's fileID on _ALOS1_CACHE_PROXY. The members are found by their names
         (LED-<scene>-<code>, IMG-<pol>-<scene>-<code>, in a folder or not), each by its own ZIP method: a stored member
         (0) is read by byte ranges of the window's lines; a deflate-compressed member (8) is read from its start and
         decompressed as it arrives (raw deflate) up to the window's last line, nothing after it, the lines before the
@@ -5368,16 +5383,17 @@ class ASF(progressbar_joblib):
         geopandas.GeoDataFrame
             One row per product in catalog order: the catalog properties with `sceneName` = the fileID (the ID
             ASF.download takes, such as 'ALPSRP131296360-L1.1' or 'ALPSRP055006360-L1.0'), `beamMode` = the catalog
-            beamModeType, the catalog processingLevel ('L1.1' or 'L1.0'), and the catalog footprint as geometry; CRS
-            EPSG:4326.
+            beamModeType, `frequency` = the range bandwidth of that mode in whole MHz (FBS 28, FBD and PLR 14; a raw
+            product has the bandwidth of its mode), the catalog processingLevel ('L1.1' or 'L1.0'), and the catalog
+            footprint as geometry; CRS EPSG:4326.
 
         Examples
         --------
         >>> product = {'type': 'Feature', 'properties': {'fileID': 'ALPSRP131296360-L1.1', 'beamModeType': 'FBD',
         ...            'polarization': 'HH+HV'}, 'geometry': {'type': 'Polygon', 'coordinates': [[[-72.89, -40.297],
         ...            [-72.684, -40.813], [-71.885, -40.621], [-72.097, -40.107], [-72.89, -40.297]]]}}
-        >>> ASF._alos1_rows([product], 'HV')['sceneName'].tolist()
-        ['ALPSRP131296360-L1.1']
+        >>> ASF._alos1_rows([product], 'HV')[['sceneName', 'frequency']].values.tolist()
+        [['ALPSRP131296360-L1.1', 14]]
         """
         import geopandas as gpd
 
@@ -5407,10 +5423,12 @@ class ASF(progressbar_joblib):
             supported = [f for f in supported if requested <= pols_of(f['properties'].get('polarization'))]
         rows = [{'type': 'Feature', 'geometry': f['geometry'],
                  'properties': {**f['properties'], 'sceneName': f['properties']['fileID'],
-                                'beamMode': f['properties'].get('beamModeType')}}
+                                'beamMode': f['properties'].get('beamModeType'),
+                                'frequency': _ALOS1_FREQUENCY[f['properties'].get('beamModeType')]}}
                 for f in supported]
         if not rows:
-            return gpd.GeoDataFrame(columns=['geometry', 'sceneName', 'beamMode'], geometry='geometry', crs='EPSG:4326')
+            return gpd.GeoDataFrame(columns=['geometry', 'sceneName', 'beamMode', 'frequency'], geometry='geometry',
+                                    crs='EPSG:4326')
         return gpd.GeoDataFrame.from_features(rows, crs='EPSG:4326')
 
     @staticmethod
@@ -5476,8 +5494,8 @@ class ASF(progressbar_joblib):
         (ASF._alos1_rows): the default search lists SLC products only, the L1.0 search raw products only. The column
         sceneName is the product ID that ASF.download
         takes, such as 'ALPSRP131296360-L1.1' or 'ALPSRP055006360-L1.0', with the catalog columns pathNumber,
-        frameNumber, offNadirAngle, polarization, startTime, processingLevel, beamMode (the catalog beamModeType) and
-        the catalog footprint.
+        frameNumber, offNadirAngle, polarization, startTime, processingLevel, beamMode (the catalog beamModeType),
+        frequency (the range bandwidth of the mode in whole MHz: FBS 28, FBD and PLR 14) and the catalog footprint.
 
         NISAR (platform='NISAR'): one row per acquisition, the most recent production product of it
         (ASF._nisar_latest). The catalog holds BETA, PROVISIONAL and VALIDATED versions of one acquisition and the

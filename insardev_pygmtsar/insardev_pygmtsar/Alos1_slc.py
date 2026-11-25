@@ -71,7 +71,8 @@ class Alos1_slc(Satellite):
         The layout is the one insardev_toolkit `ASF.download` stores: `<path>_<frame>_<offnadir>/AL1_<path>_<frame>_<offnadir>
         _<yyyymmdd>_<pol>.img`, with the date's `AL1_<path>_<frame>_<offnadir>_<yyyymmdd>.led` beside it. One record per IMG
         file (date and polarization); the LED holds the orbit, so the records carry it in the 'orbit' column. The column
-        'subswath' is the off-nadir code of the name (the beam), 'doppler' the date's Doppler centroid at mid swath in Hz
+        'subswath' is the off-nadir code of the name (the beam), 'frequency' the scene's range bandwidth in whole MHz from its
+        leader (|chirp slope| x pulse duration, rounded: FBS 28, FBD and PLR 14), 'doppler' the date's Doppler centroid at mid swath in Hz
         (utils_alos1.alos1_doppler_centroid: the image is focused at it, not at zero Doppler), and the geometry is the footprint
         of JAXA's per-line positions (utils_alos2.alos2_footprint), the image's own native-Doppler geometry.
 
@@ -147,6 +148,7 @@ class Alos1_slc(Satellite):
                 'flightDirection': prm['orbdir'],
                 'lookDirection': prm['lookdir'],
                 'band': 'L',
+                'frequency': int(round(abs(prm['chirp_slope']) * prm['pulse_dur'] / 1e6)),
                 'doppler': alos1_doppler_centroid(prm),
                 'geometry': alos2_footprint(img_path)
             })

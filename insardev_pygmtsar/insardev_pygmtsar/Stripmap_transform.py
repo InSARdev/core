@@ -674,6 +674,9 @@ def _transform_slc_int16_stripmap_chunked(outdir, conversion_dir, prm_rep, prm_r
         attrs['pathNumber'] = attrs[path_attr]
         attrs['band'] = band
         attrs['mission'] = mission
+        # the scene's range bandwidth in MHz, carried from the scan record (ALOS-1), as NISAR's frequency
+        if 'frequency' in record_dict:
+            attrs['frequency'] = _convert_value(record_dict['frequency'])
         attrs['flightDirection'] = record_dict['flightDirection']
         attrs['lookDirection'] = record_dict['lookDirection']
         attrs['polarization'] = item['pol']
